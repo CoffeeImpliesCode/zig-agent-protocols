@@ -176,5 +176,11 @@ jobs:
       - name: zig build fuzz
         run: zig build fuzz
 
+      # The runtime layer's end-to-end proof: a real client and a real server
+      # exchanging frames over a real socket. Without it, CI would only ever
+      # prove the codec works against slices.
+      - name: zig build run-runtime
+        run: zig build run-runtime
+
       - name: zig build docs
         run: zig build docs

@@ -29,11 +29,28 @@ Git.
   fields each was selected to pin, and it runs in the default `test` step. It is
   a separate binary from the library tests because a fixture is a file and
   `@embedFile` makes a missing one a build failure rather than a silent skip.
-- `src/demo.zig` is the `run` step. It is a separate executable because a static
-  library cannot be run, and because a protocol library that has only ever run
-  its own tests has never been used against real wire bytes.
-- `build.zig` exposes the `zig-agent-proto` module, installs a static library and
-  the demonstration, and defines `run`, `test`, `fuzz`, and `docs` steps.
+- `test/loopback_test.zig` drives two real connections over a Unix socket: a
+  client and a server exchanging frames through a live `Io`. It is separate
+  from the unit tests because it needs its own loop, and because a codec that
+  has only ever been tested against slices has never been driven by a
+  transport. Two defects that no slice-driven test could find live here, and
+  both are recorded in the file.
+- `src/demo.zig` is the `run` step: it decodes real wire bytes with the codec
+  and prints what came out.
+- `src/framing.zig`, `src/conn.zig` and `src/stdio.zig` are the runtime layer
+  that sits above the codec. `framing` assembles newline-delimited frames in a
+  caller-owned buffer, `conn` is the JSON-RPC connection, and `stdio` wires the
+  process's own streams to one. `ARCHITECTURE.md` records why this layer targets
+  the `std.Io` interface rather than a concrete backend.
+- `src/mcp_session.zig` is the protocol layer above the connection. Everything
+  in it is revision rules: which methods exist, where capabilities travel, and
+  how a result is classified.
+- `src/runtime_demo.zig` is the `run-runtime` step: a real MCP client and a
+  real server talking to each other over a socket, with the same `conn.Conn` a
+  server binary would use.
+- `build.zig` exposes the `zig-agent-proto` module, installs a static library,
+  the codec demonstration and the runtime example, and defines `run`,
+  `run-runtime`, `test`, `fuzz`, and `docs` steps.
 - The library has no dependencies beyond the Zig toolchain and no system library
   dependencies.
 
@@ -57,6 +74,39 @@ Git.
 - Do not allocate in a decode or encode path. Use caller-supplied buffers. A
   `Reader` has no allocator field; every escape-unescape target and every
   integer or base64 buffer is caller-owned.
+
+## Runtime contracts
+
+These are the rules the layer above the codec is bound by. They are not
+style; each one has a failure that is hard to see from the code alone.
+
+- **Every runtime entry point takes `io: std.Io`.** No library type stores an
+  `Io` it did not receive, and only the examples and tests name
+  `std.Io.Threaded`. This is what keeps the executor a consumer's choice; see
+  `ARCHITECTURE.md`.
+- **`Io.Group.async` does not run its task until `await` or `cancel`.** A
+  reader parked on a group nobody joins simply never starts, and the call
+  waiting for its answer waits forever. Join the group.
+- **Both ends of a test share one group.** Awaiting the client's group alone
+  deadlocks: the client blocks on an answer only the peer's task can produce.
+- **A transport must `shutdown` before `close`.** Closing a file descriptor
+  does not interrupt a `read` already blocked on it, so the reader sits on an
+  open file description and the group never finishes.
+- **Read with `readVec`, never `readSliceShort`, to mean "read what is
+  available".** `readSliceShort` means *fill this buffer completely* and blocks
+  waiting for the remaining kilobytes of a frame that already fully arrived.
+- **A connection's reader and writer must outlive `open`.** `conn.Conn` holds
+  raw pointers to both `Io.Reader` and `Io.Writer`, so they are fields of the
+  owning struct. A local in a constructor dangles the moment it returns, and
+  the fault lands on the first read rather than at the call.
+- **Handlers run inline on the reader task.** A handler that calls back on the
+  same connection deadlocks, because the reader that would deliver that
+  answer is the task now waiting for it.
+- **A response is matched only by id, and a peer error is not a result.**
+  `Response.error_code` is set when the peer answered with `error`; reading only
+  `body` reports a failure as a success.
+- **Request ids are monotonic and never reused.** A retry is a new call, which
+  the multi-round-trip rule requires and which `Conn.nextId` reports.
 
 ## Contracts the audit pinned down
 
@@ -85,12 +135,16 @@ Git.
 
 Run at the repository root:
 
-- `zig build` installs the static library and the demonstration, and makes the
-  `zig-agent-proto` module available to consumers. `zig build test` runs the unit
-  tests and the golden vectors. `zig build docs` generates documentation.
-  `zig build run` executes the demonstration, which prints what each decoder
-  produced from real wire bytes; it writes to stdout through one buffered
-  writer, so `zig build run > demo.txt` captures the whole report.
+- `zig build` installs the static library, the codec demonstration and the
+  runtime example, and makes the `zig-agent-proto` module available to
+  consumers. `zig build test` runs the unit tests, the golden vectors and the
+  loopback tests. `zig build docs` generates documentation. `zig build run`
+  executes the codec demonstration, which prints what each decoder produced
+  from real wire bytes; it writes to stdout through one buffered writer, so
+  `zig build run > demo.txt` captures the whole report. `zig build run-runtime`
+  runs a live MCP client and server against each other over a socket and
+  prints the exchange, which is the end-to-end proof that the codec and the
+  runtime work together on real transport bytes.
 - `zig build fuzz` runs the property and differential harness on its own. It
   takes `-Dfuzz-seed=<u64>` and `-Dfuzz-iterations=<usize>`, both in decimal, and
   prints them on every run, so a failure is reproducible from the log. It
@@ -105,9 +159,9 @@ macOS, in `.github/workflows/ci.yml`. It installs the toolchain named by
 `.minimum_zig_version` from `ziglang.org`, checks the tarball against the
 sha256 the download index publishes, cross-checks `zig version` against the
 pin the way `gate` does, and then runs `zig fmt --check .`, `zig build`,
-`zig build test` in Debug and again in ReleaseSafe, `zig ast-check` over the
-file set the manifest publishes in `.paths`, `zig build run`, and
-`zig build docs`. `zlint` and `zbc` are deliberately not in it: both are
+`zig build test` in Debug and again in ReleaseSafe, `zig build fuzz`,
+`zig ast-check` over the file set the manifest publishes in `.paths`,
+`zig build run`, `zig build run-runtime`, and `zig build docs`. `zlint` and `zbc` are deliberately not in it: both are
 builds of personal checkouts under `~/tools`, outside this repository, so CI
 would have to vendor an unpinned third-party build to run them.
 
