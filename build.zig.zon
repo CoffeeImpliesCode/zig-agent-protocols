@@ -1,0 +1,13 @@
+.{
+    .name = .zig_agent_proto,
+    .version = "0.0.0",
+    .fingerprint = 0xd05e6738d1c51d14, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "test",
+    },
+}

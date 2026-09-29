@@ -1,0 +1,12 @@
+.devenv/
+.direnv/
+.zig-cache/
+.zig-global-cache/
+zig-out/
+zig-pkg/
+
+# Jujutsu VCS
+.jj/
+
+# codedb index snapshot
+codedb.snapshot
