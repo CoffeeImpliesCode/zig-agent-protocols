@@ -35,7 +35,9 @@ pub const jsonrpc = @import("jsonrpc.zig");
 pub const mcp = @import("mcp.zig");
 pub const conn = @import("conn.zig");
 pub const mcp_session = @import("mcp_session.zig");
+pub const acp_session = @import("acp_session.zig");
 pub const bridge_session = @import("bridge_session.zig");
+pub const http = @import("http.zig");
 pub const framing = @import("framing.zig");
 pub const stdio = @import("stdio.zig");
 
