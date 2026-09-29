@@ -73,10 +73,14 @@ const TestHandler = struct {
             .response => return null,
             .request => {},
         }
-        const name = message.method.?.text;
-        const n = @min(name.len, self.saw_method.len);
-        @memcpy(self.saw_method[0..n], name[0..n]);
-        self.saw_len = n;
+        // Only the first, so a later call on the same connection cannot
+        // overwrite what the assertion is about.
+        if (self.saw_len == 0) {
+            const name = message.method.?.text;
+            const n = @min(name.len, self.saw_method.len);
+            @memcpy(self.saw_method[0..n], name[0..n]);
+            self.saw_len = n;
+        }
 
         // The scratch is this connection's handler buffer, so the answer can
         // borrow it for as long as the write takes.
@@ -160,6 +164,7 @@ test "a client and a server complete a request over a real socket" {
 
     var peer_endpoint: Endpoint = .{};
     var client_endpoint: Endpoint = .{};
+    var second_id_is_two: bool = false;
     var handler_state: TestHandler = .{};
     var answer: conn.Response = undefined;
     var call_failed: bool = false;
@@ -192,6 +197,7 @@ test "a client and a server complete a request over a real socket" {
         method: []const u8,
         params: ?[]const u8,
         notify_after: bool,
+        second_id_is_two: *bool,
 
         fn run(self: *@This()) void {
             const stream = self.address.connect(self.io) catch {
@@ -208,6 +214,24 @@ test "a client and a server complete a request over a real socket" {
                 self.failed.* = true;
                 return;
             };
+            // A second call on the same connection is a genuinely different
+            // request. Two calls sharing an id would let one steal the other's
+            // answer, and the multi-round-trip rule requires a retry to be a
+            // new call, so this is the assertion that keeps a reused id from
+            // passing silently.
+            _ = self.endpoint.connection.call(
+                "tools/list",
+                null,
+                &self.endpoint.side.result,
+                &self.endpoint.side.notify_out,
+            ) catch {
+                self.failed.* = true;
+                return;
+            };
+            const second_request = self.endpoint.side.notify_out[0..self.endpoint
+                .connection.lastEncodedLen()];
+            self.second_id_is_two.* = std.mem.indexOf(u8, second_request, "\"id\":2") != null;
+
             if (self.notify_after) {
                 self.endpoint.connection.notify(
                     "notifications/progress",
@@ -247,6 +271,7 @@ test "a client and a server complete a request over a real socket" {
         .method = "tools/call",
         .params = "{\"name\":\"echo\"}",
         .notify_after = true,
+        .second_id_is_two = &second_id_is_two,
     };
     group.async(io, Peer.run, .{&peer});
     group.async(io, Client.run, .{&client});
@@ -268,6 +293,10 @@ test "a client and a server complete a request over a real socket" {
     // The peer really read the method, so its reader ran, decoded, dispatched
     // and answered.
     try testing.expectEqualStrings("tools/call", handler_state.saw_method[0..handler_state.saw_len]);
+
+    // Two calls on one connection got two different ids.
+    try testing.expect(second_id_is_two);
+    try testing.expectEqual(@as(i64, 3), client_endpoint.connection.nextId());
 
     // The notification went out as a frame with no id at all. An id here would
     // make the peer wait for a response that this library never sends.

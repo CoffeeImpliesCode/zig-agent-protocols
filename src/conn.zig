@@ -133,6 +133,11 @@ pub const Conn = struct {
     /// Monotonic, never reused, so a late answer to a dead request cannot be
     /// mistaken for a live one.
     next_id: i64 = 1,
+    /// Bytes written into the caller's `out` buffer by the most recent
+    /// `call` or `notify`. Reported rather than returned because the buffer is
+    /// the caller's, and a caller that cannot learn the length cannot log or
+    /// proxy what went out.
+    last_encoded_len: usize = 0,
     closed: bool = false,
     /// Serialises writes. Two tasks may call at once, and a frame interleaved
     /// with another is two malformed frames on the wire.
@@ -168,6 +173,21 @@ pub const Conn = struct {
         self.handler = handler;
     }
 
+    /// The length of the request or notification most recently written into
+    /// the caller's encode buffer. Valid immediately after `call` or `notify`.
+    ///
+    /// Concurrent callers on one connection each get their own buffer, so
+    /// this is only meaningful to the task whose buffer it is.
+    pub fn lastEncodedLen(self: *const Conn) usize {
+        return self.last_encoded_len;
+    }
+
+    /// The id the next request will carry. Reported so a caller can predict
+    /// and test the id sequence rather than having to parse the wire.
+    pub fn nextId(self: *const Conn) i64 {
+        return self.next_id;
+    }
+
     /// Send a request and wait for its response.
     ///
     /// `params` is the raw JSON of the `params` member, or null to omit it.
@@ -183,6 +203,11 @@ pub const Conn = struct {
         if (self.closed) return error.Closed;
 
         const id = self.next_id;
+        // Claimed and incremented together, on the assumption that the caller
+        // is the only one issuing on this connection. Two calls sharing an id
+        // would let one steal the other's answer, and the multi-round-trip
+        // rule requires a retry to be a genuinely new call.
+        self.next_id += 1;
         const slot = self.claim(id, result) orelse return error.TooManyPending;
 
         // Encode before the id is published to the writer path: a request that
@@ -376,7 +401,6 @@ pub const Conn = struct {
         params: ?[]const u8,
         out: []u8,
     ) Error![]const u8 {
-        _ = self;
         var writer = json.Writer.init(out);
         writer.slice("{\"jsonrpc\":\"2.0\",\"id\":") catch return error.ResponseTooLarge;
         var id_buffer: [24]u8 = undefined;
@@ -389,6 +413,7 @@ pub const Conn = struct {
             writer.slice(text) catch return error.ResponseTooLarge;
         }
         writer.byte('}') catch return error.ResponseTooLarge;
+        self.last_encoded_len = writer.len;
         return writer.written();
     }
 
@@ -398,7 +423,6 @@ pub const Conn = struct {
         params: ?[]const u8,
         out: []u8,
     ) Error![]const u8 {
-        _ = self;
         var writer = json.Writer.init(out);
         writer.slice("{\"jsonrpc\":\"2.0\",\"method\":") catch return error.ResponseTooLarge;
         writer.string(method) catch return error.ResponseTooLarge;
@@ -407,6 +431,7 @@ pub const Conn = struct {
             writer.slice(text) catch return error.ResponseTooLarge;
         }
         writer.byte('}') catch return error.ResponseTooLarge;
+        self.last_encoded_len = writer.len;
         return writer.written();
     }
 };

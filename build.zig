@@ -38,6 +38,23 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(demo);
 
+    // The runtime example drives a real connection over a real socket with
+    // the same `conn.Conn` a server binary would use, so it is the proof that
+    // the codec and the runtime work together on actual transport bytes.
+
+    const runtime_mod = b.createModule(.{
+        .root_source_file = b.path("src/runtime_demo.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    runtime_mod.addImport("zig-agent-proto", lib_mod);
+
+    const runtime_demo = b.addExecutable(.{
+        .name = "zig-agent-proto-runtime",
+        .root_module = runtime_mod,
+    });
+    b.installArtifact(runtime_demo);
+
     // running
 
     const run_cmd = b.addRunArtifact(demo);
@@ -47,6 +64,10 @@ pub fn build(b: *std.Build) void {
     }
     const run_step = b.step("run", "Run the demonstration against real wire bytes");
     run_step.dependOn(&run_cmd.step);
+
+    const run_runtime_cmd = b.addRunArtifact(runtime_demo);
+    const run_runtime_step = b.step("run-runtime", "Run a live MCP client and server over a socket");
+    run_runtime_step.dependOn(&run_runtime_cmd.step);
 
     // testing
 
