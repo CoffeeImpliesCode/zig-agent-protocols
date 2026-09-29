@@ -1,0 +1,7 @@
+{
+  "experimental": { "<key>": { } },
+  "roots": {},
+  "sampling": { "context": {}, "tools": {} },
+  "elicitation": { "form": {}, "url": {} },
+  "extensions": { "<extension-identifier>": { } }
+}

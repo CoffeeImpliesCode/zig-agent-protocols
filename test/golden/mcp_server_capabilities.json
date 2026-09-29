@@ -1,0 +1,9 @@
+{
+  "experimental": { "<key>": {} },
+  "logging": {},
+  "completions": {},
+  "prompts": { "listChanged": true },
+  "resources": { "subscribe": true, "listChanged": true },
+  "tools": { "listChanged": true },
+  "extensions": { "<extension-identifier>": {} }
+}

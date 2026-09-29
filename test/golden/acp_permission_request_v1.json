@@ -1,0 +1,18 @@
+{
+  "sessionId": "sess-01",
+  "toolCall": {
+    "toolCallId": "call-1",
+    "title": "Run the test suite",
+    "kind": "execute",
+    "status": "pending",
+    "rawInput": {
+      "command": "zig",
+      "args": ["build", "test"]
+    }
+  },
+  "options": [
+    {"optionId": "opt-allow-once", "name": "Allow once", "kind": "allow_once"},
+    {"optionId": "opt-allow-always", "name": "Always allow", "kind": "allow_always"},
+    {"optionId": "opt-reject-once", "name": "Reject", "kind": "reject_once"}
+  ]
+}

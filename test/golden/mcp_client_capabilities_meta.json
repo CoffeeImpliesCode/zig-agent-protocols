@@ -1,0 +1,5 @@
+{
+  "_meta": {
+    "io.modelcontextprotocol/clientCapabilities": { "extensions": { "io.modelcontextprotocol/ui": { "mimeTypes": ["text/html;profile=mcp-app"] } } }
+  }
+}

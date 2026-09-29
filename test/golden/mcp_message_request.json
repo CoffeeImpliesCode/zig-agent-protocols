@@ -1,0 +1,8 @@
+{"jsonrpc":"2.0","id":20,"method":"mcp/message","params":{
+  "serverId":"project-tools:7a72","requestId":"mcp-request:a11f",
+  "method":"tools/call",
+  "params":{"name":"echo","arguments":{"message":"hello"},
+    "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+             "io.modelcontextprotocol/clientCapabilities":{},
+             "io.modelcontextprotocol/clientInfo":{"name":"example-agent","version":"1"},
+             "progressToken":"progress-1"}}}}

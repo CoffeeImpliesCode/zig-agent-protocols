@@ -1,0 +1,12 @@
+{
+  "resultType": "input_required",
+  "inputRequests": {
+    "e1": {
+      "method": "elicitation/create",
+      "params": {
+        "message": "Which environment should the migration target?"
+      }
+    }
+  },
+  "requestState": "eyJzdWIiOiJ1MSJ9"
+}

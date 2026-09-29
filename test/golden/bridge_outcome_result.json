@@ -1,0 +1,8 @@
+{
+  "result": {
+    "resultType": "complete",
+    "content": [
+      {"type": "text", "text": "hello"}
+    ]
+  }
+}
