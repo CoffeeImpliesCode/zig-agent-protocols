@@ -1,0 +1,180 @@
+# Continuous integration for zig-agent-proto.
+#
+# This runs the half of the house gate that a pinned Zig toolchain can
+# reproduce on any machine: `zig fmt --check`, `zig build`, `zig build test`,
+# `zig ast-check`, plus the `run` and `docs` steps. The developer's `gate`
+# script also runs zlint and zbc, but those are builds of personal checkouts
+# under `~/tools`, not dependencies of this repository, so CI cannot run them
+# without vendoring an unpinned third-party build. A lint gate that only
+# exists on one machine is not a gate; those two stay a developer-side check.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# The gate reads the source and nothing else.
+permissions:
+  contents: read
+
+# A superseded push on the same ref is dead work.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    # Both runners execute natively. The library has no system library
+    # dependencies, so a native run on Linux and on macOS is a real
+    # portability check. A cross-compile matrix would only prove that
+    # `zig build -Dtarget=...` emits objects that nothing ever runs.
+    name: gate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One runner's failure must not hide the other runner's result.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    env:
+      # devenv.nix sets this so the project keeps its global cache inside the
+      # checkout; CI uses the same layout so a cache saved here and a cache
+      # saved on the developer machine have the same shape.
+      ZIG_GLOBAL_CACHE_DIR: .zig-global-cache
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Restore the Zig caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            .zig-global-cache
+          # The manifest is the key because it carries the toolchain pin and
+          # the dependency set. Source contents are not part of the key:
+          # Zig hashes them itself, so an edit under `src/` reuses this cache
+          # and rebuilds only what changed. The restore key stays inside one
+          # runner OS, because a cache entry holds native objects.
+          key: zig-${{ runner.os }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            zig-${{ runner.os }}-
+
+      - name: Install the pinned Zig toolchain
+        run: |
+          set -euo pipefail
+          # The version is read from the manifest, never copied into this
+          # file. `.minimum_zig_version` is the one place the toolchain
+          # version is written down; this workflow, the anyzig shim, and
+          # `gate` all read it, so none of them can drift from each other.
+          version="$(sed -n 's/.*\.minimum_zig_version = "\(.*\)".*/\1/p' build.zig.zon)"
+          if [ -z "$version" ]; then
+            echo "build.zig.zon declares no .minimum_zig_version" >&2
+            exit 1
+          fi
+
+          case "$(uname -s)" in
+            Linux) os=linux ;;
+            Darwin) os=macos ;;
+            *) echo "unsupported runner os $(uname -s)" >&2; exit 1 ;;
+          esac
+          case "$(uname -m)" in
+            x86_64 | amd64) arch=x86_64 ;;
+            arm64 | aarch64) arch=aarch64 ;;
+            *) echo "unsupported runner arch $(uname -m)" >&2; exit 1 ;;
+          esac
+          target="$arch-$os"
+
+          # ziglang.org is the only download source here, and its index
+          # carries the sha256 of every tarball it publishes. A "latest"
+          # tarball URL would let a toolchain swap silently change what CI
+          # proves; a missing release is a loud failure instead.
+          index="$(curl --fail --silent --show-error --location \
+            https://ziglang.org/download/index.json)"
+          url="$(printf '%s' "$index" |
+            jq -er --arg v "$version" --arg t "$target" '.[$v][$t].tarball')" || {
+            echo "zig $version publishes no $target tarball" >&2
+            exit 1
+          }
+          expected="$(printf '%s' "$index" |
+            jq -er --arg v "$version" --arg t "$target" '.[$v][$t].shasum')"
+
+          archive="$RUNNER_TEMP/zig.tar.xz"
+          curl --fail --silent --show-error --location --output "$archive" "$url"
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual="$(sha256sum "$archive" | cut -d' ' -f1)"
+          else
+            actual="$(shasum -a 256 "$archive" | cut -d' ' -f1)"
+          fi
+          if [ "$actual" != "$expected" ]; then
+            echo "sha256 mismatch for $url" >&2
+            echo "  index says $expected" >&2
+            echo "  download  $actual" >&2
+            exit 1
+          fi
+
+          # The tarball's root directory is named after the target, and that
+          # name is not guaranteed to match what `uname` reports, so strip
+          # it instead of guessing it.
+          prefix="$RUNNER_TEMP/zig"
+          mkdir -p "$prefix"
+          tar -xf "$archive" -C "$prefix" --strip-components=1
+          echo "$prefix" >> "$GITHUB_PATH"
+          "$prefix/zig" version
+
+      # The first thing `gate` does on a developer machine. It is worth
+      # repeating here: every later step is meaningless against a toolchain
+      # the manifest does not describe.
+      - name: Cross-check the toolchain against the manifest pin
+        run: |
+          set -eu
+          version="$(zig version)"
+          pin="$(sed -n 's/.*\.minimum_zig_version = "\(.*\)".*/\1/p' build.zig.zon)"
+          test "$version" = "$pin" || {
+            echo "zig $version does not match .minimum_zig_version $pin" >&2
+            exit 1
+          }
+          echo "zig $version matches .minimum_zig_version"
+
+      - name: zig fmt --check
+        run: zig fmt --check .
+
+      - name: zig build
+        run: zig build
+
+      - name: zig build test
+        run: zig build test
+
+      # Decoders here index caller-owned buffers by offsets the tests
+      # compute. Debug mode lets an out-of-range index wrap or pass, so the
+      # second pass is the one that would catch it.
+      - name: zig build test (ReleaseSafe)
+        run: zig build test -Doptimize=ReleaseSafe
+
+      - name: zig ast-check
+        run: |
+          set -euo pipefail
+          # The file set the manifest publishes in `.paths`: the build script
+          # and the sources. Nothing else in a checkout is Zig, and a
+          # restored cache must not widen the set.
+          find build.zig src test -name '*.zig' -print | while IFS= read -r f; do
+            zig ast-check "$f"
+          done
+
+      # Exercise the decoders on real wire bytes, not just inside unit tests.
+      # The demonstration writes its report to stdout.
+      - name: zig build run
+        run: zig build run
+
+      # The property and differential harness is the only check that survives
+      # an input nobody hand-wrote, so a build without it is a build that only
+      # proves what it already assumed. It runs in Debug, where an
+      # out-of-bounds index is a trap, and the default seed is fixed so a
+      # failure on CI is reproducible from the log.
+      - name: zig build fuzz
+        run: zig build fuzz
+
+      - name: zig build docs
+        run: zig build docs
