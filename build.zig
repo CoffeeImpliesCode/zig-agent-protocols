@@ -72,9 +72,28 @@ pub fn build(b: *std.Build) void {
     });
     const run_golden_tests = b.addRunArtifact(golden_tests);
 
+    // The loopback tests drive a real connection over a real socket: a client
+    // and a server exchanging frames through a live `Io`. They are separate
+    // from the unit tests for the same reason as the golden vectors, and
+    // because they need their own `Io` rather than the one a test block
+    // cannot own. A codec that has only ever been tested against slices has
+    // never been driven by a transport.
+    const loopback_mod = b.createModule(.{
+        .root_source_file = b.path("test/loopback_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    loopback_mod.addImport("zig-agent-proto", lib_mod);
+
+    const loopback_tests = b.addTest(.{
+        .root_module = loopback_mod,
+    });
+    const run_loopback_tests = b.addRunArtifact(loopback_tests);
+
     const test_step = b.step("test", "Run unit tests and the golden vectors");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_golden_tests.step);
+    test_step.dependOn(&run_loopback_tests.step);
 
     // The property and differential harness. It is a separate step because it
     // generates tens of thousands of documents, and because the interesting

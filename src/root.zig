@@ -33,6 +33,8 @@ pub const bridge = @import("bridge.zig");
 pub const json = @import("json.zig");
 pub const jsonrpc = @import("jsonrpc.zig");
 pub const mcp = @import("mcp.zig");
+pub const conn = @import("conn.zig");
+pub const framing = @import("framing.zig");
 
 /// The single decode error set for the whole library.
 ///
