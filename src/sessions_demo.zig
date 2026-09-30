@@ -199,6 +199,14 @@ const Endpoint = struct {
     stream: Io.net.Stream = undefined,
     connection: conn.Conn = undefined,
 
+    /// Whether the pump releases this endpoint's stream when the connection
+    /// ends. The server endpoint sets it before `open` spawns the pump, because
+    /// `ServerTask.run` hands the accepted stream over and returns, so the pump
+    /// is the last task left holding the descriptor. The client endpoint leaves
+    /// it false, because `ClientTask.run` hangs up its own end and a second
+    /// close would release whatever descriptor the first one returned.
+    close_in_pump: bool = false,
+
     fn open(
         self: *Endpoint,
         io: Io,
@@ -218,7 +226,7 @@ const Endpoint = struct {
         if (handler) |h| self.connection.setHandler(h);
         // Spawned on the group the example joins, because `Io.Group.async` does
         // not promise to run its task until the group is awaited or cancelled.
-        group.async(io, pump, .{&self.connection});
+        group.async(io, pump, .{ self, io });
     }
 
     /// Hang up. `shutdown` before `close`: closing a descriptor does not
@@ -230,9 +238,29 @@ const Endpoint = struct {
     }
 };
 
-fn pump(c: *conn.Conn) void {
-    c.pump();
+/// The connection pump, and the descriptor release that goes with it.
+///
+/// `pump` returns when the peer hangs up, which on the server side is the only
+/// event that hands the accepted stream back, so that endpoint's pump closes
+/// it. The client's pump does not: `ClientTask.run` already hung up that end,
+/// and closing a descriptor twice releases an unrelated one the second time.
+fn pump(endpoint: *Endpoint, io: Io) void {
+    endpoint.connection.pump();
+    if (endpoint.close_in_pump) endpoint.hangUp(io);
 }
+
+/// One carried call's inner outcome.
+///
+/// The outer call succeeded either way, so `failed` is the only thing that
+/// tells a tool failure from a binding failure, and `text` holds whichever of
+/// the two answers the agent sent. `record` writes the flag and the text in one
+/// place, so the buffer a later call reuses cannot leave this one reporting an
+/// outcome it never received.
+const Carried = struct {
+    failed: bool = false,
+    text: [1024]u8 = undefined,
+    len: usize = 0,
+};
 
 /// What the exchange left behind, in buffers that outlive both tasks.
 const Report = struct {
@@ -249,16 +277,14 @@ const Report = struct {
     /// What the client did about the closed one, in its own words.
     closed: []const u8 = "",
 
-    /// The first carried call. The outer response succeeded and the inner one
-    /// carried a result.
-    inner_result: [1024]u8 = undefined,
-    inner_result_len: usize = 0,
-
-    /// The second carried call. The outer response succeeded and the inner one
-    /// carried an error, which is the case the binding exists to get right.
-    inner_failed: bool = false,
-    inner_error: [1024]u8 = undefined,
-    inner_error_len: usize = 0,
+    /// The first carried call, `tools/call`, and what the agent answered on
+    /// the inside. A pair of its own rather than one pair shared with the
+    /// second call, because the second answer arrives later and would then be
+    /// printed under the first call's heading as well.
+    first: Carried = .{},
+    /// The second carried call, `resources/read`. The agent answers it with an
+    /// inner error, which is the case the binding exists to get right.
+    second: Carried = .{},
 };
 
 /// Copy an answer into a buffer that outlives the task that read it.
@@ -266,6 +292,21 @@ fn keep(into: []u8, length: *usize, text: []const u8) void {
     const n = @min(text.len, into.len);
     @memcpy(into[0..n], text[0..n]);
     length.* = n;
+}
+
+/// Record one carried call's inner outcome, so that the flag and the text
+/// always describe the same answer.
+fn record(into: *Carried, outcome: bridge.Outcome) void {
+    switch (outcome) {
+        .result => |text| {
+            into.failed = false;
+            keep(&into.text, &into.len, text);
+        },
+        .@"error" => |text| {
+            into.failed = true;
+            keep(&into.text, &into.len, text);
+        },
+    }
 }
 
 /// Accepts the one connection and serves it, so the client's reader is the
@@ -283,6 +324,9 @@ const ServerTask = struct {
             self.report.failed = true;
             return;
         };
+        // Set before `open` spawns the pump, because this task returns below
+        // and the pump is then the only one left holding the accepted stream.
+        self.endpoint.close_in_pump = true;
         self.endpoint.open(self.io, self.group, stream, .{
             .ctx = self.agent,
             .call = Agent.handle,
@@ -298,8 +342,8 @@ const ClientTask = struct {
     endpoint: *Endpoint,
     report: *Report,
 
-    /// Give up on the exchange. The connection is hung up on the way out, so
-    /// the peer's pump ends and the group finishes either way.
+    /// Give up on the exchange. Every arm that reaches here has run `open`, so
+    /// there is a connection to hang up, and the peer's pump ends on it.
     fn abandon(self: *@This()) void {
         self.report.failed = true;
         self.endpoint.hangUp(self.io);
@@ -307,6 +351,13 @@ const ClientTask = struct {
 
     fn run(self: *@This()) void {
         const stream = self.address.connect(self.io) catch {
+            // Not `abandon`, because `Endpoint.stream` is undefined until
+            // `open` assigns it and a hang up here would close whatever
+            // descriptor the stack held. Nothing is hung up on this arm: the
+            // agent's task stays parked in `accept` on a listener this example
+            // never closes, and no member of the group can wake it from here.
+            // `main` listens before it spawns either task, so the listener is
+            // already there and this arm does not run.
             self.report.failed = true;
             return;
         };
@@ -407,17 +458,7 @@ const ClientTask = struct {
             first_outer,
             &side.outcome_scratch,
         ) catch return self.abandon();
-        switch (first) {
-            .result => |value| keep(
-                &report.inner_result,
-                &report.inner_result_len,
-                value,
-            ),
-            .@"error" => |value| {
-                keep(&report.inner_error, &report.inner_error_len, value);
-                report.inner_failed = true;
-            },
-        }
+        record(&report.first, first);
 
         // The second carried call. The outer call succeeds to get here: a
         // binding failure would have been a Zig error instead of a returned
@@ -437,22 +478,29 @@ const ClientTask = struct {
             second_outer,
             &side.outcome_scratch,
         ) catch return self.abandon();
-        switch (second) {
-            .result => |value| {
-                keep(&report.inner_result, &report.inner_result_len, value);
-                report.inner_failed = false;
-            },
-            .@"error" => |value| {
-                keep(&report.inner_error, &report.inner_error_len, value);
-                report.inner_failed = true;
-            },
-        }
+        record(&report.second, second);
 
         // The client hangs up. The agent's reader sees end of file and returns,
         // and this side's own pump returns with it.
         self.endpoint.hangUp(self.io);
     }
 };
+
+/// Print one carried call. The heading names the inner MCP method, so every
+/// line under it says which of the two calls it belongs to, and the outcome
+/// flag picks the last of the three, so a failed call never prints a result
+/// and a successful one never prints an error.
+fn printCarried(out: *Io.Writer, inner_method: []const u8, outcome: Carried) !void {
+    try out.print("  {s} carrying {s}\n", .{ bridge_session.method, inner_method });
+    try out.print("    outer call    succeeded\n", .{});
+    const inner: []const u8 = if (outcome.failed) "failed" else "succeeded";
+    try out.print("    inner outcome {s}\n", .{inner});
+    if (outcome.failed) {
+        try out.print("    inner error   {s}\n\n", .{outcome.text[0..outcome.len]});
+    } else {
+        try out.print("    inner result  {s}\n\n", .{outcome.text[0..outcome.len]});
+    }
+}
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -543,24 +591,8 @@ pub fn main(init: std.process.Init) !void {
     try out.print("    -> {s}\n\n", .{report.closed});
 
     try out.print("mcp-over-acp, carried over the same connection\n", .{});
-    try out.print("  {s} carrying tools/call\n", .{bridge_session.method});
-    try out.print("    outer call    succeeded\n", .{});
-    try out.print("    inner result  {s}\n\n", .{
-        report.inner_result[0..report.inner_result_len],
-    });
-    try out.print("  {s} carrying resources/read\n", .{bridge_session.method});
-    try out.print("    outer call    succeeded\n", .{});
-    const inner: []const u8 = if (report.inner_failed) "failed" else "succeeded";
-    try out.print("    inner outcome {s}\n", .{inner});
-    if (report.inner_failed) {
-        try out.print("    inner error   {s}\n\n", .{
-            report.inner_error[0..report.inner_error_len],
-        });
-    } else {
-        try out.print("    inner result  {s}\n\n", .{
-            report.inner_result[0..report.inner_result_len],
-        });
-    }
+    try printCarried(out, "tools/call", report.first);
+    try printCarried(out, "resources/read", report.second);
 
     // Four requests: the handshake, the one gated call the agent advertised,
     // and the two carried ones. The refused method is not among them, which is
@@ -569,4 +601,47 @@ pub fn main(init: std.process.Init) !void {
         agent.calls,
         agent.carried,
     });
+}
+
+const testing = std.testing;
+
+test "the second carried call cannot overwrite what the first one recorded" {
+    var report: Report = .{};
+    record(&report.first, .{ .result = "{\"echo\":\"hello\"}" });
+    record(&report.second, .{ .@"error" = "{\"code\":-32602}" });
+
+    // The two calls answered in opposite directions, so one shared pair would
+    // leave both flags reading `failed` and both texts holding the error, and
+    // the first call's own result would be gone.
+    try testing.expect(!report.first.failed);
+    try testing.expect(report.second.failed);
+    try testing.expectEqualStrings("{\"echo\":\"hello\"}", report.first.text[0..report.first.len]);
+    try testing.expectEqualStrings("{\"code\":-32602}", report.second.text[0..report.second.len]);
+}
+
+test "every printed line names the carried call it belongs to" {
+    var first: Carried = .{};
+    record(&first, .{ .result = "{\"resultType\":\"complete\"}" });
+    var second: Carried = .{};
+    record(&second, .{ .@"error" = "{\"code\":-32602}" });
+
+    var buffer: [512]u8 = undefined;
+    var out = Io.Writer.fixed(&buffer);
+    try printCarried(&out, "tools/call", first);
+    try printCarried(&out, "resources/read", second);
+
+    const printed =
+        \\  mcp/message carrying tools/call
+        \\    outer call    succeeded
+        \\    inner outcome succeeded
+        \\    inner result  {"resultType":"complete"}
+        \\
+        \\  mcp/message carrying resources/read
+        \\    outer call    succeeded
+        \\    inner outcome failed
+        \\    inner error   {"code":-32602}
+        \\
+        \\
+    ;
+    try testing.expectEqualStrings(printed, out.buffered());
 }

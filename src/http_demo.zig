@@ -15,8 +15,20 @@
 //!
 //! Every buffer below belongs to the caller, on both sides, so the example
 //! doubles as a check that the transport is usable without an allocator. The
-//! one allocator it takes from `init` is the one `std.http.Client` needs for
-//! its connection pool.
+//! one allocator it takes from `init` is the one each exchange's
+//! `std.http.Client` needs for its own connection pool, and no connection
+//! outlives the exchange that made it.
+//!
+//! The two tasks share one group and one handoff, and no wait in either of
+//! them outlives the other. The two waits fail for different reasons and are
+//! answered differently, so neither mechanism covers the other wait.
+//! A `receive` waits on a socket the client owns, and the client closing it
+//! on the way out is what ends that wait. An `accept` waits on a listening
+//! socket, which no peer can shut down, so the client announces a
+//! connection once the kernel has it queued and the accept is then a call
+//! that returns rather than one that waits. The client sets the handoff flag
+//! on every path out of its task, so the server stops whether the client
+//! finished or failed.
 //!
 //! Run it with `zig build run-http`.
 
@@ -192,23 +204,66 @@ const Side = struct {
 /// A streaming reply has no end, so the server cannot tell when the client
 /// has what it was sent. It waits here instead of hanging up on its own: a
 /// close on a socket whose peer still holds unread bytes answers with a
-/// reset, and the reset discards those bytes. The flag is what the signal
-/// means, and it carries the whole handshake, because a `Condition` signal
-/// with no waiter yet is dropped and a client that finishes first must still
-/// be seen by a server that has not begun to wait.
+/// reset, and the reset discards those bytes.
+///
+/// Two flags and one condition carry the whole handshake, and the flags are
+/// what the condition means, because a `Condition` signal with no waiter
+/// yet is dropped: a client that finishes first must still be seen by a
+/// server that has not begun to wait.
 const Handoff = struct {
     mutex: Io.Mutex = .init,
     condition: Io.Condition = .init,
     /// Read and written under `mutex`, and nowhere else.
     client_done: bool = false,
+    /// A connection the kernel has queued in the listener and the server has
+    /// not accepted yet. The client sets it once `connectTcp` has returned,
+    /// and `waitConnection` clears it, because the accept that follows is
+    /// what takes the connection.
+    connection_queued: bool = false,
 
     /// The client either holds the events it was told to expect or has given
-    /// up on them, and the server may hang up either way.
+    /// up on them, and the server may hang up either way. It is also the
+    /// answer to "will there be another connection", because the client
+    /// signals on every path out of its task and not only on the one that
+    /// succeeded.
     fn signalDone(self: *@This(), io: Io) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         self.client_done = true;
         self.condition.signal(io);
+    }
+
+    /// Whether the client is finished. A server that is about to wait does
+    /// not begin, and one that is waiting stops.
+    fn isDone(self: *@This(), io: Io) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.client_done;
+    }
+
+    /// A connection is in the listener's queue, so `accept` returns it
+    /// rather than waiting for a client that may never come.
+    fn announceConnection(self: *@This(), io: Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.connection_queued = true;
+        self.condition.signal(io);
+    }
+
+    /// Block until there is a connection to accept, or until the client says
+    /// there will not be one.
+    ///
+    /// This is what keeps `accept` from being the one wait in this example
+    /// that a client which gives up early would outlive: a listening socket
+    /// has no way to be told that no more connections are coming, so the
+    /// client is the only side that can say a wait for one is safe.
+    fn waitConnection(self: *@This(), io: Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        while (!self.connection_queued and !self.client_done) {
+            self.condition.wait(io, &self.mutex) catch return;
+        }
+        self.connection_queued = false;
     }
 
     /// Block until the client has said so. A cancelation ends the wait,
@@ -225,21 +280,22 @@ const Handoff = struct {
 /// Answers the planned POSTs, one connection at a time.
 ///
 /// The listener is the server and `http.Server` is one connection, so the
-/// loop belongs here: a client that reuses its keep-alive connection is one
-/// accept, and a client that opens a new one is two.
+/// loop belongs here. This example's client opens one connection per
+/// exchange and releases it when that exchange is over, so one pass of the
+/// outer loop is one connection, and the loop ends when the client says it
+/// is finished.
 const Serve = struct {
     io: Io,
     listener: *Io.net.Server,
     side: *Side,
-    /// The signal the client sends when it has stopped reading.
+    /// What the two tasks tell each other.
     handoff: *Handoff,
 
     handler: conn.Handler,
     /// The answer the next POST gets. The plan moves on once it has been
-    /// answered, and `next` counts what has been answered so far.
+    /// answered, and `answered` counts what has been answered so far.
     plan: Plan = plans[0],
-    next: *usize,
-    served: *usize,
+    answered: *usize,
     /// What the server concluded about the derived header, so the example can
     /// show that it crossed the socket and was compared with the body.
     verdict: *?mcp.ParamVerdict,
@@ -254,7 +310,16 @@ const Serve = struct {
     method_len: usize = 0,
 
     fn run(self: *@This()) void {
-        while (self.next.* < plans.len) {
+        while (self.answered.* < plans.len) {
+            // The two waits below fail for different reasons, and each one
+            // has its own answer. `receive` waits on a socket this side
+            // does not own, and the client closing it is what ends that
+            // wait. `accept` waits on a listening socket, which has no way to
+            // be told that no more connections are coming, so the client
+            // announces each connection it opens and only then is the
+            // accept a call that returns.
+            self.handoff.waitConnection(self.io);
+            if (self.handoff.isDone(self.io)) return;
             const connection = self.listener.accept(self.io) catch {
                 self.failed.* = true;
                 return;
@@ -270,7 +335,7 @@ const Serve = struct {
             }
             self.side.open(self.io, connection);
 
-            while (self.next.* < plans.len) {
+            while (self.answered.* < plans.len) {
                 const post = self.side.server.receive() catch {
                     self.failed.* = true;
                     return;
@@ -283,8 +348,7 @@ const Serve = struct {
                     .json_body => .event_stream,
                     .event_stream => .json_body,
                 };
-                self.next.* += 1;
-                self.served.* += 1;
+                self.answered.* += 1;
             }
         }
     }
@@ -336,6 +400,15 @@ const Serve = struct {
             self.side.server.buffers.handler_scratch,
         );
         const reply = result orelse return error.NoAnswer;
+        // A local, unlike the reader and the writer `Side.open` holds as
+        // fields, and the difference is what `respondStream` copies. A
+        // `std.http.BodyWriter` points at the server's output writer and at
+        // `buffers.stream`, both of which are fields of `Side`, and its
+        // state is a union with no pointer in it. Nothing in the copy aims
+        // at the copy, so this local is the stream and the chunk length
+        // `Stream.send` advances is the live one. `Server.answer` copies the
+        // same value into a local of its own, so this is the shape the
+        // transport itself is written for.
         var out = try self.side.server.respondStream(post);
         try out.send(self.side.server.buffers.event, reply);
         for (events) |event| {
@@ -355,7 +428,11 @@ const Client = struct {
     /// The one `Io` both tasks share, handed down from `main`. The handoff
     /// needs it, and a second executor is a second group, which deadlocks.
     io: Io,
-    wire: *wire.Client,
+    /// The allocator each exchange's `std.http.Client` takes for its own
+    /// connection pool. One pool per exchange, released with the exchange:
+    /// a pooled connection outlives the task that made it, and a server
+    /// waiting on such a connection for the next request waits forever.
+    allocator: std.mem.Allocator,
     endpoint: *const Endpoint,
     side: *Side,
     handoff: *Handoff,
@@ -393,6 +470,13 @@ const Client = struct {
     failed: bool = false,
 
     fn run(self: *@This()) void {
+        // The signal covers every path out of this task, not only the one
+        // that succeeds. A failure before the first POST leaves the server
+        // waiting for a connection, and a failure after one leaves it
+        // waiting for a request on a connection this task is about to
+        // close; either way the flag is the only thing that says the client
+        // has stopped asking, and the closed socket is the other.
+        defer self.handoff.signalDone(self.io);
         if (!self.single()) {
             self.failed = true;
             return;
@@ -406,7 +490,9 @@ const Client = struct {
     /// on the wire, and `post` calls it again over the same array to send it,
     /// so the printed request and the sent request cannot drift apart.
     fn single(self: *@This()) bool {
-        var client = openClient(self.wire, self.endpoint) orelse return false;
+        var wire_client = self.pooledClient();
+        defer wire_client.deinit();
+        var client = self.openExchange(&wire_client) orelse return false;
         const binding = (mcp.bindParamHeader(
             "Text",
             .string,
@@ -443,12 +529,13 @@ const Client = struct {
     /// One `subscriptions/listen` POST answered with a stream that never
     /// ends.
     fn listen(self: *@This()) bool {
-        // The server waits for this signal before it hangs up, and a wait it
-        // cannot leave is a deadlock rather than a failure. A `defer`
-        // releases it on every path out of this function: a failed read, a
-        // stream that ended early, an event too large, and success.
-        defer self.handoff.signalDone(self.io);
-        var client = openClient(self.wire, self.endpoint) orelse return false;
+        // The handoff is signalled in `run`, so it covers this function's
+        // failures as well as its success: a connect that failed, a read
+        // that failed, a stream that ended early, and an event too large
+        // all reach it through there.
+        var wire_client = self.pooledClient();
+        defer wire_client.deinit();
+        var client = self.openExchange(&wire_client) orelse return false;
         const spec: http.PostHeaders = .{ .method = "subscriptions/listen" };
         const headers = client.requestHeaders(spec, &self.side.head) catch return false;
         for (headers, 0..) |field, index| self.sent[1][index] = field;
@@ -458,7 +545,8 @@ const Client = struct {
         client.post(&exchange, listen_body, spec, &self.side.head, &self.side.transfer) catch
             return false;
         // Deliberate. The reply never ends, so the exchange is released once
-        // the expected events are in hand, and the connection goes with it.
+        // the expected events are in hand, and the pool that holds its
+        // connection is released with it, which closes the socket.
         defer exchange.close();
 
         // Read off the head first: taking the body reader below is what
@@ -487,22 +575,40 @@ const Client = struct {
         }
         return true;
     }
-};
 
-/// Open a connection to the endpoint and hand it to a transport client.
-///
-/// The connection is opened here rather than left to the URI, and it is
-/// opened per exchange: `connectTcp` reuses the pooled connection when the
-/// previous POST left it keep-alive, so the two exchanges of this example
-/// run over one socket, as a real client would.
-fn openClient(wire_client: *wire.Client, endpoint: *const Endpoint) ?http.Client {
-    const uri = std.Uri.parse(endpoint.uri_text) catch return null;
-    const host = Io.net.HostName.init("127.0.0.1") catch return null;
-    const connection = wire_client.connectTcp(host, endpoint.port(), .plain) catch return null;
-    var client = http.Client.init(wire_client, uri, .current);
-    client.connection = connection;
-    return client;
-}
+    /// Open one connection for a transport client over `wire_client`.
+    ///
+    /// The connection is opened here rather than left to the URI, and it is
+    /// opened per exchange, so one `std.http.Client` pool serves one POST
+    /// and is released with it.
+    ///
+    /// The connection is announced to the server once `connectTcp` has
+    /// returned, because from then on the kernel has it queued and the
+    /// server's `accept` returns it rather than waiting. That is what keeps
+    /// the accept from being a wait this task could outlive: a listening
+    /// socket cannot be told that no more connections are coming.
+    fn openExchange(self: *@This(), wire_client: *wire.Client) ?http.Client {
+        const uri = std.Uri.parse(self.endpoint.uri_text) catch return null;
+        const host = Io.net.HostName.init("127.0.0.1") catch return null;
+        const connection = wire_client.connectTcp(host, self.endpoint.port(), .plain) catch
+            return null;
+        self.handoff.announceConnection(self.io);
+        var client = http.Client.init(wire_client, uri, .current);
+        client.connection = connection;
+        return client;
+    }
+
+    /// One exchange's `std.http.Client`, pool and all, which the caller
+    /// releases with a `defer`.
+    ///
+    /// The pool is per exchange rather than per task because `deinit` closes
+    /// the socket it holds. A connection left in a pool outlives the task
+    /// that made it, so the server would sit in `receive()` on a live
+    /// keep-alive connection waiting for a POST that is never coming.
+    fn pooledClient(self: *@This()) wire.Client {
+        return .{ .allocator = self.allocator, .io = self.io };
+    }
+};
 
 /// Print the request one POST put on the wire, as the transport built it.
 fn showRequest(out: *Io.Writer, client: *const Client, index: usize, body: []const u8) !void {
@@ -534,17 +640,11 @@ pub fn main(init: std.process.Init) !void {
     defer endpoint.close(io);
     try out.print("  endpoint  {s}\n\n", .{endpoint.uri_text});
 
-    // The one allocator in this example, and the one `std.http.Client` needs
-    // for its connection pool. Nothing on the codec path allocates at all.
-    var http_client: wire.Client = .{ .allocator = init.gpa, .io = io };
-    defer http_client.deinit();
-
     var server_side: Side = .{};
     var client_side: Side = .{};
     var tools: Tools = .{};
     var verdict: ?mcp.ParamVerdict = null;
-    var next: usize = 0;
-    var served: usize = 0;
+    var answered: usize = 0;
     var failed = false;
     var handoff: Handoff = .{};
 
@@ -553,15 +653,17 @@ pub fn main(init: std.process.Init) !void {
         .listener = &endpoint.listener,
         .side = &server_side,
         .handler = .{ .ctx = &tools, .call = Tools.handle },
-        .next = &next,
-        .served = &served,
+        .answered = &answered,
         .verdict = &verdict,
         .failed = &failed,
         .handoff = &handoff,
     };
     var call = Client{
         .io = io,
-        .wire = &http_client,
+        // The one allocator in this example, and the one each exchange's
+        // `std.http.Client` takes for its own connection pool. Nothing on
+        // the codec path allocates at all.
+        .allocator = init.gpa,
         .endpoint = &endpoint,
         .side = &client_side,
         .handoff = &handoff,
@@ -573,21 +675,24 @@ pub fn main(init: std.process.Init) !void {
     group.async(io, Serve.run, .{&serve});
     group.async(io, Client.run, .{&call});
     // Join, do not cancel: cancelling here would stop both tasks before they
-    // ran. The client returns when it has read both replies, and the server
-    // returns when it has answered both plans and the client has said it is
-    // done reading, so the group drains on its own.
+    // ran. The group drains on its own on every path out of either task: the
+    // client closes the socket it opened and sets the handoff flag whether it
+    // finished or failed, and the server stops when it has answered every
+    // plan or when the client is finished. No wait here outlives the peer
+    // that has to satisfy it.
     group.await(io) catch {};
 
     if (failed or call.failed) {
         try out.print("the exchange failed\n", .{});
         return error.ExchangeFailed;
     }
-    // Every request really was answered, and the stream really carried the
-    // events the client was told to expect.
-    if (served != plans.len or call.event_count != expected_events) {
+    // Every planned POST really was answered, and the stream really carried
+    // the events the client was told to expect. One counter says both: it is
+    // the server's own, and it counts answers rather than requests read.
+    if (answered != plans.len or call.event_count != expected_events) {
         try out.print(
             "the exchange did not complete: {d} request(s) answered, {d} event(s) read\n",
-            .{ served, call.event_count },
+            .{ answered, call.event_count },
         );
         return error.ExchangeFailed;
     }
@@ -636,5 +741,129 @@ pub fn main(init: std.process.Init) !void {
             event[0..call.event_len[index]],
         });
     }
-    try out.print("\nserver handled {d} request(s)\n", .{served});
+    try out.print("\nserver handled {d} request(s)\n", .{answered});
+}
+
+const testing = std.testing;
+
+test "the server stops when the client is finished before it connects" {
+    // The client that never connects, and the server that has to notice.
+    //
+    // This is the first of the two ways this example used to hang: a client
+    // that failed before it opened a socket left the server parked in `accept`
+    // with nothing to accept, so the group never drained and the failure was
+    // never reported.
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var endpoint: Endpoint = .{};
+    try endpoint.open(io);
+    defer endpoint.close(io);
+
+    var server_side: Side = .{};
+    var tools: Tools = .{};
+    var verdict: ?mcp.ParamVerdict = null;
+    var answered: usize = 0;
+    var failed = false;
+    var handoff: Handoff = .{};
+
+    var serve = Serve{
+        .io = io,
+        .listener = &endpoint.listener,
+        .side = &server_side,
+        .handoff = &handoff,
+        .handler = .{ .ctx = &tools, .call = Tools.handle },
+        .answered = &answered,
+        .verdict = &verdict,
+        .failed = &failed,
+    };
+
+    // The whole client task, minus the connects: what the server hears is
+    // the flag, and it is set before the server ever begins to wait.
+    handoff.signalDone(io);
+    serve.run();
+
+    // Nothing was accepted, nothing was answered, and a client that went
+    // away is not a transport failure.
+    try testing.expectEqual(@as(usize, 0), answered);
+    try testing.expect(!failed);
+}
+
+test "a client that stops after its first exchange leaves the server nothing to wait for" {
+    // The client that answers one exchange and then stops.
+    //
+    // This is the other hang this example had: the connection went back to the
+    // client's pool instead of closing, so the server sat in `receive()` on a
+    // live socket waiting for a second POST that was never coming. The client
+    // closes the socket and sets the flag on the way out, and the server stops
+    // on each of them.
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var endpoint: Endpoint = .{};
+    try endpoint.open(io);
+    defer endpoint.close(io);
+
+    var server_side: Side = .{};
+    var client_side: Side = .{};
+    var tools: Tools = .{};
+    var verdict: ?mcp.ParamVerdict = null;
+    var answered: usize = 0;
+    var failed = false;
+    var handoff: Handoff = .{};
+
+    var serve = Serve{
+        .io = io,
+        .listener = &endpoint.listener,
+        .side = &server_side,
+        .handoff = &handoff,
+        .handler = .{ .ctx = &tools, .call = Tools.handle },
+        .answered = &answered,
+        .verdict = &verdict,
+        .failed = &failed,
+    };
+    var call = Client{
+        .io = io,
+        .allocator = testing.allocator,
+        .endpoint = &endpoint,
+        .side = &client_side,
+        .handoff = &handoff,
+    };
+
+    // `Client.run` with the second exchange left out, and with the signal
+    // where `Client.run` puts it.
+    const One = struct {
+        client: *Client,
+
+        fn run(self: *@This()) void {
+            defer self.client.handoff.signalDone(self.client.io);
+            if (!self.client.single()) self.client.failed = true;
+        }
+    };
+    var one = One{ .client = &call };
+
+    var group: Io.Group = .init;
+    group.async(io, Serve.run, .{&serve});
+    group.async(io, One.run, .{&one});
+    group.await(io) catch {};
+
+    try testing.expect(!failed);
+    try testing.expect(!call.failed);
+    // One POST of the two this example plans was answered, and the count
+    // says one. A second counter written from the same place could not have
+    // said anything else, so the check over it could never fail on its own.
+    try testing.expectEqual(@as(usize, 1), answered);
+    try testing.expect(answered < plans.len);
+    // The one reply that arrived is the single JSON body the plan calls for,
+    // and it came over a real socket.
+    try testing.expectEqual(wire.Status.ok, call.status);
+    try testing.expect(!call.streamed);
+    try testing.expect(call.error_code == null);
+    const reply = call.message[0..call.message_len];
+    try testing.expect(std.mem.indexOf(u8, reply, "echo: " ++ argument) != null);
+    // And the server compared the derived header the request carried.
+    const checked = verdict orelse return error.NoVerdict;
+    try testing.expectEqual(mcp.ParamVerdict.accepted, checked);
 }

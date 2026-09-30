@@ -154,10 +154,29 @@ pub fn build(b: *std.Build) void {
     });
     const run_loopback_tests = b.addRunArtifact(loopback_tests);
 
+    // The examples carry test blocks of their own: the runtime and the HTTP
+    // examples assert the failure paths their printed output cannot show, such
+    // as a handler answering a string id and an error member landing beside
+    // `result` rather than inside it. Zig only runs the tests in a root the
+    // build reaches, so without these two binaries those blocks are source
+    // that no compiler ever looks at, which is the dormancy this repository
+    // has already been bitten by once.
+    const runtime_example_tests = b.addTest(.{
+        .root_module = runtime_mod,
+    });
+    const run_runtime_example_tests = b.addRunArtifact(runtime_example_tests);
+
+    const http_example_tests = b.addTest(.{
+        .root_module = http_mod,
+    });
+    const run_http_example_tests = b.addRunArtifact(http_example_tests);
+
     const test_step = b.step("test", "Run unit tests and the golden vectors");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_golden_tests.step);
     test_step.dependOn(&run_loopback_tests.step);
+    test_step.dependOn(&run_runtime_example_tests.step);
+    test_step.dependOn(&run_http_example_tests.step);
 
     // The property and differential harness. It is a separate step because it
     // generates tens of thousands of documents, and because the interesting
