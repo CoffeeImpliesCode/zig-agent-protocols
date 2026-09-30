@@ -952,7 +952,16 @@ pub const Stream = struct {
     pub fn send(self: *Stream, event: []u8, message: []const u8) Error!void {
         const framed = try writeEvent(event, message);
         self.body.writer.writeAll(framed) catch return error.Transport;
-        self.body.flush() catch return error.Transport;
+        // `BodyWriter.flush` is not the flush this needs. It flushes for `end`,
+        // `none`, `content_length` and `chunk_len`, and the state an event
+        // stream spends its whole life in is `chunked`, which it does not
+        // cover. With only that call, a stream that never ends delivered
+        // nothing: the reader took the head and then waited for an event that
+        // had been written. Flushing the body writer and then the protocol
+        // output is what puts an event on the wire while the stream is still
+        // open, which is the whole of a subscription.
+        self.body.writer.flush() catch return error.Transport;
+        self.body.http_protocol_output.flush() catch return error.Transport;
     }
 
     /// End the stream. The connection is then ready for the next request.
