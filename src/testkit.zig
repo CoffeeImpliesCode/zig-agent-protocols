@@ -11,12 +11,27 @@
 //!
 //! ## What it asserts, and why each one is not a tautology
 //!
-//! - **Round-trip stability.** Every decoder that has a matching encoder is
-//!   encoded and decoded again, into a *second* scratch buffer, and the two
-//!   decoded values are compared by content. Re-decoding into the buffer the
-//!   first decode wrote into would compare memory the second decode has
-//!   already overwritten, which is how this kind of test passes for the wrong
-//!   reason.
+//! - **Round-trip stability, in bytes.** The two `bridge` encoders are the
+//!   ones whose output this harness compares byte for byte rather than member
+//!   by member: the bytes the *input* says each of them owes are predicted
+//!   from that input, and the prediction is compared against what the encoder
+//!   wrote. The other round trips compare decoded values, which is enough for
+//!   them and demonstrably not enough for these two. A comparison of decoded
+//!   members is blind to a member the encoder dropped: a decoder that
+//!   accepted an ACP carrier `_meta` beside a result, and an encoder that
+//!   wrote no `_meta` back, left a value whose members still compared equal,
+//!   so `encode(decode(b)) != b` went unnoticed for the life of the
+//!   repository. The expected bytes are never read back off a decoder, since
+//!   a check whose two sides come from one walk is the same check with more
+//!   steps. The comparison is against the canonical form and not against `b`
+//!   itself: member order and insignificant whitespace are two ways a
+//!   document can differ without losing anything, and a harness that failed
+//!   on legal input would be a harness people turn off. A member the schema
+//!   does not define is dropped by the encoder on purpose, so it is outside
+//!   the prediction too, and the check covers exactly the members the
+//!   protocol defines. Re-decoding into the buffer the first decode wrote
+//!   into would compare memory the second decode has already overwritten,
+//!   which is how this kind of test passes for the wrong reason.
 //! - **`requiredScratchLen` is an upper bound, and an exact one.** The
 //!   generated walk is handed a buffer of exactly the length that function
 //!   reports, so a document that decodes must decode. A count that
@@ -34,10 +49,14 @@
 //!   hands the decoders the keys the seed documents spell and nothing else, so
 //!   every rule about an unknown member, a missing member or a renamed one
 //!   would be asserted over documents it cannot emit. The vocabulary therefore
-//!   carries every member name a decoder this harness feeds branches on, and
-//!   one shape renames a member of a real message outright: a renamed `id`
-//!   turns a request into a notification, and a renamed `jsonrpc` is a
-//!   refusal.
+//!   carries every member name a decoder this harness feeds branches on, and a
+//!   name no seed spells is accounted for by name in
+//!   [`grammar_only_names`]: the grammar shape can write it as a key, but only
+//!   the renamed shape can *move* one, so a name in the vocabulary and in no
+//!   seed is reached by chance and a rule about it is asserted over a handful
+//!   of documents in the whole run. One shape renames a member of a real
+//!   message outright: a renamed `id` turns a request into a notification, and
+//!   a renamed `jsonrpc` is a refusal.
 //! - **Differential agreement.** A generated corpus goes through both this
 //!   reader and `std.json.Scanner`, and the two must agree on accept versus
 //!   reject for the whole document and on the top-level classification. The
@@ -264,14 +283,20 @@ const member_names = [_][]const u8{
 /// `renameMember` moves a name a seed already contains, so a name here widens
 /// what a mutation can produce as a key and nothing more.
 ///
-/// `_meta` is a deliberate gap: a capability object carrying it is a shape this
-/// library does not otherwise produce, nothing in `src/` emits one, and a seed
-/// invented only so the name could be renamed is a document no peer of this
-/// protocol sends. `terminalId` is an ordinary one: no seed spells it, so there
-/// is nothing for a mutation to move, and the subject it belongs to is a
-/// decoder branch nothing else in the corpus reaches.
+/// `terminalId` is the ordinary case: no seed spells it, so there is nothing
+/// for a mutation to move, and the subject it belongs to is a decoder branch
+/// nothing else in the corpus reaches.
+///
+/// `_meta` was listed here too, on the grounds that a seed invented only so
+/// the name could be renamed is a document no peer sends. Measured over the
+/// default 20 000 documents, that left the carrier `_meta` of the two
+/// `bridge` objects carried by 1 accepted envelope and 2 accepted outcomes.
+/// One document in ten thousand is not coverage: a decoder may drop the
+/// member on every run and the property harness never sees it. A seed spells
+/// it now, and a listing that names something a seed spells is the stale
+/// case `test "every member name is in a seed or listed as grammar-only"`
+/// names.
 const grammar_only_names = [_][]const u8{
-    "_meta",
     "terminalId",
 };
 
@@ -321,12 +346,14 @@ const hostile_alphabet = [_]u8{
 /// the protocols actually carry, so a mutation is a change to a real document
 /// rather than a change to noise.
 ///
-/// The last two carry members no other seed spells, and they are here for the
+/// Two of them carry members no other seed spells, and they are here for the
 /// decoder arms nothing else reaches: an MRTR interim result is the only
 /// document `mcp.decodeInputRequiredResult` accepts, and a permission request
 /// with a `toolCall` is the only document the stable arm of
 /// `acp.decodePermissionRequest` accepts. Both are real messages at the pinned
-/// revisions, so a mutation of either is a change to a real document.
+/// revisions, so a mutation of either is a change to a real document. The
+/// three after them carry a carrier `_meta`, and the comment among the seeds
+/// says why that needed one.
 const seed_documents = [_][]const u8{
     "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
         "\"params\":{\"name\":\"echo\"}}",
@@ -349,6 +376,19 @@ const seed_documents = [_][]const u8{
         "\"subject\":{\"type\":\"command\",\"command\":\"ls\",\"cwd\":\"/tmp\"}," ++
         "\"options\":[{\"optionId\":\"o\",\"name\":\"n\"," ++
         "\"kind\":\"allow_once\"}]}",
+    // The last three carry a carrier `_meta`, the one member of the two
+    // `bridge` objects the encoders write back. They are appended rather than
+    // inserted because the hand-written tests name seeds by index, and they
+    // are real messages at the pinned revisions rather than documents invented
+    // to reach a branch: `research/normative/acp-v1-v2.md` table 10b puts the
+    // envelope `_meta` after `params` and table 10c puts the carrier `_meta`
+    // after the outcome member, which is the order these three spell.
+    "{\"serverId\":\"s\",\"requestId\":\"r\",\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"echo\"},\"_meta\":{\"trace\":\"t\"}}",
+    "{\"result\":{\"resultType\":\"complete\",\"content\":[]}," ++
+        "\"_meta\":{\"trace\":\"t\"}}",
+    "{\"error\":{\"code\":-32602,\"message\":\"bad\"}," ++
+        "\"_meta\":{\"trace\":\"t\"}}",
 };
 
 fn hostileByte(rng: std.Random) u8 {
@@ -554,7 +594,24 @@ const Shape = enum {
     mutated,
     /// A real document with a member renamed.
     renamed,
-    /// Two damaged documents joined, which is wrong at exactly one seam.
+    /// Two documents joined, which is wrong at exactly one seam.
+    ///
+    /// The head is a whole, undamated seed half the time and a mutated
+    /// fragment the other half. Do not "simplify" this back to two damaged
+    /// halves: two mutated halves almost never leave the first one decodable,
+    /// so before the draw existed this shape produced no trailing-byte
+    /// document any decoder would accept, and every decoder in
+    /// [`tail_rule`] swallowed the tail on every run without the harness
+    /// noticing. The draw is the only source of those documents, and the
+    /// damage both halves used to take is still here.
+    ///
+    /// Measured on the default seed over 20 000 documents, with the decoders
+    /// in [`tail_rule`] left lenient so the count is of what they would have
+    /// accepted: 3388 documents were one value and then more, 279 of those
+    /// were accepted by `bridge.decodeOutcome` on its `result` arm and 250 on
+    /// its `error` arm. The two arms are both reached, which is what makes an
+    /// `atEnd` check misplaced inside the `error` arm's lexeme capture a
+    /// failure rather than a pass.
     spliced,
 };
 
@@ -582,7 +639,11 @@ fn writeShape(rng: std.Random, doc: *Doc, spare: *Doc, index: usize) void {
         .spliced => {
             spare.clear();
             writeMutated(rng, spare);
-            writeMutated(rng, doc);
+            if (rng.boolean()) {
+                doc.push(seed_documents[rng.intRangeLessThan(usize, 0, seed_documents.len)]);
+            } else {
+                writeMutated(rng, doc);
+            }
             doc.push(spare.slice());
         },
     }
@@ -627,6 +688,21 @@ fn borrowAccepts(input: []const u8, scratch: []u8) bool {
     var reader = json.Reader.init(input);
     reader.skipValue(scratch) catch return false;
     return reader.atEnd();
+}
+
+/// Whether `input` holds one complete value and then bytes that are not part
+/// of it.
+///
+/// The other question from [`borrowAccepts`], and a decoder given this input
+/// has to refuse it: the value is a document, the rest is not inside it, and
+/// there is nowhere in an object to put those bytes, so no encoder could ever
+/// write them back. A decoder that accepts the document anyway drops them, and
+/// nothing downstream reports the loss, because the members it does keep are
+/// all correct.
+fn hasTail(input: []const u8, scratch: []u8) bool {
+    var reader = json.Reader.init(input);
+    reader.skipValue(scratch) catch return false;
+    return !reader.atEnd();
 }
 
 /// The classification the borrow reader implies, from its first structural
@@ -726,6 +802,290 @@ fn expectSameMessage(first: jsonrpc.Message, second: jsonrpc.Message) !void {
     }
 }
 
+// --- The bytes an encoder owes -------------------------------------------------
+
+/// Write one member of a canonical object, separator included.
+///
+/// A member the decoder decoded and the encoder re-escaped comes back through
+/// `string`, and one the encoder splices comes back as it stood. The two are
+/// different rules and are named separately rather than behind a flag,
+/// because a prediction that re-escaped a spliced value would disagree with
+/// the encoder over a document both handled correctly.
+fn writeCanonicalTextMember(
+    name: []const u8,
+    text: []const u8,
+    separator: []const u8,
+    writer: *json.Writer,
+) !void {
+    try writer.slice(separator);
+    try writer.slice("\"");
+    try writer.slice(name);
+    try writer.slice("\":");
+    try writer.string(text);
+}
+
+/// The same member, spliced.
+fn writeCanonicalRawMember(
+    name: []const u8,
+    text: []const u8,
+    separator: []const u8,
+    writer: *json.Writer,
+) !void {
+    try writer.slice(separator);
+    try writer.slice("\"");
+    try writer.slice(name);
+    try writer.slice("\":");
+    try writer.slice(text);
+}
+
+/// Write the exact bytes `bridge.encodeEnvelope` owes for the document `raw`.
+///
+/// The prediction is built from the input alone, and that is the whole reason
+/// the round trip compares bytes. A comparison of the members a decoder
+/// returned cannot see a member the encoder dropped, which is how a carrier
+/// `_meta` was accepted and then lost without the harness noticing; a
+/// prediction read back off the decoder's own output would be that same
+/// comparison with more steps. Here the only thing either side is allowed to
+/// know is `raw`.
+///
+/// The prediction differs from the input in exactly the two ways a JSON
+/// document may without losing anything: insignificant whitespace goes, and
+/// the members come out in the order table 10b lists them. Every member that
+/// table defines is written whenever the input carried one, and a member the
+/// input spelled more than once is written once from the last occurrence,
+/// because that is the one the decoder keeps. A member the table does not
+/// define is written by neither side.
+fn writeCanonicalEnvelope(
+    raw: []const u8,
+    scratch: []u8,
+    writer: *json.Writer,
+) !void {
+    var reader = json.Reader.init(raw);
+    var server: ?[]const u8 = null;
+    var request: ?[]const u8 = null;
+    var method: ?[]const u8 = null;
+    var params: ?[]const u8 = null;
+    var meta: ?[]const u8 = null;
+
+    // An object with no member is not an envelope, so a caller that decoded
+    // one never reaches this branch. Refusing rather than defaulting keeps a
+    // future caller from predicting `{}` for a document nothing accepts.
+    if (try reader.beginObject()) return error.MissingMember;
+
+    while (try reader.nextKey(scratch)) |key| {
+        if (std.mem.eql(u8, key, "serverId")) {
+            server = try reader.string(scratch);
+        } else if (std.mem.eql(u8, key, "requestId")) {
+            request = try reader.string(scratch);
+        } else if (std.mem.eql(u8, key, "method")) {
+            method = try reader.string(scratch);
+        } else if (std.mem.eql(u8, key, "params")) {
+            params = try reader.rawValue(scratch);
+        } else if (std.mem.eql(u8, key, "_meta")) {
+            meta = try reader.rawValue(scratch);
+        } else {
+            try reader.skipValue(scratch);
+        }
+    }
+
+    var separator: []const u8 = "";
+    try writer.byte('{');
+    try writeCanonicalTextMember(
+        "serverId",
+        server orelse return error.MissingMember,
+        separator,
+        writer,
+    );
+    separator = ",";
+    try writeCanonicalTextMember(
+        "requestId",
+        request orelse return error.MissingMember,
+        separator,
+        writer,
+    );
+    try writeCanonicalTextMember(
+        "method",
+        method orelse return error.MissingMember,
+        separator,
+        writer,
+    );
+    separator = ",";
+    if (params) |value| try writeCanonicalRawMember("params", value, separator, writer);
+    separator = ",";
+    if (meta) |value| try writeCanonicalRawMember("_meta", value, separator, writer);
+    try writer.byte('}');
+}
+
+/// Write the exact bytes `bridge.encodeOutcome` owes for the document `raw`.
+///
+/// The same two rules as the envelope, and neither arm is decoded and rebuilt:
+/// a result carries whatever the MCP operation returned and an error object
+/// arrives with its bytes already checked, so `encodeOutcome` splices both and
+/// so does this. A document carrying both members is not an outcome and never
+/// reaches the branch below, so which name is written is decided by the only
+/// one the input had.
+fn writeCanonicalOutcome(
+    raw: []const u8,
+    scratch: []u8,
+    writer: *json.Writer,
+) !void {
+    var reader = json.Reader.init(raw);
+    var is_error = false;
+    var text: ?[]const u8 = null;
+    var meta: ?[]const u8 = null;
+
+    if (try reader.beginObject()) return error.MissingMember;
+
+    while (try reader.nextKey(scratch)) |key| {
+        if (std.mem.eql(u8, key, "result")) {
+            text = try reader.rawValue(scratch);
+        } else if (std.mem.eql(u8, key, "error")) {
+            text = try reader.rawValue(scratch);
+            is_error = true;
+        } else if (std.mem.eql(u8, key, "_meta")) {
+            meta = try reader.rawValue(scratch);
+        } else {
+            try reader.skipValue(scratch);
+        }
+    }
+
+    try writer.byte('{');
+    try writer.slice(if (is_error) "\"error\":" else "\"result\":");
+    try writer.slice(text orelse return error.MissingMember);
+    if (meta) |value| try writeCanonicalRawMember("_meta", value, ",", writer);
+    try writer.byte('}');
+}
+
+/// Fail unless the encoder wrote the bytes the input says it owed.
+///
+/// The three renderings are separate buffers rather than one, because a
+/// truncated diagnostic that names only the input is a failure nobody can
+/// reproduce from a CI log, and reproducing it is the one job this message
+/// has.
+fn expectSameDocumentBytes(
+    comptime what: []const u8,
+    input: []const u8,
+    expected: []const u8,
+    encoded: []const u8,
+) !void {
+    if (std.mem.eql(u8, expected, encoded)) return;
+    var was: [2 * max_doc_len + 8]u8 = undefined;
+    var want: [2 * max_doc_len + 8]u8 = undefined;
+    var got: [2 * max_doc_len + 8]u8 = undefined;
+    std.debug.print(
+        "\nround trip: the {s} encoder did not reproduce the document\n" ++
+            "  input:    {s}\n  expected: {s}\n  encoded:  {s}\n",
+        .{
+            what,
+            escaped(input, &was),
+            escaped(expected, &want),
+            escaped(encoded, &got),
+        },
+    );
+    return error.RoundTripBytesDiffer;
+}
+
+/// The two sets a trailing-byte assertion splits into, and why they differ.
+///
+/// Ten decoders in the tree accepted a byte sequence that is one JSON value
+/// and then more, and dropped the tail without saying so. Measured by running
+/// each on a valid document and on that document plus `" trailing"`:
+///
+///   acp.zig:725   decodeReplayFrom
+///   acp.zig:1042  decodeCapabilityObject
+///   acp.zig:1098  decodeInitializeCapabilities
+///   acp.zig:1179  decodePermissionOutcome
+///   acp.zig:1284  decodePermissionSubject
+///   acp.zig:1429  decodePermissionRequest
+///   mcp.zig:1209  decodeResultType
+///   mcp.zig:1259  decodeCacheable
+///   mcp.zig:1336  decodeInputRequiredResult
+///   mcp.zig:1388  decodeCacheLeg
+///
+/// `jsonrpc.decode` (jsonrpc.zig:274), its error object (jsonrpc.zig:552) and
+/// the two session readers (acp_session.zig:235, mcp_session.zig:637) refuse
+/// one, and `bridge` now does too (bridge.zig:184, bridge.zig:303).
+///
+/// Five of the ten are not in this harness's decoder battery at all, so the
+/// corpus feeds them nothing and no assertion here would ever fire:
+/// `acp.decodeReplayFrom`, `acp.decodeInitializeCapabilities`,
+/// `acp.decodePermissionSubject`, `mcp.decodeCacheable` and
+/// `mcp.decodeCacheLeg`. They are named here so a reader knows they are
+/// unasserted rather than clean. A check that is green because it never ran is
+/// the thing this harness exists to prevent, so they are left out rather than
+/// written decoratively.
+const tail_rule = struct {
+    /// Decoders this harness re-encodes, so a tail they accept is a lost
+    /// `encode(decode(b))`: `mcp.decodeResultType` and
+    /// `mcp.decodeInputRequiredResult` through the writers in
+    /// [`roundTripResultType`] and [`roundTripInputRequiredResult`], and
+    /// `acp.decodePermissionOutcome` through `acp.encodePermissionOutcome`.
+    ///
+    /// The byte comparison cannot see the loss even here, and that is worth
+    /// being blunt about rather than dressing up: an encoder has nowhere
+    /// inside an object to put the tail, so the prediction and the encoder
+    /// agree on a document neither can reproduce. The decoder is the thing
+    /// that is wrong, and the assertion is a refusal because a round trip
+    /// cannot express what was thrown away.
+    round_trip: []const []const u8 = &.{
+        "mcp.decodeResultType",
+        "mcp.decodeInputRequiredResult",
+        "acp.decodePermissionOutcome",
+    },
+
+    /// Decoders this harness never re-encodes, so the tail has nothing to be
+    /// lost by: `acp.decodePermissionRequest` in both wire versions and
+    /// `acp.decodeCapabilityObject`. For these the defect is only that a byte
+    /// sequence which is not a document was accepted, which is a framing
+    /// question rather than a round-trip one.
+    ///
+    /// The distinction is not cosmetic. A reader who adds an encoder to one of
+    /// these moves that one name to [`tail_rule.round_trip`] and nothing else
+    /// changes, because the two sets differ in what the loss costs and not in
+    /// what the decoder has to do about it.
+    unmodelled: []const []const u8 = &.{
+        "acp.decodePermissionRequest",
+        "acp.decodeCapabilityObject",
+    },
+};
+
+/// Fail unless a decoder whose value is re-encoded refused a tailed input.
+///
+/// See [`tail_rule.round_trip`] for the set and for why a refusal is the only
+/// shape this can take.
+fn expectRoundTripHasNoTail(
+    comptime what: []const u8,
+    input: []const u8,
+    tail: bool,
+) !void {
+    return reportTailedDocument(what, input, tail);
+}
+
+/// Fail unless a decoder this harness never re-encodes refused a tailed input.
+///
+/// See [`tail_rule.unmodelled`] for the set.
+fn expectRefusalHasNoTail(
+    comptime what: []const u8,
+    input: []const u8,
+    tail: bool,
+) !void {
+    return reportTailedDocument(what, input, tail);
+}
+
+fn reportTailedDocument(
+    comptime what: []const u8,
+    input: []const u8,
+    tail: bool,
+) !void {
+    if (!tail) return;
+    var text: [2 * max_doc_len + 8]u8 = undefined;
+    std.debug.print(
+        "\nround trip: {s} accepted a document with a tail\n  document: {s}\n",
+        .{ what, escaped(input, &text) },
+    );
+    return error.DocumentHasTail;
+}
+
 // --- Round trips ---------------------------------------------------------------
 
 const Stats = struct {
@@ -733,6 +1093,10 @@ const Stats = struct {
     accepted: usize = 0,
     refused: usize = 0,
     round_trips: usize = 0,
+    /// Documents that were one value and then more. Not a printed line,
+    /// because CI and the gate parse this block and this number is a
+    /// liveness check for the assertion above rather than a result.
+    tails: usize = 0,
 };
 
 fn roundTripJsonRpc(
@@ -750,40 +1114,96 @@ fn roundTripJsonRpc(
     stats.round_trips += 1;
 }
 
+/// Encode the envelope, compare the bytes, then compare the members.
+///
+/// The two are separate properties and the first is the one that matters. The
+/// byte comparison is what PROTOCOLS.md section 2 states, and it is the only
+/// one that can see a member the encoder dropped, because a decoder that
+/// never returned it cannot fail a comparison of its own output against
+/// itself. The member comparison is narrower and is kept because it names the
+/// member that went wrong instead of printing two escaped documents.
 fn roundTripEnvelope(
+    input: []const u8,
     envelope: bridge.Envelope,
     scratch: []u8,
     out: []u8,
+    owed: []u8,
     stats: *Stats,
 ) !void {
     const testing = std.testing;
     var writer = json.Writer.init(out);
-    if (bridge.encodeEnvelope(envelope, &writer)) |_| {
-        // The outer id is not a member of the params object, so the re-decode
-        // cannot be told the direction and reports the notification.
-        const again = try bridge.decodeEnvelope(writer.written(), scratch, null);
-        try testing.expectEqualStrings(envelope.server_id, again.server_id);
-        try testing.expectEqualStrings(envelope.request_id, again.request_id);
-        try testing.expectEqualStrings(envelope.inner_method, again.inner_method);
-        try expectSameString(envelope.inner_params, again.inner_params);
-        stats.round_trips += 1;
-    } else |err| {
-        // A decoded envelope carries three non-empty members, which is what
-        // `encodeEnvelope` validates, so the only error left here is a harness
-        // buffer that is too small.
-        return err;
-    }
+    // A decoded envelope carries three non-empty members, which is what
+    // `encodeEnvelope` validates, so the only error left here is a harness
+    // buffer that is too small, and returning it fails the test rather than
+    // quietly skipping the round trip.
+    try bridge.encodeEnvelope(envelope, &writer);
+
+    // The prediction borrows `scratch` and is spent before the re-decode takes
+    // the buffer, so one buffer serves both and the first decode's values are
+    // still intact when the members are compared.
+    var predicted = json.Writer.init(owed);
+    try writeCanonicalEnvelope(input, scratch, &predicted);
+    try expectSameDocumentBytes("envelope", input, predicted.written(), writer.written());
+
+    // The outer id is not a member of the params object, so the re-decode
+    // cannot be told the direction and reports the notification.
+    const again = try bridge.decodeEnvelope(writer.written(), scratch, null);
+    try testing.expectEqualStrings(envelope.server_id, again.server_id);
+    try testing.expectEqualStrings(envelope.request_id, again.request_id);
+    try testing.expectEqualStrings(envelope.inner_method, again.inner_method);
+    try expectSameString(envelope.inner_params, again.inner_params);
+    try expectSameString(envelope.meta, again.meta);
+    stats.round_trips += 1;
 }
 
-fn roundTripOutcome(outcome: bridge.Outcome, scratch: []u8, stats: *Stats) !void {
-    // No encoder exists for the carrier, so the property is the one the
-    // borrowed text has to satisfy: a fresh reader must still see a complete
-    // value at exactly the bytes the decoder handed back.
-    const text = switch (outcome) {
-        .result => |value| value,
-        .@"error" => |value| value,
+/// Encode the outcome, compare the bytes, then compare the members.
+///
+/// The byte comparison is the whole reason this is worth doing. The check
+/// this replaces read the borrowed payload back through a fresh reader and
+/// stopped there, and a decoder that dropped the carrier `_meta` satisfied it
+/// as completely as one that kept it: the payload was intact either way, so
+/// the loss the carrier field was added to prevent was invisible on every run.
+fn roundTripOutcome(
+    input: []const u8,
+    outcome: bridge.Outcome,
+    scratch: []u8,
+    out: []u8,
+    owed: []u8,
+    stats: *Stats,
+) !void {
+    const testing = std.testing;
+    const payload = switch (outcome) {
+        .result => |arm| arm,
+        .@"error" => |arm| arm,
     };
-    if (!borrowAccepts(text, scratch)) return error.BorrowedValueTruncated;
+    // Both halves are borrowed lexemes, so both must still be complete values
+    // to a reader that has not seen this one.
+    if (!borrowAccepts(payload.text, scratch)) return error.BorrowedValueTruncated;
+    if (payload.meta) |meta| {
+        if (!borrowAccepts(meta, scratch)) return error.BorrowedValueTruncated;
+    }
+
+    var writer = json.Writer.init(out);
+    // The payload came from `decodeOutcome`, which has already checked it
+    // against the shape its arm requires, and both it and the carrier are
+    // spliced rather than rebuilt, so the only failure left is a harness
+    // buffer that is too small.
+    try bridge.encodeOutcome(outcome, &writer);
+
+    var predicted = json.Writer.init(owed);
+    try writeCanonicalOutcome(input, scratch, &predicted);
+    try expectSameDocumentBytes("outcome", input, predicted.written(), writer.written());
+
+    const again = try bridge.decodeOutcome(writer.written(), scratch);
+    // The arm is the byte comparison's business as well, since the prediction
+    // writes the name the input carried, and one line here is what names it.
+    try testing.expect(std.meta.activeTag(again) == std.meta.activeTag(outcome));
+    const other = switch (again) {
+        .result => |arm| arm,
+        .@"error" => |arm| arm,
+    };
+    try testing.expectEqualStrings(payload.text, other.text);
+    try expectSameString(payload.meta, other.meta);
     stats.round_trips += 1;
 }
 
@@ -980,18 +1400,129 @@ test "requiredScratchLen is exact for a message holding two escaped strings" {
     try testing.expectError(error.BufferTooSmall, jsonrpc.decode(text, &tight));
 }
 
+test "the round-trip prediction is the encoder's byte order" {
+    const testing = std.testing;
+    // The prediction is a second walk of the same object, so the one way it
+    // could be worthless is by being wrong in exactly the way the encoder is
+    // wrong, and the two would then agree on a document neither reproduces.
+    // The expected bytes below are written out by hand, so a prediction that
+    // lost the carrier `_meta`, moved it, or re-escaped the spliced `params`
+    // disagrees with a literal rather than with another piece of the harness.
+    //
+    // Every document here is deliberately not in the order the encoder writes
+    // and carries whitespace beside every member. A prediction compared
+    // against the input rather than against the canonical form would fail on
+    // all of them, which is why the comparison is against the canonical form.
+    var scratch: [max_doc_len]u8 = undefined;
+    var out: [encode_buf_len]u8 = undefined;
+    var owed: [encode_buf_len]u8 = undefined;
+
+    // `method` arrives escaped and comes back as the character the escape
+    // names, because the decoder decodes it and the encoder re-escapes it.
+    // `params` arrives with whitespace inside it and keeps it, because neither
+    // end of that member ever looks at its structure.
+    const envelope_input =
+        "{ \"_meta\" : {\"trace\":\"t\"} , \"method\" : \"tools/\\u0063all\" ," ++
+        " \"serverId\" : \"s\" , \"requestId\" : \"r\" , " ++
+        "\"params\" : { \"n\" : 1 } }";
+    const envelope_bytes =
+        "{\"serverId\":\"s\",\"requestId\":\"r\",\"method\":\"tools/call\"," ++
+        "\"params\":{ \"n\" : 1 },\"_meta\":{\"trace\":\"t\"}}";
+    var envelope_predicted = json.Writer.init(&owed);
+    try writeCanonicalEnvelope(envelope_input, &scratch, &envelope_predicted);
+    try testing.expectEqualStrings(envelope_bytes, envelope_predicted.written());
+    var envelope_writer = json.Writer.init(&out);
+    try bridge.encodeEnvelope(
+        try bridge.decodeEnvelope(envelope_input, &scratch, null),
+        &envelope_writer,
+    );
+    try testing.expectEqualStrings(envelope_bytes, envelope_writer.written());
+
+    // The result arm, where the payload is spliced, so the whitespace inside
+    // it survives the round trip exactly as it arrived.
+    const result_input =
+        "{ \"_meta\" : {\"trace\":\"t\"} , \"result\" : { \"a\" : [1, 2] } }";
+    const result_bytes =
+        "{\"result\":{ \"a\" : [1, 2] },\"_meta\":{\"trace\":\"t\"}}";
+    var result_predicted = json.Writer.init(&owed);
+    try writeCanonicalOutcome(result_input, &scratch, &result_predicted);
+    try testing.expectEqualStrings(result_bytes, result_predicted.written());
+    var result_writer = json.Writer.init(&out);
+    try bridge.encodeOutcome(try bridge.decodeOutcome(result_input, &scratch), &result_writer);
+    try testing.expectEqualStrings(result_bytes, result_writer.written());
+
+    // The error arm, and a carrier that is the literal `null` rather than an
+    // object: it is a lexeme like any other and the encoder splices it.
+    const error_input = "{ \"error\" : {\"code\":-1,\"message\":\"m\"} , \"_meta\" : null }";
+    const error_bytes = "{\"error\":{\"code\":-1,\"message\":\"m\"},\"_meta\":null}";
+    var error_predicted = json.Writer.init(&owed);
+    try writeCanonicalOutcome(error_input, &scratch, &error_predicted);
+    try testing.expectEqualStrings(error_bytes, error_predicted.written());
+
+    // A member spelled twice is the one the decoder keeps, so the prediction
+    // has to be built from the same occurrence or the two disagree over a
+    // document both handle correctly.
+    const duplicate_input =
+        "{\"serverId\":\"first\",\"serverId\":\"s\"," ++
+        "\"requestId\":\"r\",\"method\":\"m\"}";
+    const duplicate_bytes = "{\"serverId\":\"s\",\"requestId\":\"r\",\"method\":\"m\"}";
+    var duplicate_predicted = json.Writer.init(&owed);
+    try writeCanonicalEnvelope(duplicate_input, &scratch, &duplicate_predicted);
+    try testing.expectEqualStrings(duplicate_bytes, duplicate_predicted.written());
+}
+
+test "an encoder that drops the carrier _meta does not reproduce the document" {
+    const testing = std.testing;
+    // What the check is for, named as a test. The carrier `_meta` was accepted
+    // by the decoder, held nowhere the encoder could reach, and dropped on the
+    // way out; the members that survived still compared equal, so the
+    // member-level check this harness used to make passed on every run. Here
+    // the two byte sequences differ by exactly that member, and the check has
+    // to say so rather than shrug.
+    var scratch: [max_doc_len]u8 = undefined;
+    var out: [encode_buf_len]u8 = undefined;
+    var owed: [encode_buf_len]u8 = undefined;
+
+    const input = "{\"result\":{\"a\":1},\"_meta\":{\"trace\":\"t\"}}";
+    const decoded = try bridge.decodeOutcome(input, &scratch);
+    const payload = switch (decoded) {
+        .result => |arm| arm,
+        .@"error" => return error.TestUnexpectedResult,
+    };
+    // The decoder really did keep it, so the loss below is the encoder's and
+    // not a document that never carried one.
+    try expectSameString("{\"trace\":\"t\"}", payload.meta);
+
+    var predicted = json.Writer.init(&owed);
+    try writeCanonicalOutcome(input, &scratch, &predicted);
+    try testing.expectEqualStrings(input, predicted.written());
+
+    // `meta = null` is what the outcome looked like while the member was being
+    // skipped, and the encoder writes exactly the document without it.
+    var dropped = json.Writer.init(&out);
+    try bridge.encodeOutcome(.{ .result = .{ .text = payload.text } }, &dropped);
+    try testing.expectEqualStrings("{\"result\":{\"a\":1}}", dropped.written());
+    try testing.expectError(
+        error.RoundTripBytesDiffer,
+        expectSameDocumentBytes("outcome", input, predicted.written(), dropped.written()),
+    );
+}
+
 // --- The decoder battery --------------------------------------------------------
 
 /// Feed one document to every public decoder and check the properties.
 ///
 /// `scratch` and `replay` are two buffers of the same size on purpose: the
 /// round trips decode into `replay`, so the first decode's borrowed values are
-/// still intact when the two are compared.
+/// still intact when the two are compared. `owed` is a third, for the bytes
+/// each `bridge` encoder was supposed to write, and it is never a decode
+/// target: the prediction is spent before the re-decode takes `replay`.
 fn exerciseEveryDecoder(
     input: []const u8,
     scratch: []u8,
     replay: []u8,
     out: []u8,
+    owed: []u8,
     stats: *Stats,
 ) !void {
     const testing = std.testing;
@@ -1004,7 +1535,13 @@ fn exerciseEveryDecoder(
     var walk_scratch: [max_doc_len]u8 = undefined;
     const measured = json.Reader.requiredScratchLen(input);
     try testing.expect(measured <= walk_scratch.len);
-    if (borrowAccepts(input, &walk_scratch)) {
+    // Whether the input is one complete value, and whether it is one value and
+    // then more. The second is the question a whole-document decoder has to
+    // refuse, and both walks are cheap: the document is bounded by
+    // `max_doc_len` and this harness already walks it several times.
+    const tail = hasTail(input, &walk_scratch);
+    if (tail) stats.tails += 1;
+    if (!tail and borrowAccepts(input, &walk_scratch)) {
         var walk_reader = json.Reader.init(input);
         try walkValue(&walk_reader, walk_scratch[0..measured]);
     }
@@ -1018,6 +1555,7 @@ fn exerciseEveryDecoder(
 
     if (mcp.decodeResultType(input, scratch)) |result| {
         stats.accepted += 1;
+        try expectRoundTripHasNoTail("mcp.decodeResultType", input, tail);
         try roundTripResultType(result, replay, out, stats);
     } else |_| {
         stats.refused += 1;
@@ -1025,6 +1563,7 @@ fn exerciseEveryDecoder(
 
     if (mcp.decodeInputRequiredResult(input, scratch)) |result| {
         stats.accepted += 1;
+        try expectRoundTripHasNoTail("mcp.decodeInputRequiredResult", input, tail);
         try roundTripInputRequiredResult(result, replay, out, stats);
     } else |_| {
         stats.refused += 1;
@@ -1045,6 +1584,7 @@ fn exerciseEveryDecoder(
 
     if (acp.decodePermissionOutcome(input, scratch)) |outcome| {
         stats.accepted += 1;
+        try expectRoundTripHasNoTail("acp.decodePermissionOutcome", input, tail);
         try roundTripPermissionOutcome(outcome, replay, out, stats);
     } else |_| {
         stats.refused += 1;
@@ -1056,6 +1596,7 @@ fn exerciseEveryDecoder(
     var permission_options: [16]acp.PermissionOption = undefined;
     if (acp.decodePermissionRequest(.stable, input, &permission_options, scratch)) |request| {
         stats.accepted += 1;
+        try expectRefusalHasNoTail("acp.decodePermissionRequest stable", input, tail);
         const v1 = switch (request) {
             .stable => |value| value,
             .draft => return error.TestUnexpectedResult,
@@ -1068,6 +1609,7 @@ fn exerciseEveryDecoder(
 
     if (acp.decodePermissionRequest(.draft, input, &permission_options, scratch)) |request| {
         stats.accepted += 1;
+        try expectRefusalHasNoTail("acp.decodePermissionRequest draft", input, tail);
         const v2 = switch (request) {
             .draft => |value| value,
             .stable => return error.TestUnexpectedResult,
@@ -1087,7 +1629,8 @@ fn exerciseEveryDecoder(
 
     if (bridge.decodeEnvelope(input, scratch, .{ .integer = 1 })) |envelope| {
         stats.accepted += 1;
-        try roundTripEnvelope(envelope, replay, out, stats);
+        try expectRoundTripHasNoTail("bridge.decodeEnvelope", input, tail);
+        try roundTripEnvelope(input, envelope, replay, out, owed, stats);
     } else |_| {
         stats.refused += 1;
     }
@@ -1103,7 +1646,8 @@ fn exerciseEveryDecoder(
 
     if (bridge.decodeOutcome(input, scratch)) |outcome| {
         stats.accepted += 1;
-        try roundTripOutcome(outcome, replay, stats);
+        try expectRoundTripHasNoTail("bridge.decodeOutcome", input, tail);
+        try roundTripOutcome(input, outcome, replay, out, owed, stats);
     } else |_| {
         stats.refused += 1;
     }
@@ -1121,6 +1665,7 @@ fn exerciseEveryDecoder(
                 scratch,
             )) |set| {
                 stats.accepted += 1;
+                try expectRefusalHasNoTail("acp.decodeCapabilityObject", input, tail);
                 // An empty object is a peer that advertises nothing, which is a
                 // fact rather than an error, so every success is present.
                 try testing.expect(set.present);
@@ -1173,10 +1718,15 @@ fn runPropertyHarness(run_seed: u64, count: usize) !Stats {
     var scratch: [max_doc_len]u8 = undefined;
     var replay: [max_doc_len]u8 = undefined;
     var out: [encode_buf_len]u8 = undefined;
+    // The bytes each `bridge` encoder owes. Sized like `out` for the reason
+    // `out` is: a prediction never re-escapes a byte into more bytes than it
+    // read, and it drops the whitespace the input spent, so a
+    // `BufferTooSmall` here is a harness bug rather than a tight buffer.
+    var owed: [encode_buf_len]u8 = undefined;
 
     for (0..count) |index| {
         writeShape(rng, &doc, &splice, index);
-        try exerciseEveryDecoder(doc.slice(), &scratch, &replay, &out, &stats);
+        try exerciseEveryDecoder(doc.slice(), &scratch, &replay, &out, &owed, &stats);
     }
 
     // A run that generated nothing useful would pass by decoding nothing.
@@ -1185,6 +1735,11 @@ fn runPropertyHarness(run_seed: u64, count: usize) !Stats {
     try testing.expect(stats.accepted != 0);
     try testing.expect(stats.refused != 0);
     try testing.expect(stats.round_trips != 0);
+    // A harness whose trailing-byte assertion never fires is a harness that
+    // has stopped checking anything, so the corpus has to keep producing the
+    // case. The same guard the differential run uses: a short run says
+    // nothing either way, so it asserts nothing.
+    if (count >= 1000) try testing.expect(stats.tails != 0);
     std.debug.print(
         "  documents={d} accepted={d} refused={d} round-trips={d}\n",
         .{ stats.documents, stats.accepted, stats.refused, stats.round_trips },

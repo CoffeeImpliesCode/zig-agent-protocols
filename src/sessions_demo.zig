@@ -339,15 +339,21 @@ fn keep(into: []u8, length: *usize, text: []const u8) void {
 
 /// Record one carried call's inner outcome, so that the flag and the text
 /// always describe the same answer.
+///
+/// An arm is a `bridge.OutcomePayload` rather than a bare slice, so its `text`
+/// is the inner MCP payload and its `meta` is the ACP carrier metadata
+/// travelling beside it. This exchange sends no carrier `_meta`, so there is
+/// none to record, and the payload's `text` is the whole of what the call
+/// below prints.
 fn record(into: *Carried, outcome: bridge.Outcome) void {
     switch (outcome) {
-        .result => |text| {
+        .result => |payload| {
             into.failed = false;
-            keep(&into.text, &into.len, text);
+            keep(&into.text, &into.len, payload.text);
         },
-        .@"error" => |text| {
+        .@"error" => |payload| {
             into.failed = true;
-            keep(&into.text, &into.len, text);
+            keep(&into.text, &into.len, payload.text);
         },
     }
 }
@@ -540,6 +546,11 @@ const ClientTask = struct {
 /// line under it says which of the two calls it belongs to, and the outcome
 /// flag picks the last of the three, so a failed call never prints a result
 /// and a successful one never prints an error.
+///
+/// The last line is the `text` of the arm's `bridge.OutcomePayload`, which is
+/// the inner MCP payload spliced verbatim. The carrier `_meta` beside it is a
+/// member of the same payload, and this exchange sends none, so there is no
+/// second line here to print.
 fn printCarried(out: *Io.Writer, inner_method: []const u8, outcome: Carried) !void {
     try out.print("  {s} carrying {s}\n", .{ bridge_session.method, inner_method });
     try out.print("    outer call    succeeded\n", .{});
@@ -657,8 +668,8 @@ const testing = std.testing;
 
 test "the second carried call cannot overwrite what the first one recorded" {
     var report: Report = .{};
-    record(&report.first, .{ .result = "{\"echo\":\"hello\"}" });
-    record(&report.second, .{ .@"error" = "{\"code\":-32602}" });
+    record(&report.first, .{ .result = .{ .text = "{\"echo\":\"hello\"}" } });
+    record(&report.second, .{ .@"error" = .{ .text = "{\"code\":-32602}" } });
 
     // The two calls answered in opposite directions, so one shared pair would
     // leave both flags reading `failed` and both texts holding the error, and
@@ -671,9 +682,9 @@ test "the second carried call cannot overwrite what the first one recorded" {
 
 test "every printed line names the carried call it belongs to" {
     var first: Carried = .{};
-    record(&first, .{ .result = "{\"resultType\":\"complete\"}" });
+    record(&first, .{ .result = .{ .text = "{\"resultType\":\"complete\"}" } });
     var second: Carried = .{};
-    record(&second, .{ .@"error" = "{\"code\":-32602}" });
+    record(&second, .{ .@"error" = .{ .text = "{\"code\":-32602}" } });
 
     var buffer: [512]u8 = undefined;
     var out = Io.Writer.fixed(&buffer);

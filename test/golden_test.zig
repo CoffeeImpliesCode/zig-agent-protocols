@@ -657,7 +657,7 @@ test "a version mismatch inside the outcome carrier is not a binding failure" {
 
     const failure = try bridge.decodeOutcome(fixture.bridge_outcome_error, try pool.next());
     const error_text = switch (failure) {
-        .@"error" => |text| text,
+        .@"error" => |payload| payload.text,
         .result => return error.TestUnexpectedResult,
     };
     // `-32022` is MCP's `UnsupportedProtocolVersion`, and the draft places it
@@ -691,7 +691,7 @@ test "a version mismatch inside the outcome carrier is not a binding failure" {
 
     const success = try bridge.decodeOutcome(fixture.bridge_outcome_result, try pool.next());
     const result_text = switch (success) {
-        .result => |text| text,
+        .result => |payload| payload.text,
         .@"error" => return error.TestUnexpectedResult,
     };
     // The inner outcome is an ordinary MCP result, so the MCP decoder runs on
