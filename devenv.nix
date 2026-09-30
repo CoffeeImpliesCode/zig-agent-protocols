@@ -8,22 +8,41 @@
 # the manifest does not pin.
 let
   packages = [ ];
+
+  # Zig flocks every global-cache manifest. A build that dies holding one of
+  # its manifest locks wedges every later build that wants the same cache, so
+  # each project gets its own root under the node-local scratch disk.
+  #
+  # The anyzig shim resolves its toolchain through this same variable, at
+  # `<root>/p/<hash>`. A root without `p` makes the shim re-fetch the tarball
+  # from ziglang.org, fail extraction, and exit 1 in silence, so `p` is a
+  # symlink to the one shared toolchain store: build caches stay per-project,
+  # downloaded toolchains stay shared.
+  zigCache = "/tmp/zig-caches/zig-agent-proto";
 in
 {
   inherit packages;
 
   env = {
-    # Zig flocks every global-cache manifest, so a build that dies holding one
-    # of those locks wedges every later build wanting the same global cache.
-    # A project-local global cache keeps this project independent of that;
-    # the cost is one extra compiler_rt build.
-    ZIG_GLOBAL_CACHE_DIR = ".zig-global-cache";
+    # The shim stages a download in its appdata directory before unpacking it,
+    # and appdata is the one path the shim reads from no variable a project can
+    # set through zig. Left at the default it lands on $HOME/.local/share, which
+    # here is an NFS export, and the staged archive does not survive the round
+    # trip: extraction aborts with "illegal file type 'unknown'" and the shim
+    # exits 1 in silence, so every documented command fails for a reason no
+    # message names. Node-local scratch, the same disk the cache root uses.
+    XDG_DATA_HOME = "/tmp/xdg-data";
+    ZIG_GLOBAL_CACHE_DIR = zigCache;
   };
 
   # The shim exits 1 with no output when it cannot resolve a toolchain, so a
   # broken pin looks like a mysterious silent build failure. Report the
-  # version on entry instead.
+  # version on entry instead. Creating the root first keeps that report fast
+  # on a node whose scratch was wiped, and the `p` symlink keeps the shim from
+  # rebuilding the toolchain from the hashstore on every entry.
   enterShell = ''
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    [ -e "$ZIG_GLOBAL_CACHE_DIR/p" ] || ln -s /tmp/zig-global-cache/p "$ZIG_GLOBAL_CACHE_DIR/p"
     echo "zig $(zig version 2>/dev/null || echo '<unresolved: check .minimum_zig_version>')"
   '';
 
