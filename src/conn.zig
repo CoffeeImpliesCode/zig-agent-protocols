@@ -157,6 +157,16 @@ pub const Conn = struct {
     };
 
     pub fn init(io: Io, reader: *Io.Reader, writer: *Io.Writer, config: Config) Conn {
+        // Every slot starts free.
+        //
+        // The array is storage this type now owns, and a caller that declares
+        // it `undefined` — which is what every buffer in this library is
+        // declared as — has not built a table of free slots. In ReleaseSafe
+        // the stack those slots land on is whatever the previous test left
+        // there, so `used` reads as true and the first call answers
+        // `error.TooManyPending` with no peer on the wire at all. Debug hides
+        // it by zeroing the frame.
+        for (config.pending) |*slot| slot.* = .{};
         return .{
             .io = io,
             .reader = reader,
@@ -435,3 +445,36 @@ pub const Conn = struct {
         return writer.written();
     }
 };
+
+// --- Tests ----------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "a pending table of garbage is a table of free slots" {
+    // The connection owns the slot table it is handed, so it clears it. A
+    // caller's array is no exception: every buffer in this library is declared
+    // `undefined`, and in ReleaseSafe the stack those slots land on is whatever
+    // the previous test left there, so an uncleared `used` flag answers the
+    // first call with `error.TooManyPending` and no peer on the wire at all.
+    // Debug hides it by zeroing the frame, so the table is poisoned here and
+    // the test fails in Debug too if the clearing is ever removed.
+    var pending: [3]Slot = undefined;
+    for (&pending) |*slot| {
+        slot.* = .{ .id = -1, .used = true, .answered = true, .result = &.{} };
+    }
+
+    var frame_buffer: [64]u8 = undefined;
+    var decode_scratch: [64]u8 = undefined;
+    var handler_scratch: [64]u8 = undefined;
+    var reader = Io.Reader.fixed("");
+    var writer = Io.Writer.fixed(&.{});
+    const connection = Conn.init(testing.io, &reader, &writer, .{
+        .frame_buffer = &frame_buffer,
+        .pending = &pending,
+        .decode_scratch = &decode_scratch,
+        .handler_scratch = &handler_scratch,
+    });
+
+    try testing.expectEqual(@as(usize, 3), connection.slots.len);
+    for (connection.slots) |slot| try testing.expect(!slot.used);
+}
