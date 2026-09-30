@@ -453,8 +453,8 @@ pub const ParamValue = union(enum) {
 /// The scratch a caller must supply to render an integer parameter, and to
 /// render one for a server-side comparison.
 ///
-/// Twenty digits plus a sign is the widest decimal an `i64` renders to, so
-/// every render fits.
+/// An `i64` renders to nineteen digits at most, so the widest output is
+/// twenty bytes with the sign. 24 leaves room above that bound.
 pub const param_value_max_len: usize = 24;
 
 /// Whether a value is bindable to a derived header: it has the type the
@@ -495,6 +495,8 @@ fn writeDecimal(value: i64, out: []u8) error{BufferTooSmall}![]const u8 {
     // the non-negative result into the unsigned domain; `@as` cannot, because
     // an `i64` does not coerce to a `u64`. The trailing `+ 1` runs unsigned,
     // where the widest magnitude, `2^63`, is a value and not an overflow.
+    // `magnitude` is undefined only until the arms below assign it: the first
+    // read is after the `if`, and neither arm falls through.
     const negative = value < 0;
     var magnitude: u64 = undefined;
     if (negative) {
@@ -574,6 +576,10 @@ pub const ParamBinding = struct {
 /// A schema fault surfaces as `error.InvalidField`, because a client holds an
 /// encode error set and the buffer faults are the other member of it.
 /// [`checkAnnotation`] names which rule a non-conforming schema broke.
+///
+/// Only `InvalidName` and `NotPrimitive` can fire here. The other two rules
+/// need the schema, and this signature carries neither a chain nor a sibling
+/// list, so a caller holding either runs [`checkAnnotation`] itself first.
 pub fn bindParamHeader(
     annotation: []const u8,
     param_type: ParamType,
@@ -679,8 +685,8 @@ pub fn checkParamBinding(
 
 /// The reserved `_meta` keys.
 ///
-/// Three bare key names are excepted from the prefix rule so W3C trace context
-/// works, and `progressToken` is the only bare key the schema defines.
+/// Four bare key names are excepted from the prefix rule: the three W3C trace
+/// context keys, and `progressToken`, which the schema also defines bare.
 pub const meta_key = struct {
     pub const progress_token = "progressToken";
     pub const protocol_version = "io.modelcontextprotocol/protocolVersion";
@@ -771,6 +777,10 @@ pub fn mandatoryMethods(revision: Revision) []const MethodInfo {
 const no_mandatory_methods: [0]MethodInfo = .{};
 
 /// The complete core `2026-07-28` client-to-server request inventory: 10 members.
+///
+/// PROTOCOLS.md section 4.4 lists the ten in this order, and a test below
+/// compares the two name for name in both directions, so a row the document
+/// gains, drops or renames fails there.
 pub const client_requests = [_]MethodInfo{
     .{
         .name = "server/discover",
@@ -779,16 +789,9 @@ pub const client_requests = [_]MethodInfo{
         .mandatory = true,
         .cacheable = true,
     },
-    .{ .name = "completion/complete", .direction = .client_to_server, .present_at_current = true },
-    .{ .name = "prompts/get", .direction = .client_to_server, .present_at_current = true, .mrtr = true },
-    .{ .name = "prompts/list", .direction = .client_to_server, .present_at_current = true, .cacheable = true },
+    .{ .name = "tools/list", .direction = .client_to_server, .present_at_current = true, .cacheable = true },
+    .{ .name = "tools/call", .direction = .client_to_server, .present_at_current = true, .mrtr = true },
     .{ .name = "resources/list", .direction = .client_to_server, .present_at_current = true, .cacheable = true },
-    .{
-        .name = "resources/templates/list",
-        .direction = .client_to_server,
-        .present_at_current = true,
-        .cacheable = true,
-    },
     .{
         .name = "resources/read",
         .direction = .client_to_server,
@@ -796,24 +799,36 @@ pub const client_requests = [_]MethodInfo{
         .mrtr = true,
         .cacheable = true,
     },
+    .{
+        .name = "resources/templates/list",
+        .direction = .client_to_server,
+        .present_at_current = true,
+        .cacheable = true,
+    },
+    .{ .name = "prompts/list", .direction = .client_to_server, .present_at_current = true, .cacheable = true },
+    .{ .name = "prompts/get", .direction = .client_to_server, .present_at_current = true, .mrtr = true },
+    .{ .name = "completion/complete", .direction = .client_to_server, .present_at_current = true },
     .{ .name = "subscriptions/listen", .direction = .client_to_server, .present_at_current = true },
-    .{ .name = "tools/call", .direction = .client_to_server, .present_at_current = true, .mrtr = true },
-    .{ .name = "tools/list", .direction = .client_to_server, .present_at_current = true, .cacheable = true },
 };
 
 /// The core notification inventory.
 ///
 /// `notifications/cancelled` is in both unions: the client sends it to cancel,
 /// and the server sends it solely to terminate a `subscriptions/listen` stream.
+///
+/// PROTOCOLS.md section 4.4 lists the eight in this order, and a test below
+/// compares the two name for name in both directions.
 pub const notifications = [_]MethodInfo{
-    .{ .name = "notifications/cancelled", .direction = .bidirectional, .present_at_current = true },
     .{ .name = "notifications/progress", .direction = .server_to_client, .present_at_current = true },
     .{
         .name = "notifications/message",
         .direction = .server_to_client,
         .present_at_current = true,
+        // Section 4.4 does not mark it deprecated; section 4.9 lists Logging as
+        // deprecated, and this is the logging notification.
         .deprecated = true,
     },
+    .{ .name = "notifications/cancelled", .direction = .bidirectional, .present_at_current = true },
     .{ .name = "notifications/resources/updated", .direction = .server_to_client, .present_at_current = true },
     .{ .name = "notifications/resources/list_changed", .direction = .server_to_client, .present_at_current = true },
     .{ .name = "notifications/tools/list_changed", .direction = .server_to_client, .present_at_current = true },
@@ -1021,7 +1036,7 @@ pub const ErrorCode = enum(i32) {
     }
 };
 
-/// The reserved implementation-defined range, section 4.5.
+/// The implementation-defined range, section 4.5.
 ///
 /// New codes MUST NOT be allocated here, and new implementations SHOULD NOT use
 /// it at all. The specification labels it "legacy".
@@ -1202,6 +1217,13 @@ pub const InputRequiredResult = struct {
     /// [`ResultType.known`] apply that rule.
     result_type: ResultType = ResultType{},
     /// The server-assigned request map, as borrowed JSON text.
+    ///
+    /// The decoder does not walk the map, does not validate an inner `method`,
+    /// and does not check that the member is a JSON object at all, so
+    /// `"inputRequests": []` decodes as readily as an object does. A consumer
+    /// that needs a method name checked reads it itself and refuses a name
+    /// outside the three with [`lookupInputRequest`], which answers
+    /// `error.UnknownMethod`.
     input_requests: ?[]const u8 = null,
     /// Opaque, and attacker-controlled.
     ///
@@ -1430,7 +1452,10 @@ const base64 = struct {
                 bits |= @as(u32, digit) << @intCast(18 - 6 * position);
                 count += 1;
             }
-            if (count == 1) return error.InvalidField;
+            // A quad carries at least two digits. One digit is not a whole
+            // byte, and a quad that opens with `=` carries none at all, so
+            // `count - 1` below would underflow a `usize`.
+            if (count < 2) return error.InvalidField;
             const produced: usize = if (count == 4) 3 else count - 1;
             if (out + produced > output.len) return error.BufferTooSmall;
             for (0..produced) |offset| {
@@ -1457,6 +1482,147 @@ test "the client request inventory has exactly the 10 core members" {
         try testing.expect(info.present_at_current);
         try testing.expectEqual(Direction.client_to_server, info.direction);
     }
+}
+
+/// Whether `set` holds exactly the members `expected` names.
+///
+/// Both directions, so a duplicate in either list fails too. The inventories are
+/// transcribed from PROTOCOLS.md section 4.4, and a count cannot check that: a
+/// renamed method, a dropped one, and a dropped one paired with a filler all
+/// leave the count standing and all break a peer that answers to the name in the
+/// document.
+fn namesAre(set: []const MethodInfo, expected: []const []const u8) bool {
+    if (set.len != expected.len) return false;
+    for (expected) |name| {
+        var found = false;
+        for (set) |info| {
+            if (std.mem.eql(u8, info.name, name)) found = true;
+        }
+        if (!found) return false;
+    }
+    for (set) |info| {
+        if (!contains(expected, info.name)) return false;
+    }
+    return true;
+}
+
+fn contains(expected: []const []const u8, needle: []const u8) bool {
+    for (expected) |name| {
+        if (std.mem.eql(u8, name, needle)) return true;
+    }
+    return false;
+}
+
+/// Whether `namespace` declares a member whose value is `key`.
+fn declaresKey(comptime namespace: type, key: []const u8) bool {
+    inline for (@typeInfo(namespace).@"struct".decls) |decl| {
+        if (std.mem.eql(u8, @field(namespace, decl.name), key)) return true;
+    }
+    return false;
+}
+
+test "the client request inventory names exactly the methods section 4.4 lists" {
+    // PROTOCOLS.md section 4.4 is the authority, and its client-to-server group
+    // is these ten names in its own row order, so a reader who edits that table
+    // edits this literal in the same direction. A count is not a check on a
+    // transcription: a renamed method, a dropped one, and a dropped one paired
+    // with a filler all leave the count standing.
+    try testing.expect(namesAre(
+        &client_requests,
+        &[_][]const u8{
+            "server/discover",
+            "tools/list",
+            "tools/call",
+            "resources/list",
+            "resources/read",
+            "resources/templates/list",
+            "prompts/list",
+            "prompts/get",
+            "completion/complete",
+            "subscriptions/listen",
+        },
+    ));
+}
+
+test "the notification inventory names exactly the methods section 4.4 lists" {
+    // The same check on the notification group: the seven server-to-client rows
+    // and the one `both` row, in the document's row order.
+    try testing.expect(namesAre(
+        &notifications,
+        &[_][]const u8{
+            "notifications/progress",
+            "notifications/message",
+            "notifications/cancelled",
+            "notifications/resources/updated",
+            "notifications/resources/list_changed",
+            "notifications/tools/list_changed",
+            "notifications/prompts/list_changed",
+            "notifications/subscriptions/acknowledged",
+        },
+    ));
+}
+
+test "each notification carries the direction section 4.4 states" {
+    // The names are pinned above, so a row that turns one-way from the
+    // document's `both`, or a server-to-client row that turns client-to-server,
+    // fails here. The client-to-server group needs no equivalent: the inventory
+    // test above asserts every one of its rows already.
+    for (notifications) |info| {
+        const expected: Direction = if (std.mem.eql(u8, info.name, "notifications/cancelled"))
+            .bidirectional
+        else
+            .server_to_client;
+        try testing.expectEqual(expected, info.direction);
+    }
+}
+
+test "the cacheable rows are the six section 4.4 marks" {
+    // Transcribed from the Notes column, which marks exactly six results
+    // "Cacheable result". The one mandatory method is already pinned by name and
+    // by exclusion in the test above, so this covers the flag nothing checks
+    // yet: a row that loses the mark, or gains one the document does not carry,
+    // fails here.
+    const cacheable = [_][]const u8{
+        "server/discover",
+        "tools/list",
+        "resources/list",
+        "resources/read",
+        "resources/templates/list",
+        "prompts/list",
+    };
+    for (client_requests) |info| {
+        try testing.expectEqual(contains(&cacheable, info.name), info.cacheable);
+    }
+}
+
+test "the _meta key set is exactly the ten keys section 4.3 lists" {
+    // Transcribed from PROTOCOLS.md section 4.3, the authority, in its row order.
+    // The document's row order is not the declaration order, so this compares the
+    // set in both directions rather than row by row. A reader who edits section
+    // 4.3 edits this literal in the same direction.
+    const keys = [_][]const u8{
+        "io.modelcontextprotocol/protocolVersion",
+        "io.modelcontextprotocol/clientCapabilities",
+        "io.modelcontextprotocol/clientInfo",
+        "io.modelcontextprotocol/serverInfo",
+        "io.modelcontextprotocol/logLevel",
+        "io.modelcontextprotocol/subscriptionId",
+        "traceparent",
+        "tracestate",
+        "baggage",
+        "progressToken",
+    };
+    // Every member the table declares is a key the document lists. `meta_key` is
+    // a namespace of reserved keys and nothing else, so a declaration that is not
+    // one is a fault here rather than an addition.
+    inline for (@typeInfo(meta_key).@"struct".decls) |decl| {
+        try testing.expect(contains(&keys, @field(meta_key, decl.name)));
+    }
+    // And every key the document lists is one the table declares.
+    for (keys) |key| {
+        try testing.expect(declaresKey(meta_key, key));
+    }
+    try testing.expectEqual(keys.len, @typeInfo(meta_key).@"struct".decls.len);
 }
 
 test "lookupMethod accepts every core client request at the current revision" {
@@ -1525,6 +1691,37 @@ test "server-initiated requests are MRTR-only, never top level" {
         if (permitsMrtr(info.name)) permitting += 1;
     }
     try testing.expectEqual(@as(usize, 3), permitting);
+}
+
+test "permitsMrtr and the mrtr flag agree on every client request" {
+    // PROTOCOLS.md 4.7 names three methods whose result may be interim, and
+    // `permitsMrtr` and the `.mrtr` flag are two transcriptions of that one
+    // sentence. A caller that applies one and not the other applies half a rule,
+    // and the count above cannot tell the two apart: dropping the flag from a
+    // row the predicate still approves leaves that count standing. Pinning them
+    // row for row is what makes the predicate usable as the single gate.
+    for (client_requests) |info| {
+        try testing.expectEqual(info.mrtr, permitsMrtr(info.name));
+    }
+    // The three the document names, and no fourth. The count below is over the
+    // flag rather than over the predicate, so it fails once the two disagree.
+    for ([_][]const u8{ "tools/call", "resources/read", "prompts/get" }) |name| {
+        try testing.expect(permitsMrtr(name));
+    }
+    var flagged: usize = 0;
+    for (client_requests) |info| {
+        if (info.mrtr) flagged += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), flagged);
+
+    // `lookupMethod` searches the notification table too and `respond` will gate
+    // on whatever method it was handed, and the document names no notification
+    // as one that may return an interim result, so neither the predicate nor the
+    // flag may answer true for a row of that table.
+    for (notifications) |info| {
+        try testing.expect(!permitsMrtr(info.name));
+        try testing.expect(!info.mrtr);
+    }
 }
 
 test "server/discover is the only mandatory method" {
@@ -1668,6 +1865,25 @@ test "a scratch buffer too small to decode is the caller's error, not a bad head
 
     // A value that is not base64 at all is still the peer's error.
     try testing.expectError(error.InvalidField, decodeHeaderValue("=?base64?aGk?aGk=?=", &tiny));
+}
+
+test "a sentinel body that opens with padding is rejected, not trapped" {
+    var scratch: [64]u8 = undefined;
+
+    // The body is four padding bytes, so the quad carries no digit at all and
+    // one byte fewer than the quad holds underflows a `usize`. Without the
+    // guard this traps, and every byte of a header value is a peer's choice,
+    // so one header takes a server task down.
+    try testing.expect(isSentinelEncoded("=?base64?====?="));
+    try testing.expectError(error.InvalidField, decodeHeaderValue("=?base64?====?=", &scratch));
+
+    // The same fault on a later quad, after a byte has already been produced,
+    // so a check that ran only on the first quad would let this through.
+    try testing.expectError(error.InvalidField, decodeHeaderValue("=?base64?aGk==AAA?=", &scratch));
+
+    // One digit then padding is the other degenerate count, and it carries no
+    // whole byte either.
+    try testing.expectError(error.InvalidField, decodeHeaderValue("=?base64?A===?=", &scratch));
 }
 
 test "the caller sizes the base64 scratch, so a long value still encodes" {
@@ -2201,6 +2417,35 @@ test "error codes match the renumbering record" {
     try testing.expectEqual(@as(i32, -32001), ErrorCode.header_mismatch.renumberedFrom().?);
     try testing.expectEqual(@as(i32, -32003), ErrorCode.missing_required_client_capability.renumberedFrom().?);
     try testing.expectEqual(@as(i32, -32004), ErrorCode.unsupported_protocol_version.renumberedFrom().?);
+}
+
+test "a wire code maps back to the member PROTOCOLS.md section 4.5 names" {
+    // The reverse of the enum. A tag added without a row here resolves to null,
+    // and this fails rather than letting the gap reach a caller.
+    inline for (@typeInfo(ErrorCode).@"enum".fields) |field| {
+        const value: ErrorCode = @field(ErrorCode, field.name);
+        try testing.expectEqual(value, ErrorCode.fromCode(@intFromEnum(value)).?);
+    }
+
+    // The three the specification allocates carry their current values, and the
+    // two retired ones keep the spellings a previous-revision peer still sends.
+    try testing.expectEqual(ErrorCode.header_mismatch, ErrorCode.fromCode(-32020).?);
+    try testing.expectEqual(
+        ErrorCode.missing_required_client_capability,
+        ErrorCode.fromCode(-32021).?,
+    );
+    try testing.expectEqual(
+        ErrorCode.unsupported_protocol_version,
+        ErrorCode.fromCode(-32022).?,
+    );
+    try testing.expectEqual(ErrorCode.resource_not_found_legacy, ErrorCode.fromCode(-32002).?);
+    try testing.expectEqual(ErrorCode.url_elicitation_required_legacy, ErrorCode.fromCode(-32042).?);
+
+    // `-32602` is the JSON-RPC resource-not-found code, not one of MCP's own,
+    // so a decoder that asked this table for it gets nothing rather than the
+    // retired `-32002` spelling of the same condition.
+    try testing.expectEqual(@as(?ErrorCode, null), ErrorCode.fromCode(-32602));
+    try testing.expectEqual(@as(?ErrorCode, null), ErrorCode.fromCode(0));
 }
 
 test "a retired code may not be emitted at the current revision" {

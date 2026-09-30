@@ -164,8 +164,9 @@ casing. And `x-mcp-header` values must be unique case-insensitively within one
 ### 4.3 Reserved `_meta` keys
 
 The `_meta` key namespace is `io.modelcontextprotocol/`, and a key outside it
-requires a vendor prefix. Three bare key names are excepted from the prefix rule
-so that W3C trace context works.
+requires a vendor prefix. Four bare key names are excepted: the three W3C trace
+context keys the schema defines bare, and `progressToken`, which it also defines
+bare.
 
 | Key | Carries |
 | --- | --- |
@@ -178,6 +179,7 @@ so that W3C trace context works.
 | `traceparent` | W3C Trace Context, exempt from the prefix rule |
 | `tracestate` | W3C Trace Context, exempt from the prefix rule |
 | `baggage` | W3C Baggage, exempt from the prefix rule |
+| `progressToken` | `ProgressToken` = string or number. Bare key, exempt from the prefix rule: the schema defines it without one |
 
 ### 4.4 Method inventory
 
@@ -185,7 +187,7 @@ Core, `2026-07-28`. `server/discover` is the only mandatory server method.
 
 | Method | Direction | Notes |
 | --- | --- | --- |
-| `server/discover` | client to server | Mandatory. Returns supported versions, capabilities, identity |
+| `server/discover` | client to server | Mandatory. Cacheable result. `supportedVersions`, `capabilities`, optional `instructions` |
 | `tools/list` | client to server | Cacheable result |
 | `tools/call` | client to server | May return `input_required` under MRTR |
 | `resources/list` | client to server | Cacheable result |
@@ -193,9 +195,16 @@ Core, `2026-07-28`. `server/discover` is the only mandatory server method.
 | `resources/templates/list` | client to server | Cacheable result |
 | `prompts/list` | client to server | Cacheable result |
 | `prompts/get` | client to server | May return `input_required` under MRTR |
+| `completion/complete` | client to server | |
 | `subscriptions/listen` | client to server | Single long-lived response stream for opted-in notifications |
 | `notifications/progress` | server to client | Request-scoped; travels on the originating request's response stream |
 | `notifications/message` | server to client | Request-scoped. A server MUST NOT emit it for a request that did not set `io.modelcontextprotocol/logLevel` |
+| `notifications/cancelled` | both | A server sends it only for a `subscriptions/listen` teardown, and a client sends it to cancel a request |
+| `notifications/resources/updated` | server to client | Carries the `uri` |
+| `notifications/resources/list_changed` | server to client | |
+| `notifications/tools/list_changed` | server to client | |
+| `notifications/prompts/list_changed` | server to client | |
+| `notifications/subscriptions/acknowledged` | server to client | Carries the subscription filter |
 
 Removed in `2026-07-28`, and therefore decoded as `UnknownMethod` at that
 revision: `initialize`, `notifications/initialized`, `ping`, `logging/setLevel`,
