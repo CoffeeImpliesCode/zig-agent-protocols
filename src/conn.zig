@@ -24,7 +24,20 @@
 //! alternative — spawning handlers here — would need the frame copied out of
 //! the framer's buffer, which is the one buffer this layer refuses to allocate.
 //!
-//! ## Two regions, and why they cannot share a byte
+//! ## The one response that belongs to nobody
+//!
+//! JSON-RPC 2.0 requires the id of an error response to be Null where the id
+//! could not be determined from the Request: a Parse error, or an Invalid
+//! Request for a batch or for a value that is not a request object. That frame
+//! is a response matching no call, so the pending table has nothing to do with
+//! it, and it is the one inbound message an application has to be told about
+//! rather than matched. [`setRefusalHandler`] is where it is told: it runs
+//! inline on the reader task, is handed the decoded error object, and returns
+//! nothing, because there is no id to answer on and nothing this connection
+//! could usefully say back. [`RefusalHandler`] says why it is not a fourth
+//! case for [`setHandler`].
+//!
+//! ## Four regions, and why no two of them may share a byte
 //!
 //! A handler is handed two buffers and they are not interchangeable: the frame
 //! is decoded into the first, and the answer is written into the second. One
@@ -35,22 +48,46 @@
 //! name it is about to compare. That is a wrong answer rather than an error,
 //! and it is silent, which is the only kind of fault worth a pair of names.
 //!
-//! `init` refuses two regions that overlap, and refuses a buffer with no room,
-//! because both are wiring faults a caller cannot see from a peer.
+//! The framer's buffer is a third region live at the same moment. The slice a
+//! frame is decoded from is a window on it, so an escape unescaped into
+//! `decode_scratch` can land on the very bytes being read — the same silence,
+//! arrived at from the other side.
+//!
+//! The pending table is a fourth, and the one overlap that is worse than a
+//! wrong answer: `claim` writes a slot from the task that called while the
+//! reader task writes the framer, so a caller that carved one array into both
+//! gets two tasks writing the same bytes at once.
+//!
+//! [`Conn.init`] refuses every one of those pairs, and refuses a buffer with
+//! no room, because all of them are wiring faults a caller cannot see from a
+//! peer.
+//!
+//! ## Ending a connection
+//!
+//! [`Conn.close`] marks the connection dead, releases every task waiting in
+//! [`Conn.call`], and stops the reader at its next frame boundary. What it
+//! cannot do is interrupt a read already blocked on a socket, so the caller
+//! still has to shut the transport down and then close it, and still has to
+//! await or cancel the group its reader was spawned on. The connection owns
+//! the reader's decision to stop; the caller owns the reader's task.
 //!
 //! ## Allocation
 //!
-//! `ARCHITECTURE.md` section 4 allows this layer an allocator, because a
-//! pending-request table has a size set by concurrency and cannot be a
-//! fixed-size array of the right length. Everything else stays caller-owned:
-//! the frame buffer, the encode buffer, and the two regions a handler is
-//! handed all belong to the caller, so the path from bytes to a decoded
-//! message still allocates nothing.
+//! `ARCHITECTURE.md` section 4 lets the runtime take an allocator where its
+//! state is genuinely dynamic, and the one structure here that would qualify
+//! is the pending-request table. Nothing here takes one. That table is a
+//! caller-supplied `[]Slot` whose length is the caller's own answer to the
+//! question a growing table would ask, and everything else is a buffer the
+//! caller hands over: [`Conn.init`] takes the frame buffer, the pending table
+//! and the two handler regions, and `call` takes the encode buffer and the
+//! result buffer. So the path from bytes to a decoded message allocates
+//! nothing, and [`Conn`] carries no allocator.
 //!
-//! The pending table is a caller-supplied array of slots rather than a map.
-//! That is deliberate: a connection then has a *known* upper bound on
-//! outstanding requests and reports exhaustion, instead of growing without
-//! limit because a peer opened calls faster than we answered them.
+//! The table is bounded rather than a map because that is what makes
+//! exhaustion reportable. A call that finds every slot taken returns
+//! [`error.TooManyPending`] having sent nothing and leaves the connection
+//! usable. A map would grow instead, because a peer can open calls faster
+//! than we answer them, and the bound a caller can check would be gone.
 
 const std = @import("std");
 const framing = @import("framing.zig");
@@ -107,8 +144,10 @@ pub const Error = error{
 
 /// What a peer answered to a request.
 pub const Response = struct {
-    /// The `result` member as raw JSON, or the `error` member as raw JSON when
-    /// the peer answered with an error. Borrows the caller's result buffer.
+    /// The `result` member as raw JSON when the peer answered, or the whole
+    /// `error` object re-serialised into this buffer when the peer refused:
+    /// `code`, `message`, and `data` when the peer sent one. Borrows the
+    /// caller's result buffer.
     body: []const u8,
     /// The JSON-RPC error code, or null when the call succeeded.
     error_code: ?i32 = null,
@@ -158,6 +197,40 @@ pub const Handler = struct {
     ) Error!?[]const u8 {
         const func = self.call orelse return null;
         return func(self.ctx, frame, decode_scratch, answer);
+    }
+};
+
+/// Told about an error response the peer sent with a `null` id.
+///
+/// One frame, and it is the frame a peer writes when it refuses something and
+/// cannot say which request it belonged to. There is no id to match it
+/// against, so it belongs to no outstanding call, and before this hook it was
+/// dropped with every other response that matched no slot: the peer that wrote
+/// it, and the peer still waiting to hear what became of a frame it sent, both
+/// learned nothing.
+///
+/// It is a hook of its own rather than a fourth case for [`Handler`]. A
+/// handler is handed a frame and returns the answer to it, and this frame has
+/// no answer: there is no id to answer on, so an answer written here would be a
+/// response sent in answer to a response. It is not a request or a
+/// notification either, so a handler typed against [`jsonrpc.Request`] would
+/// have to decline it on every path, which is the shape that made the frame
+/// invisible in the first place.
+///
+/// Runs inline on the reader task and takes the rule a handler takes: it must
+/// not make an outbound call on this connection, because the reader that would
+/// deliver that answer is the very task now waiting for it.
+///
+/// It is handed the decoded error object rather than the frame. Every slice in
+/// that object borrows the reader's decode region, so it is live for this call
+/// and for nothing after it.
+pub const RefusalHandler = struct {
+    ctx: ?*anyopaque = null,
+    call: ?*const fn (ctx: ?*anyopaque, object: jsonrpc.Error) void = null,
+
+    fn invoke(self: RefusalHandler, object: jsonrpc.Error) void {
+        const func = self.call orelse return;
+        func(self.ctx, object);
     }
 };
 
@@ -274,8 +347,10 @@ pub const Slot = struct {
     used: bool = false,
     answered: bool = false,
     /// True when the answer did not fit `result` and the caller must retry
-    /// with a larger buffer. The slot is still released, so the connection
-    /// does not leak it.
+    /// with a larger buffer. The slot is released either way, so the
+    /// connection does not leak it: every path out of `call` frees the slot
+    /// it claimed, including a request that never went out and a wait that
+    /// failed.
     overflowed: bool = false,
     is_error: bool = false,
     error_code: i32 = 0,
@@ -294,6 +369,8 @@ pub const Conn = struct {
     framer: framing.Framer,
     slots: []Slot,
     handler: Handler,
+    /// Told about an error response with a `null` id. See [`RefusalHandler`].
+    refusal: RefusalHandler = .{},
     /// The region an inbound frame is decoded into, and the region a handler
     /// is handed to decode one into.
     ///
@@ -302,12 +379,15 @@ pub const Conn = struct {
     /// outlives the handler, and all of them are invalid the moment the next
     /// frame is decoded here.
     ///
-    /// It must not share a byte with `answer`. The escape offset `json.Reader`
-    /// keeps is per reader and not per buffer, so a handler decoding a string
-    /// with an escape starts at offset 0 again and writes over whatever the
-    /// reader that decoded the request left there: an answer carrying an escape
-    /// lands exactly on a name the request borrowed from this buffer, and the
-    /// comparison that follows is between a value and itself.
+    /// It must not share a byte with `answer` or with the framer's buffer.
+    /// The escape offset `json.Reader` keeps is per reader and not per buffer,
+    /// so a handler decoding a string with an escape starts at offset 0 again
+    /// and writes over whatever the reader that decoded the request left
+    /// there: an answer carrying an escape lands exactly on a name the
+    /// request borrowed from this buffer, and the comparison that follows is
+    /// between a value and itself. The frame is a window on the framer's
+    /// buffer, so an escape unescaped into this region can land on the very
+    /// bytes being read. `init` refuses both pairs.
     decode_scratch: []u8,
     /// The region a handler writes its answer into, and the region this
     /// connection writes a refusal into.
@@ -315,7 +395,8 @@ pub const Conn = struct {
     /// A handler is handed this to write into, so nothing it decoded into
     /// `decode_scratch` is borrowed from here and nothing written here can
     /// land on a value the handler is still reading. Must not share a byte
-    /// with `decode_scratch`; `init` refuses a pair that does.
+    /// with `decode_scratch` or with the framer's buffer; `init` refuses both
+    /// pairs.
     answer: []u8,
 
     /// Monotonic, never reused, so a late answer to a dead request cannot be
@@ -335,28 +416,38 @@ pub const Conn = struct {
     ///
     /// The reason a connection died: a peer that hung up and a peer that
     /// overflowed our buffer are different faults, and only one of them is
-    /// ours. Written before `shutdown`, whose lock and broadcast are what make
+    /// ours. Written before `close`, whose lock and broadcast are what make
     /// the write visible, and read in `call`, where it decides which of the two
     /// errors a caller gets.
     peer_frame_too_large: bool = false,
     /// Serialises writes. Two tasks may call at once, and a frame interleaved
     /// with another is two malformed frames on the wire.
     write_mutex: Io.Mutex = .init,
-    /// Guards the pending table, `closed`, `peer_frame_too_large`, and the
-    /// waiting condition.
+    /// Guards the pending table, `closed`, `peer_frame_too_large`, `next_id`
+    /// and the waiting condition.
+    ///
+    /// Taken uncancelable everywhere it is taken. Every section is short and
+    /// holds nothing that blocks, and the one place a task may be cancelled
+    /// while it holds this is the condition wait inside it, which hands the
+    /// lock back on the way out either way. A cancelation that arrived at the
+    /// lock instead would leave a claimed slot with nothing pointing at it,
+    /// and a caller cannot free one it does not know about.
     state_mutex: Io.Mutex = .init,
     wake: Io.Condition = .init,
 
     pub const Config = struct {
-        /// Assembles frames. Must be large enough for the largest message the
-        /// peer may send, and must not have no room at all.
+        /// Assembles frames, and is the buffer a frame is read out of as well
+        /// as written into. Must be large enough for the largest message the
+        /// peer may send, must not have no room at all, and must share no byte
+        /// with any of the three regions below.
         frame_buffer: []u8,
         /// One slot per call that may be outstanding at once, and not none.
+        /// Written by the task that calls as well as by the reader task, so
+        /// it must share no byte with any of the other three regions.
         pending: []Slot,
         /// Where a frame is decoded into. See [`Conn.decode_scratch`].
         decode_scratch: []u8,
-        /// Where an answer is written. Must not share a byte with
-        /// `decode_scratch`. See [`Conn.answer`].
+        /// Where an answer is written. See [`Conn.answer`].
         answer: []u8,
     };
 
@@ -378,10 +469,30 @@ pub const Conn = struct {
         if (config.pending.len == 0) return error.UnusableBuffer;
         if (config.decode_scratch.len == 0) return error.UnusableBuffer;
         if (config.answer.len == 0) return error.UnusableBuffer;
-        // Two regions that share a byte are the one thing this pair of names
-        // exists to make impossible, and the one fault a caller cannot see: the
-        // connection runs, the answers come back, and they are wrong.
+        // Every pair of the four regions, because three of them are live at
+        // once on the reader task and the fourth is live there and on the
+        // task that calls. A shared byte is the one fault this pair of names
+        // exists to make impossible, and the one fault a caller cannot see:
+        // the connection runs, the answers come back, and they are wrong.
+        //
+        // `decode_scratch` against `answer`: the escape offset `json.Reader`
+        // keeps is per reader and not per buffer, so a second reader decoding
+        // a string with an escape starts at offset 0 again and writes over
+        // whatever the first left there.
         if (overlaps(config.decode_scratch, config.answer)) return error.OverlappingBuffers;
+        // The frame buffer against either handler region: the slice a frame
+        // is decoded from is a window on the framer's buffer, and the escape
+        // the decoder writes into `decode_scratch` lands on the very bytes
+        // being read.
+        if (overlaps(config.frame_buffer, config.decode_scratch)) return error.OverlappingBuffers;
+        if (overlaps(config.frame_buffer, config.answer)) return error.OverlappingBuffers;
+        // The pending table against any of the other three: `claim` writes a
+        // slot from the task that called while the reader task writes the
+        // framer, so this pair is a race on bytes rather than a wrong answer.
+        const table = std.mem.sliceAsBytes(config.pending);
+        if (overlaps(table, config.frame_buffer)) return error.OverlappingBuffers;
+        if (overlaps(table, config.decode_scratch)) return error.OverlappingBuffers;
+        if (overlaps(table, config.answer)) return error.OverlappingBuffers;
 
         // Every slot starts free.
         //
@@ -405,8 +516,48 @@ pub const Conn = struct {
         };
     }
 
+    /// Install the handler that answers the peer's requests and
+    /// notifications.
+    ///
+    /// Legal only before the reader task starts. `init` leaves the field
+    /// null and nothing guards it: `dispatch` reads it once per inbound
+    /// frame, on the reader task, and takes no lock for the read. Set it on
+    /// the task that owns the connection before `pump` runs, or from the
+    /// reader task itself between frames. A swap from another task while
+    /// the reader runs is a data race, and a ctx that swap frees can be
+    /// read by an invocation already in progress.
+    ///
+    /// A request that arrives before a handler is installed gets no answer
+    /// at all. A null handler declines every frame, `dispatch` reads that
+    /// as "no answer" rather than as a failure, and the peer waits on a
+    /// request that already arrived. A notification is dropped instead,
+    /// which is correct.
+    ///
+    /// A frame already in the framer's buffer is not held back for a later
+    /// handler: it goes to whichever handler is installed when `route`
+    /// reaches it.
+    ///
+    /// A response never reaches the handler. `route` sends one to the
+    /// pending table, where it is matched to a call by id, so this neither
+    /// intercepts nor answers an outstanding `call`. The one response that
+    /// belongs to no call goes to [`setRefusalHandler`] instead, because a
+    /// handler is handed a frame to answer and that frame has no answer.
     pub fn setHandler(self: *Conn, handler: Handler) void {
         self.handler = handler;
+    }
+
+    /// Install the hook that hears an error response with a `null` id.
+    ///
+    /// Legal only before the reader task starts, on the same terms and for the
+    /// same reason as [`setHandler`]: `route` reads the field once per inbound
+    /// response, on the reader task, and takes no lock for the read.
+    ///
+    /// Nothing is installed by default, and a connection with no hook drops
+    /// the frame exactly as it did before one existed. The hook is the only
+    /// way to see it, so installing one after `pump` has begun has already
+    /// lost every refusal that arrived in between.
+    pub fn setRefusalHandler(self: *Conn, handler: RefusalHandler) void {
+        self.refusal = handler;
     }
 
     /// The length of the request or notification most recently written into
@@ -431,6 +582,12 @@ pub const Conn = struct {
     /// `params` is the raw JSON of the `params` member, or null to omit it.
     /// `out` receives the encoded request, so a proxy or a log can have the
     /// exact bytes. `result` receives the answer and is returned borrowed.
+    ///
+    /// Every path out of here gives the slot it claimed back, including a
+    /// request that never went out, a connection that died under it and a
+    /// wait that failed. A caller's table is bounded, so a slot that survived
+    /// any one of those is a slot nothing would ever free, and enough of them
+    /// refuse every later call on a connection that is otherwise healthy.
     pub fn call(
         self: *Conn,
         method: []const u8,
@@ -438,47 +595,60 @@ pub const Conn = struct {
         result: []u8,
         out: []u8,
     ) Error!Response {
-        // The connection may already be dead, in which case there is nothing
-        // to send. A peer that hung up and a peer that overflowed our frame
-        // buffer are different faults, so the caller is told which.
-        if (self.closed) {
-            return if (self.peer_frame_too_large) error.FrameTooLarge else error.Closed;
-        }
-
-        // Taken under the mutex, because two tasks may call at once. A
-        // response is matched by id alone, so a read and an increment done
-        // outside the mutex let two calls take the same id and one of them
-        // answer the other. The multi-round-trip rule requires a retry to be a
-        // genuinely new call, and that starts here.
-        const id = self.takeId() orelse return error.Transport;
-        const slot = self.claim(id, result) orelse return error.TooManyPending;
+        // The slot and the id are taken together, under one mutex, and the id
+        // second. Two tasks may call at once, and a response is matched by id
+        // alone, so a read and an increment done outside the mutex let two
+        // calls take the same id and one of them answer the other. The
+        // multi-round-trip rule requires a retry to be a genuinely new call,
+        // and that starts here. `open` refuses a dead connection here, so
+        // the two faults a caller can be told about are told apart from one
+        // consistent read of the state rather than from a fast path that
+        // raced it.
+        const opened = try self.open(result);
 
         // Encode before the id is published to the writer path: a request that
         // cannot be encoded must not leave a slot occupied.
-        const encoded = self.encodeRequest(id, method, params, out) catch |err| {
-            self.release(slot);
+        const encoded = self.encodeRequest(opened.id, method, params, out) catch |err| {
+            self.release(opened.slot);
             return err;
         };
         self.writeFrame(encoded) catch |err| {
-            self.release(slot);
+            self.release(opened.slot);
+            // A write that fails for any other reason marks the connection
+            // dead, because a task blocked in `call` on it would otherwise
+            // wait on a writer that cannot write, for good. `error.Framing`
+            // is this caller's own bytes and leaves the connection usable,
+            // which is the same line `notify` and `dispatch` draw.
+            if (err == error.Transport) self.close();
             return err;
         };
 
-        self.state_mutex.lock(self.io) catch return error.Transport;
+        // Wait for the answer. The lock is taken uncancelable and the wait
+        // inside it is the cancelation point, because the two are not the
+        // same thing: `Io.Condition` releases a blocked waiter when its task
+        // is cancelled, and a cancelation arriving between them must not
+        // leave a slot behind that nothing points at again.
+        self.state_mutex.lockUncancelable(self.io);
         defer self.state_mutex.unlock(self.io);
-        while (!slot.answered and !self.closed) {
-            self.wake.wait(self.io, &self.state_mutex) catch return error.Transport;
+        while (!opened.slot.answered and !self.closed) {
+            // `wait` hands the mutex back on the way out, on the error path
+            // as much as on the return, so the slot is freed with the lock
+            // this task already holds.
+            self.wake.wait(self.io, &self.state_mutex) catch {
+                releaseLocked(opened.slot);
+                return error.Transport;
+            };
         }
-        if (!slot.answered) {
-            releaseLocked(slot);
+        if (!opened.slot.answered) {
+            releaseLocked(opened.slot);
             return if (self.peer_frame_too_large) error.FrameTooLarge else error.ConnectionClosed;
         }
         const answer: Response = .{
-            .body = result[0..slot.len],
-            .error_code = if (slot.is_error) slot.error_code else null,
+            .body = result[0..opened.slot.len],
+            .error_code = if (opened.slot.is_error) opened.slot.error_code else null,
         };
-        const overflowed = slot.overflowed;
-        releaseLocked(slot);
+        const overflowed = opened.slot.overflowed;
+        releaseLocked(opened.slot);
         if (overflowed) return error.ResponseTooLarge;
         return answer;
     }
@@ -492,23 +662,39 @@ pub const Conn = struct {
     /// marks the connection dead, because a task blocked in `call` on it would
     /// otherwise wait on a writer that cannot write.
     pub fn notify(self: *Conn, method: []const u8, params: ?[]const u8, out: []u8) Error!void {
-        if (self.closed) return error.Closed;
+        if (self.isClosed()) return error.Closed;
         const encoded = self.encodeNotification(method, params, out) catch return error.ResponseTooLarge;
         self.writeFrame(encoded) catch |err| {
-            if (err == error.Transport) self.shutdown();
+            if (err == error.Transport) self.close();
             return err;
         };
     }
 
-    /// Read frames and route them until the transport ends.
+    /// Read frames and route them until the transport ends or the connection
+    /// closes.
     ///
     /// The reader task's whole job. It blocks in the `readVec` that asks for
     /// more bytes, so a peer that goes quiet costs nothing.
+    ///
+    /// It stops on a closed connection rather than only on the end of the
+    /// stream. A reader that ignored `closed` kept routing and answering on a
+    /// connection it had been told was dead, and a caller joining its group
+    /// never finished for as long as the peer kept the socket open. What the
+    /// reader cannot do is interrupt a read already blocked on that socket:
+    /// [`close`] is the decision, and shutting the transport down and then
+    /// closing it, and awaiting or cancelling the group, is still the
+    /// caller's.
     pub fn pump(self: *Conn) void {
-        while (true) {
+        while (!self.isClosed()) {
             // Take every complete frame before asking for more bytes, or a
             // busy peer would keep the framer full of unprocessed frames.
-            while (self.framer.next()) |frame| self.route(frame);
+            while (self.framer.next()) |frame| {
+                self.route(frame);
+                // Between frames rather than only between reads, because a
+                // handler that reported a dead transport, or a caller that
+                // closed the connection, closes it from in here.
+                if (self.isClosed()) return;
+            }
 
             self.framer.slide();
             const space = self.framer.freeSpace();
@@ -521,7 +707,7 @@ pub const Conn = struct {
                 // and the reason is recorded so a task waiting in `call` can be
                 // told that the fault was ours.
                 self.peer_frame_too_large = true;
-                self.shutdown();
+                self.close();
                 return;
             }
             // `readVec`, not `readSliceShort`: the latter means "fill this
@@ -539,8 +725,8 @@ pub const Conn = struct {
             const got = self.reader.readVec(&slots) catch {
                 // End of stream and a read error end the connection the same
                 // way, and the pump reports neither: a task waiting in `call`
-                // learns of both from the shutdown.
-                self.shutdown();
+                // learns of both from the close.
+                self.close();
                 return;
             };
             // Nothing this time, so ask again. The next read is where the
@@ -560,9 +746,26 @@ pub const Conn = struct {
             return;
         };
         switch (message.kind) {
-            .response => self.deliver(message),
+            .response => self.routeResponse(message),
             .request, .notification => self.dispatch(frame),
         }
+    }
+
+    /// Hand a response to the call waiting for it, or to the application when
+    /// no call can be waiting for it.
+    ///
+    /// A `null` id is the specification's own id for a response whose id could
+    /// not be determined, so there is no slot to look it up in and nothing to
+    /// wake. It is told rather than dropped because it is the one response an
+    /// application has to see: the peer refused a frame and could not say
+    /// which request it belonged to, and nothing else on this connection can
+    /// act on that.
+    fn routeResponse(self: *Conn, message: jsonrpc.Message) void {
+        if (message.id_null) {
+            if (message.rpc_error) |object| self.refusal.invoke(object);
+            return;
+        }
+        self.deliver(message);
     }
 
     /// Hand a response to the call waiting for it.
@@ -575,7 +778,7 @@ pub const Conn = struct {
             .string => return,
         };
 
-        self.state_mutex.lock(self.io) catch return;
+        self.state_mutex.lockUncancelable(self.io);
         defer self.state_mutex.unlock(self.io);
 
         for (self.slots) |*slot| {
@@ -634,15 +837,21 @@ pub const Conn = struct {
             // error it is owed. A transport that failed under the handler's
             // own hand takes the connection with it, because nothing else
             // written to it would arrive either.
-            if (err == error.Transport) self.shutdown();
+            if (err == error.Transport) self.close();
             self.refuse(frame);
             return;
         };
         const body = answer orelse return;
         // The answer is composed and there is no second one to send, so a
-        // write that fails here ends the connection instead of being retried.
-        self.writeFrame(body) catch {
-            self.shutdown();
+        // write that fails here is not retried. It does not follow that the
+        // connection is finished: `error.Framing` names the handler's own
+        // bytes, which fail the same way however often they are sent, so the
+        // transport stays usable and the peer can still be served. Every
+        // other failure is the transport's, and takes the connection with it,
+        // because a task blocked in `call` on it would otherwise wait on a
+        // writer that cannot write. `call` and `notify` draw this same line.
+        self.writeFrame(body) catch |err| {
+            if (err == error.Transport) self.close();
             return;
         };
     }
@@ -678,6 +887,13 @@ pub const Conn = struct {
         self.writeFrame(body) catch {};
     }
 
+    /// The peer's error object, written into the caller's result buffer.
+    ///
+    /// Re-serialised from the decoded members rather than borrowed, and every
+    /// member of it: `data` is arbitrary JSON carried as the peer's own bytes,
+    /// and a body without it is not the object the peer sent. `jsonrpc`'s
+    /// outbound builder writes the same three members, so a refusal this
+    /// library sends is one it can read back.
     fn writeErrorBody(out: []u8, rpc_error: jsonrpc.Error) usize {
         var writer = json.Writer.init(out);
         writer.slice("{\"code\":") catch return 0;
@@ -686,12 +902,16 @@ pub const Conn = struct {
         writer.slice(text) catch return 0;
         writer.slice(",\"message\":") catch return 0;
         writer.string(rpc_error.message) catch return 0;
+        if (rpc_error.data) |data| {
+            writer.slice(",\"data\":") catch return 0;
+            writer.slice(data) catch return 0;
+        }
         writer.byte('}') catch return 0;
         return writer.len;
     }
 
     fn writeFrame(self: *Conn, bytes: []const u8) Error!void {
-        self.write_mutex.lock(self.io) catch return error.Transport;
+        self.write_mutex.lockUncancelable(self.io);
         defer self.write_mutex.unlock(self.io);
         // `framing.writeFrame` refuses a message carrying a raw newline by
         // returning `error.WriteFailed`, which is also what a short write
@@ -705,35 +925,93 @@ pub const Conn = struct {
     }
 
     /// Mark the connection dead and release everyone waiting on it.
-    fn shutdown(self: *Conn) void {
-        self.state_mutex.lock(self.io) catch return;
+    ///
+    /// Every task blocked in [`call`] is released with
+    /// [`error.ConnectionClosed`], and a [`pump`] running on this connection
+    /// returns at its next frame boundary instead of routing and answering on
+    /// a connection it has been told is dead. Idempotent, and legal from any
+    /// task, including a handler: closing is not a refusal, and a caller that
+    /// hangs up mid-answer still leaves the peer with the answers already
+    /// written.
+    ///
+    /// The lock is taken uncancelable, because this is the one section a
+    /// cancelation must not be able to interrupt. A close that returned
+    /// without setting `closed` would release nobody, and the caller that
+    /// asked for it has no other way to release them.
+    ///
+    /// It does not touch the transport, and it cannot. A read already blocked
+    /// on a socket is not interrupted by anything this layer does, so a caller
+    /// that ends a connection still has to shut the transport down and then
+    /// close it, in that order, and still has to await or cancel the group
+    /// its reader was spawned on. What a connection owns here is the reader's
+    /// decision to stop, not the reader's task.
+    pub fn close(self: *Conn) void {
+        self.state_mutex.lockUncancelable(self.io);
         self.closed = true;
         self.wake.broadcast(self.io);
         self.state_mutex.unlock(self.io);
     }
 
-    fn claim(self: *Conn, id: i64, result: []u8) ?*Slot {
-        self.state_mutex.lock(self.io) catch return null;
+    /// Whether the connection has been marked dead, read under the mutex that
+    /// `close` writes it under.
+    fn isClosed(self: *Conn) bool {
+        self.state_mutex.lockUncancelable(self.io);
         defer self.state_mutex.unlock(self.io);
+        return self.closed;
+    }
+
+    /// Claim a free slot for `result` and give it the next request id, or
+    /// report why a request cannot be started at all.
+    ///
+    /// One lock section, and the id is taken second, because
+    /// [`error.TooManyPending`] promises the caller's id sequence is
+    /// untouched. An id burned by a table with no room is a hole in a sequence
+    /// whose whole point is that a late answer to a dead request cannot be
+    /// mistaken for a live one.
+    ///
+    /// Claim before write is the other half of the same rule, and it is what
+    /// `Scripted.gate` pins: an answer delivered before the slot exists is
+    /// dropped, and the call then waits for a message that has already gone
+    /// by. Taking the slot first would fix the id but lose that, so the two
+    /// are published together here and the slot is never visible without its
+    /// id.
+    fn open(self: *Conn, result: []u8) Error!Open {
+        self.state_mutex.lockUncancelable(self.io);
+        defer self.state_mutex.unlock(self.io);
+
+        // A peer that hung up and a peer that overflowed our frame buffer are
+        // different faults, so the caller is told which. Read under the mutex
+        // `close` writes them under: the fast path is the one place in this
+        // file that used to touch both without it, and a caller that saw the
+        // two inconsistently would be told `Closed` for a `FrameTooLarge` or
+        // the reverse.
+        if (self.closed) {
+            return if (self.peer_frame_too_large) error.FrameTooLarge else error.Closed;
+        }
         for (self.slots) |*slot| {
             if (slot.used) continue;
+            const id = self.next_id;
+            self.next_id += 1;
             slot.* = .{ .id = id, .used = true, .result = result };
-            return slot;
+            return .{ .id = id, .slot = slot };
         }
-        return null;
+        return error.TooManyPending;
     }
 
-    /// Take the next request id under the mutex.
-    fn takeId(self: *Conn) ?i64 {
-        self.state_mutex.lock(self.io) catch return null;
-        defer self.state_mutex.unlock(self.io);
-        const id = self.next_id;
-        self.next_id += 1;
-        return id;
-    }
+    /// A slot claimed for one request, with the id that request carries.
+    const Open = struct {
+        id: i64,
+        slot: *Slot,
+    };
 
+    /// Free a claimed slot, taking the mutex for it.
+    ///
+    /// Uncancelable, like every section this connection takes the mutex for.
+    /// A `release` that returned without freeing left a slot that nothing
+    /// pointed at again and nothing would ever free, and a table of those
+    /// refuses every call on a healthy connection.
     fn release(self: *Conn, slot: *Slot) void {
-        self.state_mutex.lock(self.io) catch return;
+        self.state_mutex.lockUncancelable(self.io);
         defer self.state_mutex.unlock(self.io);
         releaseLocked(slot);
     }
@@ -913,6 +1191,33 @@ const Failing = struct {
     }
 };
 
+/// Records the error object of a refusal that matched no call, so a test can
+/// tell a told refusal from a dropped one.
+///
+/// The object borrows the reader's decode region, so the message is copied
+/// into a field rather than kept as a slice. A slice would be dead at the next
+/// frame, and a test asserting on it after the pump returned would be
+/// asserting on whatever the reader decoded after it.
+const Refused = struct {
+    calls: usize = 0,
+    code: i32 = 0,
+    message: [64]u8 = undefined,
+    message_len: usize = 0,
+
+    fn told(ctx: ?*anyopaque, object: jsonrpc.Error) void {
+        const self: *Refused = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        self.code = object.code;
+        const n = @min(object.message.len, self.message.len);
+        @memcpy(self.message[0..n], object.message[0..n]);
+        self.message_len = n;
+    }
+
+    fn text(self: *const Refused) []const u8 {
+        return self.message[0..self.message_len];
+    }
+};
+
 /// A handler that overwrites the region it decoded into and then fails, which
 /// is the shape the two regions were split to survive.
 ///
@@ -925,6 +1230,53 @@ const Scrambler = struct {
     fn handle(_: ?*anyopaque, _: []const u8, decode_scratch: []u8, _: []u8) Error!?[]const u8 {
         @memset(decode_scratch, 'x');
         return error.Framing;
+    }
+};
+
+/// A handler whose first answer carries a raw newline and whose second does
+/// not, so a test can tell a framing fault from a dead connection: one that
+/// killed the connection answers neither.
+///
+/// The newline is the shape `call` and `notify` already refuse as
+/// [`error.Framing`] — the caller's own text, spliced into an envelope — and a
+/// handler composes an answer out of whatever it was given, so a string
+/// echoed from peer content reaches the writer the same way.
+const Newlinier = struct {
+    calls: usize = 0,
+
+    /// A refusal whose message carries a raw newline, which is the shape a
+    /// handler composes when it echoes an error string or a path back out of
+    /// peer content.
+    const split = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601," ++
+        "\"message\":\"no\nsuch method\"}}";
+    /// A whole answer, which is what the next request gets if the connection
+    /// survived the first one.
+    const whole = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}";
+
+    fn handle(ctx: ?*anyopaque, _: []const u8, _: []u8, answer: []u8) Error!?[]const u8 {
+        const self: *Newlinier = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        const body: []const u8 = if (self.calls == 1) split else whole;
+        @memcpy(answer[0..body.len], body);
+        return answer[0..body.len];
+    }
+};
+
+/// A handler that closes its own connection on the first request, so the
+/// second one shows whether the reader stopped.
+const Closer = struct {
+    connection: *Conn,
+    calls: usize = 0,
+
+    fn handle(ctx: ?*anyopaque, _: []const u8, _: []u8, answer: []u8) Error!?[]const u8 {
+        const self: *Closer = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        if (self.calls == 1) {
+            self.connection.close();
+        }
+        const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
+        @memcpy(answer[0..body.len], body);
+        return answer[0..body.len];
     }
 };
 
@@ -943,6 +1295,22 @@ const Caller = struct {
             self.result,
             self.out,
         );
+    }
+};
+
+/// A [`Caller`] that waits for an event before it calls, so a test can order
+/// two calls on one connection and know which of them is second.
+///
+/// The event is the one a [`Recorder`] sets on its first drain, so "second"
+/// means "after the first call's request reached the writer" rather than
+/// "whichever task the scheduler ran first".
+const GatedCaller = struct {
+    caller: *Caller,
+    gate: *Io.Event,
+
+    fn run(self: *@This()) void {
+        self.gate.waitUncancelable(self.caller.connection.io);
+        self.caller.run();
     }
 };
 
@@ -1090,6 +1458,181 @@ test "a notification that did not go out is reported, and it takes the connectio
     try testing.expectError(error.Closed, connection.call("tools/list", null, &result, &out));
 }
 
+test "a call cancelled while it waits gives its slot back" {
+    // `Io.Condition` is used over `std.Thread.Condition` precisely so a
+    // blocked waiter is released when its group is cancelled, and that makes
+    // the wait fail rather than block. A call returning from a failed wait
+    // still holding its slot leaks one slot per cancelled call, and a table
+    // of sixteen then refuses every call on a connection that is otherwise
+    // perfectly healthy.
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var frame_buffer: [512]u8 = undefined;
+    var pending: [2]Slot = undefined;
+    var decode_scratch: [256]u8 = undefined;
+    var answer: [256]u8 = undefined;
+    var out: [256]u8 = undefined;
+    var result: [256]u8 = undefined;
+    var sent: [256]u8 = undefined;
+    // A reader with nothing to say, so nothing ever answers the request.
+    var source = Scripted{ .io = io, .bytes = "" };
+    var recorder = Recorder{ .io = io, .sent = &sent };
+    var connection = try Conn.init(io, &source.reader, &recorder.writer, .{
+        .frame_buffer = &frame_buffer,
+        .pending = &pending,
+        .decode_scratch = &decode_scratch,
+        .answer = &answer,
+    });
+    var caller = Caller{ .connection = &connection, .result = &result, .out = &out };
+
+    // The owner of a connection returns early for a reason of its own and
+    // runs the `errdefer group.cancel(io)` its spawned tasks are under, which
+    // is the whole point of `Io.Condition` over `std.Thread.Condition`: the
+    // blocked waiter is released instead of hanging. The wait is the first
+    // point in `call` that can observe a cancelation, so the slot is always
+    // claimed by the time one arrives.
+    var group: Io.Group = .init;
+    group.async(io, Caller.run, .{&caller});
+    // `cancel` returns once the task has finished, so the answer below is the
+    // one the failed wait produced rather than one still being written.
+    group.cancel(io);
+
+    try testing.expectError(error.Transport, caller.answer.?);
+    // The slot the call claimed is free again, and the connection is still
+    // the one it was: nothing about a cancelled wait kills it.
+    for (connection.slots) |slot| try testing.expect(!slot.used);
+    try testing.expect(!connection.closed);
+}
+
+test "a call whose write failed takes the connection with it" {
+    // Two calls on one connection, and a writer with room for exactly one
+    // frame. The first claims a slot, writes and waits for an answer that
+    // never comes; the second cannot write at all. A caller that reported
+    // its own write and left the connection open left the first one waiting
+    // on a writer that provably cannot write, which is the hang `notify`
+    // already refuses and `call` did not.
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // The wire form of the call `Caller.run` makes, and the size of the room
+    // the recorder has: one frame and not two, so the second call's write
+    // finds none left.
+    const frame = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"echo\"}}\n";
+    var sent: [frame.len]u8 = undefined;
+    var frame_buffer: [512]u8 = undefined;
+    var pending: [2]Slot = undefined;
+    var decode_scratch: [256]u8 = undefined;
+    var answer: [256]u8 = undefined;
+    var waiter_out: [256]u8 = undefined;
+    var waiter_result: [256]u8 = undefined;
+    var breaker_out: [256]u8 = undefined;
+    var breaker_result: [256]u8 = undefined;
+    var reader = Io.Reader.fixed("");
+    // The recorder's gate is the ordering: the call that cannot write does
+    // not reach the writer until the waiting call's request is already there,
+    // so which of the two is second is not left to the scheduler.
+    var gate: Io.Event = .unset;
+    var recorder = Recorder{ .io = io, .sent = &sent, .gate = &gate };
+    var connection = try Conn.init(io, &reader, &recorder.writer, .{
+        .frame_buffer = &frame_buffer,
+        .pending = &pending,
+        .decode_scratch = &decode_scratch,
+        .answer = &answer,
+    });
+    var waiter = Caller{ .connection = &connection, .result = &waiter_result, .out = &waiter_out };
+    var breaker = Caller{
+        .connection = &connection,
+        .result = &breaker_result,
+        .out = &breaker_out,
+    };
+    var breaker_task = GatedCaller{ .caller = &breaker, .gate = &gate };
+
+    var waiter_group: Io.Group = .init;
+    waiter_group.async(io, Caller.run, .{&waiter});
+    var breaker_group: Io.Group = .init;
+    breaker_group.async(io, GatedCaller.run, .{&breaker_task});
+
+    // Awaiting the call whose write fails first: it returns only after the
+    // fault has been reported and the connection marked dead, so what the
+    // waiter reports below is the connection's and not a cancelation.
+    try breaker_group.await(io);
+    // A bound rather than a decision. With the connection dead the waiter
+    // was already released by the write that failed, and this returns at
+    // once; without it, this is the line that releases the waiter, and the
+    // assertions below are what fail.
+    waiter_group.cancel(io);
+
+    // The fault is reported, and it is the connection's: a writer that cannot
+    // write leaves nothing else to be answered on.
+    try testing.expect(connection.closed);
+    // The call that wrote reports the connection dying under it, and the call
+    // whose write failed reports its own.
+    try testing.expectError(error.ConnectionClosed, waiter.answer.?);
+    try testing.expectError(error.Transport, breaker.answer.?);
+    // A call after that is refused rather than written to a dead writer, and
+    // both slots are free again.
+    try testing.expectError(
+        error.Closed,
+        connection.call("tools/list", null, &breaker_result, &breaker_out),
+    );
+    for (connection.slots) |slot| try testing.expect(!slot.used);
+}
+
+test "a table with no room for the call leaves the id sequence alone" {
+    // `TooManyPending` promises the caller's id sequence is untouched, and a
+    // sequence whose whole point is that a late answer to a dead request
+    // cannot be mistaken for a live one does not survive a hole. The id is
+    // taken after the slot, so a full table costs the caller a retry and not
+    // an id.
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var frame_buffer: [512]u8 = undefined;
+    // One slot, so the second call on this connection has nowhere to go.
+    var pending: [1]Slot = undefined;
+    var decode_scratch: [256]u8 = undefined;
+    var answer: [256]u8 = undefined;
+    var out: [256]u8 = undefined;
+    var result: [256]u8 = undefined;
+    var refused_out: [256]u8 = undefined;
+    var refused_result: [256]u8 = undefined;
+    var sent: [512]u8 = undefined;
+    var source = Scripted{ .io = io, .bytes = "" };
+    var gate: Io.Event = .unset;
+    var recorder = Recorder{ .io = io, .sent = &sent, .gate = &gate };
+    var connection = try Conn.init(io, &source.reader, &recorder.writer, .{
+        .frame_buffer = &frame_buffer,
+        .pending = &pending,
+        .decode_scratch = &decode_scratch,
+        .answer = &answer,
+    });
+    var caller = Caller{ .connection = &connection, .result = &result, .out = &out };
+
+    // `var`, because `Future.cancel` takes the future by mutable pointer: the
+    // cancelation request is delivered at the call's wait and the slot is
+    // freed on that task's own path, which is what the loop below reads.
+    var parked = io.async(Caller.run, .{&caller});
+    gate.wait(io) catch {};
+
+    // The parked call took the first id, so the next one will be the second.
+    try testing.expectEqual(@as(i64, 2), connection.nextId());
+    try testing.expectError(
+        error.TooManyPending,
+        connection.call("tools/list", null, &refused_result, &refused_out),
+    );
+    // Nothing was sent, so the id sequence did not move either. A caller
+    // predicting its own ids through `nextId` is the one this promises to.
+    try testing.expectEqual(@as(i64, 2), connection.nextId());
+
+    _ = parked.cancel(io);
+    for (connection.slots) |slot| try testing.expect(!slot.used);
+}
+
 test "a peer error too large for the result buffer is reported, not read as an answer" {
     // A peer's error object is re-serialised into the caller's result buffer,
     // and a buffer too small for it yields nothing. Storing that nothing as the
@@ -1196,6 +1739,123 @@ test "a peer error is a refusal, and `failed` is what says so" {
     try testing.expect(!answered.failed());
 }
 
+test "a peer's error data reaches the caller" {
+    // `data` is a member of the error object on the wire and a member of the
+    // one this library sends, so re-serialising the object without it took
+    // away the structured detail a caller has to act on — silently, with no
+    // error anywhere. `errorResponse` carries `data` and the test below pins
+    // that, so without this the loss was one-directional: this library sent
+    // a member it could never read back.
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var frame_buffer: [512]u8 = undefined;
+    var pending: [2]Slot = undefined;
+    var decode_scratch: [256]u8 = undefined;
+    var answer: [256]u8 = undefined;
+    var out: [256]u8 = undefined;
+    var result: [256]u8 = undefined;
+    var sent: [256]u8 = undefined;
+    var gate: Io.Event = .unset;
+    var source = Scripted{
+        .io = io,
+        .bytes = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32602," ++
+            "\"message\":\"Invalid params\",\"data\":{\"tool\":\"nope\"}}}\n",
+        .gate = &gate,
+    };
+    var recorder = Recorder{ .io = io, .sent = &sent, .gate = &gate };
+    var connection = try Conn.init(io, &source.reader, &recorder.writer, .{
+        .frame_buffer = &frame_buffer,
+        .pending = &pending,
+        .decode_scratch = &decode_scratch,
+        .answer = &answer,
+    });
+    var caller = Caller{ .connection = &connection, .result = &result, .out = &out };
+
+    var group: Io.Group = .init;
+    group.async(io, Caller.run, .{&caller});
+    group.async(io, pumpTask, .{&connection});
+    group.await(io) catch {};
+
+    const replied = try caller.answer.?;
+    try testing.expectEqual(@as(?i32, -32602), replied.error_code);
+    // Every member of the object the peer sent, in the order PROTOCOLS.md 3.1
+    // gives them and with `data` spliced the way the wire carried it.
+    try testing.expectEqualStrings(
+        "{\"code\":-32602,\"message\":\"Invalid params\",\"data\":{\"tool\":\"nope\"}}",
+        replied.body,
+    );
+}
+
+test "a refusal whose id is null is told to the application, not dropped" {
+    // A peer that refuses a frame it could not read, or a batch array it must
+    // not accept, answers with a `null` id: JSON-RPC 2.0 says that is the id
+    // where the id could not be determined from the Request. Such a frame
+    // belongs to no call, so nothing in the pending table can match it, and
+    // before the hook it was dropped with every other response that matched no
+    // slot. The peer that wrote it learned nothing, and so did whoever was
+    // waiting to hear what became of a frame it had sent.
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var frame_buffer: [512]u8 = undefined;
+    var pending: [2]Slot = undefined;
+    var decode_scratch: [256]u8 = undefined;
+    var answer: [256]u8 = undefined;
+    var out: [256]u8 = undefined;
+    var result: [256]u8 = undefined;
+    var sent: [256]u8 = undefined;
+    var gate: Io.Event = .unset;
+    // The refusal first and the answer the call is waiting for second. A frame
+    // with no id must consume no slot and wake nobody, and only a call that is
+    // still answered afterwards shows that it did not.
+    var source = Scripted{
+        .io = io,
+        .bytes = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600," ++
+            "\"message\":\"Invalid Request\"}}\n" ++
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n",
+        .gate = &gate,
+    };
+    var recorder = Recorder{ .io = io, .sent = &sent, .gate = &gate };
+    var connection = try Conn.init(io, &source.reader, &recorder.writer, .{
+        .frame_buffer = &frame_buffer,
+        .pending = &pending,
+        .decode_scratch = &decode_scratch,
+        .answer = &answer,
+    });
+    var state: Refused = .{};
+    connection.setRefusalHandler(.{ .ctx = &state, .call = Refused.told });
+
+    var caller = Caller{ .connection = &connection, .result = &result, .out = &out };
+    var group: Io.Group = .init;
+    group.async(io, Caller.run, .{&caller});
+    group.async(io, pumpTask, .{&connection});
+    group.await(io) catch {};
+
+    // Told once, with what the peer actually said rather than with a guess at
+    // which request it belonged to.
+    try testing.expectEqual(@as(usize, 1), state.calls);
+    try testing.expectEqual(@as(i32, -32600), state.code);
+    try testing.expectEqualStrings("Invalid Request", state.text());
+
+    // Nothing was sent back. There is no id to answer on, so a frame this
+    // connection did answer would be a response in answer to a response, and
+    // the only thing on the wire is the request the caller made.
+    try testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+            "\"params\":{\"name\":\"echo\"}}\n",
+        recorder.written(),
+    );
+
+    // The call behind the refusal is untouched by it: the frame matched no
+    // slot, so it woke no caller and took none.
+    const replied = try caller.answer.?;
+    try testing.expect(!replied.failed());
+    try testing.expectEqualStrings("{\"ok\":true}", replied.body);
+}
+
 test "a request whose handler failed is answered with an error" {
     // A handler that returned an error did not decline the request; it tried
     // to answer and could not. Silence leaves the peer waiting on a request
@@ -1232,6 +1892,91 @@ test "a request whose handler failed is answered with an error" {
     // The handler reported a dead transport, so nothing else would arrive
     // either and the connection is finished rather than left half open.
     try testing.expect(connection.closed);
+}
+
+test "an answer carrying a raw newline is the handler's fault, and the connection survives it" {
+    // `error.Framing` names the caller's own bytes, and the doc says the
+    // transport stays usable, because these same bytes fail the same way
+    // however often they are sent. A handler composes an answer out of
+    // whatever it was handed — an error string echoed from peer content, a
+    // tool name, a path — so the same fault arrives on this path, and killing
+    // the connection for it left `call` and `notify` disagreeing with their
+    // own documentation about when a message is the caller's to fix.
+    var frame_buffer: [512]u8 = undefined;
+    var pending: [2]Slot = undefined;
+    var decode_scratch: [256]u8 = undefined;
+    var answer: [256]u8 = undefined;
+    var out_buffer: [512]u8 = undefined;
+    // Two requests in one read, so the second is in the framer's buffer when
+    // the first is answered.
+    var source = Scripted{
+        .io = testing.io,
+        .bytes = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n" ++
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n",
+    };
+    var writer = Io.Writer.fixed(&out_buffer);
+    var connection = try Conn.init(testing.io, &source.reader, &writer, .{
+        .frame_buffer = &frame_buffer,
+        .pending = &pending,
+        .decode_scratch = &decode_scratch,
+        .answer = &answer,
+    });
+    var state: Newlinier = .{};
+    connection.setHandler(.{ .ctx = &state, .call = Newlinier.handle });
+
+    connection.pump();
+
+    // The first answer was refused rather than written: a raw newline would
+    // have split one message into two the peer cannot decode, so the peer saw
+    // no half-frame and nothing to retry. The second went out whole, which is
+    // the proof the transport is alive — a connection killed by the first
+    // fault answers nobody, and the handler is not even reached twice.
+    try testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}\n",
+        writer.buffered(),
+    );
+    try testing.expectEqual(@as(usize, 2), state.calls);
+}
+
+test "a closed connection stops its reader" {
+    // The reader used to ignore `closed`, so after `close` it kept routing
+    // frames and answering them on a connection it had been told was dead,
+    // and a caller joining its group never finished for as long as the peer
+    // kept the socket open. Two requests arrive in one read: the handler
+    // closes on the first, and the second is what a reader that ignored the
+    // close would go on to answer.
+    var frame_buffer: [512]u8 = undefined;
+    var pending: [2]Slot = undefined;
+    var decode_scratch: [256]u8 = undefined;
+    var answer: [256]u8 = undefined;
+    var out_buffer: [512]u8 = undefined;
+    var source = Scripted{
+        .io = testing.io,
+        .bytes = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n" ++
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n",
+    };
+    var writer = Io.Writer.fixed(&out_buffer);
+    var connection = try Conn.init(testing.io, &source.reader, &writer, .{
+        .frame_buffer = &frame_buffer,
+        .pending = &pending,
+        .decode_scratch = &decode_scratch,
+        .answer = &answer,
+    });
+    var state: Closer = undefined;
+    state = .{ .connection = &connection };
+    connection.setHandler(.{ .ctx = &state, .call = Closer.handle });
+
+    connection.pump();
+
+    // The close was reached, and it ended the reader before the second frame.
+    try testing.expectEqual(@as(usize, 1), state.calls);
+    try testing.expect(connection.closed);
+    // The first answer still went out: closing is not a refusal, and a caller
+    // that hangs up mid-answer still leaves the peer with what it had.
+    try testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n",
+        writer.buffered(),
+    );
 }
 
 test "a frame the frame buffer cannot hold ends the connection, and a call says so" {
@@ -1474,13 +2219,14 @@ test "a buffer with no room is refused before the first message" {
     try testing.expectError(error.UnusableBuffer, Conn.init(testing.io, &reader, &writer, config));
 }
 
-test "two regions that share a byte are refused before the first message" {
+test "regions that share a byte are refused before the first message" {
     // The fault the pair of names exists to make impossible, and the one fault
     // a caller cannot see: the connection runs, answers come back, and they are
     // wrong. Nothing reports it but the caller's own review of the wiring.
     var regions: [128]u8 = undefined;
     var frame_buffer: [64]u8 = undefined;
     var pending: [2]Slot = undefined;
+    var answer: [64]u8 = undefined;
     var reader = Io.Reader.fixed("");
     var writer = Io.Writer.fixed(&.{});
 
@@ -1507,6 +2253,37 @@ test "two regions that share a byte are refused before the first message" {
             .frame_buffer = &frame_buffer,
             .pending = &pending,
             .decode_scratch = regions[0..64],
+            .answer = regions[32..],
+        },
+    ));
+    // The frame buffer is a third region live at once. The slice a frame is
+    // decoded from is a window on it, and the escape the decoder unescapes
+    // into `decode_scratch` lands on the very bytes being read, so the pair
+    // is refused even though neither of the two handler regions is in it.
+    try testing.expectError(error.OverlappingBuffers, Conn.init(
+        testing.io,
+        &reader,
+        &writer,
+        .{
+            .frame_buffer = &regions,
+            .pending = &pending,
+            .decode_scratch = &regions,
+            .answer = &answer,
+        },
+    ));
+    // And the pending table is live at the same time on another task: a
+    // `claim` writes a slot from the task that called while the reader task
+    // writes the framer. That pair is a race on bytes rather than a wrong
+    // answer, and it is the same silence.
+    var slots: [1]Slot = undefined;
+    try testing.expectError(error.OverlappingBuffers, Conn.init(
+        testing.io,
+        &reader,
+        &writer,
+        .{
+            .frame_buffer = std.mem.sliceAsBytes(slots[0..1]),
+            .pending = &slots,
+            .decode_scratch = regions[0..32],
             .answer = regions[32..],
         },
     ));

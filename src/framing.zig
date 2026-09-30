@@ -12,11 +12,26 @@
 //!
 //! ## No allocation, and a hard bound
 //!
-//! The buffer is the caller's. A peer that never sends a newline would
-//! otherwise grow the buffer without limit, so [`Framer.push`] reports
-//! `error.FrameTooLarge` the moment a frame exceeds the buffer rather than
-//! waiting to find out. That is the difference between a client that refuses
-//! one message and one that runs out of memory on a hostile stream.
+//! The buffer is the caller's, so a peer that never sends a newline cannot
+//! make this module grow: the framer copies into a fixed region and refuses
+//! rather than allocating. The bound is on the bytes a caller offers, not on a
+//! frame, and [`Framer.push`] is all-or-nothing about them. A chunk that does
+//! not fit the free region is refused whole, with `error.FrameTooLarge` and no
+//! copy at all, so a peer that fills the buffer without a delimiter in it is
+//! refused on every later push and holds no more than the caller sized. That
+//! is the difference between a client that refuses one message and one that
+//! runs out of memory on a hostile stream.
+//!
+//! All-or-nothing has a cost the caller has to plan for, because the refused
+//! chunk carried bytes that would have fitted on their own. A 1 KiB buffer
+//! refuses a push of 200 eight-byte frames offered together, and the 200
+//! frames are lost with it. Take every frame with [`Framer.next`] before
+//! offering more bytes and this does not arise, because the next `push`
+//! reclaims the space behind the frames already taken. A caller reading from
+//! a transport should bound its read with [`Framer.freeSpace`] and report
+//! [`Framer.filled`] instead, as `conn.Conn.pump` does. Then a frame that
+//! outgrows the buffer is a full buffer with no delimiter in it, and the
+//! caller decides what that means for the connection.
 //!
 //! The error set is deliberately its own rather than `DecodeError`: a frame
 //! that does not fit is a transport condition, not a wire-format one, and
@@ -30,6 +45,12 @@ const std = @import("std");
 /// peer that sends CRLF is read rather than rejected.
 pub const delimiter: u8 = '\n';
 
+/// Every failure framing itself can report.
+///
+/// One member, and [`Framer.push`] is the only operation that produces one.
+/// Writing is not in this set: [`writeFrame`] reports
+/// [`std.Io.Writer.Error`], and it answers `error.WriteFailed` for a message
+/// that carries a delimiter of its own.
 pub const Error = error{
     /// The bytes offered did not fit the caller's buffer.
     ///
@@ -52,6 +73,11 @@ pub const Framer = struct {
     /// End of the bytes received but not yet consumed.
     end: usize = 0,
 
+    /// Bind the caller's buffer to an empty framer.
+    ///
+    /// The buffer is the framer's whole storage and nothing is allocated, so
+    /// it has to outlive the framer. Both cursors start at zero, so a fresh
+    /// framer is not [`Framer.pending`] and has no frame to take.
     pub fn init(buffer: []u8) Framer {
         return .{ .buffer = buffer };
     }
@@ -60,6 +86,9 @@ pub const Framer = struct {
     ///
     /// All-or-nothing: on `error.FrameTooLarge` nothing is appended, so the
     /// caller can drain and report without having half a frame in the buffer.
+    /// The offered chunk is the unit, so the complete frames it carried are
+    /// discarded with it. Taking frames with [`Framer.next`] between pushes
+    /// keeps the free region open and avoids the refusal.
     pub fn push(self: *Framer, bytes: []const u8) Error!void {
         if (bytes.len == 0) return;
         self.compact();
@@ -137,8 +166,9 @@ pub const Framer = struct {
         self.end = 0;
     }
 
-    /// Slide the unconsumed bytes to the front so a full buffer can be reused
-    /// instead of being reported as full while holding only one byte.
+    /// [`Framer.slide`] under its internal name, because [`Framer.push`] needs
+    /// the same move before it can measure the free region and has no slide
+    /// step in its own contract.
     fn compact(self: *Framer) void {
         if (self.start == 0) return;
         const held = self.end - self.start;
@@ -232,6 +262,58 @@ test "a frame larger than the buffer is refused, and none of it is kept" {
     // connection down.
     try framer.push("{\"a\":1}\n");
     try testing.expectEqualStrings("{\"a\":1}", framer.next().?);
+}
+
+test "an oversized read discards the frames it carried, and draining between reads keeps them" {
+    // The bound is on the bytes offered, not on a frame, and the refusal is
+    // all-or-nothing. Offering 200 small frames in one push and expecting
+    // every one of them to survive would pin the opposite rule, the one the
+    // code does not implement.
+    const frame = "{\"a\":1}\n";
+    var chunk: [200 * frame.len]u8 = undefined;
+    for (0..200) |i| @memcpy(chunk[i * frame.len ..][0..frame.len], frame[0..]);
+
+    var buffer: [1024]u8 = undefined;
+    var framer = Framer.init(&buffer);
+
+    try testing.expectError(error.FrameTooLarge, framer.push(&chunk));
+    // The chunk did not fit, so not one of its bytes is in the buffer and the
+    // 200 complete frames it carried are gone. This is the consequence the
+    // module doc names, and the part a caller has to be able to reason about.
+    try testing.expectEqualStrings("", framer.partial());
+    try testing.expectEqual(@as(?[]const u8, null), framer.next());
+
+    // Offered one at a time, the same 200 frames all survive, because the
+    // next push reclaims the space behind a frame already taken. Draining
+    // between pushes is what keeps a reader off the refusal.
+    for (0..200) |_| {
+        try framer.push(frame);
+        try testing.expectEqualStrings("{\"a\":1}", framer.next().?);
+    }
+    try testing.expect(!framer.pending());
+}
+
+test "a peer that sends no delimiter fills the buffer, and every later push is refused" {
+    // The bound the module doc claims. The framer cannot know that the bytes
+    // it holds are one frame until a delimiter arrives, so a full buffer is
+    // what ends the stream: a peer that never sends a newline gets a refusal
+    // instead of memory the caller never sized.
+    const unterminated = "{\"jsonrpc\":1}";
+    var buffer: [unterminated.len]u8 = undefined;
+    var framer = Framer.init(&buffer);
+
+    try framer.push(unterminated);
+    try testing.expectEqual(@as(?[]const u8, null), framer.next());
+    // The buffer is full, so the delimiter that would end this frame has
+    // nowhere to go, and the push carrying it is refused like any other.
+    try testing.expectError(error.FrameTooLarge, framer.push("\n"));
+    // What arrived before the refusal is still here, so a caller can report
+    // it and resynchronise rather than guess.
+    try testing.expectEqualStrings(unterminated, framer.partial());
+
+    framer.reset();
+    try framer.push("{}\n");
+    try testing.expectEqualStrings("{}", framer.next().?);
 }
 
 test "the buffer is reused across many frames without running out" {

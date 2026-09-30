@@ -17,10 +17,19 @@
 //! may arrive per syscall, and the frame buffer is what bounds a message; a
 //! peer that sends a message larger than the frame buffer is refused rather
 //! than buffered without limit.
+//!
+//! Every region is vetted where the caller passes it: a region with no room is
+//! refused by [`Stdio.init`] or by [`conn.Conn.init`] rather than at the first
+//! message, so a wiring mistake is never reported as a dead transport.
 
 const std = @import("std");
 const conn = @import("conn.zig");
 
+/// The `std.Io` namespace, under the name this file's signatures use.
+///
+/// It is the same namespace and not a wrapper, so the `Io` a [`Stdio`] is
+/// built over and the readers and writers a caller hands it are the standard
+/// ones.
 pub const Io = std.Io;
 
 /// Standard input and output wired for a protocol connection.
@@ -37,7 +46,7 @@ pub const Io = std.Io;
 /// var c = try Stdio.init(io, &r, &w).connection(config);
 ///
 /// // Right. The streams live in a local that outlives the connection.
-/// var stdio = Stdio.init(io, &r, &w);
+/// var stdio = try Stdio.init(io, &r, &w);
 /// var c = try stdio.connection(config);
 /// ```
 pub const Stdio = struct {
@@ -46,7 +55,22 @@ pub const Stdio = struct {
 
     /// Open the process's own streams. Neither is closed by this type: they
     /// belong to the process rather than to a connection.
-    pub fn init(io: Io, read_buffer: []u8, write_buffer: []u8) Stdio {
+    ///
+    /// Falls with `error.UnusableBuffer`, and with nothing else, for a
+    /// `read_buffer` or a `write_buffer` with no room. The refusal is checked
+    /// before anything is built, so a refused call leaves no half-wired reader
+    /// behind. It is the error `conn.Conn.init` raises for a configuration
+    /// region and the one name it raises it under, so the rule stays one rule
+    /// over all six regions a connection is handed. It lands here rather than
+    /// at [`Stdio.connection`] because this is the call that names the array:
+    /// one call later a region with no room is one nobody can see, and a write
+    /// buffer with no room comes back as `error.Transport` from the first
+    /// frame, a dead socket for a wiring mistake the caller can still make.
+    pub fn init(io: Io, read_buffer: []u8, write_buffer: []u8) conn.Error!Stdio {
+        // One test per argument, in the order they are passed, rather than one
+        // over both that cannot say which of them was short.
+        if (read_buffer.len == 0) return error.UnusableBuffer;
+        if (write_buffer.len == 0) return error.UnusableBuffer;
         // Streaming, not the positional default. A pipe is unseekable, so the
         // positional default finds that out by failing a syscall and then
         // falling back, and the streaming constructors skip the failed call
@@ -63,11 +87,16 @@ pub const Stdio = struct {
     ///
     /// Falls when `conn.Conn.init` refuses the configuration, and it refuses
     /// before it builds anything: `error.UnusableBuffer` for a region sized
-    /// with no room, `error.OverlappingBuffers` for a `config` whose decode
-    /// region and answer region share a byte. Both are wiring faults the
-    /// caller fixes by resizing or separating its buffers, and neither is
-    /// visible once a peer is on the wire, which is why they arrive here
-    /// rather than at the first message.
+    /// with no room, and `error.OverlappingBuffers` for any two of the four
+    /// regions that share a byte. All six pairs are checked — the frame buffer
+    /// against each handler region, and the pending table against all three.
+    /// Both faults are the caller's to fix by resizing or separating its
+    /// buffers, and neither is visible once a peer is on the wire, which is
+    /// why they arrive here rather than at the first message.
+    ///
+    /// The transport's own two regions were refused earlier and by the only
+    /// call the caller passed them to, [`Stdio.init`]. A caller that replaces
+    /// `reader` or `writer` after that owns the buffers it supplies.
     pub fn connection(self: *Stdio, config: conn.Conn.Config) conn.Error!conn.Conn {
         return conn.Conn.init(
             self.reader.io,
@@ -103,6 +132,8 @@ pub const Buffers = struct {
     frame: [65536]u8 = undefined,
     /// Slots for calls that may be outstanding at once.
     pending: [16]conn.Slot = undefined,
+    /// The region an inbound frame is decoded into, and the region a handler
+    /// is handed to decode one into. See [`conn.Conn.decode_scratch`].
     decode_scratch: [4096]u8 = undefined,
     /// The region a handler composes an answer into. It shares no byte with
     /// `decode_scratch`, because a handler that decoded into the region it
@@ -114,6 +145,10 @@ pub const Buffers = struct {
     result: [8192]u8 = undefined,
     params: [8192]u8 = undefined,
 
+    /// The four buffers the connection owns, borrowed from this struct.
+    ///
+    /// They borrow rather than copy, so this struct has to outlive the
+    /// connection for the reason [`Stdio`] has to.
     pub fn config(self: *Buffers) conn.Conn.Config {
         return .{
             .frame_buffer = &self.frame,
@@ -162,7 +197,7 @@ test "the transport is the process's own streams, and flush pushes them out" {
     // A consumer starts here, so what `init` builds is asserted rather than
     // assumed. The wrong descriptor, the positional default on an unseekable
     // pipe, or a buffer the caller did not supply each fail this test.
-    var stdio = Stdio.init(testing.io, &buffers.read, &buffers.write);
+    var stdio = try Stdio.init(testing.io, &buffers.read, &buffers.write);
     try testing.expect(std.Io.File.stdin().handle == stdio.reader.file.handle);
     try testing.expect(std.Io.File.stdout().handle == stdio.writer.file.handle);
     try testing.expect(std.meta.eql(testing.io, stdio.reader.io));
@@ -218,9 +253,31 @@ test "the transport is the process's own streams, and flush pushes them out" {
     try testing.expectEqualStrings(frame, back[0..frame.len]);
 }
 
+test "a read buffer with no room is refused at the call that passed it" {
+    var buffers: Buffers = .{};
+
+    // The write region beside it is the full array, so this passes only when
+    // the refusal is specific to the region that had no room. An `init` that
+    // failed on either argument, or on every call, would fail this test for
+    // the wrong reason, and one that refused nothing hands back a transport
+    // where the error is.
+    try testing.expectError(error.UnusableBuffer, Stdio.init(testing.io, &.{}, &buffers.write));
+}
+
+test "a write buffer with no room is refused at the call that passed it" {
+    var buffers: Buffers = .{};
+
+    // The mirror of the region above, and the one the fault was reported
+    // against: this pair built a transport whose first frame failed inside
+    // `Io.File.Writer`, which `Conn.writeFrame` maps to `error.Transport`, so
+    // the caller was told the socket was dead for a buffer it had not been
+    // told to check.
+    try testing.expectError(error.UnusableBuffer, Stdio.init(testing.io, &buffers.read, &.{}));
+}
+
 test "a request off the transport is answered on the transport" {
     var buffers: Buffers = .{};
-    var stdio = Stdio.init(testing.io, &buffers.read, &buffers.write);
+    var stdio = try Stdio.init(testing.io, &buffers.read, &buffers.write);
 
     // The two interfaces are replaced with in-memory ones. A `Stdio` bound to
     // the process's own streams cannot be driven by a test. Reading standard

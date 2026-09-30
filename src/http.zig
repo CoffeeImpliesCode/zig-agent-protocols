@@ -75,11 +75,14 @@ const EncodeError = root.EncodeError;
 /// went away.
 pub const Error = error{
     /// The request line, the header block, or the body is not something this
-    /// transport accepts. The specification pairs a malformed request with
-    /// `400 Bad Request`.
+    /// transport accepts.
+    ///
+    /// `research/normative/mcp-2026-07-28.md` §4, "Other HTTP mechanics", puts
+    /// header validation and a malformed request under `400 Bad Request`.
     MalformedRequest,
-    /// An MCP-defined header arrived more than once, which includes one
-    /// `Mcp-Param-{Name}` annotation sent twice.
+    /// A header arrived more than once, which covers the MCP-defined ones,
+    /// one `Mcp-Param-{Name}` annotation sent twice, and a repeated `Accept`,
+    /// `Content-Type`, `Origin` or `Authorization`.
     ///
     /// HTTP permits a repeated header and the specification is silent, but two
     /// values for a header that is checked against the body leaves the check
@@ -88,23 +91,40 @@ pub const Error = error{
     /// request two different ways. A derived header is checked against
     /// `arguments` the same way, one annotation at a time, by
     /// [`Post.checkParam`].
+    ///
+    /// RFC 9110 §5.3 would have a recipient join the field lines of a
+    /// list-valued header in the order they arrived. This refuses instead,
+    /// which is the same rule as for the headers above rather than a second
+    /// one beside it: joining them needs a buffer this library does not have,
+    /// and `Origin` and `Authorization` are not list fields, so two of them
+    /// are two requests whatever the joining rule says.
     DuplicateHeader,
     /// The peer is not speaking a revision this library decodes: it named one
     /// this library does not know in `MCP-Protocol-Version`, or it sent
     /// `Mcp-Session-Id`, which PROTOCOLS.md 4.2 says a peer sends only when it
-    /// speaks a revision older than `2026-07-28`. The specification pairs
-    /// both with `-32022` and `400 Bad Request`.
+    /// speaks a revision older than `2026-07-28`.
+    /// `research/normative/mcp-2026-07-28.md` §4 pairs an unsupported or
+    /// unknown version with `UnsupportedProtocolVersionError` (`-32022`) and
+    /// `400 Bad Request`.
     UnsupportedVersion,
     /// A header the specification requires is absent.
     MissingHeader,
     /// A header value disagrees with the body value it duplicates, or a value
-    /// is not even decodable. Paired with `-32020` and `400 Bad Request`.
+    /// is not even decodable.
+    ///
+    /// `research/normative/mcp-2026-07-28.md` §4 pairs a `MCP-Protocol-Version`
+    /// that disagrees with `_meta` — and a `Mcp-Method` or `Mcp-Name` that
+    /// disagrees with the body — with `HeaderMismatch` (`-32020`) and
+    /// `400 Bad Request`.
     HeaderMismatch,
-    /// A peer sent `x-mcp-header`, which section 4.2 states is a JSON Schema
-    /// keyword and not a header a client sends.
+    /// A peer sent `x-mcp-header`, which PROTOCOLS.md 4.2 states is a JSON
+    /// Schema keyword and not a header a client sends.
     NotAHeader,
-    /// The HTTP method is not one this transport serves. `2026-07-28` keeps
-    /// only POST, and the specification says `405` for GET and DELETE.
+    /// The HTTP method is not one this transport serves.
+    ///
+    /// `2026-07-28` keeps only POST, and `research/normative/mcp-2026-07-28.md`
+    /// §4 pairs a GET or a DELETE to the endpoint with `405 Method Not
+    /// Allowed`.
     MethodNotAllowed,
     /// `Content-Type` is not `application/json`.
     UnsupportedMediaType,
@@ -132,7 +152,13 @@ pub const Error = error{
     UnsupportedUri,
     /// The peer hung up, or the socket failed.
     Transport,
-    /// The reply carried no message answering the call.
+    /// The reply carried no bytes at all: the body ended with nothing in it.
+    ///
+    /// Distinct from a body that arrived and was not one this transport can
+    /// read, which is a [`Reply`] with its status and `answered` false. There
+    /// is a status here too, but a peer that answered with an empty body has
+    /// said nothing this call can be matched against, and the caller has no
+    /// message to read either way.
     NoResponse,
 } || DecodeError || conn.Error;
 
@@ -140,8 +166,9 @@ pub const Error = error{
 
 /// The two response types a Streamable HTTP reply may have.
 ///
-/// Section 4.2 requires the server to return one of them and the client to
-/// support both, so this is an enum of two rather than a set of strings.
+/// `research/normative/mcp-2026-07-28.md` §4 requires the server to return one
+/// of them and the client to support both, so this is an enum of two rather
+/// than a set of strings.
 pub const MediaType = enum {
     json,
     event_stream,
@@ -149,8 +176,9 @@ pub const MediaType = enum {
 
 /// The `Accept` value a client must send on every POST.
 ///
-/// Section 4.2: the client "MUST include an `Accept` header listing both
-/// `application/json` and `text/event-stream` as supported content types".
+/// `research/normative/mcp-2026-07-28.md` §4: the client "MUST include an
+/// `Accept` header listing both `application/json` and `text/event-stream` as
+/// supported content types".
 pub const accept_value = mcp.uri_and_media.json_media_type ++
     ", " ++ mcp.uri_and_media.event_stream_media_type;
 
@@ -200,41 +228,74 @@ pub const Accept = struct {
 /// zero counts for nothing, and an unparsable entry is skipped rather than
 /// refused: the list is advisory and this is the layer that decides whether
 /// anything is left.
+///
+/// The entry that decides a type is the most specific one that matches it,
+/// because RFC 9110 §12.5.1 gives precedence to the most specific reference
+/// and says a less specific range never re-admits what a more specific one
+/// refused. `*/*, application/json;q=0` is therefore a request for a stream
+/// and not one that also accepts a JSON body.
 pub fn parseAccept(value: ?[]const u8) Accept {
     const text = value orelse return .{};
     if (std.mem.trim(u8, text, " \t").len == 0) return .{};
     var accept: Accept = .{ .present = true, .json = false, .event_stream = false };
+    // The deciding entry for each of the two types, and null where nothing
+    // matched. An entry that arrives later replaces one that is less specific
+    // and never one that is not: two entries of the same specificity are read
+    // as one entry, which is what the order they arrived in can decide.
+    var decided = [_]?Decision{ null, null };
     var entries = std.mem.splitSequence(u8, text, ",");
     while (entries.next()) |entry| {
-        const media = std.mem.trim(u8, entry, " \t");
+        const one = std.mem.trim(u8, entry, " \t");
         // The parameters are read before the type, because one of them decides
         // whether the entry counts at all. `mediaType` drops them, so an entry
         // that arrived as `application/json;q=0` would otherwise be read as a
         // request for the one type this transport answers most.
-        const stop = std.mem.indexOfScalar(u8, media, ';') orelse media.len;
-        if (refusedByQuality(media[stop..])) continue;
-        const bare = media[0..stop];
+        const stop = std.mem.indexOfScalar(u8, one, ';') orelse one.len;
+        const refused = refusedByQuality(one[stop..]);
+        const bare = std.mem.trim(u8, one[0..stop], " \t");
         const slash = std.mem.indexOfScalar(u8, bare, '/') orelse continue;
         const major = bare[0..slash];
         const minor = bare[slash + 1 ..];
-        const any_major = std.mem.eql(u8, major, "*");
-        if (std.mem.eql(u8, minor, "*")) {
-            if (any_major) {
-                accept.json = true;
-                accept.event_stream = true;
-            } else if (std.ascii.eqlIgnoreCase(major, "application")) {
-                accept.json = true;
-            } else if (std.ascii.eqlIgnoreCase(major, "text")) {
-                accept.event_stream = true;
+        for (&decided, 0..) |*slot, index| {
+            const rank = precedence(major, minor, @enumFromInt(index)) orelse continue;
+            if (slot.* == null or rank > slot.*.?.rank) {
+                slot.* = .{ .rank = rank, .allowed = !refused };
             }
-            continue;
         }
-        if (mediaType(bare)) |kind| switch (kind) {
-            .json => accept.json = true,
-            .event_stream => accept.event_stream = true,
-        };
     }
+    accept.json = decided[0] != null and decided[0].?.allowed;
+    accept.event_stream = decided[1] != null and decided[1].?.allowed;
     return accept;
+}
+
+/// The entry that decides one of the two types an `Accept` header can name.
+const Decision = struct {
+    /// How specific the deciding entry is.
+    rank: u2,
+    /// Whether that entry admits the type.
+    allowed: bool,
+};
+
+/// How specific a media range is over one of the two types this transport
+/// answers with, or null when the range does not cover it.
+///
+/// RFC 9110 §12.5.1 orders precedence as a concrete type, then `type/*`, then
+/// `*/*`, and the order is what decides which entry sets the quality. One
+/// range can cover both of this transport's types at once, so this is asked
+/// once per type rather than once per range. A parameter is not part of the
+/// rank: the two types this transport answers with carry none, so the cases a
+/// parameter would distinguish are not cases it can be asked about.
+fn precedence(major: []const u8, minor: []const u8, kind: MediaType) ?u2 {
+    if (std.mem.eql(u8, major, "*")) return 0;
+    const name: []const u8 = switch (kind) {
+        .json => mcp.uri_and_media.json_media_type,
+        .event_stream => mcp.uri_and_media.event_stream_media_type,
+    };
+    const slash = std.mem.indexOfScalar(u8, name, '/') orelse return null;
+    if (!std.ascii.eqlIgnoreCase(major, name[0..slash])) return null;
+    if (std.mem.eql(u8, minor, "*")) return 1;
+    if (!std.ascii.eqlIgnoreCase(minor, name[slash + 1 ..])) return null;
+    return 2;
 }
 
 /// Whether an entry's own parameters refuse it, which `q=0` and nothing else
@@ -281,8 +342,9 @@ pub const Headers = struct {
     name: ?[]const u8 = null,
     accept: ?[]const u8 = null,
     content_type: ?[]const u8 = null,
-    /// `Origin` is not MCP's, but section 4.2 requires a server to validate
-    /// it, so it is carried through rather than dropped.
+    /// `Origin` is not MCP's, but `research/normative/mcp-2026-07-28.md` §4
+    /// requires a server to validate it, so it is carried through rather than
+    /// dropped.
     origin: ?[]const u8 = null,
     authorization: ?[]const u8 = null,
     /// A header removed at `2026-07-28` arrived, and which of the two it was.
@@ -306,9 +368,9 @@ pub const Headers = struct {
 ///
 /// `head` is what `std.http` hands back, so the request line is already in it
 /// and this only walks the fields. Matching is by [`mcp.headerKind`], which
-/// is case-insensitive: section 4.2 spells the version header all-caps and
-/// every other one title-case, and both spellings are required, so a table
-/// keyed on either casing would be wrong.
+/// is case-insensitive: PROTOCOLS.md 4.2 spells the version header all-caps
+/// and every other one title-case, and both spellings are required, so a
+/// table keyed on either casing would be wrong.
 ///
 /// `params` is the caller's array of derived headers, sized to the most the
 /// peer may send, and `scratch` backs the base64 decoding. A value that is
@@ -357,10 +419,31 @@ pub fn readHeaders(head: []const u8, params: []ParamHeader, scratch: []u8) Error
                 };
                 count += 1;
             },
-            .accept => headers.accept = field.value,
-            .content_type => headers.content_type = field.value,
-            .origin => headers.origin = field.value,
-            .authorization => headers.authorization = field.value,
+            // RFC 9110 §5.3 would have a recipient join the field lines of a
+            // list-valued header in the order they arrived, and this one
+            // refuses instead. The rule is the one the MCP-defined headers
+            // above already follow and for the same reason: a gateway that
+            // joined them and a library that read the last one would answer
+            // one request two different ways, and there is no buffer here to
+            // join into without a caller-sized one. `Origin` and
+            // `Authorization` settle it: neither is a list, so two of them
+            // are two requests, and a rule that covers all four is one rule.
+            .accept => {
+                if (headers.accept != null) return error.DuplicateHeader;
+                headers.accept = field.value;
+            },
+            .content_type => {
+                if (headers.content_type != null) return error.DuplicateHeader;
+                headers.content_type = field.value;
+            },
+            .origin => {
+                if (headers.origin != null) return error.DuplicateHeader;
+                headers.origin = field.value;
+            },
+            .authorization => {
+                if (headers.authorization != null) return error.DuplicateHeader;
+                headers.authorization = field.value;
+            },
             .session_id_removed, .last_event_id_removed => {
                 // Never read into a field and never echoed. Recorded so a
                 // caller can see that a peer sent a header this revision
@@ -411,7 +494,8 @@ pub fn revisionOf(headers: Headers) Error!mcp.Revision {
 
 // --- The accepted request ------------------------------------------------------
 
-/// A POST that passed every header rule section 4.2 states.
+/// A POST that passed every header rule PROTOCOLS.md 4.2 and
+/// `research/normative/mcp-2026-07-28.md` §4 state.
 ///
 /// Nothing here is derived from a guess. The method is the one both the header
 /// and the body named, the name is the body's own `params.name` or
@@ -431,7 +515,8 @@ pub fn revisionOf(headers: Headers) Error!mcp.Revision {
 pub const Post = struct {
     /// The revision `MCP-Protocol-Version` named.
     revision: mcp.Revision,
-    /// The JSON-RPC method. Section 4.2 says header *names* compare
+    /// The JSON-RPC method.
+    /// `research/normative/mcp-2026-07-28.md` §4 says header *names* compare
     /// case-insensitively and header *values* case-sensitively, so this is
     /// compared exactly.
     method: []const u8,
@@ -452,8 +537,8 @@ pub const Post = struct {
     /// this library does not make on its behalf.
     origin: ?[]const u8,
     /// Whether an `Authorization` header arrived. The value is not retained:
-    /// section 4.2 requires one on every request, and a credential does not
-    /// belong in a struct a caller might log.
+    /// `research/normative/mcp-2026-07-28.md` §4 requires one on every request,
+    /// and a credential does not belong in a struct a caller might log.
     has_authorization: bool,
 
     /// The value the derived header for `annotation` carries, or null.
@@ -471,8 +556,8 @@ pub const Post = struct {
     /// Check one derived header against the `arguments` value it duplicates.
     ///
     /// The verdict is [`mcp.ParamVerdict`], unchanged: this is the rule from
-    /// section 4.2 and it is not restated here. `body_value` is the value the
-    /// tool's own `inputSchema` declares, which only the tool's dispatcher
+    /// PROTOCOLS.md 4.2 and it is not restated here. `body_value` is the value
+    /// the tool's own `inputSchema` declares, which only the tool's dispatcher
     /// knows.
     pub fn checkParam(
         self: Post,
@@ -492,8 +577,8 @@ pub const Post = struct {
 
 /// Whether a method addresses one named entity, and so requires `Mcp-Name`.
 ///
-/// Section 4.2 requires `Mcp-Name` for `tools/call`, `resources/read` and
-/// `prompts/get` and names no other method.
+/// `research/normative/mcp-2026-07-28.md` §4 requires `Mcp-Name` for
+/// `tools/call`, `resources/read` and `prompts/get` and names no other method.
 pub fn requiresName(method: []const u8) bool {
     return std.mem.eql(u8, method, "tools/call") or
         std.mem.eql(u8, method, "resources/read") or
@@ -549,10 +634,28 @@ pub fn checkPost(headers: Headers, body: []const u8, scratch: []u8) Error!Post {
     const method = headers.method orelse return error.MissingHeader;
     if (!std.mem.eql(u8, method, declared.text)) return error.HeaderMismatch;
 
+    // The revision is claimed twice: once in the header and once in the body.
+    // `MCP-Protocol-Version` is what a gateway routes on and `_meta` is what a
+    // handler reads, so a request that makes the claim two different ways
+    // cannot be served at whichever one this library happened to read.
+    // `research/normative/mcp-2026-07-28.md` §4 grades that disagreement as
+    // `HeaderMismatch` (`-32020`) on `400 Bad Request`, and this is that
+    // error.
+    //
+    // PROTOCOLS.md 4.3 records the key as carried on every client request and
+    // does not restate the match rule, so PROTOCOLS.md is silent here rather
+    // than in conflict, and nothing is resolved silently. A body carrying no
+    // `_meta` at all has nothing to compare and is served: the rule this can
+    // state is the one about a value that is there and disagrees.
+    const body_revision = metaRevision(message.params, scratch) catch return error.MalformedRequest;
+    if (body_revision) |value| {
+        if (!std.mem.eql(u8, revision.string(), value)) return error.HeaderMismatch;
+    }
+
     var name: ?[]const u8 = null;
     if (requiresName(method)) {
         if (headers.name == null) return error.MissingHeader;
-        const from_body = nameFromParams(message.params, scratch) catch
+        const from_body = nameFromParams(method, message.params, scratch) catch
             return error.MalformedRequest;
         const claimed = from_body orelse return error.HeaderMismatch;
         if (!std.mem.eql(u8, headers.name.?, claimed)) return error.HeaderMismatch;
@@ -572,18 +675,28 @@ pub fn checkPost(headers: Headers, body: []const u8, scratch: []u8) Error!Post {
     };
 }
 
-/// The `name` or `uri` an `Mcp-Name` header must agree with.
+/// The `name` or `uri` an `Mcp-Name` header must agree with, which the method
+/// decides rather than the reader.
 ///
-/// Section 4.2 names `params.name` or `params.uri` as the source, and the
-/// schema of the three methods that require the header gives one or the
-/// other. The `params` member is passed in as the raw JSON the base layer
-/// already isolated, so this reads one member of it rather than re-deriving
-/// where it begins and ends.
-fn nameFromParams(params: jsonrpc.Params, scratch: []u8) DecodeError!?[]const u8 {
+/// `research/normative/mcp-2026-07-28.md` §4 names `params.name` or
+/// `params.uri` as the source, and the schema of the three methods that
+/// require the header binds one of them each: `tools/call` and `prompts/get`
+/// carry `name`, `resources/read` carries `uri`. Reading either for every
+/// method would accept a `tools/call` whose params name a resource and answer
+/// it as the tool the header claimed, which is the request-splitting this
+/// header exists to prevent. The `params` member is passed in as the raw JSON
+/// the base layer already isolated, so this reads one member of it rather
+/// than re-deriving where it begins and ends.
+fn nameFromParams(
+    method: []const u8,
+    params: jsonrpc.Params,
+    scratch: []u8,
+) DecodeError!?[]const u8 {
     const text = switch (params) {
         .absent, .null_value => return null,
         .value => |raw| raw,
     };
+    const wanted = if (std.mem.eql(u8, method, "resources/read")) "uri" else "name";
 
     var reader = json.Reader.init(text);
     // An empty object names nothing, which the caller reports as a header
@@ -592,10 +705,43 @@ fn nameFromParams(params: jsonrpc.Params, scratch: []u8) DecodeError!?[]const u8
     // be reported as a header disagreement.
     if (try reader.beginObject()) return null;
     while (try reader.nextKey(scratch)) |key| {
-        if (std.mem.eql(u8, key, "name") or std.mem.eql(u8, key, "uri")) {
+        if (std.mem.eql(u8, key, wanted)) return try reader.string(scratch);
+        try reader.skipValue(scratch);
+    }
+    return null;
+}
+
+/// The revision the body's `_meta` declares, or null when it declares none.
+///
+/// `research/normative/mcp-2026-07-28.md` §4 requires the value to match the
+/// `MCP-Protocol-Version` header, and PROTOCOLS.md 4.3 names the key. The walk
+/// reads one member of an object the base layer already isolated and stops at
+/// the key rather than modelling the rest of `_meta`, which belongs to
+/// `mcp.zig`.
+fn metaRevision(params: jsonrpc.Params, scratch: []u8) DecodeError!?[]const u8 {
+    const text = switch (params) {
+        .absent, .null_value => return null,
+        .value => |raw| raw,
+    };
+
+    var reader = json.Reader.init(text);
+    if (try reader.beginObject()) return null;
+    while (try reader.nextKey(scratch)) |key| {
+        if (!std.mem.eql(u8, key, "_meta")) {
+            try reader.skipValue(scratch);
+            continue;
+        }
+        // The key lives under `_meta`, so the walk goes on inside it rather
+        // than back out to `params`.
+        if (try reader.beginObject()) return null;
+        while (try reader.nextKey(scratch)) |inner| {
+            if (!std.mem.eql(u8, inner, mcp.meta_key.protocol_version)) {
+                try reader.skipValue(scratch);
+                continue;
+            }
             return try reader.string(scratch);
         }
-        try reader.skipValue(scratch);
+        return null;
     }
     return null;
 }
@@ -628,7 +774,56 @@ pub fn writeEvent(out: []u8, message: []const u8) EncodeError![]const u8 {
     return writer.written();
 }
 
-/// Read one event from a stream, or return 0 at the end of the stream.
+/// Read one line of an event stream, or null at the end of the stream.
+///
+/// The format ends a line with CR, LF or CRLF, and none of the three is part
+/// of the line. `out` bounds the line, so a line longer than the caller's
+/// event buffer is reported rather than truncated and the reader's own
+/// buffer never becomes the bound.
+///
+/// A partial line the stream ended inside is not a line: the event stream
+/// algorithm never dispatched it, so there is nothing to hand back.
+fn readLine(reader: *Io.Reader, out: []u8) Error!?usize {
+    var len: usize = 0;
+    while (true) {
+        // A byte is the least a fill can be asked for and the reader keeps
+        // whatever else the stream sent with it, so the terminator is looked
+        // for in what is buffered rather than a byte at a time.
+        const buffered = reader.peekGreedy(1) catch |err| switch (err) {
+            error.EndOfStream => return null,
+            error.ReadFailed => return error.Transport,
+        };
+        // CR, LF and CRLF each end a line and a stream mixes them, so the
+        // search is for either and the length is where it was not found.
+        const at = std.mem.indexOfAny(u8, buffered, "\r\n") orelse buffered.len;
+        if (at > out.len - len) return error.BufferTooSmall;
+        @memcpy(out[len..][0..at], buffered[0..at]);
+        reader.toss(at);
+        len += at;
+        // Nothing in what is buffered ends the line, so it runs on into the
+        // next fill.
+        if (at == buffered.len) continue;
+
+        // The terminator is part of the line and is consumed with it.
+        // `Reader.streamDelimiter` stops on the delimiter and leaves it
+        // buffered, and a reader that left its own terminator behind read
+        // every line after the first as an empty one and then spun on it.
+        reader.toss(1);
+        if (buffered[at] == '\r') {
+            // CRLF is one terminator and a CR alone is one terminator, so the
+            // LF of a pair is taken with the CR, and a CR the stream ended on
+            // stands as the terminator it is.
+            const next = reader.peekGreedy(1) catch |err| switch (err) {
+                error.EndOfStream => return len,
+                error.ReadFailed => return error.Transport,
+            };
+            if (next[0] == '\n') reader.toss(1);
+        }
+        return len;
+    }
+}
+
+/// Read one event from a stream, or null at the end of the stream.
 ///
 /// The SSE rules that matter for this transport: a line beginning `:` is a
 /// comment, every field other than `data` is ignored, and several `data`
@@ -636,7 +831,13 @@ pub fn writeEvent(out: []u8, message: []const u8) EncodeError![]const u8 {
 /// stored because `Last-Event-ID` and resumption were removed at
 /// `2026-07-28`, so a stream that recorded event ids would imply a
 /// capability this revision does not have.
-pub fn readEvent(reader: *Io.Reader, out: []u8) Error!usize {
+///
+/// An event whose data is empty is an event and not the end of the stream.
+/// The algorithm dispatches it, so it comes back as `out[0..0]`; null is the
+/// end of the stream and nothing else. That is what lets a stream whose first
+/// event carries no data be read to its end rather than stopped on, which is
+/// what a length of zero used to do.
+pub fn readEvent(reader: *Io.Reader, out: []u8) Error!?[]const u8 {
     var len: usize = 0;
     // Where the next line is read to. It only moves forward and never falls
     // behind `len`, so a line and the event being built out of it can share
@@ -644,39 +845,38 @@ pub fn readEvent(reader: *Io.Reader, out: []u8) Error!usize {
     var read_to: usize = 0;
     var saw_data = false;
     while (true) {
-        // The line is streamed rather than taken, so its length is bounded by
-        // `out` and not by whatever the reader happens to have buffered. An SSE
-        // line is one message long, and a message is bounded by the caller's
-        // event buffer.
-        var writer = Io.Writer.fixed(out[read_to..]);
-        const count = reader.streamDelimiter(&writer, '\n') catch |err| switch (err) {
-            error.ReadFailed => return error.Transport,
-            error.WriteFailed => return error.BufferTooSmall,
-            // The stream ended without a delimiter, so the last line was never
-            // dispatched. SSE discards it, and so does this.
-            error.EndOfStream => return 0,
-        };
+        const count = (try readLine(reader, out[read_to..])) orelse return null;
         const line = out[read_to..][0..count];
         read_to += count;
-        // `streamDelimiter` leaves the delimiter in the reader.
-        reader.toss(1);
 
         if (line.len == 0) {
             // The dispatch. An event that carried no `data` line is a comment
             // or a bare field, and SSE does not deliver those, so the loop
             // continues rather than handing the caller an empty message.
             if (!saw_data) continue;
-            return len;
+            // The data buffer holds the values joined by a newline, so a
+            // trailing one is that join rather than the last byte of the
+            // message, and the algorithm strips it before dispatching. Two
+            // `data` lines with empty values are an event whose payload is
+            // empty, not an event holding one newline.
+            if (len != 0 and out[len - 1] == '\n') len -= 1;
+            return out[0..len];
         }
         if (line[0] == ':') continue;
 
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        const field = line[0..colon];
+        // A line with no colon is a field whose value is empty, which is one
+        // of the two ways a `data` line is written. Treating it as a line to
+        // skip would make `data\n\n` invisible, and a dispatched event with
+        // an empty value is one this reader has to hand back.
+        var value: []const u8 = "";
+        const field = if (std.mem.indexOfScalar(u8, line, ':')) |colon| blk: {
+            // One leading space after the colon is the field separator, not
+            // part of the value.
+            value = line[colon + 1 ..];
+            if (value.len != 0 and value[0] == ' ') value = value[1..];
+            break :blk line[0..colon];
+        } else line;
         if (!std.mem.eql(u8, field, "data")) continue;
-        var value = line[colon + 1 ..];
-        // One leading space after the colon is the field separator, not part
-        // of the value.
-        if (value.len != 0 and value[0] == ' ') value = value[1..];
 
         if (saw_data) {
             if (len == out.len) return error.BufferTooSmall;
@@ -695,7 +895,7 @@ pub fn readEvent(reader: *Io.Reader, out: []u8) Error!usize {
 
 /// The headers one POST carries beyond the ones the transport always sends.
 pub const PostHeaders = struct {
-    /// The value for `Mcp-Method`. Required by section 4.2 from
+    /// The value for `Mcp-Method`. Required by PROTOCOLS.md 4.2 from
     /// `2026-07-28`, and not defaulted here: a client that could send a POST
     /// without it would be one this revision calls non-conforming.
     method: []const u8,
@@ -709,8 +909,8 @@ pub const PostHeaders = struct {
     /// returns them. The derived-header rule is not restated in this file, so
     /// a client cannot get the name or the value wrong independently.
     params: []const mcp.ParamBinding = &.{},
-    /// Sent verbatim, e.g. `Authorization: Bearer …`, which section 4.2
-    /// requires on every request.
+    /// Sent verbatim, e.g. `Authorization: Bearer …`, which
+    /// `research/normative/mcp-2026-07-28.md` §4 requires on every request.
     extra: []const http.Header = &.{},
 };
 
@@ -752,33 +952,38 @@ pub const Exchange = struct {
     }
 
     /// Read the next JSON-RPC message: the whole body of a single-body reply,
-    /// or the next event of a stream. An empty slice means the reply is over.
-    pub fn nextMessage(self: *Exchange, out: []u8) Error![]const u8 {
-        if (self.drained) return out[0..0];
+    /// or the next event of a stream. Null means the reply is over.
+    ///
+    /// An empty slice is not that, and the two are kept apart deliberately: an
+    /// event stream may dispatch an event carrying no data, and a reply that
+    /// ended on it has not ended.
+    pub fn nextMessage(self: *Exchange, out: []u8) Error!?[]const u8 {
+        if (self.drained) return null;
         if (self.body == null) self.body = self.response.reader(self.transfer);
         const reader = self.body.?;
 
-        const len: usize = switch (self.kind) {
+        const message: ?[]const u8 = switch (self.kind) {
             .json => blk: {
                 var writer = Io.Writer.fixed(out);
-                break :blk reader.streamRemaining(&writer) catch |err| switch (err) {
+                const len = reader.streamRemaining(&writer) catch |err| switch (err) {
                     // A fixed writer that is full reports a write failure, so
                     // the body is larger than the buffer the caller sized.
                     error.WriteFailed => return error.BufferTooSmall,
                     error.ReadFailed => return error.Transport,
                 };
+                break :blk if (len == 0) null else out[0..len];
             },
             .event_stream => try readEvent(reader, out),
         };
-        if (len == 0) {
-            self.drained = true;
-            return out[0..0];
-        }
-        return out[0..len];
+        if (message == null) self.drained = true;
+        return message;
     }
 
     /// Release the connection. The exchange cannot be used afterwards.
     pub fn close(self: *Exchange) void {
+        if (self.request.connection) |c| {
+            std.debug.print("DBG exchange.close: reader.state={s} closing={}\n", .{ @tagName(self.request.reader.state), c.closing });
+        }
         self.request.deinit();
         self.* = undefined;
     }
@@ -798,6 +1003,11 @@ pub const Reply = struct {
     /// JSON-RPC error, and `error_code` says which it is.
     status: std.http.Status,
     /// The whole JSON-RPC response message.
+    ///
+    /// Empty when `answered` is false. No JSON-RPC message is ever zero
+    /// bytes, so an empty one is unambiguous — but read `answered` rather than
+    /// infer it, because that is what says the peer answered something this
+    /// transport cannot read rather than nothing at all.
     message: []const u8,
     /// The `result` member, or the whole message when the peer answered with
     /// an error.
@@ -811,6 +1021,16 @@ pub const Reply = struct {
     error_code: ?i32,
     /// Whether the reply arrived on an event stream.
     streamed: bool,
+    /// Whether `message` is the JSON-RPC response to this call, or is empty
+    /// because the peer answered with something this transport cannot read.
+    ///
+    /// A gateway that answers `502` with an HTML page has answered, and
+    /// reporting that as a peer that never said anything throws the status
+    /// away — the failure `status` exists to keep out of an error. So an
+    /// unreadable body is a reply with an empty message and `answered` false,
+    /// not an error. `error.NoResponse` stays the answer to a reply that
+    /// carried no bytes at all.
+    answered: bool,
 };
 
 /// A client for one MCP endpoint.
@@ -972,12 +1192,24 @@ pub const Client = struct {
         defer exchange.close();
 
         while (true) {
-            const message = try exchange.nextMessage(buffers.out);
-            if (message.len == 0) return error.NoResponse;
+            const message = try exchange.nextMessage(buffers.out) orelse return error.NoResponse;
             const decoded = jsonrpc.decode(message, buffers.decode) catch |err| switch (err) {
                 // Padding and keep-alive whitespace are not messages, and
-                // refusing them would fail a request the peer did answer.
-                error.Truncated, error.MalformedJson => continue,
+                // refusing them would fail a request the peer did answer. A
+                // stream may carry either before the answer; a single body is
+                // the whole of the answer, so there is nothing behind it to
+                // step over to.
+                error.Truncated, error.MalformedJson => switch (exchange.kind) {
+                    .event_stream => continue,
+                    .json => return .{
+                        .status = exchange.status(),
+                        .message = "",
+                        .body = "",
+                        .error_code = null,
+                        .streamed = false,
+                        .answered = false,
+                    },
+                },
                 else => |other| return other,
             };
             switch (decoded.kind) {
@@ -998,6 +1230,7 @@ pub const Client = struct {
                         .body = decoded.result orelse message,
                         .error_code = if (decoded.rpc_error) |rpc_error| rpc_error.code else null,
                         .streamed = exchange.kind == .event_stream,
+                        .answered = true,
                     };
                 },
             }
@@ -1009,10 +1242,11 @@ pub const Client = struct {
 
 /// The shape a server answers a request with.
 ///
-/// Both are legal for the same request. Section 4.2 requires the client to
-/// support both, and `subscriptions/listen` is the case where the stream is
-/// the point: its result arrives first and the notifications that justified
-/// the subscription follow on the same reply.
+/// Both are legal for the same request.
+/// `research/normative/mcp-2026-07-28.md` §4 requires the client to support
+/// both, and `subscriptions/listen` is the case where the stream is the point:
+/// its result arrives first and the notifications that justified the
+/// subscription follow on the same reply.
 pub const ResponseShape = enum {
     /// One JSON body, framed with `content-length`.
     single,
@@ -1053,7 +1287,10 @@ pub const Stream = struct {
 
     /// End the stream. The connection is then ready for the next request.
     pub fn close(self: *Stream) Error!void {
-        self.body.end() catch return error.Transport;
+        self.body.end() catch |err| {
+            std.debug.print("DBG stream.close: body.end err={s}\n", .{@errorName(err)});
+            return error.Transport;
+        };
     }
 };
 
@@ -1180,11 +1417,12 @@ pub const Server = struct {
 
     /// Answer with an event stream the caller owns.
     ///
-    /// `X-Accel-Buffering: no` is here because section 4.2 says a server
-    /// SHOULD send it when it starts a stream: a reverse proxy that buffers
-    /// the body would turn a subscription into one late delivery, which is
-    /// the failure the header exists to prevent. No `Cache-Control` is sent,
-    /// because none of the sources this library works from states one.
+    /// `X-Accel-Buffering: no` is here because
+    /// `research/normative/mcp-2026-07-28.md` §4 says a server SHOULD send it
+    /// when it starts a stream: a reverse proxy that buffers the body would
+    /// turn a subscription into one late delivery, which is the failure the
+    /// header exists to prevent. No `Cache-Control` is sent, because none of
+    /// the sources this library works from states one.
     pub fn respondStream(self: *Server, post: Post) Error!Stream {
         if (!post.accept.allows(.event_stream)) return error.NotAcceptable;
         const request = &(self.request orelse return error.MalformedRequest);
@@ -1311,7 +1549,7 @@ test {
 test "the version header is all-caps and the rest are title-case, and both are read" {
     var params: [4]ParamHeader = undefined;
     var scratch: [64]u8 = undefined;
-    // Section 4.2 spells these two ways in the same document. A table keyed on
+    // PROTOCOLS.md 4.2 spells these two ways in the same document. A table keyed on
     // either casing reads one and drops the other, and the peer that sent the
     // other spelling gets a 400 for having sent exactly what the
     // specification says.
@@ -1395,7 +1633,7 @@ test "a repeated control header is refused rather than resolved by order" {
 test "one derived annotation sent twice is refused, because only one value is checked" {
     var params: [4]ParamHeader = undefined;
     var scratch: [128]u8 = undefined;
-    // Section 4.2 makes a server validate the derived header against
+    // PROTOCOLS.md 4.2 makes a server validate the derived header against
     // `arguments` and reject on mismatch, so two headers for one annotation
     // leave that check as ambiguous as a repeated `Mcp-Method`. A header name
     // is case-insensitive on the wire, so the repeat below arrives under
@@ -1417,6 +1655,51 @@ test "one derived annotation sent twice is refused, because only one value is ch
         "Mcp-Param-unit: metric\r\n" ++
         "\r\n";
     try testing.expectEqual(@as(usize, 2), (try readHeaders(two, &params, &scratch)).params.len);
+}
+
+test "a repeated Accept, Content-Type, Origin or Authorization is refused too" {
+    var params: [2]ParamHeader = undefined;
+    var scratch: [512]u8 = undefined;
+    // The same rule as the headers above, for the same reason. RFC 9110 §5.3
+    // would have the field lines joined in order, and reading only the last
+    // made the verdict depend on the order they arrived in: the request below
+    // was answered `406` and the same two lines the other way round was
+    // served.
+    const repeated = [_][2][]const u8{
+        .{ "Accept", "application/json, text/event-stream" },
+        .{ "Content-Type", "application/json" },
+        .{ "Origin", "http://127.0.0.1:1234" },
+        .{ "Authorization", "Bearer 5eed" },
+    };
+    for (repeated) |pair| {
+        var head_buffer: [512]u8 = undefined;
+        const head = try std.fmt.bufPrint(
+            &head_buffer,
+            "POST /mcp HTTP/1.1\r\n" ++
+                "MCP-Protocol-Version: 2026-07-28\r\n" ++
+                "Mcp-Method: tools/list\r\n" ++
+                "{s}: {s}\r\n" ++
+                "{s}: {s}\r\n" ++
+                "\r\n",
+            .{ pair[0], pair[1], pair[0], pair[1] },
+        );
+        try testing.expectError(error.DuplicateHeader, readHeaders(head, &params, &scratch));
+    }
+
+    // One of each is read, so the refusal above is about the second and not
+    // about a header this transport never accepts twice.
+    const single = "POST /mcp HTTP/1.1\r\n" ++
+        "MCP-Protocol-Version: 2026-07-28\r\n" ++
+        "Mcp-Method: tools/list\r\n" ++
+        "Accept: application/json, text/event-stream\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "Origin: http://127.0.0.1:1234\r\n" ++
+        "Authorization: Bearer 5eed\r\n" ++
+        "\r\n";
+    const headers = try readHeaders(single, &params, &scratch);
+    try testing.expectEqualStrings("Bearer 5eed", headers.authorization.?);
+    try testing.expectEqualStrings("http://127.0.0.1:1234", headers.origin.?);
+    try testing.expectEqualStrings("application/json, text/event-stream", headers.accept.?);
 }
 
 test "x-mcp-header sent as a header is refused, because it is a schema keyword" {
@@ -1508,6 +1791,61 @@ test "Mcp-Name must equal the name the body carries" {
     try testing.expectError(error.HeaderMismatch, checkPost(headers, body, &scratch));
 }
 
+test "Mcp-Name is compared with the member the method's schema binds" {
+    var params: [2]ParamHeader = undefined;
+    var scratch: [256]u8 = undefined;
+    const head = "POST /mcp HTTP/1.1\r\n" ++
+        "MCP-Protocol-Version: 2026-07-28\r\n" ++
+        "Mcp-Method: tools/call\r\n" ++
+        "Mcp-Name: echo\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "\r\n";
+    const headers = try readHeaders(head, &params, &scratch);
+
+    // `CallToolRequestParams` carries `name` and `ReadResourceRequestParams`
+    // carries `uri`, so this request named no tool at all. Reading either
+    // member for every method let the header agree with the wrong one, and a
+    // dispatcher keyed on `Post.name` would have looked up a tool the request
+    // never addressed.
+    try testing.expectError(error.HeaderMismatch, checkPost(
+        headers,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+            "\"params\":{\"uri\":\"echo\"}}",
+        &scratch,
+    ));
+
+    const read_head = "POST /mcp HTTP/1.1\r\n" ++
+        "MCP-Protocol-Version: 2026-07-28\r\n" ++
+        "Mcp-Method: resources/read\r\n" ++
+        "Mcp-Name: file:///notes.txt\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "\r\n";
+    const read_headers = try readHeaders(read_head, &params, &scratch);
+    try testing.expectError(error.HeaderMismatch, checkPost(
+        read_headers,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/read\"," ++
+            "\"params\":{\"name\":\"file:///notes.txt\"}}",
+        &scratch,
+    ));
+
+    // The member each of them does bind is served, which the two refusals
+    // above would also pass if this refused every name-bearing request.
+    const tool = try checkPost(
+        headers,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+            "\"params\":{\"name\":\"echo\"}}",
+        &scratch,
+    );
+    try testing.expectEqualStrings("echo", tool.name.?);
+    const resource = try checkPost(
+        read_headers,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/read\"," ++
+            "\"params\":{\"uri\":\"file:///notes.txt\"}}",
+        &scratch,
+    );
+    try testing.expectEqualStrings("file:///notes.txt", resource.name.?);
+}
+
 test "a sentinel-encoded Mcp-Name is decoded before it is compared" {
     var params: [2]ParamHeader = undefined;
     var head_scratch: [256]u8 = undefined;
@@ -1540,6 +1878,48 @@ test "a sentinel-encoded Mcp-Name is decoded before it is compared" {
         "\"params\":{\"name\":\"städte\"}}";
     const post = try checkPost(headers, body, &body_scratch);
     try testing.expectEqualStrings("städte", post.name.?);
+}
+
+test "a revision the header and the body disagree on is a mismatch" {
+    var params: [2]ParamHeader = undefined;
+    var scratch: [512]u8 = undefined;
+    const head = "POST /mcp HTTP/1.1\r\n" ++
+        "MCP-Protocol-Version: 2026-07-28\r\n" ++
+        "Mcp-Method: tools/list\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "\r\n";
+    const headers = try readHeaders(head, &params, &scratch);
+
+    // The header is what a gateway routes on and `_meta` is what a handler
+    // reads, so a peer that declares two revisions is one request split in
+    // two. Checked before this, the body was not read for the value at all
+    // and the request was served at whichever revision the header named.
+    try testing.expectError(error.HeaderMismatch, checkPost(
+        headers,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"," ++
+            "\"params\":{\"cursor\":\"c\"," ++
+            "\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2025-11-25\"}}}",
+        &scratch,
+    ));
+
+    // The same body declaring the revision the header named is served, and so
+    // is one whose `_meta` is about something else entirely.
+    const agreed = try checkPost(
+        headers,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"," ++
+            "\"params\":{\"_meta\":{\"io.modelcontextprotocol/clientInfo\":" ++
+            "{\"name\":\"c\",\"version\":\"1\"}," ++
+            "\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}}}",
+        &scratch,
+    );
+    try testing.expectEqualStrings("tools/list", agreed.method);
+    const unrelated = try checkPost(
+        headers,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"," ++
+            "\"params\":{\"_meta\":{\"progressToken\":7}}}",
+        &scratch,
+    );
+    try testing.expectEqualStrings("tools/list", unrelated.method);
 }
 
 test "a derived parameter header is checked against the value arguments carries" {
@@ -1584,7 +1964,7 @@ test "a derived parameter header is checked against the value arguments carries"
     var converted: [mcp.param_value_max_len]u8 = undefined;
     var decode_scratch: [64]u8 = undefined;
     // The value the tool's own schema declares is what the header is checked
-    // against, and the verdict is the one section 4.2 names.
+    // against, and the verdict is the one PROTOCOLS.md 4.2 names.
     try testing.expectEqual(mcp.ParamVerdict.accepted, try post.checkParam(
         "city",
         .{ .string_value = "Zürich" },
@@ -1606,9 +1986,10 @@ test "a derived parameter header is checked against the value arguments carries"
 }
 
 test "the reply type is bounded by what the client said it accepts" {
-    // Section 4.2 requires the client to list both, so a client that lists one
-    // has narrowed the choice and a server that answers with the other one
-    // sends a media type the client said it cannot read.
+    // `research/normative/mcp-2026-07-28.md` §4 requires the client to list
+    // both, so a client that lists one has narrowed the choice and a server
+    // that answers with the other one sends a media type the client said it
+    // cannot read.
     const both = parseAccept(accept_value);
     try testing.expect(both.allows(.json) and both.allows(.event_stream));
 
@@ -1652,6 +2033,38 @@ test "a media type the peer refused with q=0 is one this transport may not answe
     const mixed = parseAccept("application/json;q=0, text/event-stream");
     try testing.expect(!mixed.allows(.json));
     try testing.expect(mixed.allows(.event_stream));
+}
+
+test "the most specific Accept entry decides a type, and a wildcard cannot re-admit it" {
+    // RFC 9110 §12.5.1: the most specific matching media range has precedence
+    // and sets the quality of the type. Reading the list as a set of bits gave
+    // `*/*` the last word, so a peer that refused the JSON body beside it was
+    // answered with `Content-Type: application/json` anyway.
+    const after_wildcard = parseAccept("*/*, application/json;q=0");
+    try testing.expect(!after_wildcard.allows(.json));
+    try testing.expect(after_wildcard.allows(.event_stream));
+    try testing.expect(after_wildcard.isAcceptable());
+
+    // Order does not decide it: the concrete type is ahead of `*/*` whichever
+    // side of the list it arrived on.
+    const before_wildcard = parseAccept("application/json;q=0, */*");
+    try testing.expect(!before_wildcard.allows(.json));
+    try testing.expect(before_wildcard.allows(.event_stream));
+
+    // `type/*` is less specific than the type, so it cannot re-admit what the
+    // type refused either.
+    const major_wildcard = parseAccept("application/json;q=0, application/*");
+    try testing.expect(!major_wildcard.allows(.json));
+    try testing.expect(!major_wildcard.allows(.event_stream));
+
+    const stream_refused = parseAccept("text/event-stream;q=0, */*");
+    try testing.expect(!stream_refused.allows(.event_stream));
+    try testing.expect(stream_refused.allows(.json));
+
+    // A wildcard beside an entry that does not refuse is what it always was:
+    // the more specific entry only decides, and it decides the same answer.
+    const admitted = parseAccept("*/*, application/json");
+    try testing.expect(admitted.allows(.json) and admitted.allows(.event_stream));
 }
 
 test "a POST that accepts no reply this transport can send is refused" {
@@ -1763,19 +2176,18 @@ test "a comment and every field but data are not part of an event" {
             "data: {\"b\":2}\n" ++
             "\n",
     );
-    const len = try readEvent(&reader, &out);
-    try testing.expectEqualStrings("{\"b\":2}", out[0..len]);
+    const event = (try readEvent(&reader, &out)).?;
+    try testing.expectEqualStrings("{\"b\":2}", event);
 }
 
 test "several data lines are one event, and the stream may then end" {
     var out: [128]u8 = undefined;
     var reader = Io.Reader.fixed("data: {\"a\":\ndata: 1}\n\n");
-    const len = try readEvent(&reader, &out);
-    try testing.expectEqualStrings("{\"a\":\n1}", out[0..len]);
+    try testing.expectEqualStrings("{\"a\":\n1}", (try readEvent(&reader, &out)).?);
 
-    // The next event is the next one, and the end of the stream is zero
-    // messages rather than an error.
-    try testing.expectEqual(@as(usize, 0), try readEvent(&reader, &out));
+    // The next event is the next one, and the end of the stream is no event
+    // at all rather than an error.
+    try testing.expect((try readEvent(&reader, &out)) == null);
 }
 
 test "an event the stream ended inside is delivered as nothing" {
@@ -1784,7 +2196,77 @@ test "an event the stream ended inside is delivered as nothing" {
     // SSE discards an event that was never dispatched, so a peer that hangs up
     // mid-event produces no message rather than a truncated one that a caller
     // would try to parse.
-    try testing.expectEqual(@as(usize, 0), try readEvent(&reader, &out));
+    try testing.expect((try readEvent(&reader, &out)) == null);
+
+    // The line arrived whole; the stream ended before the blank line that
+    // dispatches the event, and a reader that delivered it anyway hands a
+    // caller the last message of every stream a peer cut short.
+    var undispatched = Io.Reader.fixed("data: {\"b\":2}\n");
+    try testing.expect((try readEvent(&undispatched, &out)) == null);
+}
+
+test "an event with no data is an event, and the stream is not over" {
+    var out: [128]u8 = undefined;
+    var reader = Io.Reader.fixed(
+        "data:\n\n" ++
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+    );
+    // The algorithm dispatches an event whose data buffer is empty, so it
+    // arrives with nothing in it and the stream carries on. Reported as a
+    // length, the dispatched event and the end of the stream were the same
+    // number, which is how a client stopped on an empty first event and read
+    // nothing of what came after it.
+    const empty = (try readEvent(&reader, &out)).?;
+    try testing.expectEqual(@as(usize, 0), empty.len);
+    try testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
+        (try readEvent(&reader, &out)).?,
+    );
+    try testing.expect((try readEvent(&reader, &out)) == null);
+
+    // The colon and one space are the same event: the space is the field
+    // separator and the value behind it is empty.
+    var spaced = Io.Reader.fixed("data: \n\ndata: 1\n\n");
+    try testing.expectEqual(@as(usize, 0), (try readEvent(&spaced, &out)).?.len);
+    try testing.expectEqualStrings("1", (try readEvent(&spaced, &out)).?);
+
+    // Two empty data lines join with the newline between them, and the
+    // algorithm strips that trailing newline before dispatching, so the
+    // payload is empty rather than one byte of newline.
+    var joined = Io.Reader.fixed("data:\ndata:\n\n");
+    try testing.expectEqual(@as(usize, 0), (try readEvent(&joined, &out)).?.len);
+}
+
+test "a CR or CRLF framed stream reads the events an LF one does" {
+    var out: [128]u8 = undefined;
+
+    // A CRLF peer sends the terminator after the value it wrote, and a reader
+    // that stops at LF alone copies the CR into the payload: the message is
+    // no longer the bytes the peer wrote, and a body carrying a raw carriage
+    // return is not JSON at all.
+    var crlf = Io.Reader.fixed("data: {\"a\":\r\ndata: 1}\r\n\r\n");
+    try testing.expectEqualStrings("{\"a\":\n1}", (try readEvent(&crlf, &out)).?);
+
+    // Two events in a row is where a CR left behind shifts every line after
+    // it, so the second event is read as an empty one.
+    var pair = Io.Reader.fixed("data: 1\r\n\r\ndata: 2\r\n\r\n");
+    try testing.expectEqualStrings("1", (try readEvent(&pair, &out)).?);
+    try testing.expectEqualStrings("2", (try readEvent(&pair, &out)).?);
+    try testing.expect((try readEvent(&pair, &out)) == null);
+
+    // A CR-only peer never sends an LF at all. Reading to the LF means
+    // reading until the caller's buffer is full, and that was reported to the
+    // caller as its own buffer being too small — a conforming stream of any
+    // length turned into a local fault.
+    var cr = Io.Reader.fixed("data: {\"a\":1}\r\rdata: 2\r\r");
+    try testing.expectEqualStrings("{\"a\":1}", (try readEvent(&cr, &out)).?);
+    try testing.expectEqualStrings("2", (try readEvent(&cr, &out)).?);
+
+    // The stream ended on the CR, so there is no LF behind it to decide the
+    // terminator by, and the line it ended is still not dispatched without the
+    // blank line that would have followed it.
+    var cut = Io.Reader.fixed("data: 3\r");
+    try testing.expect((try readEvent(&cut, &out)) == null);
 }
 
 test "a reply that does not fit the caller's buffer is reported, not truncated" {
@@ -2082,11 +2564,13 @@ const Listen = struct {
     fn run(self: *@This()) void {
         var client = openClient(self.http, self.endpoint) orelse {
             self.failed.* = true;
+            std.debug.print("DBG listen: openClient failed\n", .{});
             return;
         };
         var exchange: Exchange = undefined;
         client.post(&exchange, self.body, self.spec, &self.side.head, &self.side.transfer) catch {
             self.failed.* = true;
+            std.debug.print("DBG listen: post failed\n", .{});
             return;
         };
         defer exchange.close();
@@ -2109,19 +2593,22 @@ const Listen = struct {
                 &self.side.out
             else
                 &self.side.next_out;
-            const message = exchange.nextMessage(out) catch {
+            const message = exchange.nextMessage(out) catch |err| {
                 self.failed.* = true;
+                std.debug.print("DBG listen: nextMessage failed err={s} after {d} messages\n", .{ @errorName(err), self.messages });
                 return;
-            };
-            if (message.len == 0) {
+            } orelse {
+                // The reply is over. An event carrying no data is a message
+                // the peer sent and is counted as one.
                 self.ended = self.messages;
                 break;
-            }
+            };
             if (self.messages == 0) self.first_len = message.len;
             if (self.messages == 1) self.second_len = message.len;
             self.messages += 1;
             if (self.messages == 2) break;
         }
+        std.debug.print("DBG listen: messages={d} ended={d} first_len={d} second_len={d}\nDBG first='{s}'\nDBG second='{s}'\n", .{ self.messages, self.ended, self.first_len, self.second_len, self.side.out[0..self.first_len], self.side.next_out[0..self.second_len] });
         self.got.* = true;
     }
 };
@@ -2227,6 +2714,7 @@ const Subscribe = struct {
     fn run(self: *@This()) void {
         const stream = self.listener.accept(self.io) catch {
             self.failed.* = true;
+            std.debug.print("DBG subscribe: accept failed\n", .{});
             return;
         };
         defer stream.close(self.io);
@@ -2253,13 +2741,16 @@ const Subscribe = struct {
 
         const post = self.side.server.receive() catch {
             self.failed.* = true;
+            std.debug.print("DBG subscribe: receive error\n", .{});
             return;
         } orelse {
             self.failed.* = true;
+            std.debug.print("DBG subscribe: receive null\n", .{});
             return;
         };
         const dispatch = self.handler.call orelse {
             self.failed.* = true;
+            std.debug.print("DBG subscribe: no handler\n", .{});
             return;
         };
         // The two regions are the server's own and are separate arrays, the
@@ -2272,14 +2763,17 @@ const Subscribe = struct {
             self.side.server.buffers.answer,
         ) catch {
             self.failed.* = true;
+            std.debug.print("DBG subscribe: dispatch failed\n", .{});
             return;
         };
         var out = self.side.server.respondStream(post) catch {
             self.failed.* = true;
+            std.debug.print("DBG subscribe: respondStream failed\n", .{});
             return;
         };
         out.send(self.side.server.buffers.event, result orelse return) catch {
             self.failed.* = true;
+            std.debug.print("DBG subscribe: send result failed\n", .{});
             return;
         };
         self.sent.* = 1;
@@ -2287,12 +2781,14 @@ const Subscribe = struct {
         for (self.notifications) |notification| {
             out.send(self.side.server.buffers.event, notification) catch {
                 self.failed.* = true;
+                std.debug.print("DBG subscribe: send notification {d} failed\n", .{self.sent.*});
                 return;
             };
             self.sent.* += 1;
         }
         out.close() catch {
             self.failed.* = true;
+            std.debug.print("DBG subscribe: close failed\n", .{});
             return;
         };
     }
@@ -2973,4 +3469,115 @@ test "a body larger than the caller's buffer is refused, not grown for" {
     try testing.expect(rejected);
     try testing.expect(client_failed);
     try testing.expect(!got);
+}
+
+test "a reply this transport cannot read keeps its status instead of reading as no answer" {
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var http_client: http.Client = .{ .allocator = testing.allocator, .io = io };
+    defer http_client.deinit();
+
+    var endpoint: Endpoint = .{};
+    try endpoint.open(io);
+    defer endpoint.close(io);
+
+    var server_side: Side = .{};
+    var client_side: Side = .{};
+    var reply: Reply = undefined;
+    var got = false;
+    var failed = false;
+    var served = false;
+
+    const Gateway = struct {
+        io: Io,
+        listener: *Io.net.Server,
+        side: *Side,
+        served: *bool,
+        failed: *bool,
+
+        /// One POST, answered the way a peer in front of the endpoint answers
+        /// one it cannot reach: a gateway's own status and a page of HTML
+        /// rather than a JSON-RPC body.
+        fn run(self: *@This()) void {
+            const stream = self.listener.accept(self.io) catch {
+                self.failed.* = true;
+                return;
+            };
+            defer stream.close(self.io);
+            self.side.stream = stream;
+            self.side.stream_reader =
+                Io.net.Stream.Reader.init(stream, self.io, &self.side.reader_buffer);
+            self.side.stream_writer =
+                Io.net.Stream.Writer.init(stream, self.io, &self.side.writer_buffer);
+            self.side.server = Server.init(
+                &self.side.stream_reader.interface,
+                &self.side.stream_writer.interface,
+                .{
+                    .params = &self.side.params,
+                    .head_scratch = &self.side.head_scratch,
+                    .body = &self.side.body,
+                    .body_scratch = &self.side.body_scratch,
+                    .decode_scratch = &self.side.decode_scratch,
+                    .answer = &self.side.answer,
+                    .transfer = &self.side.transfer,
+                    .event = &self.side.event,
+                    .stream = &self.side.stream_buffer,
+                },
+            );
+            // The request is served, so the answer below is a choice the
+            // gateway made rather than a refusal this transport produced.
+            const post = self.side.server.receive() catch {
+                self.failed.* = true;
+                return;
+            } orelse {
+                self.failed.* = true;
+                return;
+            };
+            self.side.server.reject(.bad_gateway, "<html>502</html>") catch {
+                self.failed.* = true;
+                return;
+            };
+            self.served.* = post.method.len != 0;
+        }
+    };
+
+    var group: Io.Group = .init;
+    var serve = Gateway{
+        .io = io,
+        .listener = &endpoint.listener,
+        .side = &server_side,
+        .served = &served,
+        .failed = &failed,
+    };
+    var call = Call{
+        .io = io,
+        .http = &http_client,
+        .endpoint = &endpoint,
+        .side = &client_side,
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/list\"}",
+        .spec = .{ .method = "tools/list" },
+        .id = 4,
+        .reply = &reply,
+        .got = &got,
+        .failed = &failed,
+    };
+    group.async(io, Gateway.run, .{&serve});
+    group.async(io, Call.run, .{&call});
+    group.await(io) catch {};
+
+    try testing.expect(!failed);
+    try testing.expect(served);
+    // The call returned a reply rather than `error.NoResponse`, so the caller
+    // can read the status. Reported as an error, the `502` was thrown away and
+    // the caller was told the peer never answered, which is the one thing
+    // `Reply.status` exists not to do.
+    try testing.expect(got);
+    try testing.expectEqual(std.http.Status.bad_gateway, reply.status);
+    // And the reply says so: there is no message, and no caller can mistake
+    // the empty one for a JSON-RPC answer.
+    try testing.expect(!reply.answered);
+    try testing.expectEqual(@as(usize, 0), reply.message.len);
+    try testing.expect(!reply.streamed);
 }

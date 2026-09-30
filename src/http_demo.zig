@@ -587,12 +587,15 @@ const Client = struct {
 
         const reader = exchange.response.reader(exchange.transfer);
         while (self.event_count < expected_events) {
-            const len = http.readEvent(reader, &self.side.out) catch return false;
-            // Zero is the end of the stream, and a stream that ended before
-            // the client held its events is a failure, not a short reply.
-            if (len == 0) return false;
+            // A null is the end of the stream, and a stream that ended before
+            // the client held its events is a failure, not a short reply. An
+            // event carrying no data is an event, so it arrives as an empty
+            // slice and only a null ends the stream.
+            const event = (http.readEvent(reader, &self.side.out) catch return false) orelse
+                return false;
+            const len = event.len;
             if (len > self.events[self.event_count].len) return false;
-            @memcpy(self.events[self.event_count][0..len], self.side.out[0..len]);
+            @memcpy(self.events[self.event_count][0..len], event);
             self.event_len[self.event_count] = len;
             self.event_count += 1;
         }
