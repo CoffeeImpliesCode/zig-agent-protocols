@@ -53,3 +53,22 @@ invent one; the case is an explicit decode or encode failure instead.
   the `Message` itself (`result` and `rpc_error` are separate optional members
   and exactly one is set on a response), so collapsing the fourth variant loses
   no information while matching the authority.
+
+## 4. MCP Apps and AG-UI scope
+
+- **Decision:** neither is implemented. The `PROTOCOLS.md` §9 exclusion list is
+  the scope this library holds itself to.
+- **Conflict:** `research/sota-2026-09-29.md` §7, "Scope for this library",
+  places both protocols in scope, because "both are Stable or 1.0 and both are
+  consumed by the hosts this library's users already run". `PROTOCOLS.md` §9,
+  "Not implemented", excludes both: "Specified and stable, but the client
+  support matrix is a community-maintained list. Deferred until a host is chosen"
+  for MCP Apps, and "Declined for the same reason as A2UI: a vendor-governed 1.0
+  with no foundation home. Revisit if it is donated" for AG-UI.
+- **Resolution:** `PROTOCOLS.md` is the stated authority for `src/`, so §9
+  governs and the **Conditional** list stays unimplemented. The exclusions stand
+  on the reasons §9 records: the MCP Apps `ui/*` surface waits for a host,
+  because its client support matrix is community-maintained, and AG-UI waits
+  for a foundation home it does not have. Each is lifted by the condition §9
+  names, a chosen host or a donation. The research document stays the deeper
+  value source and the protocol document the authority, as for A2A above.
