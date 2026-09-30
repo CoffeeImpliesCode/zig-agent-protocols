@@ -157,6 +157,29 @@ style; each one has a failure that is hard to see from the code alone.
   cause an overlap and so it is not a wire error. Every `Conn.init` call site
   needs `try`, and a call that fails must still hang the transport up: no pump
   was started, so nothing else releases the accepted stream.
+- **A failed write kills the connection.** `call`, `notify` and `dispatch` all
+  mark the connection dead on `error.Transport`, because a task blocked in
+  `call` would otherwise wait on a writer that provably cannot write. An
+  `error.Framing` does not: the transport is healthy and stays usable, because
+  those same bytes fail the same way however often they are sent and the fault
+  is the caller's message. Making one path fatal and another recoverable is the
+  bug, not the rule.
+- **Every path out of `call` gives its pending slot back.** The table is
+  caller-supplied and fixed, so one leaked slot is one fewer request for the
+  life of the connection, and sixteen leaked slots make a healthy connection
+  answer `error.TooManyPending` forever. Cancellation is the path that does it,
+  which is why every mutex acquisition in `conn.zig` is `lockUncancelable`: a
+  lock that can fail is a slot that can be dropped.
+- **A response nobody can correlate is surfaced, not dropped.** JSON-RPC 2.0
+  requires `"id": null` on an error response whose request id could not be
+  determined, and that is the one shape `jsonrpc.decode` admits on an error and
+  refuses everywhere else. `Conn` reports it to a `RefusalHandler` rather than
+  discarding it: the peer refused something and could not say which, and
+  silence there reads as "the request is still outstanding".
+- **`Conn.close` ends the reader, and the caller owns the group.** `pump` tests
+  the closed flag rather than reading forever, so a connection that declares
+  itself dead stops dispatching. The group is the caller's, spawned on it and
+  awaited or cancelled there; `Conn` holds no executor and starts no task.
 
 ## Contracts the audit pinned down
 
@@ -179,6 +202,25 @@ style; each one has a failure that is hard to see from the code alone.
   in `json.Reader.skipValue` as advisory; that finding is wrong, the bound is
   enforced by `enterContainer` and covered by a test, so do not add a second
   guard without removing the first.
+- **A repeated JSON member resolves first-wins everywhere.** `json.memberText`
+  and `jsonrpc.decode` both take the first, because a later member must not be
+  able to make a failed comparison pass. `http` is the deliberate exception and
+  refuses a repeated MCP-defined header outright, since two values for a header
+  checked against the body leaves the check ambiguous. Three copies of this
+  rule disagreeing is drift, not a decision; `json.memberText`'s doc says no
+  layer may keep a private copy of that walk, and the ACP session layer once
+  did.
+- **A JSON document is exactly one value.** Every decoder checks `reader.atEnd()`
+  after its member loop — never inside an arm that captures a lexeme around a
+  validation call, and never before the loop closes. Ten decoders once skipped
+  it and swallowed the tail, and for three of them with a matching encoder that
+  was a silent `encode(decode(b)) != b`. The property harness asserts it over
+  generated input; see `src/testkit.zig`'s `tail_rule`.
+- **A decoder that accepts a member has to be able to write it back.** A member
+  the shape does not model is carried as the borrowed lexeme it arrived as,
+  never decoded into a type that cannot hold every key a peer may send — that is
+  what `bridge.Envelope.meta` and `bridge.OutcomePayload` do, and a typed shape
+  is exactly what re-opened the loss.
 
 ## Toolchain traps
 
@@ -192,8 +234,9 @@ nor its file, so the next reader pays for it twice unless it is written down.
 - **A line is streamed, never taken.** `std.Io.Reader.takeDelimiter` bounds the
   result by the reader's own buffer rather than the caller's, so an event
   stream line longer than the transfer buffer fails there. `http.readEvent`
-  uses `streamDelimiter`, which makes the caller's buffer the bound. An SSE line
-  is one message long, and a message is bounded by the caller's buffer.
+  reads a line itself and copies it into the caller's buffer, which is what
+  makes the caller's buffer the bound. An SSE line is one message long, and a
+  message is bounded by the caller's buffer.
 - **`BodyWriter.flush` does nothing in the `chunked` state.** It flushes for
   `end`, `none`, `content_length` and `chunk_len`, and `chunked` is the state a
   `transfer-encoding: chunked` body stays in for its whole life. An event stream

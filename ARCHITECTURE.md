@@ -61,32 +61,41 @@ follows that: every task that outlives a call is spawned on a `Group`, and
 `errdefer group.cancel(io)` guarantees it is cancelled on an early return
 rather than leaked. There is no detached background work.
 
-A connection owns one group. Its reader task is spawned there when the
-connection starts and the group is awaited or cancelled when it closes, so the
-reader's lifetime is the connection's lifetime and there is no way to close a
-connection while a task is still touching its buffers.
+A connection owns no group and starts no task. The caller holds the group,
+spawns `Conn.pump` on it, and awaits or cancels it; `Conn` holds the reader's
+buffers and nothing else about the executor. That is the same choice as taking
+`io: std.Io` by parameter rather than storing it: the executor belongs to the
+caller.
+
+The reader's lifetime is bounded by two things the caller can both observe.
+`Conn.close` marks the connection dead, and `pump` tests that flag rather than
+reading forever, so closing a connection ends its reader instead of only
+declaring it unusable. And the group the caller owns is cancelled rather than
+leaked, because `Io.Group.async` does not run its task until `await` or
+`cancel`: a reader parked on a group nobody joins simply never starts.
 
 Synchronisation uses `Io.Mutex` and `Io.Condition`, not `std.Thread.Mutex` and
 `std.Thread.Condition`, for the same reason: they cooperate with the
 implementation's cancellation, so a blocked waiter is released when its group is
 cancelled instead of hanging.
 
-## 4. The codec stays allocation-free; the runtime may not be
+## 4. Nothing allocates, at either layer
 
 The encoding contract in `PROTOCOLS.md` section 2 says no decode or encode path
 allocates. That contract is unchanged and still holds for every `src/*.zig`
 codec module.
 
-The runtime is a different kind of code and is allowed an allocator, because a
-connection has genuinely dynamic state (a pending-request table whose size
-depends on concurrency). Where it can avoid allocating it does:
+The runtime is a different kind of code and is permitted an allocator, because
+a server has state whose size a fixed array cannot set. Nothing in this
+repository takes one: the one structure that would qualify is the pending table,
+and it is a caller-supplied array of slots rather than a map. Where the runtime
+avoids allocating, it does so as a property rather than by accident:
 
 - Frame assembly and every decode buffer stay caller-owned, so the wire path
   from bytes to a decoded message still allocates nothing.
-- The pending-request table is the one structure that grows with concurrency,
-  and it is a caller-supplied array of slots rather than a hash map, so a
-  connection has a known upper bound on outstanding requests and reports
-  exhaustion instead of growing without limit.
+- The pending-request table is a caller-supplied array of slots rather than a
+  hash map, so a connection has a known upper bound on outstanding requests and
+  reports exhaustion instead of growing without limit.
 
 ## 5. A handler is given two regions, not one
 
