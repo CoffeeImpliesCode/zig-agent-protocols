@@ -182,5 +182,16 @@ jobs:
       - name: zig build run-runtime
         run: zig build run-runtime
 
+      # The ACP session and the mcp-over-acp binding over one real
+      # connection. An inner MCP error arrives inside a successful outer
+      # response, and only a transport shows that it stays that way.
+      - name: zig build run-sessions
+        run: zig build run-sessions
+
+      # The Streamable HTTP transport over a real loopback socket, answering
+      # one POST with a single JSON body and one with an event stream.
+      - name: zig build run-http
+        run: zig build run-http
+
       - name: zig build docs
         run: zig build docs
