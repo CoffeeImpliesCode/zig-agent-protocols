@@ -245,6 +245,12 @@ pub fn classifyOutcome(outer_result: []const u8, scratch: []u8) Error!Outcome {
 /// propagates it without writing a frame. A failure to run the resolver is
 /// the caller's own condition and not a protocol answer, and this binding
 /// refuses to invent one for it.
+///
+/// Not a [`conn.Handler`], and the arity is what says so: the connection hands
+/// a handler a raw frame, a decode region and an answer region, and it hands a
+/// resolver an envelope `serve` has already decoded plus the one buffer the
+/// payload goes into. A resolver is handed no frame and no id, so nothing it
+/// writes can land on a value the connection is still reading.
 pub const Resolver = struct {
     ctx: ?*anyopaque = null,
     call: ?*const fn (
@@ -666,6 +672,10 @@ test "the binding refuses an MCP revision it cannot carry" {
 
 /// A resolver that carries nothing, so every method it is handed is one this
 /// provider does not have.
+///
+/// A [`Resolver`] callback and not a [`conn.Handler`]: it is called with an
+/// envelope and one buffer, never with a frame, so it holds no decoded value
+/// that writing could land on.
 fn refuseAll(_: ?*anyopaque, _: bridge.Envelope, _: []u8) Error!?bridge.Outcome {
     return null;
 }
@@ -1068,16 +1078,30 @@ fn listenOn(io: Io, path_buffer: []u8, tag: u64) !Socket {
 /// has to be able to tell it from the outcomes above.
 const CarriedPeer = struct {
     state: *State,
-    /// Separate from the connection's handler scratch, which `jsonrpc.decode`
-    /// has already taken by the time the carried envelope is decoded.
+    /// Separate from the connection's decode region, which `jsonrpc.decode`
+    /// has already spent by the time the carried envelope is decoded. The
+    /// escape offset a reader keeps is per reader and not per buffer, so a
+    /// second decode into the same buffer starts at offset zero again.
     envelope_scratch: [1024]u8 = undefined,
 
     /// Runs inline on the reader task, so it answers and returns. It makes no
     /// call of its own: the reader is the only task on this side, so a call
     /// made here would wait for an answer that task cannot deliver.
-    fn handle(ctx: ?*anyopaque, frame: []const u8, scratch: []u8) conn.Error!?[]const u8 {
+    ///
+    /// The two regions come from `conn.Conn`, which owns both and hands this
+    /// handler one of each: the frame is decoded into `decode_scratch` and
+    /// every frame below is composed in `answer`. An id a refusal echoes can
+    /// carry a JSON escape, and a decoded id lives in `decode_scratch`, so one
+    /// region for both would have the writer's first bytes land on the value
+    /// it is about to read.
+    fn handle(
+        ctx: ?*anyopaque,
+        frame: []const u8,
+        decode_scratch: []u8,
+        answer: []u8,
+    ) conn.Error!?[]const u8 {
         const self: *CarriedPeer = @ptrCast(@alignCast(ctx.?));
-        const message = jsonrpc.decode(frame, scratch) catch return null;
+        const message = jsonrpc.decode(frame, decode_scratch) catch return null;
         if (message.kind != .request) return null;
         const id = message.id orelse return null;
         const name = message.method orelse return null;
@@ -1098,7 +1122,7 @@ const CarriedPeer = struct {
         // binding's own `server_registration_unavailable`. The connection that
         // carried either one is the caller's still.
         if (std.mem.eql(u8, envelope.inner_method, "resources/list")) {
-            var refusal = json.Writer.init(scratch);
+            var refusal = json.Writer.init(answer);
             jsonrpc.encode(.{
                 .kind = .response,
                 .id = id,
@@ -1109,7 +1133,7 @@ const CarriedPeer = struct {
         }
 
         if (!std.mem.eql(u8, envelope.server_id, "project-tools:7a72")) {
-            var refusal = json.Writer.init(scratch);
+            var refusal = json.Writer.init(answer);
             jsonrpc.encode(.{
                 .kind = .response,
                 .id = id,
@@ -1124,9 +1148,11 @@ const CarriedPeer = struct {
         else
             "{\"error\":{\"code\":-32602,\"message\":\"unknown tool\"}}";
 
-        // The scratch is this connection's handler buffer, so the answer can
-        // borrow it for the length of the write.
-        var writer = json.Writer.init(scratch);
+        // `answer` belongs to this connection and lives for the length of the
+        // write, so the frame can borrow it. Nothing the decode left in
+        // `decode_scratch` is read after this point, and nothing here writes
+        // there.
+        var writer = json.Writer.init(answer);
         jsonrpc.encode(.{ .kind = .response, .id = id, .result = body }, &writer) catch return null;
         self.state.answered += 1;
         return writer.written();
@@ -1147,7 +1173,13 @@ const ProviderTask = struct {
         self.endpoint.open(self.io, self.group, stream, .{
             .ctx = self.provider,
             .call = CarriedPeer.handle,
-        });
+        }) catch {
+            // The descriptor is released on that path, so the caller's next
+            // call comes back instead of waiting for a reader that was never
+            // started.
+            self.provider.state.failed = true;
+            return;
+        };
     }
 };
 
@@ -1270,8 +1302,10 @@ const ServedPeer = struct {
     /// provider never reads an entry before it claims it, so `undefined` is
     /// all the table needs.
     active: [4]Active = undefined,
-    /// Separate from the connection's handler scratch, which `jsonrpc.decode`
-    /// has already taken by the time the carried envelope is decoded.
+    /// Separate from the connection's decode region, which `jsonrpc.decode`
+    /// has already spent by the time the carried envelope is decoded. The
+    /// escape offset a reader keeps is per reader and not per buffer, so a
+    /// second decode into the same buffer starts at offset zero again.
     envelope_scratch: [1024]u8 = undefined,
     outcome_scratch: [2048]u8 = undefined,
     inner: [2048]u8 = undefined,
@@ -1286,9 +1320,33 @@ const ServedPeer = struct {
     /// Whether the nested call has happened.
     reentered: bool = false,
 
-    fn handle(ctx: ?*anyopaque, frame: []const u8, scratch: []u8) conn.Error!?[]const u8 {
+    /// Serve one carried request, and answer everything else as itself.
+    ///
+    /// The two regions come from `conn.Conn`, which owns both and hands this
+    /// handler one of each: the frame is decoded into `decode_scratch` and the
+    /// frame that answers it is composed in `answer`. `init` refuses a pair
+    /// that shares a byte, so what this handler used to do is not something it
+    /// can do now. It decoded into the region it then wrote its refusals into,
+    /// and `conn.errorResponse` and `conn.methodNotFound` below filled the
+    /// region the id they echo had been decoded into. An id carrying a JSON
+    /// escape is scratch, so the writer's first bytes landed on the value it
+    /// was about to read and the refusal went out echoing its own punctuation.
+    /// Nothing reported it: the connection ran, the peer got a frame, and the
+    /// frame was wrong.
+    ///
+    /// The refusals are what a live socket puts that to. "A provider answers
+    /// each carried request on the side its failure belongs to" takes the
+    /// foreign method through `methodNotFound` below and reads its `-32601`
+    /// back off the wire, and `serve` reports a failure of its own into the
+    /// same `answer`.
+    fn handle(
+        ctx: ?*anyopaque,
+        frame: []const u8,
+        decode_scratch: []u8,
+        answer: []u8,
+    ) conn.Error!?[]const u8 {
         const self: *ServedPeer = @ptrCast(@alignCast(ctx.?));
-        const message = jsonrpc.decode(frame, scratch) catch {
+        const message = jsonrpc.decode(frame, decode_scratch) catch {
             self.state.declined += 1;
             return null;
         };
@@ -1329,7 +1387,7 @@ const ServedPeer = struct {
                 const refusal = try conn.errorResponse(request, .{
                     .code = -32603,
                     .message = "the provider could not serve the request",
-                }, scratch);
+                }, answer);
                 return refusal;
             };
             if (composed != null) self.state.answered += 1;
@@ -1339,8 +1397,13 @@ const ServedPeer = struct {
         // Another method is not this binding's, so this provider's own
         // dispatcher answers it. A `mcp/message` result here would tell the
         // caller this provider carried a request it never read.
+        //
+        // `request` borrows the frame or `decode_scratch`, and `answer` is a
+        // region of its own, so the id this refusal echoes is still the
+        // caller's id after the write. One region would have made the two the
+        // same bytes.
         self.state.declined += 1;
-        const refusal = try conn.methodNotFound(request, scratch);
+        const refusal = try conn.methodNotFound(request, answer);
         return refusal;
     }
 
@@ -1372,6 +1435,11 @@ const ServedPeer = struct {
 };
 
 /// The MCP operations this provider carries: `tools/list`, and nothing else.
+///
+/// A [`Resolver`] callback and not a [`conn.Handler`], so the arity stays an
+/// envelope and one buffer: the connection never hands this one a frame, a
+/// decode region or an answer region, and `envelope` is already decoded by
+/// the time it arrives.
 fn resolve(ctx: ?*anyopaque, envelope: bridge.Envelope, out: []u8) Error!?bridge.Outcome {
     const self: *ServedPeer = @ptrCast(@alignCast(ctx.?));
     self.state.resolved += 1;
@@ -1400,7 +1468,12 @@ const ServedTask = struct {
         self.endpoint.open(self.io, self.group, stream, .{
             .ctx = self.peer,
             .call = ServedPeer.handle,
-        });
+        }) catch {
+            // As above: no connection means no pump to notice the peer hanging
+            // up, so `open` released the descriptor itself.
+            self.peer.state.failed = true;
+            return;
+        };
         // The connection exists only once `open` built it, and the group's
         // task does not run until the group is awaited. Nothing in `serve`
         // reads this field, so the write cannot race with a frame the pump
@@ -1424,7 +1497,11 @@ const ServedCaller = struct {
             self.state.reason = err;
             return;
         };
-        self.endpoint.open(self.io, self.group, stream, null);
+        self.endpoint.open(self.io, self.group, stream, null) catch |err| {
+            self.state.failed = true;
+            self.state.reason = err;
+            return;
+        };
         self.exchange() catch |err| {
             self.state.failed = true;
             self.state.reason = err;
@@ -1580,7 +1657,10 @@ const Caller = struct {
             self.state.failed = true;
             return;
         };
-        self.endpoint.open(self.io, self.group, stream, null);
+        self.endpoint.open(self.io, self.group, stream, null) catch {
+            self.state.failed = true;
+            return;
+        };
         self.exchange() catch {
             self.state.failed = true;
         };
@@ -1700,7 +1780,11 @@ const Side = struct {
     frame_buffer: [4096]u8 = undefined,
     pending: [4]conn.Slot = undefined,
     decode_scratch: [1024]u8 = undefined,
-    handler_scratch: [2048]u8 = undefined,
+    /// Where a handler composes the frame it returns, and its own region: the
+    /// connection hands it over per call and overwrites it for the next one.
+    /// Separate from `decode_scratch` because a handler decodes into one and
+    /// writes into the other, and `init` refuses a pair that shares a byte.
+    answer: [2048]u8 = undefined,
     /// The envelope `call` builds, the bytes it puts on the wire, and the
     /// answer it reads back.
     envelope: [1024]u8 = undefined,
@@ -1740,13 +1824,21 @@ const Endpoint = struct {
     /// so neither path closes it twice.
     released: bool = false,
 
+    /// Open a side over `stream`, or report why there is no connection to
+    /// open.
+    ///
+    /// `init` refuses a region with no room and a pair that shares a byte, and
+    /// both are wiring faults in this file rather than conditions a run can
+    /// hit. The descriptor is released on that path, because no pump runs
+    /// without a connection and the peer would otherwise sit on a read that
+    /// never returns.
     fn open(
         self: *Endpoint,
         io: Io,
         group: *Io.Group,
         stream: Io.net.Stream,
         handler: ?conn.Handler,
-    ) void {
+    ) conn.Error!void {
         self.stream = stream;
         self.reader = Io.net.Stream.Reader.init(stream, io, &self.reader_buffer);
         self.writer = Io.net.Stream.Writer.init(stream, io, &self.writer_buffer);
@@ -1754,8 +1846,11 @@ const Endpoint = struct {
             .frame_buffer = &self.side.frame_buffer,
             .pending = &self.side.pending,
             .decode_scratch = &self.side.decode_scratch,
-            .handler_scratch = &self.side.handler_scratch,
-        });
+            .answer = &self.side.answer,
+        }) catch |err| {
+            self.hangUp(io);
+            return err;
+        };
         if (handler) |h| self.connection.setHandler(h);
         // Spawned on the group the test joins, because `Io.Group.async` does
         // not promise to run its task until the group is awaited or cancelled.

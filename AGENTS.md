@@ -135,6 +135,28 @@ style; each one has a failure that is hard to see from the code alone.
   not a table of whatever the stack held. ReleaseSafe does not zero a frame, so
   an uncleared `used` flag answers the first call with `error.TooManyPending`
   before a single byte reaches the wire, and Debug hides it.
+- **A handler is handed its decode scratch and its answer buffer as two
+  arguments, and they must be two regions.** The escape offset `json.Reader`
+  keeps is per reader, not per buffer, so a second reader decoding a string with
+  an escape starts at offset 0 again and writes over what the first left there:
+  a value the handler borrowed is compared with bytes the handler itself
+  produced, and the answer is wrong rather than an error. Never carve one
+  buffer into two by a bare index, however the arithmetic looks.
+- **A handler that needs a third live region needs a caller-owned struct field,
+  not a sub-range.** `escape offset` again: two decoded values cannot share one
+  reader's scratch, so `acp_session`'s permission outcome and
+  `sessions_demo`'s carried envelope are fields of the owning struct, sized by
+  the caller. A fixed array field needs `&` to become a slice; a bare field does
+  not coerce.
+- **`Conn.init` is fallible, and it refuses before it clears the slot table.** A
+  region with no room is `error.UnusableBuffer` and a pair sharing a byte is
+  `error.OverlappingBuffers`, both raised before any slot is written, so a
+  refused `init` leaves the caller's pending array as it was handed over.
+  `conn.overlaps` is the one definition of the predicate — the HTTP transport
+  asserts through it rather than defining a second, because a peer cannot
+  cause an overlap and so it is not a wire error. Every `Conn.init` call site
+  needs `try`, and a call that fails must still hang the transport up: no pump
+  was started, so nothing else releases the accepted stream.
 
 ## Contracts the audit pinned down
 

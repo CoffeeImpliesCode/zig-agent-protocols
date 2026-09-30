@@ -34,11 +34,11 @@ pub const Io = std.Io;
 /// ```zig
 /// // Wrong. The temporary dies at the end of the statement, and the
 /// // connection reads a freed struct on its first frame.
-/// var c = Stdio.init(io, &r, &w).connection(config);
+/// var c = try Stdio.init(io, &r, &w).connection(config);
 ///
 /// // Right. The streams live in a local that outlives the connection.
 /// var stdio = Stdio.init(io, &r, &w);
-/// var c = stdio.connection(config);
+/// var c = try stdio.connection(config);
 /// ```
 pub const Stdio = struct {
     reader: std.Io.File.Reader,
@@ -60,7 +60,15 @@ pub const Stdio = struct {
 
     /// Build a connection over these streams. The result borrows `self`, so
     /// `self` must outlive it; see the lifetime rule on [`Stdio`].
-    pub fn connection(self: *Stdio, config: conn.Conn.Config) conn.Conn {
+    ///
+    /// Falls when `conn.Conn.init` refuses the configuration, and it refuses
+    /// before it builds anything: `error.UnusableBuffer` for a region sized
+    /// with no room, `error.OverlappingBuffers` for a `config` whose decode
+    /// region and answer region share a byte. Both are wiring faults the
+    /// caller fixes by resizing or separating its buffers, and neither is
+    /// visible once a peer is on the wire, which is why they arrive here
+    /// rather than at the first message.
+    pub fn connection(self: *Stdio, config: conn.Conn.Config) conn.Error!conn.Conn {
         return conn.Conn.init(
             self.reader.io,
             &self.reader.interface,
@@ -96,7 +104,11 @@ pub const Buffers = struct {
     /// Slots for calls that may be outstanding at once.
     pending: [16]conn.Slot = undefined,
     decode_scratch: [4096]u8 = undefined,
-    handler_scratch: [4096]u8 = undefined,
+    /// The region a handler composes an answer into. It shares no byte with
+    /// `decode_scratch`, because a handler that decoded into the region it
+    /// writes its answer into has the writer's first bytes land on the value
+    /// it is about to read; `conn.Conn.init` refuses a pair that overlaps.
+    answer: [4096]u8 = undefined,
     /// Per-call buffers for the encode and the response.
     out: [8192]u8 = undefined,
     result: [8192]u8 = undefined,
@@ -107,7 +119,7 @@ pub const Buffers = struct {
             .frame_buffer = &self.frame,
             .pending = &self.pending,
             .decode_scratch = &self.decode_scratch,
-            .handler_scratch = &self.handler_scratch,
+            .answer = &self.answer,
         };
     }
 };
@@ -131,7 +143,11 @@ const EchoAgent = struct {
     frame: [256]u8 = undefined,
     len: usize = 0,
 
-    fn handle(ctx: ?*anyopaque, frame: []const u8, _: []u8) conn.Error!?[]const u8 {
+    /// Both regions are discarded, and the reason is the shape of a handler
+    /// that decodes nothing: it has no borrowed value to keep alive and no
+    /// envelope to compose, so it needs neither. A handler that does decode
+    /// writes only into the first.
+    fn handle(ctx: ?*anyopaque, frame: []const u8, _: []u8, _: []u8) conn.Error!?[]const u8 {
         const self: *EchoAgent = @ptrCast(@alignCast(ctx.?));
         const n = @min(frame.len, self.frame.len);
         @memcpy(self.frame[0..n], frame[0..n]);
@@ -222,7 +238,7 @@ test "a request off the transport is answered on the transport" {
     // right of a dot. The connection keeps raw pointers to both interfaces,
     // and a temporary would leave it reading freed memory on its first frame.
     var agent: EchoAgent = .{};
-    var connection = stdio.connection(buffers.config());
+    var connection = try stdio.connection(buffers.config());
     connection.setHandler(.{ .ctx = &agent, .call = EchoAgent.handle });
 
     const progress = "{\"progress\":1}";

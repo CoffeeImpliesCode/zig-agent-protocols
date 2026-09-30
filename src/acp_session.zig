@@ -655,7 +655,7 @@ pub const Agent = struct {
         request_scratch: []u8,
         outcome_scratch: []u8,
     ) Error!PermissionDecision {
-        if (overlaps(request_scratch, outcome_scratch)) {
+        if (conn.overlaps(request_scratch, outcome_scratch)) {
             return .{ .unreadable = error.InvalidField };
         }
         const body = try permissionParams(permission, params);
@@ -794,7 +794,7 @@ pub fn readOutcome(
     request_scratch: []u8,
     outcome_scratch: []u8,
 ) PermissionDecision {
-    if (overlaps(request_scratch, outcome_scratch)) {
+    if (conn.overlaps(request_scratch, outcome_scratch)) {
         return .{ .unreadable = error.InvalidField };
     }
     const outcome_text = memberText(body, "outcome", outcome_scratch) orelse
@@ -919,17 +919,6 @@ fn findOption(request: *const acp.PermissionRequest, option_id: []const u8) ?acp
         if (std.mem.eql(u8, option.option_id, option_id)) return option;
     }
     return null;
-}
-
-/// Whether two caller-supplied regions share a byte.
-///
-/// Pointer arithmetic rather than a content comparison, because the question is
-/// where the bytes are and not what is in them. An empty region overlaps
-/// nothing, because its end is its start.
-fn overlaps(a: []const u8, b: []const u8) bool {
-    const a_start = @intFromPtr(a.ptr);
-    const b_start = @intFromPtr(b.ptr);
-    return a_start < b_start + b.len and b_start < a_start + a.len;
 }
 
 // --- Bodies -------------------------------------------------------------------
@@ -1983,8 +1972,29 @@ const permission_params =
 const Side = struct {
     frame_buffer: [8192]u8 = undefined,
     pending: [4]conn.Slot = undefined,
+    /// Where an inbound frame is decoded into, and the region `conn.Conn` lends
+    /// a handler to decode into.
     decode_scratch: [1024]u8 = undefined,
-    handler_scratch: [4096]u8 = undefined,
+    /// Where a handler writes its answer, and the region `conn.Conn` lends a
+    /// handler to write into. `init` refuses a pair that shares a byte with
+    /// `decode_scratch`, and neither handler below carves either one.
+    answer: [4096]u8 = undefined,
+    /// The client's permission request, decoded beside the two regions above
+    /// rather than inside one of them.
+    ///
+    /// The handler decodes twice — the JSON-RPC envelope and the permission
+    /// request inside it — and the envelope's id is echoed after the request's
+    /// option ids have been read, so both borrows are live at once. One decode
+    /// region cannot hold both: the escape offset is per reader, so the second
+    /// decode starts at offset 0 and writes over what the first left there.
+    permission_request: [1024]u8 = undefined,
+    /// The outcome the client composes, beside `answer` rather than inside it.
+    ///
+    /// `conn.respond` writes the envelope's first bytes into the answer region
+    /// before it splices the outcome in, so an outcome written at the head of
+    /// that region is gone before it is read, and the frame says nothing about
+    /// what the user chose.
+    permission_outcome: [256]u8 = undefined,
     out: [1024]u8 = undefined,
     result: [1024]u8 = undefined,
     params: [1024]u8 = undefined,
@@ -2016,21 +2026,26 @@ const Endpoint = struct {
     /// after it, so the two can both reach for the same stream.
     closed: bool = false,
 
+    /// Take the stream and hand it to a connection over `Side`'s buffers.
+    ///
+    /// Whatever `conn.Conn.init` refuses is refused here: the buffers are the
+    /// test's own, so there is no caller to grow one and a task reports it as a
+    /// failed test rather than as a fault the peer committed.
     fn open(
         self: *Endpoint,
         io: Io,
         group: *Io.Group,
         stream: Io.net.Stream,
         handler: ?conn.Handler,
-    ) void {
+    ) conn.Error!void {
         self.stream = stream;
         self.reader = Io.net.Stream.Reader.init(stream, io, &self.reader_buffer);
         self.writer = Io.net.Stream.Writer.init(stream, io, &self.writer_buffer);
-        self.connection = conn.Conn.init(io, &self.reader.interface, &self.writer.interface, .{
+        self.connection = try conn.Conn.init(io, &self.reader.interface, &self.writer.interface, .{
             .frame_buffer = &self.side.frame_buffer,
             .pending = &self.side.pending,
             .decode_scratch = &self.side.decode_scratch,
-            .handler_scratch = &self.side.handler_scratch,
+            .answer = &self.side.answer,
         });
         if (handler) |h| self.connection.setHandler(h);
         // Spawned on the group the test joins, because `Io.Group.async` does not
@@ -2107,18 +2122,24 @@ const Outcome = struct {
 
 /// The agent's handler: answers `initialize` with a real response envelope
 /// carrying the request's own id, and counts everything it is asked.
-fn agentHandler(ctx: ?*anyopaque, frame: []const u8, scratch: []u8) conn.Error!?[]const u8 {
+fn agentHandler(
+    ctx: ?*anyopaque,
+    frame: []const u8,
+    decode_scratch: []u8,
+    answer: []u8,
+) conn.Error!?[]const u8 {
     const state: *Outcome = @ptrCast(@alignCast(ctx.?));
-    // The answer is built in the buffer the connection lends the handler, not in
-    // a local. That is the region `conn.Conn` passes for exactly this, and it is
-    // the one the write it performs the moment the handler returns is certain to
-    // be able to read.
-    const key_scratch = scratch[0..128];
-    const body = scratch[128..];
+    // The two regions the connection lends are the whole of what this handler
+    // needs, so neither is carved: the frame is decoded into one and the answer
+    // is composed into the other. A handler that decoded into the region it
+    // wrote its answer into would have the writer's first bytes land on the
+    // method name it is about to compare, because the escape offset
+    // `json.Reader` keeps is per reader and not per buffer.
+    //
     // The request shape, so the answer carries the id the client chose and the
     // envelope is the shared builder's. A response is not a request and never
     // reaches a builder.
-    const request = jsonrpc.decodeRequest(frame, key_scratch) catch return null;
+    const request = jsonrpc.decodeRequest(frame, decode_scratch) catch return null;
     state.agent_calls += 1;
 
     if (std.mem.eql(u8, request.method.text, "initialize")) {
@@ -2129,32 +2150,34 @@ fn agentHandler(ctx: ?*anyopaque, frame: []const u8, scratch: []u8) conn.Error!?
             "{\"protocolVersion\":1," ++
                 "\"agentCapabilities\":{\"loadSession\":true}," ++
                 "\"agentInfo\":{\"name\":\"test-agent\"}}",
-            body,
+            answer,
         ) catch null;
     }
-    return conn.respond(request, "{\"sessionId\":\"s9\"}", body) catch null;
+    return conn.respond(request, "{\"sessionId\":\"s9\"}", answer) catch null;
 }
 
 /// The client answers the agent's permission request. Runs inline on the client's
 /// reader task, so it may encode a body but must not call back on the same
 /// connection.
+///
+/// `ctx` is the side's own [`Side`], which owns the two regions the connection
+/// does not lend. Four regions are live at once: the frame's borrows, the
+/// decoded permission request, the outcome, and the envelope. The first and the
+/// last are the parameters and neither is carved; the two in between are
+/// fields, because the escape offset `json.Reader` keeps is per reader and not
+/// per buffer, so a second decode into one region starts at offset 0 again and
+/// writes over what the first left there.
 fn clientPermissionHandler(
-    _: ?*anyopaque,
+    ctx: ?*anyopaque,
     frame: []const u8,
-    scratch: []u8,
+    decode_scratch: []u8,
+    answer: []u8,
 ) conn.Error!?[]const u8 {
-    // Four regions of the buffer the connection lends, none of them a local. The
-    // decoded message, the request, the answer and the envelope are all live at
-    // once, and the answer has to stay readable for the write the connection
-    // does next.
-    const key_scratch = scratch[0..128];
-    const request_scratch = scratch[128..1152];
-    const outcome_buffer = scratch[1152..1280];
-    const body = scratch[1280..];
+    const side: *Side = @ptrCast(@alignCast(ctx.?));
 
     // The request shape, so the answer carries the id the agent chose and the
     // envelope is the shared builder's rather than an assembly of members here.
-    const call = jsonrpc.decodeRequest(frame, key_scratch) catch return null;
+    const call = jsonrpc.decodeRequest(frame, decode_scratch) catch return null;
     if (!std.mem.eql(u8, call.method.text, "session/request_permission")) return null;
     const params: []const u8 = switch (call.params) {
         .value => |value| value,
@@ -2167,15 +2190,74 @@ fn clientPermissionHandler(
     // disagreed with these bytes would find no such option and would read the
     // answer as unreadable rather than as a grant.
     var options: [4]acp.PermissionOption = undefined;
-    const request = acp.decodePermissionRequest(.stable, params, &options, request_scratch) catch
-        return null;
+    const request = acp.decodePermissionRequest(
+        .stable,
+        params,
+        &options,
+        &side.permission_request,
+    ) catch return null;
     if (request.stable.options.len == 0) return null;
+
+    // Composed beside the answer and not inside it. `conn.respond` writes the
+    // envelope's opening bytes into the answer region before it splices the
+    // outcome in, so an outcome written at the head of that region is gone
+    // before it is read, and the frame says nothing about what the user chose.
     const outcome = answerPermission(
         &request,
         .{ .selected = request.stable.options[0].option_id },
-        outcome_buffer,
+        &side.permission_outcome,
     ) catch return null;
-    return conn.respond(call, outcome, body) catch null;
+    return conn.respond(call, outcome, answer) catch null;
+}
+
+test "the client's answer is composed beside the outcome it splices in" {
+    // The frame as an agent sends it. Both of the values a decode borrows into
+    // a region of its own carry an escape: the string id, which the answer
+    // echoes, and the option id, which the answer names. An escape is the one
+    // thing that makes a reader write rather than borrow, and the first write a
+    // reader makes starts at offset 0 again. So a request decoded into the
+    // region the frame was decoded into leaves the answer echoing the option id
+    // where the id was, and an outcome composed at the head of the answer is
+    // gone before the envelope splices it in.
+    const params =
+        "{\"sessionId\":\"s9\",\"toolCall\":{},\"options\":[" ++
+        "{\"optionId\":\"\\u0079es\",\"name\":\"Yes\",\"kind\":\"allow_once\"}]}";
+    const frame = "{\"jsonrpc\":\"2.0\",\"id\":\"p\\u0031\"," ++
+        "\"method\":\"session/request_permission\",\"params\":" ++ params ++ "}";
+
+    var side: Side = .{};
+    const answered = try clientPermissionHandler(&side, frame, &side.decode_scratch, &side.answer);
+    const envelope = answered orelse return error.TestUnexpectedResult;
+
+    // The frame is a whole answer, which it is only if the outcome was composed
+    // into bytes the envelope did not overwrite on its way to the splice.
+    try testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":\"p1\",\"result\":" ++
+            "{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"yes\"}}}",
+        envelope,
+    );
+    // And the outcome the client composed is still there, beside the answer
+    // rather than under it.
+    try testing.expect(std.mem.startsWith(
+        u8,
+        side.permission_outcome[0..],
+        "{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"yes\"}}",
+    ));
+
+    // Read back the way an agent reads it: the same params into the agent's own
+    // request region, and this answer through a third. The escaped id arrives
+    // unescaped on both sides, so the option the client named is the option the
+    // agent offered, and the answer is the grant rather than an id that matched
+    // itself.
+    var agent_options: [1]acp.PermissionOption = undefined;
+    var agent_request: [512]u8 = undefined;
+    const asked = try decodeRequest(.stable, params, &agent_options, &agent_request);
+    var envelope_scratch: [512]u8 = undefined;
+    var outcome_region: [256]u8 = undefined;
+    const result = memberText(envelope, "result", &envelope_scratch) orelse
+        return error.TestUnexpectedResult;
+    const decision = readOutcome(result, &asked, &agent_request, &outcome_region);
+    try testing.expectEqual(@as(?ReadableOutcome, .{ .grants = true }), decision.readable());
 }
 
 test "a client negotiates and gates against an agent over a real socket" {
@@ -2330,7 +2412,11 @@ const ServerTask = struct {
         self.endpoint.open(self.io, self.group, stream, .{
             .ctx = self.state,
             .call = agentHandler,
-        });
+        }) catch {
+            self.state.failed = true;
+            self.endpoint.hangUp(self.io);
+            return;
+        };
     }
 };
 
@@ -2346,7 +2432,11 @@ const ClientTask = struct {
             self.state.failed = true;
             return;
         };
-        self.endpoint.open(self.io, self.group, stream, null);
+        self.endpoint.open(self.io, self.group, stream, null) catch {
+            self.state.failed = true;
+            self.endpoint.hangUp(self.io);
+            return;
+        };
 
         const side = &self.endpoint.side;
         var client: Client = .{ .connection = &self.endpoint.connection, .version = .stable };
@@ -2432,7 +2522,12 @@ const PermissionCaller = struct {
             self.state.set(self.io);
             return;
         };
-        self.endpoint.open(self.io, self.group, stream, null);
+        self.endpoint.open(self.io, self.group, stream, null) catch {
+            self.state.failed = true;
+            self.state.set(self.io);
+            self.endpoint.hangUp(self.io);
+            return;
+        };
 
         const side = &self.endpoint.side;
         var agent: Agent = .{ .connection = &self.endpoint.connection, .version = .stable };
@@ -2490,9 +2585,13 @@ const PermissionServer = struct {
             return;
         };
         self.endpoint.open(self.io, self.group, stream, .{
-            .ctx = self.state,
+            .ctx = &self.endpoint.side,
             .call = clientPermissionHandler,
-        });
+        }) catch {
+            self.state.failed = true;
+            self.endpoint.hangUp(self.io);
+            return;
+        };
         // The agent's call is in flight on the other side of this socket, and
         // closing now would race it: the answer would arrive at a connection that
         // no longer existed.

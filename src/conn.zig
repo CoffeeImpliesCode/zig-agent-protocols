@@ -24,13 +24,27 @@
 //! alternative — spawning handlers here — would need the frame copied out of
 //! the framer's buffer, which is the one buffer this layer refuses to allocate.
 //!
+//! ## Two regions, and why they cannot share a byte
+//!
+//! A handler is handed two buffers and they are not interchangeable: the frame
+//! is decoded into the first, and the answer is written into the second. One
+//! buffer cannot serve both, because the escape offset `json.Reader` keeps is
+//! per reader and not per buffer. A reader decoding a string carrying an escape
+//! starts at offset 0 again, so a handler that decodes into the region it
+//! writes its answer into has the writer's first bytes land on the decoded
+//! name it is about to compare. That is a wrong answer rather than an error,
+//! and it is silent, which is the only kind of fault worth a pair of names.
+//!
+//! `init` refuses two regions that overlap, and refuses a buffer with no room,
+//! because both are wiring faults a caller cannot see from a peer.
+//!
 //! ## Allocation
 //!
 //! `ARCHITECTURE.md` section 4 allows this layer an allocator, because a
 //! pending-request table has a size set by concurrency and cannot be a
 //! fixed-size array of the right length. Everything else stays caller-owned:
-//! the frame buffer, the encode buffer, the decode scratch and the handler
-//! scratch all belong to the caller, so the path from bytes to a decoded
+//! the frame buffer, the encode buffer, and the two regions a handler is
+//! handed all belong to the caller, so the path from bytes to a decoded
 //! message still allocates nothing.
 //!
 //! The pending table is a caller-supplied array of slots rather than a map.
@@ -73,6 +87,20 @@ pub const Error = error{
     /// it. `params` is spliced in verbatim, so a newline in a caller's own
     /// JSON reaches here.
     Framing,
+    /// A buffer the connection was handed has no room, so the connection cannot
+    /// work at all: a zero frame buffer refuses every frame, a zero pending
+    /// table fails every call, and a zero decode or answer region fails the
+    /// first thing that needs it.
+    ///
+    /// Reported by `init` rather than at the first message, because a caller
+    /// with no peer to blame has nothing else to go on.
+    UnusableBuffer,
+    /// Two of the regions the connection was handed share a byte.
+    ///
+    /// The one fault the pair of names exists to make impossible, and the one
+    /// a caller cannot see: the connection still runs, and the answers it
+    /// writes are wrong.
+    OverlappingBuffers,
     /// The caller used the connection after it closed.
     Closed,
 };
@@ -99,6 +127,15 @@ pub const Response = struct {
 
 /// A handler for a request or notification from the peer.
 ///
+/// It is handed two regions and they are not interchangeable. `decode_scratch`
+/// is where the frame may be decoded into, and `answer` is where the reply is
+/// written. A handler that decodes into the second has the writer's first bytes
+/// land on the value it is about to read, because the escape offset
+/// `json.Reader` keeps is per reader and not per buffer; see the module doc.
+///
+/// The answer may borrow either region. The connection writes it out before it
+/// reads the next frame, so either is live for exactly as long as it is needed.
+///
 /// Returning null means "no answer", which is correct for a notification
 /// and leaves a peer's request unanswered. An error is not a refusal: a
 /// request that returns one is answered with an internal error, because a
@@ -109,12 +146,18 @@ pub const Handler = struct {
     call: ?*const fn (
         ctx: ?*anyopaque,
         frame: []const u8,
-        scratch: []u8,
+        decode_scratch: []u8,
+        answer: []u8,
     ) Error!?[]const u8 = null,
 
-    fn invoke(self: Handler, frame: []const u8, scratch: []u8) Error!?[]const u8 {
+    fn invoke(
+        self: Handler,
+        frame: []const u8,
+        decode_scratch: []u8,
+        answer: []u8,
+    ) Error!?[]const u8 {
         const func = self.call orelse return null;
-        return func(self.ctx, frame, scratch);
+        return func(self.ctx, frame, decode_scratch, answer);
     }
 };
 
@@ -202,6 +245,29 @@ fn encodeFailure(err: root.EncodeError) Error {
     };
 }
 
+/// Whether two caller-supplied regions share a byte.
+///
+/// Pointer arithmetic rather than a content comparison, because the question is
+/// where the bytes are and not what is in them. An empty region overlaps
+/// nothing, because its end is its start, which is why `init` refuses an empty
+/// region on its own account rather than through this.
+///
+/// A shared byte is fatal rather than untidy because the escape offset
+/// `json.Reader` keeps is per reader and not per buffer. A second reader
+/// decoding a string with an escape starts at offset 0 again, so it writes
+/// over whatever the first left there: a value the first borrowed is compared
+/// with bytes the second produced, and the answer is wrong rather than an error.
+///
+/// `init` is not the only caller. A session layer that hands a handler two of
+/// its own regions checks them through here too, so one rule covers the
+/// connection's pair and a session's.
+pub fn overlaps(a: []const u8, b: []const u8) bool {
+    if (a.len == 0 or b.len == 0) return false;
+    const a_start = @intFromPtr(a.ptr);
+    const b_start = @intFromPtr(b.ptr);
+    return a_start < b_start + b.len and b_start < a_start + a.len;
+}
+
 /// One outstanding request awaiting its answer.
 pub const Slot = struct {
     id: i64 = 0,
@@ -228,12 +294,29 @@ pub const Conn = struct {
     framer: framing.Framer,
     slots: []Slot,
     handler: Handler,
-    /// Scratch for decoding an inbound frame. Separate from `handler_scratch`
-    /// because a decoded message borrows the first while the handler is still
-    /// using the second; sharing one buffer would have the handler overwrite
-    /// the message it was dispatched with.
+    /// The region an inbound frame is decoded into, and the region a handler
+    /// is handed to decode one into.
+    ///
+    /// It is the region a handler's borrows live in: a decoded method name, an
+    /// unescaped option id, a `Request` sliced out of the frame. None of them
+    /// outlives the handler, and all of them are invalid the moment the next
+    /// frame is decoded here.
+    ///
+    /// It must not share a byte with `answer`. The escape offset `json.Reader`
+    /// keeps is per reader and not per buffer, so a handler decoding a string
+    /// with an escape starts at offset 0 again and writes over whatever the
+    /// reader that decoded the request left there: an answer carrying an escape
+    /// lands exactly on a name the request borrowed from this buffer, and the
+    /// comparison that follows is between a value and itself.
     decode_scratch: []u8,
-    handler_scratch: []u8,
+    /// The region a handler writes its answer into, and the region this
+    /// connection writes a refusal into.
+    ///
+    /// A handler is handed this to write into, so nothing it decoded into
+    /// `decode_scratch` is borrowed from here and nothing written here can
+    /// land on a value the handler is still reading. Must not share a byte
+    /// with `decode_scratch`; `init` refuses a pair that does.
+    answer: []u8,
 
     /// Monotonic, never reused, so a late answer to a dead request cannot be
     /// mistaken for a live one.
@@ -266,15 +349,40 @@ pub const Conn = struct {
 
     pub const Config = struct {
         /// Assembles frames. Must be large enough for the largest message the
-        /// peer may send.
+        /// peer may send, and must not have no room at all.
         frame_buffer: []u8,
-        /// One slot per call that may be outstanding at once.
+        /// One slot per call that may be outstanding at once, and not none.
         pending: []Slot,
+        /// Where a frame is decoded into. See [`Conn.decode_scratch`].
         decode_scratch: []u8,
-        handler_scratch: []u8,
+        /// Where an answer is written. Must not share a byte with
+        /// `decode_scratch`. See [`Conn.answer`].
+        answer: []u8,
     };
 
-    pub fn init(io: Io, reader: *Io.Reader, writer: *Io.Writer, config: Config) Conn {
+    /// A connection over `config`'s buffers, or the reason it cannot be one.
+    ///
+    /// The two refusals are wiring faults rather than wire conditions, and
+    /// `init` is the only place that can see them: by the time a peer has sent
+    /// anything, a buffer with no room and a pair of regions that overlap look
+    /// the same as a peer being difficult.
+    pub fn init(io: Io, reader: *Io.Reader, writer: *Io.Writer, config: Config) Error!Conn {
+        // Refused before anything is written, so a caller's pending table is
+        // left exactly as it was handed over rather than half-initialised by a
+        // connection that was never built.
+        //
+        // A buffer with no room is a connection that cannot work, and the first
+        // message or the first call is a poor place to hear about it. Named one
+        // at a time so the error says which buffer the caller sized wrong.
+        if (config.frame_buffer.len == 0) return error.UnusableBuffer;
+        if (config.pending.len == 0) return error.UnusableBuffer;
+        if (config.decode_scratch.len == 0) return error.UnusableBuffer;
+        if (config.answer.len == 0) return error.UnusableBuffer;
+        // Two regions that share a byte are the one thing this pair of names
+        // exists to make impossible, and the one fault a caller cannot see: the
+        // connection runs, the answers come back, and they are wrong.
+        if (overlaps(config.decode_scratch, config.answer)) return error.OverlappingBuffers;
+
         // Every slot starts free.
         //
         // The array is storage this type now owns, and a caller that declares
@@ -293,7 +401,7 @@ pub const Conn = struct {
             .slots = config.pending,
             .handler = .{},
             .decode_scratch = config.decode_scratch,
-            .handler_scratch = config.handler_scratch,
+            .answer = config.answer,
         };
     }
 
@@ -453,7 +561,7 @@ pub const Conn = struct {
         };
         switch (message.kind) {
             .response => self.deliver(message),
-            .request, .notification => self.dispatch(frame, message),
+            .request, .notification => self.dispatch(frame),
         }
     }
 
@@ -505,8 +613,21 @@ pub const Conn = struct {
     }
 
     /// Answer a request from the peer, or note a notification.
-    fn dispatch(self: *Conn, frame: []const u8, message: jsonrpc.Message) void {
-        const answer = self.handler.invoke(frame, self.handler_scratch) catch |err| {
+    fn dispatch(self: *Conn, frame: []const u8) void {
+        // The regions are the connection's own, in the order the handler sees
+        // them, and the two carry the same names everywhere a handler is
+        // called. Two places invoke one: this, and `http.Server.answer` in
+        // `http.zig`, which hands over the two buffers from its own set. Ten
+        // files supply one, and a change to this signature breaks every one of
+        // them: `stdio.zig`, `mcp_session.zig`, `acp_session.zig`,
+        // `bridge_session.zig`, `runtime_demo.zig`, `sessions_demo.zig`,
+        // `http_demo.zig`, `http.zig`'s own test driver, and
+        // `test/loopback_test.zig`. That list is why it is written down.
+        //
+        // `decode_scratch` is the region the reader has just classified the
+        // frame in, and lending it out is safe because the classification is
+        // made by then and nothing here reads the message again.
+        const answer = self.handler.invoke(frame, self.decode_scratch, self.answer) catch |err| {
             // A handler that failed did not decline the request. It tried to
             // answer and could not, and silence would leave the peer waiting on
             // a request that already arrived, so a request is answered with the
@@ -514,7 +635,7 @@ pub const Conn = struct {
             // own hand takes the connection with it, because nothing else
             // written to it would arrive either.
             if (err == error.Transport) self.shutdown();
-            self.refuse(message);
+            self.refuse(frame);
             return;
         };
         const body = answer orelse return;
@@ -534,23 +655,26 @@ pub const Conn = struct {
     /// decision a builder cannot make: a handler that failed is this peer's own
     /// internal error, and a notification has no id to answer on, so one it
     /// failed on is dropped exactly as one it declined is.
-    fn refuse(self: *Conn, message: jsonrpc.Message) void {
-        if (message.kind != .request) return;
-        // A request decoded by `route` carries a method, and `decodeRequest`
-        // would have refused the message without one. Written out rather than
-        // unwrapped because unwrapping is a trap on a path the kind check has
-        // already narrowed, not closed.
-        const request: jsonrpc.Request = .{
-            .id = message.id orelse return,
-            .method = message.method orelse return,
-            .params = message.params,
-        };
-        // The handler failed, so nothing it wrote into the scratch is still
-        // borrowed and the envelope can be built over it.
+    ///
+    /// The frame is decoded again here rather than read from the `Message` the
+    /// reader already holds, because the handler has just been handed
+    /// `decode_scratch` to decode into and whatever it left there is not this
+    /// function's to trust. The frame is still the framer's, and nothing is
+    /// borrowed: a handler that returned an error borrowed nothing.
+    ///
+    /// The refusal goes into `answer`, the region the handler was handed to
+    /// write into, so it cannot land on a value the handler was still reading.
+    /// That is the whole reason the two regions are separate and the reason is
+    /// invisible here: with one region, this line wrote over the id it was
+    /// about to echo.
+    fn refuse(self: *Conn, frame: []const u8) void {
+        // A notification has no id to answer on, so `decodeRequest` refuses it
+        // and nothing is written, exactly as for a handler that declined one.
+        const request = jsonrpc.decodeRequest(frame, self.decode_scratch) catch return;
         const body = errorResponse(request, .{
             .code = @intFromEnum(jsonrpc.StandardError.internal_error),
             .message = "this peer could not serve the request",
-        }, self.handler_scratch) catch return;
+        }, self.answer) catch return;
         self.writeFrame(body) catch {};
     }
 
@@ -769,19 +893,38 @@ const Recorder = struct {
 const FixedAnswer = struct {
     calls: usize = 0,
 
-    fn handle(ctx: ?*anyopaque, _: []const u8, scratch: []u8) Error!?[]const u8 {
+    /// Writes a fixed envelope into the region it was handed to write into, and
+    /// decodes nothing, which is the shape a handler is meant to have. The
+    /// region it writes is named `answer`; `decode_scratch` is left unnamed
+    /// because nothing here touches it.
+    fn handle(ctx: ?*anyopaque, _: []const u8, _: []u8, answer: []u8) Error!?[]const u8 {
         const self: *FixedAnswer = @ptrCast(@alignCast(ctx.?));
         self.calls += 1;
         const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
-        @memcpy(scratch[0..body.len], body);
-        return scratch[0..body.len];
+        @memcpy(answer[0..body.len], body);
+        return answer[0..body.len];
     }
 };
 
 /// A handler that cannot answer, for the case where the peer has to be told.
 const Failing = struct {
-    fn handle(_: ?*anyopaque, _: []const u8, _: []u8) Error!?[]const u8 {
+    fn handle(_: ?*anyopaque, _: []const u8, _: []u8, _: []u8) Error!?[]const u8 {
         return error.Transport;
+    }
+};
+
+/// A handler that overwrites the region it decoded into and then fails, which
+/// is the shape the two regions were split to survive.
+///
+/// The scribble goes the other way from the fault the split fixes: a handler
+/// used to write its answer over the name it was comparing, and this one
+/// writes over the region the connection decoded the frame into. Either way the
+/// connection has to build its refusal from something the handler did not
+/// touch, because it cannot know how far a failing handler got.
+const Scrambler = struct {
+    fn handle(_: ?*anyopaque, _: []const u8, decode_scratch: []u8, _: []u8) Error!?[]const u8 {
+        @memset(decode_scratch, 'x');
+        return error.Framing;
     }
 };
 
@@ -823,14 +966,14 @@ test "a pending table of garbage is a table of free slots" {
 
     var frame_buffer: [64]u8 = undefined;
     var decode_scratch: [64]u8 = undefined;
-    var handler_scratch: [64]u8 = undefined;
+    var answer: [64]u8 = undefined;
     var reader = Io.Reader.fixed("");
     var writer = Io.Writer.fixed(&.{});
-    const connection = Conn.init(testing.io, &reader, &writer, .{
+    const connection = try Conn.init(testing.io, &reader, &writer, .{
         .frame_buffer = &frame_buffer,
         .pending = &pending,
         .decode_scratch = &decode_scratch,
-        .handler_scratch = &handler_scratch,
+        .answer = &answer,
     });
 
     try testing.expectEqual(@as(usize, 3), connection.slots.len);
@@ -847,7 +990,7 @@ test "a read of nothing is not the end of the stream" {
     var frame_buffer: [512]u8 = undefined;
     var pending: [2]Slot = undefined;
     var decode_scratch: [256]u8 = undefined;
-    var handler_scratch: [256]u8 = undefined;
+    var answer: [256]u8 = undefined;
     var out_buffer: [256]u8 = undefined;
     var source = Scripted{
         .io = testing.io,
@@ -855,11 +998,11 @@ test "a read of nothing is not the end of the stream" {
         .silent_reads = 1,
     };
     var writer = Io.Writer.fixed(&out_buffer);
-    var connection = Conn.init(testing.io, &source.reader, &writer, .{
+    var connection = try Conn.init(testing.io, &source.reader, &writer, .{
         .frame_buffer = &frame_buffer,
         .pending = &pending,
         .decode_scratch = &decode_scratch,
-        .handler_scratch = &handler_scratch,
+        .answer = &answer,
     });
     connection.setHandler(.{ .ctx = &state, .call = FixedAnswer.handle });
 
@@ -885,16 +1028,16 @@ test "a notification whose params carry a newline is a framing fault, and the co
     var frame_buffer: [256]u8 = undefined;
     var pending: [2]Slot = undefined;
     var decode_scratch: [128]u8 = undefined;
-    var handler_scratch: [128]u8 = undefined;
+    var answer: [128]u8 = undefined;
     var out: [128]u8 = undefined;
     var out_buffer: [256]u8 = undefined;
     var reader = Io.Reader.fixed("");
     var writer = Io.Writer.fixed(&out_buffer);
-    var connection = Conn.init(testing.io, &reader, &writer, .{
+    var connection = try Conn.init(testing.io, &reader, &writer, .{
         .frame_buffer = &frame_buffer,
         .pending = &pending,
         .decode_scratch = &decode_scratch,
-        .handler_scratch = &handler_scratch,
+        .answer = &answer,
     });
 
     try testing.expectError(
@@ -925,17 +1068,17 @@ test "a notification that did not go out is reported, and it takes the connectio
     var frame_buffer: [256]u8 = undefined;
     var pending: [2]Slot = undefined;
     var decode_scratch: [128]u8 = undefined;
-    var handler_scratch: [128]u8 = undefined;
+    var answer: [128]u8 = undefined;
     var out: [128]u8 = undefined;
     var result: [128]u8 = undefined;
     var reader = Io.Reader.fixed("");
     // A writer with nowhere to put a byte: every write fails.
     var writer = Io.Writer.failing;
-    var connection = Conn.init(testing.io, &reader, &writer, .{
+    var connection = try Conn.init(testing.io, &reader, &writer, .{
         .frame_buffer = &frame_buffer,
         .pending = &pending,
         .decode_scratch = &decode_scratch,
-        .handler_scratch = &handler_scratch,
+        .answer = &answer,
     });
 
     try testing.expectError(
@@ -960,7 +1103,7 @@ test "a peer error too large for the result buffer is reported, not read as an a
     var frame_buffer: [512]u8 = undefined;
     var pending: [2]Slot = undefined;
     var decode_scratch: [256]u8 = undefined;
-    var handler_scratch: [256]u8 = undefined;
+    var answer: [256]u8 = undefined;
     var out: [256]u8 = undefined;
     // Far too small for the error object the peer sends.
     var result: [8]u8 = undefined;
@@ -973,11 +1116,11 @@ test "a peer error too large for the result buffer is reported, not read as an a
         .gate = &gate,
     };
     var recorder = Recorder{ .io = io, .sent = &sent, .gate = &gate };
-    var connection = Conn.init(io, &source.reader, &recorder.writer, .{
+    var connection = try Conn.init(io, &source.reader, &recorder.writer, .{
         .frame_buffer = &frame_buffer,
         .pending = &pending,
         .decode_scratch = &decode_scratch,
-        .handler_scratch = &handler_scratch,
+        .answer = &answer,
     });
     var caller = Caller{ .connection = &connection, .result = &result, .out = &out };
 
@@ -1012,7 +1155,7 @@ test "a peer error is a refusal, and `failed` is what says so" {
     var frame_buffer: [512]u8 = undefined;
     var pending: [2]Slot = undefined;
     var decode_scratch: [256]u8 = undefined;
-    var handler_scratch: [256]u8 = undefined;
+    var answer: [256]u8 = undefined;
     var out: [256]u8 = undefined;
     // Big enough for the serialised error object, so the answer comes back
     // rather than being refused for want of room.
@@ -1026,11 +1169,11 @@ test "a peer error is a refusal, and `failed` is what says so" {
         .gate = &gate,
     };
     var recorder = Recorder{ .io = io, .sent = &sent, .gate = &gate };
-    var connection = Conn.init(io, &source.reader, &recorder.writer, .{
+    var connection = try Conn.init(io, &source.reader, &recorder.writer, .{
         .frame_buffer = &frame_buffer,
         .pending = &pending,
         .decode_scratch = &decode_scratch,
-        .handler_scratch = &handler_scratch,
+        .answer = &answer,
     });
     var caller = Caller{ .connection = &connection, .result = &result, .out = &out };
 
@@ -1039,13 +1182,13 @@ test "a peer error is a refusal, and `failed` is what says so" {
     group.async(io, pumpTask, .{&connection});
     group.await(io) catch {};
 
-    const answer = try caller.answer.?;
-    try testing.expect(answer.failed());
-    try testing.expectEqual(@as(?i32, -32601), answer.error_code);
+    const replied = try caller.answer.?;
+    try testing.expect(replied.failed());
+    try testing.expectEqual(@as(?i32, -32601), replied.error_code);
     // The body carries the error object and not a result, which is precisely
     // why reading it without `failed` is the mistake this accessor removes.
-    try testing.expect(std.mem.indexOf(u8, answer.body, "\"code\":-32601") != null);
-    try testing.expect(std.mem.indexOf(u8, answer.body, "result") == null);
+    try testing.expect(std.mem.indexOf(u8, replied.body, "\"code\":-32601") != null);
+    try testing.expect(std.mem.indexOf(u8, replied.body, "result") == null);
 
     // The other end of the rule: a call the peer answered is not a refusal,
     // and no code on a success is a failure.
@@ -1060,7 +1203,7 @@ test "a request whose handler failed is answered with an error" {
     var frame_buffer: [512]u8 = undefined;
     var pending: [2]Slot = undefined;
     var decode_scratch: [256]u8 = undefined;
-    var handler_scratch: [256]u8 = undefined;
+    var answer: [256]u8 = undefined;
     var out_buffer: [512]u8 = undefined;
     var source = Scripted{
         .io = testing.io,
@@ -1068,11 +1211,11 @@ test "a request whose handler failed is answered with an error" {
             "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n",
     };
     var writer = Io.Writer.fixed(&out_buffer);
-    var connection = Conn.init(testing.io, &source.reader, &writer, .{
+    var connection = try Conn.init(testing.io, &source.reader, &writer, .{
         .frame_buffer = &frame_buffer,
         .pending = &pending,
         .decode_scratch = &decode_scratch,
-        .handler_scratch = &handler_scratch,
+        .answer = &answer,
     });
     connection.setHandler(.{ .call = Failing.handle });
 
@@ -1103,7 +1246,7 @@ test "a frame the frame buffer cannot hold ends the connection, and a call says 
     var frame_buffer: [64]u8 = undefined;
     var pending: [2]Slot = undefined;
     var decode_scratch: [128]u8 = undefined;
-    var handler_scratch: [128]u8 = undefined;
+    var answer: [128]u8 = undefined;
     var out: [256]u8 = undefined;
     var result: [256]u8 = undefined;
     var sent: [256]u8 = undefined;
@@ -1111,11 +1254,11 @@ test "a frame the frame buffer cannot hold ends the connection, and a call says 
     // frame buffer can hold.
     var source = Scripted{ .io = io, .bytes = "x" ** 200 };
     var recorder = Recorder{ .io = io, .sent = &sent };
-    var connection = Conn.init(io, &source.reader, &recorder.writer, .{
+    var connection = try Conn.init(io, &source.reader, &recorder.writer, .{
         .frame_buffer = &frame_buffer,
         .pending = &pending,
         .decode_scratch = &decode_scratch,
-        .handler_scratch = &handler_scratch,
+        .answer = &answer,
     });
     var caller = Caller{ .connection = &connection, .result = &result, .out = &out };
 
@@ -1293,5 +1436,123 @@ test "a message the grammar cannot carry is written through, not refused" {
         "{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":-32601," ++
             "\"message\":\"no such method\",\"data\":{\"why\":\"unknown\"}}}",
         carried,
+    );
+}
+
+test "a buffer with no room is refused before the first message" {
+    // A zero frame buffer refuses every frame, a zero pending table fails every
+    // call, and a zero decode or answer region fails the first thing that needs
+    // it. None of those is a wire condition, and by the time a peer has spoken
+    // each of them looks like a peer being difficult.
+    var frame_buffer: [64]u8 = undefined;
+    var pending: [2]Slot = undefined;
+    var decode_scratch: [64]u8 = undefined;
+    var answer: [64]u8 = undefined;
+    var reader = Io.Reader.fixed("");
+    var writer = Io.Writer.fixed(&.{});
+
+    var config = Conn.Config{
+        .frame_buffer = &frame_buffer,
+        .pending = &pending,
+        .decode_scratch = &decode_scratch,
+        .answer = &answer,
+    };
+
+    // One region at a time and restored after each, so the refusal is about
+    // wiring rather than about a peer and the test says which buffer the
+    // caller sized wrong.
+    config.frame_buffer = &.{};
+    try testing.expectError(error.UnusableBuffer, Conn.init(testing.io, &reader, &writer, config));
+    config.frame_buffer = &frame_buffer;
+    config.pending = &.{};
+    try testing.expectError(error.UnusableBuffer, Conn.init(testing.io, &reader, &writer, config));
+    config.pending = &pending;
+    config.decode_scratch = &.{};
+    try testing.expectError(error.UnusableBuffer, Conn.init(testing.io, &reader, &writer, config));
+    config.decode_scratch = &decode_scratch;
+    config.answer = &.{};
+    try testing.expectError(error.UnusableBuffer, Conn.init(testing.io, &reader, &writer, config));
+}
+
+test "two regions that share a byte are refused before the first message" {
+    // The fault the pair of names exists to make impossible, and the one fault
+    // a caller cannot see: the connection runs, answers come back, and they are
+    // wrong. Nothing reports it but the caller's own review of the wiring.
+    var regions: [128]u8 = undefined;
+    var frame_buffer: [64]u8 = undefined;
+    var pending: [2]Slot = undefined;
+    var reader = Io.Reader.fixed("");
+    var writer = Io.Writer.fixed(&.{});
+
+    // The same buffer twice, which is what a caller wiring this by accident
+    // writes first.
+    try testing.expectError(error.OverlappingBuffers, Conn.init(
+        testing.io,
+        &reader,
+        &writer,
+        .{
+            .frame_buffer = &frame_buffer,
+            .pending = &pending,
+            .decode_scratch = &regions,
+            .answer = &regions,
+        },
+    ));
+    // And two regions carved out of one, where the overlap is only a matter of
+    // where the cuts fell.
+    try testing.expectError(error.OverlappingBuffers, Conn.init(
+        testing.io,
+        &reader,
+        &writer,
+        .{
+            .frame_buffer = &frame_buffer,
+            .pending = &pending,
+            .decode_scratch = regions[0..64],
+            .answer = regions[32..],
+        },
+    ));
+    // Two regions that abut share no byte, and a connection built from them is
+    // the ordinary case rather than a near miss.
+    _ = try Conn.init(testing.io, &reader, &writer, .{
+        .frame_buffer = &frame_buffer,
+        .pending = &pending,
+        .decode_scratch = regions[0..64],
+        .answer = regions[64..],
+    });
+}
+
+test "a refusal is built from the frame, not from what a failed handler left" {
+    // The handler is handed `decode_scratch` to decode into, and it is the
+    // region this connection decoded the frame in as well, so the bytes a
+    // failing handler leaves there are not the connection's to trust. A refusal
+    // that read the id out of them would echo whatever the handler overwrote.
+    // The id here carries an escape, so a refusal built from the wrong region is
+    // wrong in a way a plain integer id would hide.
+    var frame_buffer: [512]u8 = undefined;
+    var pending: [2]Slot = undefined;
+    var decode_scratch: [256]u8 = undefined;
+    var answer: [256]u8 = undefined;
+    var out_buffer: [512]u8 = undefined;
+    var source = Scripted{
+        .io = testing.io,
+        .bytes = "{\"jsonrpc\":\"2.0\",\"id\":\"a\\\"b\",\"method\":\"tools/list\"}\n",
+    };
+    var writer = Io.Writer.fixed(&out_buffer);
+    var connection = try Conn.init(testing.io, &source.reader, &writer, .{
+        .frame_buffer = &frame_buffer,
+        .pending = &pending,
+        .decode_scratch = &decode_scratch,
+        .answer = &answer,
+    });
+    connection.setHandler(.{ .call = Scrambler.handle });
+
+    connection.pump();
+
+    // The id is the frame's, escaped as the frame escaped it, and the refusal
+    // went into the region the handler was handed to write into, so it could
+    // not have landed on anything the handler was reading.
+    try testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":\"a\\\"b\",\"error\":{\"code\":-32603," ++
+            "\"message\":\"this peer could not serve the request\"}}\n",
+        writer.buffered(),
     );
 }

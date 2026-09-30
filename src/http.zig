@@ -1080,10 +1080,20 @@ pub const Server = struct {
         head_scratch: []u8,
         /// Where the request body is read.
         body: []u8,
-        /// Backs the body decode.
+        /// Backs the body decode in `checkPost`, which is the transport's own
+        /// decode scratch.
         body_scratch: []u8,
-        /// Handed to the handler that answers a request.
-        handler_scratch: []u8,
+        /// Backs the decode a handler performs on the request body.
+        ///
+        /// A separate array from `answer`, and a separate array from
+        /// `body_scratch` as well. `Post.name` borrows `body_scratch` when the
+        /// body's own string had to be unescaped, and the handler runs after
+        /// the `Post` exists, so handing the handler the transport's scratch
+        /// would pull the name out from under a caller that still holds the
+        /// `Post`.
+        decode_scratch: []u8,
+        /// Receives the answer a handler composes, returned borrowed from it.
+        answer: []u8,
         /// Chunked-transfer scratch, owned by `std.http`. The body reader
         /// writes through it, so it must not be empty.
         transfer: []u8,
@@ -1104,7 +1114,15 @@ pub const Server = struct {
     /// There is no `Io` parameter because nothing here blocks on anything but
     /// the reader and the writer: every wait this transport does is a read or
     /// a write, and both already carry the interface.
+    ///
+    /// `decode_scratch` and `answer` are checked here to be different memory.
+    /// They reach the handler as two arguments, so one array behind both of
+    /// them is a caller fault that would put the answer over the decode it is
+    /// being written from, and this is the one place that can see both before
+    /// a request is on the wire. The check is an assert rather than an error
+    /// because a peer cannot cause it: the bytes are the caller's own.
     pub fn init(in: *Io.Reader, out: *Io.Writer, buffers: Buffers) Server {
+        std.debug.assert(!conn.overlaps(buffers.decode_scratch, buffers.answer));
         return .{ .http = std.http.Server.init(in, out), .buffers = buffers };
     }
 
@@ -1218,7 +1236,22 @@ pub const Server = struct {
         shape: ResponseShape,
     ) Error!std.http.Status {
         const dispatch = handler.call orelse return error.NoAnswer;
-        const response = try dispatch(handler.ctx, post.body, self.buffers.handler_scratch);
+        // Two regions, and they are the two the caller sized as separate
+        // arrays: the handler decodes into the first and composes its answer
+        // into the second, so nothing it is comparing can land under the
+        // bytes it is writing. [`Server.init`] is what proves they are
+        // different memory, and this call site is where a reader sees that
+        // they are handed over separately rather than carved from one buffer.
+        // The frame it reads is a third region it only reads, and what is read
+        // here after the call is `post.notification` and `post.accept`, neither
+        // of which borrows a region, so a handler that fills both of the
+        // regions it was given still leaves the answer intact.
+        const response = try dispatch(
+            handler.ctx,
+            post.body,
+            self.buffers.decode_scratch,
+            self.buffers.answer,
+        );
 
         if (post.notification) {
             try self.respondAccepted();
@@ -1797,6 +1830,12 @@ const Endpoint = struct {
     }
 };
 
+/// How much one message read off a reply may occupy.
+///
+/// Named because two of these regions are live at once, so a caller that
+/// expects a bigger message has one place to change.
+const message_size: usize = 4096;
+
 /// Every buffer one side of an exchange needs.
 ///
 /// Caller-owned, so a leak in the transport shows up as a leak in the test
@@ -1812,14 +1851,22 @@ const Side = struct {
     head_scratch: [256]u8 = undefined,
     body: [4096]u8 = undefined,
     body_scratch: [1024]u8 = undefined,
-    handler_scratch: [1024]u8 = undefined,
+    decode_scratch: [1024]u8 = undefined,
+    answer: [1024]u8 = undefined,
     transfer: [64]u8 = undefined,
     event: [4096]u8 = undefined,
     stream_buffer: [4096]u8 = undefined,
     server: Server = undefined,
 
     head: [16]http.Header = undefined,
-    out: [8192]u8 = undefined,
+    /// The message read first, or a whole response body.
+    out: [message_size]u8 = undefined,
+    /// The message read after that one.
+    ///
+    /// A second field and not a second half of `out`, because both are live at
+    /// once: the first message is still readable when the second arrives, and
+    /// a caller reads both of them afterwards.
+    next_out: [message_size]u8 = undefined,
     decode: [1024]u8 = undefined,
 };
 
@@ -1829,9 +1876,14 @@ const Answer = struct {
     method_buffer: [64]u8 = undefined,
     method_len: usize = 0,
 
-    fn handle(ctx: ?*anyopaque, body: []const u8, scratch: []u8) conn.Error!?[]const u8 {
+    fn handle(
+        ctx: ?*anyopaque,
+        frame: []const u8,
+        decode_scratch: []u8,
+        answer: []u8,
+    ) conn.Error!?[]const u8 {
         const self: *Answer = @ptrCast(@alignCast(ctx.?));
-        const message = jsonrpc.decode(body, scratch) catch return null;
+        const message = jsonrpc.decode(frame, decode_scratch) catch return null;
         self.calls += 1;
         const name = message.method orelse return null;
         const n = @min(name.text.len, self.method_buffer.len);
@@ -1840,8 +1892,15 @@ const Answer = struct {
         if (message.id == null) return null;
 
         // The reply is a real JSON-RPC envelope carrying the request's own id,
-        // which is the only thing a client can match an answer by.
-        var writer = json.Writer.init(scratch);
+        // which is the only thing a client can match an answer by. The two
+        // regions are the caller's separate arrays, so writing the envelope
+        // into `answer` cannot reach the decode above it. That is now
+        // structural rather than a matter of the order of these statements, and
+        // the order is kept anyway: a handler that reads everything it borrows
+        // before it writes is correct whichever way the two regions are laid
+        // out, and one that is correct only one way is a handler a reader has
+        // to check rather than trust.
+        var writer = json.Writer.init(answer);
         writer.slice("{\"jsonrpc\":\"2.0\",\"id\":") catch return null;
         var id_buffer: [24]u8 = undefined;
         const id = switch (message.id.?) {
@@ -1908,7 +1967,8 @@ const Serve = struct {
                 .head_scratch = &self.side.head_scratch,
                 .body = &self.side.body,
                 .body_scratch = &self.side.body_scratch,
-                .handler_scratch = &self.side.handler_scratch,
+                .decode_scratch = &self.side.decode_scratch,
+                .answer = &self.side.answer,
                 .transfer = &self.side.transfer,
                 .event = &self.side.event,
                 .stream = &self.side.stream_buffer,
@@ -2041,13 +2101,14 @@ const Listen = struct {
             self.content_type_len = n;
         }
 
-        // Two halves of one buffer, so a message read second does not land on
-        // top of the first.
+        // A region of its own per read, because both messages stay live: the
+        // lengths below go back to a test that reads the first message's bytes
+        // again after the second one has arrived.
         while (true) {
-            const out = if (self.messages == 0)
-                self.side.out[0..4096]
+            const out: []u8 = if (self.messages == 0)
+                &self.side.out
             else
-                self.side.out[4096..8192];
+                &self.side.next_out;
             const message = exchange.nextMessage(out) catch {
                 self.failed.* = true;
                 return;
@@ -2182,7 +2243,8 @@ const Subscribe = struct {
                 .head_scratch = &self.side.head_scratch,
                 .body = &self.side.body,
                 .body_scratch = &self.side.body_scratch,
-                .handler_scratch = &self.side.handler_scratch,
+                .decode_scratch = &self.side.decode_scratch,
+                .answer = &self.side.answer,
                 .transfer = &self.side.transfer,
                 .event = &self.side.event,
                 .stream = &self.side.stream_buffer,
@@ -2200,10 +2262,14 @@ const Subscribe = struct {
             self.failed.* = true;
             return;
         };
+        // The two regions are the server's own and are separate arrays, the
+        // same pair `Server.answer` hands over, so the envelope this writes is
+        // not written over the decode it was written from.
         const result = dispatch(
             self.handler.ctx,
             post.body,
-            self.side.server.buffers.handler_scratch,
+            self.side.server.buffers.decode_scratch,
+            self.side.server.buffers.answer,
         ) catch {
             self.failed.* = true;
             return;
@@ -2642,7 +2708,8 @@ test "a GET to the endpoint is 405, because this revision serves POST only" {
                     .head_scratch = &self.side.head_scratch,
                     .body = &self.side.body,
                     .body_scratch = &self.side.body_scratch,
-                    .handler_scratch = &self.side.handler_scratch,
+                    .decode_scratch = &self.side.decode_scratch,
+                    .answer = &self.side.answer,
                     .transfer = &self.side.transfer,
                     .event = &self.side.event,
                     .stream = &self.side.stream_buffer,
@@ -2792,7 +2859,7 @@ test "a stream keeps delivering after the result, which is what a subscription i
     );
     try testing.expectEqualStrings(
         notifications[0],
-        client_side.out[4096..][0..listen.second_len],
+        client_side.next_out[0..listen.second_len],
     );
 }
 
@@ -2849,7 +2916,8 @@ test "a body larger than the caller's buffer is refused, not grown for" {
                     .head_scratch = &self.side.head_scratch,
                     .body = &self.side.body,
                     .body_scratch = &self.side.body_scratch,
-                    .handler_scratch = &self.side.handler_scratch,
+                    .decode_scratch = &self.side.decode_scratch,
+                    .answer = &self.side.answer,
                     .transfer = &self.side.transfer,
                     .event = &self.side.event,
                     .stream = &self.side.stream_buffer,

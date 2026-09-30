@@ -49,28 +49,28 @@ const call_result =
 const ToolServer = struct {
     calls: usize = 0,
 
-    fn handle(ctx: ?*anyopaque, frame: []const u8, scratch: []u8) conn.Error!?[]const u8 {
+    fn handle(
+        ctx: ?*anyopaque,
+        frame: []const u8,
+        decode_scratch: []u8,
+        answer: []u8,
+    ) conn.Error!?[]const u8 {
         const self: *ToolServer = @ptrCast(@alignCast(ctx.?));
-        // The connection lends one handler scratch to every request, and two
-        // things are live in it at once. The decoded request borrows the region
-        // the decode writes into, and the answer borrows a second while it is
-        // written from the first. One region cannot hold both: the writer's
-        // first bytes land on the method name the branches below are about to
-        // compare, and a peer that escaped its method name is enough to make
-        // that happen, because `jsonrpc.decode` unescapes into the region it is
-        // given rather than borrowing from the frame.
+        // The connection lends two regions to every request, and two things
+        // are live at once: the decoded request and the answer. The decode
+        // writes into the first, the answer is composed into the second, and
+        // a handler need not check which one it is holding.
         //
-        // The front region dies with this call. The back one is what the
-        // connection writes out before it lends the scratch to the next
-        // request, so the answer has to be the second region written.
-        const half = scratch.len / 2;
-        const request_scratch = scratch[0..half];
-        const answer = scratch[half..];
-
-        // A request and nothing else: a notification and a response are not
-        // `Request` values at all, so there is nothing here to hand a builder
-        // that must not be answered.
-        const request = jsonrpc.decodeRequest(frame, request_scratch) catch return null;
+        // One region could not carry both. `jsonrpc.decode` unescapes into the
+        // region it is given rather than borrowing from the frame, and the
+        // escape offset `json.Reader` keeps is per reader and not per buffer,
+        // so a peer that escaped its method name is enough to make the two
+        // collide: the writer's first bytes land on the name the branches
+        // below are about to compare.
+        //
+        // Both regions die with this call. The connection writes the answer out
+        // before it lends either of them to the next request.
+        const request = jsonrpc.decodeRequest(frame, decode_scratch) catch return null;
         self.calls += 1;
 
         if (std.mem.eql(u8, request.method.text, "tools/list")) {
@@ -98,10 +98,12 @@ const ToolServer = struct {
         // can tell which one was refused.
         //
         // The message is the one thing built here rather than handed to a
-        // builder whole, so it is the one thing that does not need a region of
-        // the scratch: `errorResponse` reads it and it is dead before this
-        // function returns, and what the connection writes out is the answer
-        // beside it. A local is the honest home for text with that lifetime.
+        // builder whole, and the one thing with nowhere to live. `answer` is
+        // what `errorResponse` writes into, so a message kept there is the text
+        // its own writer is about to overwrite; `decode_scratch` may be holding
+        // the method name itself, unescaped there rather than borrowed from the
+        // frame. So it is a local, which needs to outlive neither: the builder
+        // has read it by the time this function returns.
         var message_buffer: [256]u8 = undefined;
         var text = json.Writer.init(&message_buffer);
         text.slice("no handler for ") catch return standard_refusal(request, answer);
@@ -143,18 +145,22 @@ const Side = struct {
     /// releases whatever descriptor the second one is given.
     release_in_pump: bool = false,
 
+    /// Open a side over `stream`, or report why there is no connection to
+    /// open. `init` refuses a region with no room and a pair that shares a
+    /// byte, and both are wiring faults a caller sees here rather than as a
+    /// wrong answer on the wire.
     fn open(
         self: *Side,
         io: Io,
         group: *Io.Group,
         stream: Io.net.Stream,
         handler: ?conn.Handler,
-    ) void {
+    ) conn.Error!void {
         self.io = io;
         self.stream = stream;
         self.reader = Io.net.Stream.Reader.init(stream, io, &self.reader_buffer);
         self.writer = Io.net.Stream.Writer.init(stream, io, &self.writer_buffer);
-        self.connection = conn.Conn.init(
+        self.connection = try conn.Conn.init(
             io,
             &self.reader.interface,
             &self.writer.interface,
@@ -228,10 +234,17 @@ const Peer = struct {
         // client hangs up, so this task has nothing left to do and the pump is
         // the last task holding the accepted descriptor.
         self.side.release_in_pump = true;
+        // A side that could not be opened hangs its end up rather than
+        // returning quietly: the pump never started, so nothing else would
+        // close the accepted descriptor and the client would sit in `call`
+        // waiting for a server that is no longer there.
         self.side.open(self.io, self.group, stream, .{
             .ctx = self.handler,
             .call = ToolServer.handle,
-        });
+        }) catch {
+            self.side.hangUp();
+            return;
+        };
     }
 };
 
@@ -262,13 +275,18 @@ const Client = struct {
             self.failure = "the socket would not connect";
             return;
         };
-        self.side.open(self.io, self.group, stream, null);
         // Hung up on every path out of this task, so the peer's pump sees end
         // of file and the group drains. A `defer` rather than a last line,
         // because the paths that skipped that line were the ones that failed:
         // the client returned with a flag set, its own pump stayed blocked in
         // a read on a descriptor nobody closed, and the join never returned.
+        // Ahead of the open for the same reason: a side with no connection is
+        // a path out of this task too, and it already holds a descriptor.
         defer self.side.hangUp();
+        self.side.open(self.io, self.group, stream, null) catch |err| {
+            self.failure = @errorName(err);
+            return;
+        };
 
         // A session pinned to the current revision. There is no handshake
         // here, so the capabilities ride on each request in `_meta`.
@@ -435,7 +453,8 @@ test "the three frames this example's client sends are all answered" {
     // handler turns it into a failure instead, and it is the one case a frame
     // without `params` does not reach.
     var server: ToolServer = .{};
-    var scratch: [4096]u8 = undefined;
+    var decode_scratch: [4096]u8 = undefined;
+    var answer: [4096]u8 = undefined;
     var check: [512]u8 = undefined;
 
     const meta = "\"_meta\":{\"io.modelcontextprotocol/clientCapabilities\":" ++
@@ -448,11 +467,11 @@ test "the three frames this example's client sends are all answered" {
     };
 
     for (frames) |frame| {
-        const answer = (try ToolServer.handle(&server, frame, &scratch)) orelse
+        const reply = (try ToolServer.handle(&server, frame, &decode_scratch, &answer)) orelse
             return error.DeclinedARequest;
         // An answer the reader cannot decode is as bad as no answer: the
         // reader drops a frame it cannot read and the caller waits on it.
-        const message = try jsonrpc.decode(answer, &check);
+        const message = try jsonrpc.decode(reply, &check);
         try testing.expectEqual(jsonrpc.Kind.response, message.kind);
     }
     try testing.expectEqual(@as(usize, 3), server.calls);
@@ -531,12 +550,13 @@ test "the exchange drains, and a refusal the server sent reaches the client as a
 
 test "a method the server does not have is refused beside the result, not inside it" {
     var server: ToolServer = .{};
-    var scratch: [4096]u8 = undefined;
+    var decode_scratch: [4096]u8 = undefined;
+    var answer: [4096]u8 = undefined;
     const frame = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"resources/list\"}";
-    const answer = (try ToolServer.handle(&server, frame, &scratch)).?;
+    const reply = (try ToolServer.handle(&server, frame, &decode_scratch, &answer)).?;
 
     var check: [512]u8 = undefined;
-    const message = try jsonrpc.decode(answer, &check);
+    const message = try jsonrpc.decode(reply, &check);
     // `result` and `error` are mutually exclusive on the wire, and a decoder
     // reads a result with no error member as a success. An error object inside
     // a result is a successful call whose body is a refusal, and the code the
@@ -555,12 +575,13 @@ test "a method the server does not have is refused beside the result, not inside
 
 test "a string id is answered in the arm it arrived in" {
     var server: ToolServer = .{};
-    var scratch: [4096]u8 = undefined;
+    var decode_scratch: [4096]u8 = undefined;
+    var answer: [4096]u8 = undefined;
     const frame = "{\"jsonrpc\":\"2.0\",\"id\":\"call-7\",\"method\":\"tools/list\"}";
-    const answer = (try ToolServer.handle(&server, frame, &scratch)).?;
+    const reply = (try ToolServer.handle(&server, frame, &decode_scratch, &answer)).?;
 
     var check: [512]u8 = undefined;
-    const message = try jsonrpc.decode(answer, &check);
+    const message = try jsonrpc.decode(reply, &check);
     try testing.expectEqual(jsonrpc.Kind.response, message.kind);
     // An id is an integer or a string, and a response is matched by id and by
     // nothing else, so the answer has to carry the id as the string it
@@ -573,17 +594,22 @@ test "a string id is answered in the arm it arrived in" {
 
 test "a method written with an escape is answered as the method it decodes to" {
     var server: ToolServer = .{};
-    var scratch: [4096]u8 = undefined;
+    var decode_scratch: [4096]u8 = undefined;
+    var answer: [4096]u8 = undefined;
     // `tools\/list` decodes to `tools/list`, and the decoder unescapes it into
-    // the scratch rather than borrowing it from the frame. The answer is
-    // written into that same scratch and the name is compared while it is
-    // written, so a handler with one region has the writer's first bytes land
-    // on the name and answers the refusal branch instead.
+    // the decode region rather than borrowing it from the frame. The answer is
+    // composed into the other region, so the name is still whole when the
+    // branch compares it and the id is still whole when the builder echoes it.
+    //
+    // Two regions make that structural rather than a matter of order. A handler
+    // given one has the writer's first bytes land on the name and takes the
+    // refusal branch instead, silently, and no assertion inside the handler
+    // would say so.
     const frame = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools\\/list\"}";
-    const answer = (try ToolServer.handle(&server, frame, &scratch)).?;
+    const reply = (try ToolServer.handle(&server, frame, &decode_scratch, &answer)).?;
 
     var check: [512]u8 = undefined;
-    const message = try jsonrpc.decode(answer, &check);
+    const message = try jsonrpc.decode(reply, &check);
     try testing.expect(message.rpc_error == null);
     try testing.expect(std.mem.indexOf(u8, message.result.?, "\"cacheScope\"") != null);
 }

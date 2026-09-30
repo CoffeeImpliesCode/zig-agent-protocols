@@ -88,7 +88,46 @@ depends on concurrency). Where it can avoid allocating it does:
   connection has a known upper bound on outstanding requests and reports
   exhaustion instead of growing without limit.
 
-## 5. What this buys
+## 5. A handler is given two regions, not one
+
+`json.Reader` keeps its escape offset per reader rather than per buffer. A
+second reader decoding a string with an escape therefore starts at offset zero
+again and writes over whatever the first left there. A handler handed one
+buffer decodes into it and then composes its answer into it, so the writer's
+first bytes land on the method name or the id the handler is about to read. The
+result is a wrong answer rather than an error: the comparison simply fails and
+the handler takes the branch that names an absent method.
+
+`conn.Handler.call` takes `(ctx, frame, decode_scratch, answer)`. The decode
+region holds anything the reader unescaped; the answer region holds the
+envelope. A `Request` may borrow the frame or the decode region and the
+envelope may borrow either, and all of it dies when the handler returns because
+the connection owns both and overwrites them for the next request.
+
+Three consequences, in the order they bind:
+
+- **The regions are caller-supplied and separately sized.** A caller who wanted
+  two halves of one buffer could have carved them, and several handlers did,
+  but a proportional carve's bound is not one a caller can reason about when
+  choosing a size, and a silently halved answer region is the failure this
+  change exists to remove. `Conn.init` refuses a zero-length region and a pair
+  sharing a byte, before it clears the slot table, so the mistake is reported
+  where the caller can see which arrays it passed rather than on the first
+  message. `conn.overlaps` is the one definition of that check.
+- **A third live region becomes a struct field.** Two decoded values cannot
+  share one reader's scratch, so `acp_session`'s permission outcome and
+  `sessions_demo`'s carried envelope are caller-owned fields of the session's
+  struct rather than sub-ranges of a parameter. The cost is that the owning
+  type has to know the size, which is a cost worth paying for a value that has
+  to stay readable while an answer is being written next to it.
+- **Each transport keeps its own pair.** `http.Server` is built from an
+  `Io.Reader`/`Io.Writer` and sits *below* `conn.Conn`, which is the layer above
+  framing with its own frame buffer and pending table. It shares a
+  `conn.Handler` *value* precisely so one dispatcher serves both transports, and
+  that shared value is why a second pair in `Server.Buffers` is cheaper than
+  making the HTTP transport depend on the connection it sits under.
+
+## 6. What this buys
 
 A consumer picks the executor, not the library. The same connection code runs
 under `std.Io.Threaded` in the test suite, under whatever `init.io` provides in

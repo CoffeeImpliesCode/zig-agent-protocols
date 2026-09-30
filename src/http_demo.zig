@@ -84,21 +84,32 @@ const expected_events = 1 + events.len;
 
 /// A server that answers the two methods this example drives.
 ///
-/// The reply is written into the scratch the transport hands the handler, so
-/// it borrows that buffer for the length of the write and nothing allocates.
+/// The reply is composed in the answer region the transport hands the
+/// handler, so it borrows that array for the length of the write and nothing
+/// allocates.
 const Tools = struct {
     /// The handler holds no state, on purpose. One field for the method
     /// answered would hold the last request's method, because both plans
     /// dispatch this same handler and the second request overwrites the
     /// first before `main` prints. `Serve` records the method per plan.
-    fn handle(_: ?*anyopaque, frame: []const u8, scratch: []u8) conn.Error!?[]const u8 {
-        const message = jsonrpc.decode(frame, scratch) catch return null;
+    fn handle(
+        _: ?*anyopaque,
+        frame: []const u8,
+        decode_scratch: []u8,
+        answer: []u8,
+    ) conn.Error!?[]const u8 {
+        const message = jsonrpc.decode(frame, decode_scratch) catch return null;
         if (message.kind != .request) return null;
         // A request that names no method is not one this server answers.
         if (message.method == null) return null;
 
-        // Read out of the decode scratch before the reply is written over
-        // it, and carry the request's own id into the answer.
+        // The request's own id is read out of the decode region and into a
+        // stack local before the reply is composed. The order is no longer
+        // what makes this safe: the two regions are two arrays, and
+        // `http.Server.init` proves they are different memory, so the answer
+        // lands over neither the frame nor the decode. The order is kept
+        // anyway, because a handler that reads everything it borrows before
+        // it writes is correct whichever way the two regions are laid out.
         const id = switch (message.id orelse return null) {
             .integer => |value| value,
             // A string id is legal JSON-RPC and is not an id this library
@@ -108,7 +119,7 @@ const Tools = struct {
         var id_buffer: [24]u8 = undefined;
         const id_text = std.fmt.bufPrint(&id_buffer, "{d}", .{id}) catch return null;
 
-        var writer = json.Writer.init(scratch);
+        var writer = json.Writer.init(answer);
         writer.slice("{\"jsonrpc\":\"2.0\",\"id\":") catch return null;
         writer.slice(id_text) catch return null;
         writer.slice(
@@ -169,7 +180,13 @@ const Side = struct {
     head_scratch: [256]u8 = undefined,
     body: [4096]u8 = undefined,
     body_scratch: [1024]u8 = undefined,
-    handler_scratch: [1024]u8 = undefined,
+    /// What a handler decodes into, and the region any string it had to
+    /// unescape lives in. A separate array from `answer` because
+    /// `http.Server.init` proves the two are different memory.
+    decode_scratch: [1024]u8 = undefined,
+    /// Where a handler composes the answer it returns, which is borrowed from
+    /// it for the length of the write.
+    answer: [1024]u8 = undefined,
     transfer: [64]u8 = undefined,
     event: [4096]u8 = undefined,
     stream_buffer: [4096]u8 = undefined,
@@ -190,7 +207,8 @@ const Side = struct {
                 .head_scratch = &self.head_scratch,
                 .body = &self.body,
                 .body_scratch = &self.body_scratch,
-                .handler_scratch = &self.handler_scratch,
+                .decode_scratch = &self.decode_scratch,
+                .answer = &self.answer,
                 .transfer = &self.transfer,
                 .event = &self.event,
                 .stream = &self.stream_buffer,
@@ -393,11 +411,16 @@ const Serve = struct {
     /// expect and then says so on the handoff, and only then does the caller
     /// hang the connection up.
     fn stream(self: *@This(), post: http.Post) !void {
+        // The same two regions `Server.answer` hands a handler, taken from
+        // the server's own buffers because this plan cannot go through it:
+        // the notifications below follow the result on one reply, and
+        // `Server.answer` sends the result and then closes the stream.
         const dispatch = self.handler.call orelse return error.NoAnswer;
         const result = try dispatch(
             self.handler.ctx,
             post.body,
-            self.side.server.buffers.handler_scratch,
+            self.side.server.buffers.decode_scratch,
+            self.side.server.buffers.answer,
         );
         const reply = result orelse return error.NoAnswer;
         // A local, unlike the reader and the writer `Side.open` holds as

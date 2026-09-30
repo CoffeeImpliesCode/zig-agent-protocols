@@ -41,11 +41,24 @@ const testing = std.testing;
 
 /// The buffers one side needs. Caller-owned, so a test cannot hide a leak in
 /// the connection behind a test-side allocation.
+///
+/// `Conn.init` refuses a region with no room and refuses two that share a
+/// byte, both before it clears the slot table, so every length here is
+/// deliberately non-zero and no two of these regions touch. The sizes are far
+/// more than the test exchanges — the largest frame either side sends is a
+/// notification under a hundred bytes — because a buffer bound is not what is
+/// under test here; the wire is.
 const Side = struct {
     frame_buffer: [8192]u8 = undefined,
     pending: [8]conn.Slot = undefined,
+    /// Where an inbound frame is decoded, and the region a handler is handed
+    /// to decode one into.
     decode_scratch: [1024]u8 = undefined,
-    handler_scratch: [1024]u8 = undefined,
+    /// Where a handler writes its answer. Separate from `decode_scratch`
+    /// because the escape offset `json.Reader` keeps is per reader and not per
+    /// buffer: a decode and a write into one region both start at offset 0 and
+    /// overwrite each other.
+    answer: [1024]u8 = undefined,
     /// One encode buffer and one result buffer per call, plus a third encode
     /// buffer for the notification. Two frames or two answers that shared one
     /// of them would overwrite the bytes an assertion is about.
@@ -68,9 +81,9 @@ const TestHandler = struct {
     saw_len: usize = 0,
     notifications: usize = 0,
 
-    fn handle(ctx: ?*anyopaque, frame: []const u8, scratch: []u8) conn.Error!?[]const u8 {
+    fn handle(ctx: ?*anyopaque, frame: []const u8, decode_scratch: []u8, answer: []u8) conn.Error!?[]const u8 {
         const self: *TestHandler = @ptrCast(@alignCast(ctx.?));
-        const message = jsonrpc.decode(frame, scratch) catch return null;
+        const message = jsonrpc.decode(frame, decode_scratch) catch return null;
         switch (message.kind) {
             .notification => {
                 self.notifications += 1;
@@ -88,11 +101,19 @@ const TestHandler = struct {
             self.saw_len = n;
         }
 
-        // The scratch is this connection's handler buffer, so the answer can
-        // borrow it for as long as the write takes. The result carries the id
-        // the peer was asked for, so the two answers this test collects are
-        // different bytes and neither can be mistaken for the other.
-        var writer = json.Writer.init(scratch);
+        // The answer is composed into `answer` while the name came out of
+        // `decode_scratch`, so the writer cannot land on the value this
+        // handler is still reading. That is what turns the copy above from a
+        // rule into a shape: handed one region for both jobs, this handler
+        // would hold only because its statements happen to run in this order,
+        // and the next reader has to re-verify that by reading. The id is
+        // formatted into a local, so nothing this handler still reads is
+        // borrowed from the region the writer is filling.
+        //
+        // The result carries the id the peer was asked for, so the two answers
+        // this test collects are different bytes and neither can be mistaken
+        // for the other.
+        var writer = json.Writer.init(answer);
         writer.slice("{\"jsonrpc\":\"2.0\",\"id\":") catch return null;
         var id_buffer: [24]u8 = undefined;
         const id_text = std.fmt.bufPrint(&id_buffer, "{d}", .{message.id.?.integer}) catch return null;
@@ -106,7 +127,10 @@ const TestHandler = struct {
 
 /// Answers every request with a JSON-RPC error object, which is the case where
 /// a connection that only reads `result` silently reports success.
-fn errorReply(_: ?*anyopaque, _: []const u8, _: []u8) conn.Error!?[]const u8 {
+///
+/// It decodes nothing and writes nothing, so the body it returns borrows
+/// neither region and is still valid after the connection overwrites both.
+fn errorReply(_: ?*anyopaque, _: []const u8, _: []u8, _: []u8) conn.Error!?[]const u8 {
     return "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"no such method\"}}";
 }
 
@@ -129,21 +153,29 @@ const Endpoint = struct {
     close_on_end_of_stream: bool = false,
 
     /// Start the connection and spawn its reader on `group`.
+    ///
+    /// A wiring fault is `init`'s to report and this function's to return: the
+    /// refusal comes before the slot table is cleared, so a refused `open`
+    /// leaves the caller's slots as they were handed over. The stream is
+    /// closed on the way out, because the reader that would have released it
+    /// is never started and the peer would otherwise wait on a connection that
+    /// was never made.
     fn open(
         self: *Endpoint,
         io: Io,
         group: *Io.Group,
         stream: Io.net.Stream,
         handler: ?conn.Handler,
-    ) void {
+    ) conn.Error!void {
         self.stream = stream;
+        errdefer stream.close(io);
         self.reader = Io.net.Stream.Reader.init(stream, io, &self.reader_buffer);
         self.writer = Io.net.Stream.Writer.init(stream, io, &self.writer_buffer);
-        self.connection = conn.Conn.init(io, &self.reader.interface, &self.writer.interface, .{
+        self.connection = try conn.Conn.init(io, &self.reader.interface, &self.writer.interface, .{
             .frame_buffer = &self.side.frame_buffer,
             .pending = &self.side.pending,
             .decode_scratch = &self.side.decode_scratch,
-            .handler_scratch = &self.side.handler_scratch,
+            .answer = &self.side.answer,
         });
         if (handler) |h| self.connection.setHandler(h);
         group.async(io, Endpoint.pump, .{self});
@@ -218,7 +250,12 @@ test "each answer is matched to its own call over a real socket" {
             // The accepted side has no caller left to close it, so its reader
             // closes it when the client hangs up.
             self.endpoint.close_on_end_of_stream = true;
-            self.endpoint.open(self.io, self.group, stream, self.handler);
+            // A refused `open` leaves no connection, so the flag is the whole
+            // report; the stream has already been closed by `open` itself.
+            self.endpoint.open(self.io, self.group, stream, self.handler) catch {
+                self.failed.* = true;
+                return;
+            };
         }
     };
 
@@ -254,7 +291,10 @@ test "each answer is matched to its own call over a real socket" {
                 self.failed.* = true;
                 return;
             };
-            self.endpoint.open(self.io, self.group, stream, null);
+            self.endpoint.open(self.io, self.group, stream, null) catch {
+                self.failed.* = true;
+                return;
+            };
             const side = &self.endpoint.side;
             self.observed.first_answer = self.endpoint.connection.call(
                 self.method,
@@ -340,6 +380,9 @@ test "each answer is matched to its own call over a real socket" {
     // for it by its own id. The peer stamps every result with the id it was
     // asked for, so an answer read out of the other call's buffer would carry
     // the other id and fail here instead of passing under the wrong name.
+    // The peer's handler is handed a decode region and an answer region that
+    // share no byte, so what is read here cannot be an answer the handler
+    // wrote over the frame it decoded: only a swapped answer fails now.
     try testing.expectEqual(@as(?i32, null), observed.first_answer.error_code);
     try testing.expectEqualStrings(
         "{\"resultType\":\"complete\",\"call\":1}",
@@ -422,7 +465,10 @@ test "a peer error answer is reported as an error, not as a result" {
             // The accepted side has no caller left to close it, so its reader
             // closes it when the client hangs up.
             self.endpoint.close_on_end_of_stream = true;
-            self.endpoint.open(self.io, self.group, stream, .{ .call = errorReply });
+            self.endpoint.open(self.io, self.group, stream, .{ .call = errorReply }) catch {
+                self.failed.* = true;
+                return;
+            };
         }
     };
 
@@ -439,7 +485,10 @@ test "a peer error answer is reported as an error, not as a result" {
                 self.failed.* = true;
                 return;
             };
-            self.endpoint.open(self.io, self.group, stream, null);
+            self.endpoint.open(self.io, self.group, stream, null) catch {
+                self.failed.* = true;
+                return;
+            };
             self.answer.* = self.endpoint.connection.call(
                 "nosuch/method",
                 null,

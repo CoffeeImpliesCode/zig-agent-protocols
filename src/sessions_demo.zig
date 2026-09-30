@@ -58,25 +58,49 @@ const Agent = struct {
     /// The `mcp/message` requests among them.
     carried: usize = 0,
 
-    /// Runs inline on the reader task, so it answers out of the buffer the
-    /// connection lends it and never calls back on this connection.
-    fn handle(ctx: ?*anyopaque, frame: []const u8, scratch: []u8) conn.Error!?[]const u8 {
-        const self: *Agent = @ptrCast(@alignCast(ctx.?));
-        // Three regions of the one buffer, none of them a local. The decoded
-        // message, the decoded envelope and the answer are all live at once,
-        // and the answer has to stay readable for the write the connection
-        // performs the moment this returns.
-        const key_scratch = scratch[0..128];
-        const envelope_scratch = scratch[128..1152];
-        const body = scratch[1152..];
+    /// Where a carried request's own envelope is decoded, which is neither of
+    /// the two regions the handler is handed.
+    ///
+    /// Two decoded values are live at once here: the outer message, in the
+    /// `decode_scratch` the connection lends, and the inner envelope, decoded
+    /// out of that message's `params`. Decoding the second into the first puts
+    /// the second reader's escape offset back at zero and writes over the
+    /// outer message it is still reading, and `answer` is no better, because
+    /// anything the envelope unescapes would then live in the region the reply
+    /// is composed into. So it is a field of the agent rather than a slice of
+    /// either parameter, and its size is this caller's to choose.
+    ///
+    /// What it has to hold is the widest carried request's escaped `serverId`,
+    /// `requestId` and inner `method` names together, since each takes its own
+    /// region of it and none is recycled. The inner `params` member borrows the
+    /// frame and costs nothing here.
+    envelope: [1024]u8 = undefined,
 
-        const message = jsonrpc.decode(frame, key_scratch) catch return null;
+    /// Runs inline on the reader task, so it answers out of the buffers the
+    /// connection lends it and never calls back on this connection.
+    fn handle(
+        ctx: ?*anyopaque,
+        frame: []const u8,
+        decode_scratch: []u8,
+        answer: []u8,
+    ) conn.Error!?[]const u8 {
+        const self: *Agent = @ptrCast(@alignCast(ctx.?));
+        // The frame decodes into the region the connection lends and the reply
+        // is composed into the other one. A name the peer escaped is unescaped
+        // into `decode_scratch` rather than borrowed from the frame, and the
+        // escape offset `json.Reader` keeps is per reader and not per buffer,
+        // so a reply composed into the region that name was decoded into puts
+        // its first bytes on the name the branches below are about to compare.
+        //
+        // Both regions die with this call, because the connection writes the
+        // answer out before it lends either of them to the next request.
+        const message = jsonrpc.decode(frame, decode_scratch) catch return null;
         if (message.kind != .request) return null;
         const id = message.id orelse return null;
         const method = message.method orelse return null;
         self.calls += 1;
 
-        var writer = json.Writer.init(body);
+        var writer = json.Writer.init(answer);
         writer.slice("{\"jsonrpc\":\"2.0\",\"id\":") catch return null;
         var digits: [24]u8 = undefined;
         const id_text = std.fmt.bufPrint(&digits, "{d}", .{id.integer}) catch return null;
@@ -102,7 +126,7 @@ const Agent = struct {
                 .value => |value| value,
                 else => return null,
             };
-            carried(params, id, &writer, envelope_scratch) catch return null;
+            carried(params, id, &writer, &self.envelope) catch return null;
         } else {
             // Answered, not dropped. A request left unanswered is a caller
             // blocked forever, and a count that skipped one would hide the
@@ -121,6 +145,11 @@ const Agent = struct {
 /// the outcome: this agent carries one tool and holds no resources at all.
 /// Both answers are successful outer responses, which is the whole of
 /// PROTOCOLS.md section 7.
+///
+/// `scratch` is the agent's own region rather than a slice of one the handler
+/// was handed: the inner envelope is decoded while the outer message's borrows
+/// are still live, and a second reader over either of those regions starts its
+/// escape offset at zero again and writes over them.
 ///
 /// The call closes the message the handler opened, outer object included.
 /// The `tools/call` answer carries four opening braces and four closing ones;
@@ -164,8 +193,15 @@ fn carried(
 const Side = struct {
     frame_buffer: [8192]u8 = undefined,
     pending: [4]conn.Slot = undefined,
+    /// Where an inbound frame is decoded into, and the region a handler is
+    /// handed to decode one into. An escaped name is unescaped here rather than
+    /// borrowed from the frame, so it has to hold every escaped string in one
+    /// frame at once: an escaped `method`, a string `id`, an error `message`
+    /// and any escaped key, each of which takes its own region of it.
     decode_scratch: [1024]u8 = undefined,
-    handler_scratch: [4096]u8 = undefined,
+    /// Where this side's answers are composed, and the other half of the pair
+    /// `conn.Conn.init` refuses to let share a byte with the one above.
+    answer: [4096]u8 = undefined,
     out: [2048]u8 = undefined,
     result: [2048]u8 = undefined,
     params: [2048]u8 = undefined,
@@ -207,21 +243,28 @@ const Endpoint = struct {
     /// close would release whatever descriptor the first one returned.
     close_in_pump: bool = false,
 
+    /// Open an endpoint over `stream`, or report why there is no connection to
+    /// open. `conn.Conn.init` refuses a region with no room and a pair that
+    /// shares a byte, and both are wiring faults a caller sees here rather
+    /// than as a wrong answer on the wire.
+    ///
+    /// `stream` is stored before the connection is built, so a caller that
+    /// gives up here still holds the descriptor it has to hang up.
     fn open(
         self: *Endpoint,
         io: Io,
         group: *Io.Group,
         stream: Io.net.Stream,
         handler: ?conn.Handler,
-    ) void {
+    ) conn.Error!void {
         self.stream = stream;
         self.reader = Io.net.Stream.Reader.init(stream, io, &self.reader_buffer);
         self.writer = Io.net.Stream.Writer.init(stream, io, &self.writer_buffer);
-        self.connection = conn.Conn.init(io, &self.reader.interface, &self.writer.interface, .{
+        self.connection = try conn.Conn.init(io, &self.reader.interface, &self.writer.interface, .{
             .frame_buffer = &self.side.frame_buffer,
             .pending = &self.side.pending,
             .decode_scratch = &self.side.decode_scratch,
-            .handler_scratch = &self.side.handler_scratch,
+            .answer = &self.side.answer,
         });
         if (handler) |h| self.connection.setHandler(h);
         // Spawned on the group the example joins, because `Io.Group.async` does
@@ -327,10 +370,16 @@ const ServerTask = struct {
         // Set before `open` spawns the pump, because this task returns below
         // and the pump is then the only one left holding the accepted stream.
         self.endpoint.close_in_pump = true;
+        // A refused `open` spawned no pump, so nothing else releases the
+        // accepted stream and this task hangs its end up itself.
         self.endpoint.open(self.io, self.group, stream, .{
             .ctx = self.agent,
             .call = Agent.handle,
-        });
+        }) catch {
+            self.report.failed = true;
+            self.endpoint.hangUp(self.io);
+            return;
+        };
     }
 };
 
@@ -342,8 +391,9 @@ const ClientTask = struct {
     endpoint: *Endpoint,
     report: *Report,
 
-    /// Give up on the exchange. Every arm that reaches here has run `open`, so
-    /// there is a connection to hang up, and the peer's pump ends on it.
+    /// Give up on the exchange. Every arm that reaches here has an endpoint
+    /// holding this side's stream — `open` stores it before it can refuse —
+    /// so there is a descriptor to hang up, and the peer's pump ends on it.
     fn abandon(self: *@This()) void {
         self.report.failed = true;
         self.endpoint.hangUp(self.io);
@@ -361,7 +411,7 @@ const ClientTask = struct {
             self.report.failed = true;
             return;
         };
-        self.endpoint.open(self.io, self.group, stream, null);
+        self.endpoint.open(self.io, self.group, stream, null) catch return self.abandon();
         const side = &self.endpoint.side;
         const report = self.report;
 
@@ -644,4 +694,51 @@ test "every printed line names the carried call it belongs to" {
         \\
     ;
     try testing.expectEqualStrings(printed, out.buffered());
+}
+
+test "a method written with an escape is answered on the branch it decodes to" {
+    // `mcp\/message` decodes to `mcp/message`, and the decoder unescapes it
+    // into the decode region rather than borrowing it from the frame. The
+    // reply is composed into the other region, so the name is still whole
+    // when the branch below compares it. One region would put the writer's
+    // first bytes on the name, the agent would answer `-32601` instead, and
+    // nothing on the wire or inside the handler would say so.
+    var agent: Agent = .{};
+    var decode_scratch: [1024]u8 = undefined;
+    var answer: [4096]u8 = undefined;
+    const frame =
+        \\{"jsonrpc":"2.0","id":7,"method":"mcp\/message","params":{"serverId":"project-tools","requestId":"req-1","method":"tools/call","params":{"name":"echo","arguments":{"text":"hello"}}}}
+    ;
+    const reply = (try Agent.handle(&agent, frame, &decode_scratch, &answer)).?;
+
+    // The carried branch, and the inner success that decides it. The whole
+    // outer response is pinned rather than a member of it: `conn.Conn.route`
+    // drops a frame that will not parse, so an answer one closing brace short
+    // is a caller blocked forever on an answer that was already sent.
+    try testing.expectEqual(@as(usize, 1), agent.calls);
+    try testing.expectEqual(@as(usize, 1), agent.carried);
+    try testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":7,"result":{"result":{"resultType":"complete","content":[{"type":"text","text":"echo"}]}}}
+    , reply);
+}
+
+test "an escaped carried envelope is decoded into the agent's own region" {
+    // Both escapes here are the peer's own spelling and decode to the names the
+    // demo already sends: `project-tools` and `tools/call`. The inner one
+    // decides the branch, so it has to be unescaped into a region of its own
+    // before the comparison, and a region too small to hold it fails the
+    // decode and the handler declines. A caller blocked forever on a request
+    // that arrived is what pins the size.
+    var agent: Agent = .{};
+    var decode_scratch: [1024]u8 = undefined;
+    var answer: [4096]u8 = undefined;
+    const frame =
+        \\{"jsonrpc":"2.0","id":8,"method":"mcp/message","params":{"serverId":"project\u002Dtools","requestId":"req-2","method":"tools\/call","params":{"name":"echo"}}}
+    ;
+    const reply = (try Agent.handle(&agent, frame, &decode_scratch, &answer)).?;
+
+    try testing.expectEqual(@as(usize, 1), agent.carried);
+    try testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":8,"result":{"result":{"resultType":"complete","content":[{"type":"text","text":"echo"}]}}}
+    , reply);
 }

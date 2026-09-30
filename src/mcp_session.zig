@@ -962,8 +962,14 @@ test "a server with no caching values cannot write a discover body at all" {
 const Side = struct {
     frame_buffer: [8192]u8 = undefined,
     pending: [4]conn.Slot = undefined,
+    /// Where a frame is decoded, and the region a handler decodes one into. An
+    /// array of its own rather than a slice of the one below, because the two
+    /// must not share a byte.
     decode_scratch: [1024]u8 = undefined,
-    handler_scratch: [8192]u8 = undefined,
+    /// Where a handler writes its answer. Not an offset into the region above:
+    /// a handler that decoded into what it writes has the envelope it is
+    /// building land on the value it is about to read.
+    answer: [8192]u8 = undefined,
     out: [2048]u8 = undefined,
     result: [4096]u8 = undefined,
     params: [2048]u8 = undefined,
@@ -982,21 +988,27 @@ const Endpoint = struct {
     stream: Io.net.Stream = undefined,
     connection: conn.Conn = undefined,
 
+    /// Hand the endpoint its connection, or the reason it cannot have one.
+    ///
+    /// A region with no room and a pair that share a byte are wiring faults,
+    /// and the peer never shows them: the connection runs and the answers it
+    /// writes are wrong. `conn.Conn.init` refuses both before it touches the
+    /// slot table, so a refused endpoint leaves `side` as it was handed over.
     fn open(
         self: *Endpoint,
         io: Io,
         group: *Io.Group,
         stream: Io.net.Stream,
         handler: ?conn.Handler,
-    ) void {
+    ) conn.Error!void {
         self.stream = stream;
         self.reader = Io.net.Stream.Reader.init(stream, io, &self.reader_buffer);
         self.writer = Io.net.Stream.Writer.init(stream, io, &self.writer_buffer);
-        self.connection = conn.Conn.init(io, &self.reader.interface, &self.writer.interface, .{
+        self.connection = try conn.Conn.init(io, &self.reader.interface, &self.writer.interface, .{
             .frame_buffer = &self.side.frame_buffer,
             .pending = &self.side.pending,
             .decode_scratch = &self.side.decode_scratch,
-            .handler_scratch = &self.side.handler_scratch,
+            .answer = &self.side.answer,
         });
         if (handler) |h| self.connection.setHandler(h);
         // Spawned on the group the test joins, because `Io.Group.async` does not
@@ -1086,6 +1098,11 @@ const Exchange = struct {
     meta_on_wire: bool = false,
     members_kept: bool = false,
 
+    /// The name the peer unescaped into the region it decodes into, copied
+    /// because the next frame is decoded over it long before the test reads it.
+    prompt_name: [32]u8 = undefined,
+    prompt_name_len: usize = 0,
+
     // What the client read back. Each body is a copy, because it borrows the
     // client's `result` buffer and the next call overwrites that.
     read_failed: bool = false,
@@ -1103,9 +1120,10 @@ const Exchange = struct {
     final_body_len: usize = 0,
 };
 
-/// Copy a body out of the client's result buffer, which the next call
-/// overwrites. A body longer than the slot is dropped rather than truncated,
-/// so the assertion fails instead of comparing half a reply.
+/// Copy a borrowed value out of a buffer the next call overwrites: the
+/// client's result buffer, or the region the peer decoded a name into. A value
+/// longer than the slot is dropped rather than truncated, so the assertion
+/// fails instead of comparing half of it.
 fn keepBody(slot: []u8, length: *usize, body: []const u8) void {
     if (body.len > slot.len) return;
     @memcpy(slot[0..body.len], body);
@@ -1119,18 +1137,22 @@ fn keepBody(slot: []u8, length: *usize, body: []const u8) void {
 fn scriptedHandler(
     ctx: ?*anyopaque,
     frame: []const u8,
-    scratch: []u8,
+    decode_scratch: []u8,
+    answer: []u8,
 ) conn.Error!?[]const u8 {
     const exchange: *Exchange = @ptrCast(@alignCast(ctx.?));
-    // Two regions of the buffer the connection lends, none of them a local: the
-    // decoded request and the answer are live at once, and the answer has to
-    // stay readable for the write the connection does next.
-    const key_scratch = scratch[0..128];
-    const body = scratch[128..];
     // The request shape, so the answer carries the id the peer chose and the
     // envelope is the shared builder's. A notification and a response are not
     // requests, so neither of them reaches a builder here.
-    const request = jsonrpc.decodeRequest(frame, key_scratch) catch return null;
+    //
+    // Decoded into `decode_scratch` and answered into `answer`, because the
+    // escape offset `json.Reader` keeps is per reader and not per buffer. A
+    // handler that decoded into the region it writes its answer into has the
+    // envelope's first bytes land on the value it is about to read, and the
+    // answer that comes back is wrong rather than missing. Both regions are the
+    // connection's, neither is a local, and the answer stays readable for the
+    // write the connection does next.
+    const request = jsonrpc.decodeRequest(frame, decode_scratch) catch return null;
     const method = request.method;
 
     if (std.mem.eql(u8, method.text, "resources/read")) {
@@ -1141,23 +1163,33 @@ fn scriptedHandler(
         return conn.errorResponse(request, .{
             .code = @intFromEnum(jsonrpc.StandardError.invalid_params),
             .message = "unknown resource",
-        }, body) catch null;
+        }, answer) catch null;
     } else if (std.mem.eql(u8, method.text, "tools/list")) {
         // A `resultType` outside the two the specification defines. A method
         // 4.7 does not let answer that way either, so this case is about the
         // value, and `resources/list` below is about the method.
         exchange.list_calls += 1;
-        return conn.respond(request, "{\"resultType\":\"weird\"}", body) catch null;
+        return conn.respond(request, "{\"resultType\":\"weird\"}", answer) catch null;
     } else if (std.mem.eql(u8, method.text, "prompts/get")) {
         // An interim result the client supplies no answer to.
         exchange.prompt_calls += 1;
-        return conn.respond(request, interim_result, body) catch null;
+        // The one read in this script that lands in `decode_scratch` rather
+        // than in the frame: the client sent the name with a JSON escape, and
+        // only an unescape puts bytes in the region the two-region contract is
+        // about. A read that borrowed the frame would prove nothing.
+        const name = readName(request.params, decode_scratch);
+        const written = conn.respond(request, interim_result, answer) catch null;
+        // Read after the write. The answer went into `answer` and this reads
+        // what is left in `decode_scratch`, which is the whole point: handed
+        // one region for both, the envelope would be sitting on the name here.
+        keepBody(&exchange.prompt_name, &exchange.prompt_name_len, name);
+        return written;
     } else if (std.mem.eql(u8, method.text, "resources/list")) {
         // An interim result, well formed, on a method PROTOCOLS.md 4.7 does
         // not let answer that way. The value is one this library knows, so the
         // only thing left to refuse it on is the method.
         exchange.resource_list_calls += 1;
-        return conn.respond(request, interim_result, body) catch null;
+        return conn.respond(request, interim_result, answer) catch null;
     } else if (std.mem.eql(u8, method.text, "tools/call")) {
         // Two interim answers and then a final one, so a caller that stops
         // after one round trip is caught handing back an interim result.
@@ -1183,11 +1215,38 @@ fn scriptedHandler(
             exchange.members_kept = std.mem.indexOf(u8, params, "\"name\":\"echo\"") != null;
         }
         if (exchange.tool_calls < 3) {
-            return conn.respond(request, interim_result, body) catch null;
+            return conn.respond(request, interim_result, answer) catch null;
         }
-        return conn.respond(request, final_result, body) catch null;
+        return conn.respond(request, final_result, answer) catch null;
     }
     return null;
+}
+
+/// The `name` member of a `prompts/get` request, unescaped into `scratch`.
+///
+/// A walk of its own rather than [`json.memberText`], because that one hands a
+/// member's raw text back and unescapes nothing: the name would stay in the
+/// frame and the two regions would have nothing to say about each other.
+///
+/// A params that is not an object, or one this cannot walk, reports no name
+/// rather than a fault. The script answers such a request all the same, and a
+/// peer that sent one has not broken the exchange.
+fn readName(params: jsonrpc.Params, scratch: []u8) []const u8 {
+    return readNameIn(params, scratch) catch "";
+}
+
+fn readNameIn(params: jsonrpc.Params, scratch: []u8) root.DecodeError![]const u8 {
+    const raw = switch (params) {
+        .value => |value| value,
+        else => return "",
+    };
+    var reader = json.Reader.init(raw);
+    _ = try reader.beginObject();
+    while (try reader.nextKey(scratch)) |key| {
+        if (std.mem.eql(u8, key, "name")) return reader.string(scratch);
+        try reader.skipValue(scratch);
+    }
+    return "";
 }
 
 /// Accepts one connection and lets its reader answer the client.
@@ -1206,7 +1265,14 @@ const Serving = struct {
         self.endpoint.open(self.io, self.group, stream, .{
             .ctx = self.exchange,
             .call = scriptedHandler,
-        });
+        }) catch {
+            // Hung up rather than left open, because a peer that never comes
+            // up leaves the client waiting on an answer for ever and the group
+            // the test awaits never finishes.
+            self.exchange.failed = true;
+            self.endpoint.hangUp(self.io);
+            return;
+        };
     }
 };
 
@@ -1223,7 +1289,11 @@ const Calling = struct {
             self.exchange.failed = true;
             return;
         };
-        self.endpoint.open(self.io, self.group, stream, null);
+        self.endpoint.open(self.io, self.group, stream, null) catch {
+            self.exchange.failed = true;
+            self.endpoint.hangUp(self.io);
+            return;
+        };
 
         const side = &self.endpoint.side;
         // A session pinned to the current revision. There is no handshake here,
@@ -1284,10 +1354,14 @@ const Calling = struct {
             self.exchange.list_refused = err == error.UnknownResultType;
         }
 
-        // An interim result with no answer to give ends the exchange here.
+        // An interim result with no answer to give ends the exchange here. The
+        // name carries a JSON escape, so the peer has to unescape it into the
+        // region it decodes into rather than borrow it from the frame, and the
+        // copy of it the test checks below is what says the two regions stayed
+        // apart.
         if (session.respond(
             "prompts/get",
-            "{\"name\":\"p\"}",
+            "{\"name\":\"a\\tb\"}",
             &side.result,
             &side.out,
             &side.params,
@@ -1440,4 +1514,38 @@ test "a peer error is a failure and an interim result is never the final one" {
     // members beside them.
     try testing.expect(exchange.meta_on_wire);
     try testing.expect(exchange.members_kept);
+
+    // The peer read a name back out of the region it decodes into, after it
+    // had written its answer into the other one. Handed a single region, the
+    // envelope it wrote would have been sitting on the name, and this is the
+    // name the client sent.
+    try testing.expectEqualStrings("a\tb", exchange.prompt_name[0..exchange.prompt_name_len]);
+}
+
+test "the two regions a handler is handed cannot share a byte" {
+    // The fault the pair of names exists for. A handler given one region for
+    // both still runs and still answers, and the answer is wrong rather than
+    // absent, so the connection refuses the pair where the caller can see it.
+    var frame_buffer: [64]u8 = undefined;
+    var pending: [2]conn.Slot = undefined;
+    var shared: [64]u8 = undefined;
+    var reader = Io.Reader.fixed("");
+    var writer = Io.Writer.fixed(&.{});
+
+    try testing.expectError(error.OverlappingBuffers, conn.Conn.init(testing.io, &reader, &writer, .{
+        .frame_buffer = &frame_buffer,
+        .pending = &pending,
+        .decode_scratch = shared[0..32],
+        .answer = shared[16..],
+    }));
+
+    // The other half of the same contract, and the failure `Endpoint.open`
+    // above hands back for a side that was sized wrong: a region with no room
+    // refuses the first thing that needs it, which is too late to be useful.
+    try testing.expectError(error.UnusableBuffer, conn.Conn.init(testing.io, &reader, &writer, .{
+        .frame_buffer = &frame_buffer,
+        .pending = &pending,
+        .decode_scratch = shared[0..32],
+        .answer = shared[0..0],
+    }));
 }
