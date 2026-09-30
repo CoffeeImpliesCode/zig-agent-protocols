@@ -5,7 +5,7 @@
 //! | Element | Value |
 //! | --- | --- |
 //! | `jsonrpc` | `"2.0"`, always present, always this exact string |
-//! | `id` | Integer or string. Absent on notifications. `i64`, range-checked |
+//! | `id` | Integer or string, `i64`. Absent, or `null` on a refusal |
 //! | `method` | String. Split once on `/` for the category-action form |
 //! | `params` | Object or array. `null` and absent are distinct and preserved |
 //! | `result` | Present on success, mutually exclusive with `error` |
@@ -20,6 +20,32 @@
 //! writes, so a refused message leaves the writer untouched, and it omits the
 //! `id` member on a notification rather than writing a null the decoder would
 //! then reject.
+//!
+//! The three bodies it splices — `params`, `result` and an error's `data` —
+//! are validated too. They reach the wire as the caller's own bytes, so a body
+//! that is not one complete JSON value is refused here rather than reported by
+//! the peer that reads it back.
+//!
+//! ## The one `null` id, and the single place it is legal
+//!
+//! JSON-RPC 2.0 says that where an error occurred in detecting the id — a
+//! Parse error or an Invalid Request — the error response's id "MUST be
+//! Null". `{"id":null,"error":{...}}` is therefore the specification's own
+//! shape for a refusal that belongs to no request, and a codec that refused
+//! it outright could not read the very frame it writes when a peer refuses
+//! one of ours: the refusal would be the one message this library's own
+//! reader throws away.
+//!
+//! It is accepted on a response carrying an `error`, and nowhere else. A
+//! request has an id by definition, a notification has none at all, and a
+//! result is an answer to an id, so a `null` beside any of them is a member
+//! present with a value the protocol does not permit — `InvalidField`, not
+//! the `MalformedJson` a value of the wrong JSON type is. The rule is narrow
+//! on purpose: a codec that accepted `null` anywhere an id appears would
+//! match an answer against nothing, which is the fault the whole id
+//! mechanism exists to prevent. `validate` and `encode` apply the same rule,
+//! so the shape round trips to the same bytes and is refused everywhere it is
+//! not legal.
 //!
 //! ## What "exact inverse" means here
 //!
@@ -44,9 +70,14 @@ pub const version = "2.0";
 
 /// A JSON-RPC request id.
 ///
-/// An id is an integer or a string, never a float and never `null`. MCP states
-/// the `null` ban explicitly, and a fractional id has never been legal, so both
-/// are rejected here rather than coerced.
+/// An id *value* is an integer or a string, never a float and never `null`.
+/// MCP states the `null` ban explicitly, and a fractional id has never been
+/// legal, so both are rejected here rather than coerced.
+///
+/// The `null` JSON-RPC 2.0 requires on the error response of a request it
+/// could not identify is not an id value. It is the specification's way of
+/// saying there is none, so it is modelled as a state of the `id` *member*
+/// and not as a third value of this type: see [`Message.id_null`].
 pub const Id = union(enum) {
     integer: i64,
     string: []const u8,
@@ -122,7 +153,26 @@ pub const Message = struct {
     /// What this message is. `encode` refuses a kind that disagrees with `id`
     /// and `method`, because `decode` derives the classification from them.
     kind: Kind,
+    /// The id, when the member carried a value this library models. Null on a
+    /// notification, and null on a refusal whose id could not be determined;
+    /// those two are told apart by `id_null` and by `kind`.
     id: ?Id = null,
+    /// The `id` member was present and was the JSON value `null`.
+    ///
+    /// Set only where JSON-RPC 2.0 names it: on a response carrying an
+    /// `error`, because that is the answer to a request the peer could not
+    /// identify. `decode` refuses it on anything carrying a `method` and on
+    /// anything carrying a `result`, and `validate` refuses the same, so a
+    /// message this library encodes is a message it reads back.
+    ///
+    /// It is a flag beside `id` rather than a third state of it, because the
+    /// two answer different questions. `id` is the value a caller matches an
+    /// answer by, and it is switched over exhaustively in every caller in the
+    /// tree; `null` is not a value to match anything against, it is the
+    /// specification's statement that there is no id at all. Widening `Id`
+    /// would have put that statement into every one of those switches, and
+    /// each of them would then need an arm for a case none of them can be in.
+    id_null: bool = false,
     method: ?Method = null,
     params: Params = .absent,
     /// The `result` member, as borrowed JSON text, on a successful response.
@@ -207,12 +257,51 @@ pub fn decode(input: []const u8, scratch: []u8) DecodeError!Message {
     if (try reader.beginObject()) return error.MissingField;
 
     while (try reader.nextKey(scratch)) |key| {
-        if (std.mem.eql(u8, key, "jsonrpc")) {
+        // A member this decoder has already taken is not taken again. RFC 8259
+        // section 4 says the names within an object *should* be unique, so a
+        // repeat is a document the grammar permits and a decoder still has to
+        // pick one. The first occurrence wins.
+        //
+        // `json.memberText` resolves a repeat the same way, and its doc is the
+        // argument: the caller compares what it reads against a value it
+        // already holds, and the first is enough to make that comparison fail
+        // closed, because a later member cannot make a comparison that has
+        // already failed pass. One rule, one reason, two files.
+        //
+        // The case that decides it is a peer this library does not terminate.
+        // A peer that sends `{"method":"safe","method":"other"}` must not have
+        // `other` applied here while an intermediary that stopped at the first
+        // saw `safe`: the two hold different answers to what the message said,
+        // and the one that stopped at the first is the one that gets asked why.
+        // A decoder and a gateway reading different members of one name is the
+        // ambiguity `http.zig` refuses outright for a repeated header.
+        //
+        // The discarded copy is read as a value rather than stepped over
+        // blindly. A document that does not parse anywhere does not parse, and
+        // a peer must not be able to hide a syntax error in the second slot of
+        // a name the first slot already used.
+        const repeated = (saw_version and std.mem.eql(u8, key, "jsonrpc")) or
+            (saw_id and std.mem.eql(u8, key, "id")) or
+            (saw_method and std.mem.eql(u8, key, "method")) or
+            (message.params != .absent and std.mem.eql(u8, key, "params")) or
+            (saw_result and std.mem.eql(u8, key, "result")) or
+            (saw_error and std.mem.eql(u8, key, "error"));
+
+        if (repeated) {
+            try reader.skipValue(scratch);
+        } else if (std.mem.eql(u8, key, "jsonrpc")) {
             const text = try reader.string(scratch);
             if (!std.mem.eql(u8, text, version)) return error.UnsupportedVersion;
             saw_version = true;
         } else if (std.mem.eql(u8, key, "id")) {
             message.id = try decodeId(&reader, scratch);
+            // The member was read and carried no value, which is the
+            // specification's `null` and not an absent member. `saw_id`
+            // cannot tell the two apart — both leave `id` unset — so the
+            // state of the member is kept beside it, and the rules below
+            // decide whether this message is one the specification allows it
+            // on.
+            message.id_null = message.id == null;
             saw_id = true;
         } else if (std.mem.eql(u8, key, "method")) {
             message.method = Method.split(try reader.string(scratch));
@@ -247,6 +336,19 @@ pub fn decode(input: []const u8, scratch: []u8) DecodeError!Message {
     if (saw_result and saw_error) return error.InvalidField;
     if (saw_method and (saw_result or saw_error)) return error.InvalidField;
     if (!saw_method and !saw_result and !saw_error) return error.MissingField;
+
+    // `null` is the id of an error response whose id could not be determined
+    // from the Request, and it is legal nowhere else. Each of the three cases
+    // has already been decided by the lines above: a message carrying a
+    // `method` is a request whatever else it holds, one carrying a `result`
+    // is an answer to an id, and one carrying neither was refused as
+    // `MissingField` before this line. So the only question left is whether
+    // this is a refusal, which is the one shape the specification gives it.
+    if (message.id_null) {
+        if (saw_method) return error.InvalidField;
+        if (saw_result) return error.InvalidField;
+        if (!saw_error) return error.InvalidField;
+    }
 
     // `error` does not enter into it. PROTOCOLS.md section 3 classifies on
     // `id` and `method`, and a caller that needs to tell a successful
@@ -296,7 +398,7 @@ pub fn decodeRequest(input: []const u8, scratch: []u8) DecodeError!Request {
     return .{ .id = id, .method = method, .params = message.params };
 }
 
-fn decodeId(reader: *json.Reader, scratch: []u8) DecodeError!Id {
+fn decodeId(reader: *json.Reader, scratch: []u8) DecodeError!?Id {
     reader.skipWhitespace();
     const byte = reader.peek() orelse return error.Truncated;
     switch (byte) {
@@ -306,15 +408,29 @@ fn decodeId(reader: *json.Reader, scratch: []u8) DecodeError!Id {
             return .{
                 .integer = std.fmt.parseInt(i64, lexeme, 10) catch |err| switch (err) {
                     error.Overflow => return error.LimitExceeded,
-                    // `parseInt` rejects a fractional or exponent lexeme. That is a
-                    // type error, not an overflow, so it is reported as such rather
-                    // than silently truncating the id.
-                    error.InvalidCharacter => return error.InvalidField,
+                    // `parseInt` rejects a fractional or exponent lexeme, which
+                    // is a value of the wrong JSON type rather than an
+                    // overflow, so it is named as one rather than silently
+                    // truncating the id.
+                    error.InvalidCharacter => return error.MalformedJson,
                 },
             };
         },
-        // An explicit `null` id is a decoding error, not an absent id.
-        'n' => return error.InvalidField,
+        // A `null` is not an id value, so there is no `Id` to return. The
+        // member is present and it said `null`, which the specification uses
+        // for a response whose id could not be determined, and whether this
+        // message is one of those is the caller's question to answer: this
+        // function reads members, and refusing it here would refuse the
+        // refusal this library writes.
+        'n' => {
+            try reader.nullLiteral();
+            return null;
+        },
+        // Everything else is a value of the wrong JSON type for an id, and
+        // PROTOCOLS.md section 2.1 gives `MalformedJson` as "a JSON syntax
+        // error, or a value of the wrong JSON type". The member is present
+        // either way, so none of these is an absent id to be read as a
+        // notification: no answer could ever be matched to it.
         else => return error.MalformedJson,
     }
 }
@@ -348,9 +464,9 @@ fn decodeError(reader: *json.Reader, scratch: []u8) DecodeError!Error {
             result.code = std.fmt.parseInt(i32, lexeme, 10) catch |err| switch (err) {
                 error.Overflow => return error.LimitExceeded,
                 // `parseInt` rejects a fractional or exponent lexeme. That is a
-                // type error rather than an overflow, and `decodeId` reports it
-                // as one.
-                error.InvalidCharacter => return error.InvalidField,
+                // value of the wrong JSON type rather than an overflow, and
+                // `decodeId` names the same fault on an id the same way.
+                error.InvalidCharacter => return error.MalformedJson,
             };
             saw_code = true;
         } else if (std.mem.eql(u8, key, "message")) {
@@ -375,8 +491,14 @@ fn decodeError(reader: *json.Reader, scratch: []u8) DecodeError!Error {
 ///
 /// The message is validated before a byte is written, so a rejected one leaves
 /// the writer untouched and a caller can report the error without having
-/// produced a half message to discard.
+/// produced a half message to discard. `BufferTooSmall` is no exception: a
+/// failure rewinds the writer's length to the value it arrived with, which is
+/// the state a retry starts from. The buffer it points at is the only other
+/// thing, and that one is the caller's to widen.
 pub fn encode(message: Message, writer: *json.Writer) EncodeError!void {
+    const mark = writer.len;
+    errdefer writer.len = mark;
+
     try validate(message);
 
     try writer.byte('{');
@@ -387,9 +509,15 @@ pub fn encode(message: Message, writer: *json.Writer) EncodeError!void {
     // A notification has no id, and that absence is what makes it one, so the
     // member is omitted rather than required. `validate` has already refused a
     // response without one, which is a different thing entirely.
+    //
+    // The `null` id is written where the specification names it and in the
+    // spelling it names it in, so a decode of these bytes carries `id_null`
+    // and an encode of that message writes the same bytes back.
     if (message.id) |id| {
         try writer.slice(",\"id\":");
         try writeId(id, writer);
+    } else if (message.id_null) {
+        try writer.slice(",\"id\":null");
     }
 
     if (message.method) |method| {
@@ -426,6 +554,12 @@ pub fn encode(message: Message, writer: *json.Writer) EncodeError!void {
 /// decoder rejects, which is a programming error in the caller and not a
 /// wire condition, so it is `InvalidField`.
 ///
+/// The bodies are the one part of a frame this function has to read rather than
+/// compare, so they are read last and the shape rules above stay the cheap
+/// ones. The cost is one walk of the body's own bytes per spliced member, no
+/// allocation, and it is paid once: this runs before the first byte, so a body
+/// refused here leaves the writer untouched rather than half framed.
+///
 /// The rules here mirror `decode` exactly. If one of them is relaxed there, it
 /// has to be relaxed here too, or `decode(encode(x)) != x`.
 fn validate(message: Message) EncodeError!void {
@@ -434,9 +568,20 @@ fn validate(message: Message) EncodeError!void {
     if (has_method and (message.result != null or message.rpc_error != null)) {
         return error.InvalidField;
     }
+    // `id` and `id_null` are one member read two ways, so a message holding
+    // both is a caller's own mistake rather than a shape any peer can send.
+    if (message.id != null and message.id_null) return error.InvalidField;
+    // A `null` id is legal on a refusal and nowhere else, which is the same
+    // narrow rule `decode` applies: a request has an id, a notification has
+    // none, and a result is an answer to one.
+    if (message.id_null) {
+        if (has_method) return error.InvalidField;
+        if (message.result != null) return error.InvalidField;
+        if (message.rpc_error == null) return error.InvalidField;
+    }
     // Without a method the message is a response, and a response the peer
     // cannot match to a request is not one.
-    if (!has_method and message.id == null) return error.InvalidField;
+    if (!has_method and message.id == null and !message.id_null) return error.InvalidField;
     // A response with neither a result nor an error says nothing, which
     // PROTOCOLS.md section 3 calls a decode error. Writing one would put bytes
     // on the wire that this library refuses to read back.
@@ -453,6 +598,64 @@ fn validate(message: Message) EncodeError!void {
     else
         .response;
     if (message.kind != derived) return error.InvalidField;
+
+    // `params`, `result` and an error's `data` are spliced as the caller's own
+    // bytes, so they are the members a shape rule cannot vouch for. Each is
+    // what `decode` would read back verbatim, so each has to be what it reads.
+    switch (message.params) {
+        .absent, .null_value => {},
+        .value => |text| try requireParamsBody(text),
+    }
+    if (message.result) |text| try requireJsonBody(text);
+    if (message.rpc_error) |object| {
+        if (object.data) |data| try requireJsonBody(data);
+    }
+}
+
+/// Refuse a body that is not one complete JSON value.
+///
+/// A body is the caller's own bytes, spliced into the frame as they stand, so
+/// whatever is wrong with them reaches the peer. PROTOCOLS.md section 2 asks for
+/// `encode(decode(x)) == x` on every value `encode` accepts, and a body is the
+/// one member no shape rule can vouch for: `params` holding `"not json"`
+/// writes a frame this library refuses to read back. The fault is the caller's,
+/// so it is `InvalidField`, which is what `root.zig` gives a value that could
+/// not have been decoded.
+///
+/// The walk is `json.Reader`'s, so the refusals here are the refusals there: a
+/// syntax error, a bad escape, a byte that is not UTF-8, a value nested past
+/// `json.max_depth`, and anything left behind the value. Each is the same
+/// fault here and each is `InvalidField`. The depth starts at one because the
+/// body lands inside the frame's own object, so a body this accepts at the
+/// bound is one `decode` accepts at the bound.
+///
+/// This is not the framing check. The framer refuses a newline inside a frame
+/// on the way to the wire and `framing.zig` is where that rule lives, so a
+/// body that parses and spans lines is a framing fault this walk has nothing
+/// to say about. Two faults, two places, and neither check duplicated.
+fn requireJsonBody(text: []const u8) EncodeError!void {
+    var reader = json.Reader.init(text);
+    reader.depth = 1;
+    // A value that is stepped over writes nothing, so it needs no scratch.
+    const none: [0]u8 = .{};
+    _ = reader.rawValue(&none) catch return error.InvalidField;
+    // `rawValue` stops at the end of the first value. Text behind it would land
+    // behind one colon as a second member.
+    if (!reader.atEnd()) return error.InvalidField;
+}
+
+/// Refuse a `params` body that `decodeParams` would refuse.
+///
+/// `Params.value` is an object or an array, and a scalar is a valid JSON value
+/// that is still not a params. The walk above has already proved the text is one
+/// complete value, so the leading byte is all that is left to ask about, and
+/// the trim takes the four bytes JSON calls whitespace, which is what the
+/// reader skipped to find it.
+fn requireParamsBody(text: []const u8) EncodeError!void {
+    try requireJsonBody(text);
+    const body = std.mem.trimStart(u8, text, " \t\r\n");
+    if (body.len == 0) return error.InvalidField;
+    if (body[0] != '{' and body[0] != '[') return error.InvalidField;
 }
 
 /// Write an id in the arm it arrived in.
@@ -479,6 +682,11 @@ fn writeId(id: Id, writer: *json.Writer) EncodeError!void {
 /// Write the `error` member, with the comma that separates it from the member
 /// before it. The brace that closes the frame is the caller's, because the
 /// frame is not only an error.
+///
+/// `data` is spliced, so this function does not check it: both callers do, and
+/// each before either opens its frame. A caller added later has to as well. The
+/// check belongs before the first byte rather than in here, because a refusal
+/// halfway through the object would leave a frame behind.
 fn writeErrorObject(object: Error, writer: *json.Writer) EncodeError!void {
     try writer.slice(",\"error\":{\"code\":");
     var digits: [16]u8 = undefined;
@@ -507,13 +715,21 @@ fn writeErrorObject(object: Error, writer: *json.Writer) EncodeError!void {
 /// answer.
 ///
 /// The rule is applied before a byte is written, so a refused answer leaves the
-/// writer untouched. A short writer is `error.BufferTooSmall`, which is the
-/// caller's own buffer fault rather than a wire condition.
+/// writer untouched, and so does a short one: a failure rewinds the writer's
+/// length to the value it arrived with, which is the state a retry starts
+/// from. `error.BufferTooSmall` is the caller's own buffer fault rather than a
+/// wire condition.
 ///
 /// A body is spliced verbatim, the way `Conn.call` splices caller params. A
 /// raw newline inside one is caught by the framer on the way to the wire, as
 /// `Conn` reports it, and is not checked a second time here: the check belongs
 /// in one place and this is not it.
+///
+/// What is checked here is the other fault and not the framing one: a body that
+/// is not one complete JSON value, which the rule above cannot see and which
+/// `decode` would refuse. `encode` makes the same check in `validate`, before
+/// its first byte; this one runs before the opening brace, so either way a
+/// refused answer leaves the writer untouched.
 ///
 /// The id is echoed in the arm it arrived in, so an integer id stays an integer
 /// and a string id stays a string. A response carries no `method`, and no
@@ -525,8 +741,17 @@ pub fn encodeResponse(
     object: ?Error,
     writer: *json.Writer,
 ) EncodeError!void {
+    const mark = writer.len;
+    errdefer writer.len = mark;
+
     if (result == null and object == null) return error.InvalidField;
     if (result != null and object != null) return error.InvalidField;
+    // The rule above says which body, not what is in it. Both are spliced, so
+    // both are read here, before the frame opens.
+    if (result) |text| try requireJsonBody(text);
+    if (object) |value| {
+        if (value.data) |data| try requireJsonBody(data);
+    }
 
     try writer.byte('{');
     try writer.slice("\"jsonrpc\":");
@@ -557,10 +782,21 @@ pub fn errorResponse(request: Request, object: Error, out: []u8) EncodeError![]c
 /// The `-32601` answer for a method this peer does not have, in `out`.
 ///
 /// The code is `StandardError.method_not_found` and the message is the name
-/// table 3.1 of PROTOCOLS.md gives that code. The bytes are the ones the
-/// hand-written builders in `mcp_session` and `acp_session` write, member for
-/// member and comma for comma, so a cutover to this one changes nothing on the
-/// wire.
+/// table 3.1 of PROTOCOLS.md gives that code, so neither value is chosen here.
+/// The envelope is `encodeResponse`'s, and the id comes back in the arm it
+/// arrived in, so an integer id is echoed as an integer and a string id as a
+/// string.
+///
+/// `conn.methodNotFound` hands the same writer the same two values, so that
+/// answer and this one are byte-identical without either being a copy of the
+/// other. `mcp_session.Server.methodNotFound` forwards to it rather than
+/// writing a second. `acp_session` builds no `-32601` frame at all: a method
+/// its version does not carry is reported to the caller as
+/// `MethodNotInVersion`, before the wire.
+///
+/// `runtime_demo` writes the method's name as the message and
+/// `bridge_session` puts it in a `data` member, both on this code, so a peer
+/// can tell which method was refused.
 pub fn methodNotFound(request: Request, out: []u8) EncodeError![]const u8 {
     return errorResponse(request, .{
         .code = @intFromEnum(StandardError.method_not_found),
@@ -643,11 +879,154 @@ test "an i64 id beyond f64 precision survives the round trip" {
 
 test "a null or fractional id is a decode error, not a coercion" {
     var scratch: [64]u8 = undefined;
+    // A request has an id by definition, so a `null` beside one is a member
+    // present with a value the protocol does not permit. `InvalidField` rather
+    // than the `MalformedJson` a value of the wrong JSON type is, because
+    // `null` is a value of the right JSON type that this position does not
+    // admit: PROTOCOLS.md section 2.1 draws exactly that line.
     try testing.expectError(error.InvalidField, decode(
         \\{"jsonrpc":"2.0","id":null,"method":"m"}
     , &scratch));
-    try testing.expectError(error.InvalidField, decode(
+    // The other half, unchanged: a fraction has never been an id, and the peer
+    // that sends one gets the name of the fault it made.
+    try testing.expectError(error.MalformedJson, decode(
         \\{"jsonrpc":"2.0","id":1.5,"method":"m"}
+    , &scratch));
+}
+
+test "a null id is legal on a refusal and nowhere else" {
+    // The one place the specification names it. A peer that refused a frame and
+    // could not say which request it belonged to sends this, and a codec that
+    // refused it would drop the loudest refusal it is able to write.
+    var scratch: [128]u8 = undefined;
+    const refusal = try decode(
+        \\{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid Request"}}
+    , &scratch);
+    try testing.expectEqual(Kind.response, refusal.kind);
+    try testing.expect(refusal.id_null);
+    try testing.expectEqual(@as(?Id, null), refusal.id);
+    try testing.expectEqual(@as(i32, -32600), refusal.rpc_error.?.code);
+
+    // A request, which has an id. A `null` beside a `method` cannot be read as
+    // a notification either: the member is present, so the message is a request
+    // whose id no answer could ever be matched to.
+    try testing.expectError(error.InvalidField, decode(
+        \\{"jsonrpc":"2.0","id":null,"method":"m","params":{}}
+    , &scratch));
+    // A result, which is an answer to an id and answers nothing here.
+    try testing.expectError(error.InvalidField, decode(
+        \\{"jsonrpc":"2.0","id":null,"result":{}}
+    , &scratch));
+    // A message that is neither: there is no shape here to put the id on, so
+    // the member is the second fault rather than the first.
+    try testing.expectError(error.MissingField, decode(
+        \\{"jsonrpc":"2.0","id":null}
+    , &scratch));
+    // And a result beside the error, which the mutual exclusion refuses before
+    // the narrow rule is reached. It is here because widening the rule to "any
+    // response" is exactly the fault it exists to prevent, and this document
+    // is what that widening would have let through.
+    try testing.expectError(error.InvalidField, decode(
+        \\{"jsonrpc":"2.0","id":null,"result":{},"error":{"code":1,"message":"m"}}
+    , &scratch));
+}
+
+test "a null id round trips to the same bytes" {
+    // PROTOCOLS.md section 2 asks for `encode(decode(b)) == b`, and this is the
+    // frame `acp_session.refusalBody` writes for a batch frame this session
+    // must not accept. The bytes a peer would receive are the bytes read back
+    // here, which is the whole of what makes the refusal observable.
+    const source = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600," ++
+        "\"message\":\"Invalid Request\"}}";
+    var scratch: [128]u8 = undefined;
+    const decoded = try decode(source, &scratch);
+
+    var out: [128]u8 = undefined;
+    var writer = json.Writer.init(&out);
+    try encode(decoded, &writer);
+    // Member for member and byte for byte: `id_null` is what puts the `id`
+    // back, and an id written as absent would decode as `MissingField`.
+    try testing.expectEqualStrings(source, writer.written());
+
+    // The other direction. The value decoded from the re-encoded frame is the
+    // value decoded from the original, which is the round trip the module doc
+    // states at the value level.
+    var other: [128]u8 = undefined;
+    const again = try decode(writer.written(), &other);
+    try testing.expectEqual(decoded.kind, again.kind);
+    try testing.expectEqual(decoded.id, again.id);
+    try testing.expectEqual(decoded.id_null, again.id_null);
+    try testing.expectEqual(decoded.rpc_error.?.code, again.rpc_error.?.code);
+    try testing.expectEqualStrings(decoded.rpc_error.?.message, again.rpc_error.?.message);
+    try testing.expectEqual(@as(?[]const u8, null), again.result);
+}
+
+test "encode refuses a null id anywhere but on a refusal" {
+    var buffer: [128]u8 = undefined;
+    // The same narrow rule `decode` applies, or a caller could write a frame
+    // this library refuses to read back.
+    var request = json.Writer.init(&buffer);
+    try testing.expectError(error.InvalidField, encode(.{
+        .kind = .request,
+        .id_null = true,
+        .method = Method.split("m"),
+    }, &request));
+
+    var answered = json.Writer.init(&buffer);
+    try testing.expectError(error.InvalidField, encode(.{
+        .kind = .response,
+        .id_null = true,
+        .result = "{}",
+    }, &answered));
+
+    // A message claiming both is one member read two ways, and no peer can
+    // send it.
+    var both = json.Writer.init(&buffer);
+    try testing.expectError(error.InvalidField, encode(.{
+        .kind = .response,
+        .id = .{ .integer = 1 },
+        .id_null = true,
+        .rpc_error = .{ .code = -32600, .message = "Invalid Request" },
+    }, &both));
+
+    // Refused before a byte, so each writer is still where a retry starts.
+    try testing.expectEqual(@as(usize, 0), request.written().len);
+    try testing.expectEqual(@as(usize, 0), answered.written().len);
+    try testing.expectEqual(@as(usize, 0), both.written().len);
+}
+
+test "a value of the wrong JSON type is MalformedJson wherever it appears" {
+    // PROTOCOLS.md section 2.1 gives `MalformedJson` as "a JSON syntax error, or
+    // a value of the wrong JSON type", and `InvalidField` as a field present
+    // with a value the protocol does not permit. A member carrying the wrong
+    // type is the first of those, and the id and the code are the two members
+    // that used to say the second. One fault has one name, so a caller learns
+    // it from any member rather than from the one that happens to be modelled.
+    var scratch: [64]u8 = undefined;
+    try testing.expectError(error.MalformedJson, decode(
+        \\{"jsonrpc":"2.0","id":true,"method":"m"}
+    , &scratch));
+    try testing.expectError(error.MalformedJson, decode(
+        \\{"jsonrpc":"2.0","id":{"a":1},"method":"m"}
+    , &scratch));
+    try testing.expectError(error.MalformedJson, decode(
+        \\{"jsonrpc":"2.0","id":1,"method":7}
+    , &scratch));
+    try testing.expectError(error.MalformedJson, decode(
+        \\{"jsonrpc":"2.0","id":1,"method":"m","params":7}
+    , &scratch));
+    try testing.expectError(error.MalformedJson, decode(
+        \\{"jsonrpc":"2.0","id":1,"method":"m","params":"a"}
+    , &scratch));
+    try testing.expectError(error.MalformedJson, decode(
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":"-32601","message":"m"}}
+    , &scratch));
+
+    // The other member of the pair still means what it says: a field the
+    // protocol does not permit beside the others, which is a document the
+    // grammar admits and the specification does not.
+    try testing.expectError(error.InvalidField, decode(
+        \\{"jsonrpc":"2.0","id":1,"method":"m","result":{}}
     , &scratch));
 }
 
@@ -670,9 +1049,10 @@ test "an out-of-range error code is LimitExceeded, as an out-of-range id is" {
     try testing.expectError(error.LimitExceeded, decode(
         \\{"jsonrpc":"2.0","id":99999999999999999999,"method":"m"}
     , &scratch));
-    // The other arm, which the two paths also share: a fraction is a type
-    // fault rather than an overflow, so it stays `InvalidField`.
-    try testing.expectError(error.InvalidField, decode(
+    // The other arm, which the two paths also share: a fraction is a value of
+    // the wrong JSON type rather than an overflow, so it is `MalformedJson` as
+    // every other wrong-typed member is.
+    try testing.expectError(error.MalformedJson, decode(
         \\{"jsonrpc":"2.0","id":1,"error":{"code":1.5,"message":"m"}}
     , &scratch));
 }
@@ -804,6 +1184,35 @@ test "encode reports BufferTooSmall rather than truncating" {
         .method = Method.split("tools/call"),
     };
     try testing.expectError(error.BufferTooSmall, encode(message, &writer));
+}
+
+test "a short buffer leaves the writer where a retry can start" {
+    // `json.Writer`'s doc tells a caller to size a buffer, retry on failure and
+    // grow it. That is only true of a writer that is back where it started:
+    // without the rewind the frame written up to the byte that did not fit is
+    // the prefix of the next one, and the retry writes a document no peer sent.
+    var small: [8]u8 = undefined;
+    var buffer: [256]u8 = undefined;
+    const message: Message = .{
+        .kind = .request,
+        .id = .{ .integer = 1 },
+        .method = Method.split("tools/call"),
+    };
+
+    var writer = json.Writer.init(&small);
+    try testing.expectError(error.BufferTooSmall, encode(message, &writer));
+    // The length the caller handed in, so none of the half frame can be read
+    // as the start of the next one.
+    try testing.expectEqual(@as(usize, 0), writer.written().len);
+
+    // The buffer is the only state a caller has to restore; the length is
+    // already back where the call started.
+    writer.buffer = &buffer;
+    try encode(message, &writer);
+    try testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"}",
+        writer.written(),
+    );
 }
 
 test "encode refuses a response with no id" {
@@ -966,12 +1375,123 @@ test "encode refuses a message decode would reject, and writes nothing" {
     try testing.expectEqual(@as(usize, 0), silent.written().len);
 }
 
+test "a spliced body that is not one JSON value is refused, and writes nothing" {
+    // The three bodies `encode` writes as the caller's own bytes. Each of them
+    // framed a document this library refuses to read back before the rule, so
+    // the peer was the first thing to find out what the caller had built.
+    // PROTOCOLS.md section 2 asks for `decode(encode(x)) == x` on every value
+    // `encode` accepts, and a body is the one member no shape rule can vouch
+    // for.
+    var scratch: [256]u8 = undefined;
+    var buffer: [256]u8 = undefined;
+
+    // `params`, spelled the way a caller spells it: text from somewhere that is
+    // not JSON at all.
+    var params = json.Writer.init(&buffer);
+    try testing.expectError(error.InvalidField, encode(
+        .{
+            .kind = .request,
+            .id = .{ .integer = 1 },
+            .method = Method.split("m"),
+            .params = .{ .value = "not json at all" },
+        },
+        &params,
+    ));
+    try testing.expectEqual(@as(usize, 0), params.written().len);
+    // The frame that used to reach the wire, and what the peer made of it.
+    try testing.expectError(error.MalformedJson, decode(
+        \\{"jsonrpc":"2.0","id":1,"method":"m","params":not json at all}
+    , &scratch));
+
+    // `result`, truncated after its first member.
+    var result = json.Writer.init(&buffer);
+    try testing.expectError(error.InvalidField, encode(
+        .{ .kind = .response, .id = .{ .integer = 1 }, .result = "{\"ok\":true" },
+        &result,
+    ));
+    try testing.expectEqual(@as(usize, 0), result.written().len);
+
+    // An error's `data`, which is a body like any other.
+    var data = json.Writer.init(&buffer);
+    try testing.expectError(error.InvalidField, encode(
+        .{
+            .kind = .response,
+            .id = .{ .integer = 1 },
+            .rpc_error = .{ .code = -32603, .message = "m", .data = "{\"why\":" },
+        },
+        &data,
+    ));
+    try testing.expectEqual(@as(usize, 0), data.written().len);
+
+    // A `params` that is one value of a type `decodeParams` does not admit. A
+    // scalar is a valid JSON value and still not a params.
+    var scalar = json.Writer.init(&buffer);
+    try testing.expectError(error.InvalidField, encode(
+        .{
+            .kind = .request,
+            .id = .{ .integer = 1 },
+            .method = Method.split("m"),
+            .params = .{ .value = "7" },
+        },
+        &scalar,
+    ));
+    try testing.expectEqual(@as(usize, 0), scalar.written().len);
+
+    // Two values behind one colon is one too many, and `rawValue` stops at the
+    // end of the first.
+    var trailing = json.Writer.init(&buffer);
+    try testing.expectError(error.InvalidField, encode(
+        .{ .kind = .response, .id = .{ .integer = 1 }, .result = "{} {}" },
+        &trailing,
+    ));
+    try testing.expectEqual(@as(usize, 0), trailing.written().len);
+}
+
 test "an unknown top-level member is skipped, not a decode error" {
     var scratch: [128]u8 = undefined;
     const decoded = try decode(
         \\{"jsonrpc":"2.0","id":1,"method":"m","extensionField":{"a":[1,2]}}
     , &scratch);
     try testing.expectEqual(Kind.request, decoded.kind);
+}
+
+test "a repeated member is resolved first-wins, the rule json.memberText applies" {
+    var scratch: [128]u8 = undefined;
+
+    // The case the rule exists for: a peer that sends two methods must not have
+    // the second one applied here while an intermediary that stopped at the
+    // first saw the safe one.
+    const decoded = try decode(
+        \\{"jsonrpc":"2.0","id":1,"method":"safe","method":"other"}
+    , &scratch);
+    try testing.expectEqualStrings("safe", decoded.method.?.text);
+
+    // The same through `decodeRequest`, which is the entry point a dispatcher
+    // reads and therefore the answer that gets acted on.
+    const request = try decodeRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"safe","method":"other"}
+    , &scratch);
+    try testing.expectEqualStrings("safe", request.method.text);
+
+    // Every modelled member resolves the same way, `params` included: its three
+    // states are why it is asked of the message and not of a flag.
+    const body = try decode(
+        \\{"jsonrpc":"2.0","id":1,"method":"m","params":{"a":1},"params":{"b":2}}
+    , &scratch);
+    try testing.expectEqualStrings("{\"a\":1}", body.params.value);
+
+    // A repeated version fails closed. The first is the one an intermediary
+    // that read only the version member saw, so a peer cannot write a frame
+    // that reads as 2.0 here and as something else there.
+    try testing.expectError(error.UnsupportedVersion, decode(
+        \\{"jsonrpc":"1.0","jsonrpc":"2.0","id":1,"method":"m"}
+    , &scratch));
+
+    // The discarded copy is read as a value rather than stepped over, so a
+    // syntax error hidden in the second slot is still a syntax error.
+    try testing.expectError(error.MalformedJson, decode(
+        \\{"jsonrpc":"2.0","id":1,"method":"m","method":[}
+    , &scratch));
 }
 
 test "decodeRequest refuses a notification and a response" {
@@ -1158,6 +1678,41 @@ test "an answer with neither body, or with both, is refused and writes nothing" 
     try testing.expectEqual(@as(usize, 0), both.written().len);
 }
 
+test "an answer whose body is not JSON is refused, and writes nothing" {
+    var scratch: [128]u8 = undefined;
+    const request = try decodeRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call"}
+    , &scratch);
+    var out: [256]u8 = undefined;
+
+    // The result arm, which is where `Conn.respond` splices the caller's own
+    // text.
+    var result = json.Writer.init(&out);
+    try testing.expectError(error.InvalidField, encodeResponse(
+        request,
+        "not json at all",
+        null,
+        &result,
+    ));
+    try testing.expectEqual(@as(usize, 0), result.written().len);
+
+    // The error arm's `data`, through the writer and through the buffer form.
+    // Both refuse before either opens its frame.
+    var data = json.Writer.init(&out);
+    try testing.expectError(error.InvalidField, encodeResponse(
+        request,
+        null,
+        .{ .code = -32603, .message = "m", .data = "}}" },
+        &data,
+    ));
+    try testing.expectEqual(@as(usize, 0), data.written().len);
+    try testing.expectError(error.InvalidField, errorResponse(request, .{
+        .code = -32603,
+        .message = "m",
+        .data = "}}",
+    }, &out));
+}
+
 test "an answer too long for its buffer is BufferTooSmall and no slice escapes" {
     // The buffer builders return a slice of the caller's buffer, so a short
     // one is the only way a truncated document could reach a caller. It does
@@ -1233,10 +1788,15 @@ test "errorResponse returns the whole frame in the caller's buffer" {
     );
 }
 
-test "methodNotFound writes the bytes the hand-written builders write" {
-    // The two session layers build this frame by hand, and a cutover to this
-    // one must not move a byte. Both expectations are copied from those
-    // builders, one per id arm.
+test "methodNotFound pins the -32601 frame, member for member" {
+    // The expectation is the frame written out member by member: `jsonrpc`,
+    // the id in the arm it arrived in, then an `error` object carrying the code
+    // and the name table 3.1 of PROTOCOLS.md gives it, and no `result` beside
+    // it. Both values are normative and the order is `encodeResponse`'s, so a
+    // change that moves a comma or renames the message changes the wire this
+    // library promises rather than refactoring it. Both id arms are pinned
+    // because the id is echoed, and an echoed id is the member a peer matches
+    // the refusal by.
     var numeric_scratch: [128]u8 = undefined;
     var string_scratch: [128]u8 = undefined;
     var out: [256]u8 = undefined;

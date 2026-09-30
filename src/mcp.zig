@@ -31,6 +31,11 @@ pub const latest_protocol_version = "2026-07-28";
 /// The older revision, decoded separately rather than as a flag.
 pub const previous_protocol_version = "2025-11-25";
 
+/// The `jsonrpc` member every MCP message carries, section 4.1.
+///
+/// It names the JSON-RPC envelope, not the revision: both decoded revisions
+/// send it and neither is derived from it, so a message carrying `"2.0"` says
+/// nothing about which revision its methods are read against.
 pub const jsonrpc_version = "2.0";
 
 /// The two decoded revisions.
@@ -42,12 +47,19 @@ pub const Revision = enum {
     /// `2025-11-25` and earlier. Capabilities travel in `initialize`.
     previous,
 
+    /// The revision a wire spelling names, or null for one this library does
+    /// not decode.
+    ///
+    /// Null rather than a default: a revision with no method table here has
+    /// nothing to resolve a method against, so naming one would answer for a
+    /// protocol the caller did not say it speaks.
     pub fn fromString(text: []const u8) ?Revision {
         if (std.mem.eql(u8, text, latest_protocol_version)) return .current;
         if (std.mem.eql(u8, text, previous_protocol_version)) return .previous;
         return null;
     }
 
+    /// The wire spelling of this revision, which is what a peer sends.
     pub fn string(self: Revision) []const u8 {
         return switch (self) {
             .current => latest_protocol_version,
@@ -294,6 +306,11 @@ pub fn areSchemaHeaderNamesUnique(names: []const []const u8) bool {
 pub const header_integer_min: i64 = -(1 << 53) + 1;
 pub const header_integer_max: i64 = (1 << 53) - 1;
 
+/// Whether `value` is inside the range above, both ends included.
+///
+/// The membership test, for a caller holding an integer read out of
+/// `arguments` rather than an annotation. [`isBindableValue`] is what applies
+/// it to a parameter the schema typed `integer`.
 pub fn isValidHeaderInteger(value: i64) bool {
     return value >= header_integer_min and value <= header_integer_max;
 }
@@ -353,6 +370,9 @@ pub const ParamType = enum {
     /// guessing which member of a union the peer meant.
     unstated,
 
+    /// The tag a schema `type` name maps to. A name this library does not know
+    /// is [`ParamType.unstated`], so [`isBindableParamType`] refuses it
+    /// rather than this function.
     pub fn fromSchemaType(name: []const u8) ParamType {
         return if (std.mem.eql(u8, name, "string"))
             .string
@@ -628,12 +648,29 @@ pub const ParamVerdict = enum {
     /// reject the request.
     missing_header,
     /// The client sent a header for a value `arguments` omits or sets to
-    /// `null`. The server MUST NOT expect it, so the request is rejected.
+    /// `null`. The server MUST NOT expect it, which is a rule about what the
+    /// server acts on and not a rule about rejecting: see [`isAcceptable`].
     unexpected_header,
 
     /// Whether the request may proceed.
+    ///
+    /// PROTOCOLS.md 4.2 makes a server "MUST reject on mismatch", which is
+    /// [`ParamVerdict.mismatch`], and the normative table's last row adds one
+    /// more: "Client omits header but value is in body | Non-conforming client
+    /// | MUST reject the request", which is
+    /// [`ParamVerdict.missing_header`]. Those two and no other.
+    ///
+    /// The two rows that read "MUST NOT expect the header" — a value that is
+    /// `null`, and a parameter not in `arguments` — state what the server must
+    /// not *expect*, and the table contains no rejection for either. Turning
+    /// that sentence into a refusal derived a rejection the authority does not
+    /// state, and it made [`ParamVerdict.unexpected_header`] a hard gate
+    /// alongside a row that genuinely is one. A conforming client never
+    /// reaches it, so no behaviour depended on the gate; what was wrong was
+    /// the rule behind it. The verdict is still reported, so a server that
+    /// does want to refuse one has the fact by name.
     pub fn isAcceptable(self: ParamVerdict) bool {
-        return self == .accepted;
+        return self != .mismatch and self != .missing_header;
     }
 
     /// The code to reject with, where the specification names one.
@@ -739,6 +776,19 @@ pub const Direction = enum {
     bidirectional,
 };
 
+/// Which leg of a request a result arrived on.
+///
+/// The two members are the two facts the no-cache rule composes. A client
+/// that reads [`MethodInfo.cacheable`] on its own caches the `complete` leg of
+/// a multi round-trip retry, which the specification forbids;
+/// [`MethodInfo.mayCache`] takes both and is where that rule lives.
+pub const CacheLeg = enum {
+    /// The request the client sent first.
+    original,
+    /// A retry carrying `inputResponses` or `requestState`.
+    mrtr_retry,
+};
+
 /// A method name and where it is valid.
 pub const MethodInfo = struct {
     name: []const u8,
@@ -757,6 +807,25 @@ pub const MethodInfo = struct {
     cacheable: bool = false,
     /// Whether the method is retired rather than active.
     deprecated: bool = false,
+
+    /// Whether a result for this method, arrived on `leg`, may be cached.
+    ///
+    /// PROTOCOLS.md section 4.6 states the two caching fields and does not
+    /// carry the no-cache rule, so this is a gap in the authority rather than
+    /// a contradiction of it and it is recorded here. The normative source
+    /// does state it, verbatim: "Results produced by retrying a request
+    /// through the multi round-trip requests mechanism—that is, requests
+    /// carrying `inputResponses` or `requestState`—MUST NOT be cached."
+    ///
+    /// It is not folded into [`MethodInfo.cacheable`], which stays a property
+    /// of the method: `resources/read` genuinely is cacheable on the leg that
+    /// was not a retry, and two independent booleans are exactly what invite
+    /// the wrong one. A method that is not cacheable is not cacheable on
+    /// either leg, so this is a composition and not a third flag.
+    pub fn mayCache(self: MethodInfo, leg: CacheLeg) bool {
+        if (leg == .mrtr_retry) return false;
+        return self.cacheable;
+    }
 };
 
 /// The methods a server MUST implement at `revision`.
@@ -1007,6 +1076,12 @@ pub const ErrorCode = enum(i32) {
     /// URL elicitation required, `-32042`, `2025-11-25` only.
     url_elicitation_required_legacy = -32042,
 
+    /// The number this code carried before the `2026-07-28` renumbering, or
+    /// null for a code the specification did not move.
+    ///
+    /// A client reading a previous-revision peer needs it, because
+    /// [`ErrorCode.fromCode`] does not answer for the three codes the draft
+    /// moved.
     pub fn renumberedFrom(self: ErrorCode) ?i32 {
         return switch (self) {
             .header_mismatch => -32001,
@@ -1016,6 +1091,13 @@ pub const ErrorCode = enum(i32) {
         };
     }
 
+    /// The code a wire number names, or null for a number this library does
+    /// not know.
+    ///
+    /// It answers for the two retired codes a previous-revision peer still
+    /// sends, and for nothing else: `-32602` is the JSON-RPC spelling of a
+    /// condition MCP shares rather than one of its own, so
+    /// [`acceptsResourceNotFound`] is what classifies that number.
     pub fn fromCode(code: i32) ?ErrorCode {
         return switch (code) {
             -32020 => .header_mismatch,
@@ -1080,11 +1162,24 @@ pub const ResultType = struct {
     /// The wire value, or null when the member was absent.
     value: ?[]const u8 = null,
 
-    /// Parse a `resultType` string.
+    /// Parse a `resultType` string, keeping it as written.
+    ///
+    /// It validates nothing and normalises nothing: a name the revision does
+    /// not define is kept, and [`ResultType.known`] is where a caller decides
+    /// what it means. `text` is borrowed, so it has to outlive the result.
     pub fn parse(text: []const u8) ResultType {
         return .{ .value = text };
     }
 
+    /// The [`KnownResultType`] this value names, or null for one the revision
+    /// does not define.
+    ///
+    /// An absent value is `complete`, which is a decision rather than a
+    /// default: a peer on an earlier revision omits the member and the client
+    /// MUST treat that as complete. An unrecognised name is null rather than
+    /// `complete`, for the opposite reason — the specification requires the
+    /// client to consider it invalid, and what to do about a value an
+    /// extension contributed is the caller's to choose.
     pub fn known(self: ResultType) ?KnownResultType {
         const value = self.value orelse return .complete;
         if (std.mem.eql(u8, value, result_type_value.complete)) return .complete;
@@ -1114,14 +1209,25 @@ pub const ResultType = struct {
 pub fn decodeResultType(raw: []const u8, scratch: []u8) DecodeError!ResultType {
     var reader = json.Reader.init(raw);
     var result: ResultType = .{};
-    if (try reader.beginObject()) return result;
-    while (try reader.nextKey(scratch)) |key| {
-        if (std.mem.eql(u8, key, "resultType")) {
-            result.value = try reader.string(scratch);
-        } else {
-            try reader.skipValue(scratch);
+    // An empty object is a result that carries no `resultType` rather than a
+    // refusal, so the loop is skipped and not the function: the check below
+    // then stands for the empty object as well.
+    if (!try reader.beginObject()) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, "resultType")) {
+                result.value = try reader.string(scratch);
+            } else {
+                try reader.skipValue(scratch);
+            }
         }
     }
+
+    // A result object is one JSON value. Bytes after the closing brace are a
+    // second document the transport did not split, or a peer that disagrees
+    // with it about where a message ends, and a decoder that accepted them
+    // would re-encode the result without them — the silent truncation
+    // `jsonrpc.decode` and `bridge.decodeEnvelope` refuse for the same reason.
+    if (!reader.atEnd()) return error.MalformedJson;
     return result;
 }
 
@@ -1176,6 +1282,12 @@ pub fn decodeCacheable(raw: []const u8, scratch: []u8) DecodeError!Cacheable {
             try reader.skipValue(scratch);
         }
     }
+
+    // A result object is one JSON value, for the reason stated in
+    // `decodeResultType`. Nothing in this library re-encodes a `Cacheable`, so
+    // a tail would cost no bytes on the way out; it would only mean the
+    // decoder had read a document the specification does not describe.
+    if (!reader.atEnd()) return error.MalformedJson;
 
     // "Cacheable results add two required fields."
     return .{
@@ -1261,6 +1373,12 @@ pub fn decodeInputRequiredResult(
         }
     }
 
+    // A result object is one JSON value, for the reason stated in
+    // `decodeResultType`. This is the decoder a caller re-encodes most often —
+    // the client answers the interim result with a retry — so the tail is
+    // dropped on the retry the same way, and nothing downstream reports it.
+    if (!reader.atEnd()) return error.MalformedJson;
+
     // "At least one of inputRequests or requestState MUST be present."
     if (result.input_requests == null and result.request_state == null) {
         return error.MissingField;
@@ -1277,6 +1395,43 @@ pub fn permitsMrtr(method: []const u8) bool {
     return std.mem.eql(u8, method, "prompts/get") or
         std.mem.eql(u8, method, "resources/read") or
         std.mem.eql(u8, method, "tools/call");
+}
+
+/// Which leg a request's `params` put it on.
+///
+/// The normative no-cache rule reads "requests carrying `inputResponses` or
+/// `requestState`", so presence of either member is the whole test and the
+/// members are not walked: an `inputResponses` map a client cannot have filled
+/// yet still puts the request on the retry leg, and a client that read only
+/// the method would cache a result the specification forbids caching.
+///
+/// `params` is a borrowed JSON object as it arrived. A peer that sends no
+/// params at all has sent nothing that can be a retry, and an empty object
+/// has sent nothing either, so both are `.original`.
+pub fn decodeCacheLeg(params: []const u8, scratch: []u8) DecodeError!CacheLeg {
+    var reader = json.Reader.init(params);
+    var leg: CacheLeg = .original;
+
+    // An empty object is a request that can have been on no leg rather than a
+    // refusal, so the loop is skipped and not the function: the check below
+    // then stands for the empty object as well.
+    if (!try reader.beginObject()) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, "inputResponses") or
+                std.mem.eql(u8, key, "requestState"))
+            {
+                leg = .mrtr_retry;
+            }
+            try reader.skipValue(scratch);
+        }
+    }
+
+    // `params` is one JSON object, for the reason stated in
+    // `decodeResultType`. Nothing re-encodes a `CacheLeg` either, so a tail
+    // would cost no bytes on the way out; it would only mean the leg was read
+    // off the first of two documents a peer sent as one.
+    if (!reader.atEnd()) return error.MalformedJson;
+    return leg;
 }
 
 // --- 4.8 Capabilities and extensions --------------------------------------------
@@ -1722,6 +1877,67 @@ test "permitsMrtr and the mrtr flag agree on every client request" {
         try testing.expect(!permitsMrtr(info.name));
         try testing.expect(!info.mrtr);
     }
+}
+
+test "a retry leg's result is never cacheable, whatever the method says" {
+    var scratch: [256]u8 = undefined;
+
+    // `resources/read` is the one client request that is both cacheable and
+    // may return an interim result, so it is the row where reading one flag
+    // instead of the composition caches the `complete` leg of a retry and
+    // serves it stale. The method flag is deliberately unchanged: the method
+    // genuinely is cacheable on the leg that was not a retry.
+    const read = try lookupMethod(.current, "resources/read");
+    try testing.expect(read.cacheable);
+    try testing.expect(read.mrtr);
+    try testing.expect(read.mayCache(.original));
+    try testing.expect(!read.mayCache(.mrtr_retry));
+
+    // The other five cacheable requests have no interim leg at all, so nothing
+    // changes for them and the flag stays the whole answer on the leg that can
+    // arrive.
+    const cacheable = [_][]const u8{
+        "server/discover",
+        "tools/list",
+        "prompts/list",
+        "resources/list",
+        "resources/templates/list",
+    };
+    for (cacheable) |name| {
+        const info = try lookupMethod(.current, name);
+        try testing.expect(info.mayCache(.original));
+        try testing.expect(!info.mayCache(.mrtr_retry));
+    }
+
+    // A method that is not cacheable is not cacheable on either leg, so this
+    // is a composition of two facts and not a third flag.
+    const call = try lookupMethod(.current, "tools/call");
+    try testing.expect(!call.cacheable);
+    try testing.expect(!call.mayCache(.original));
+    try testing.expect(!call.mayCache(.mrtr_retry));
+
+    // Which leg a request is on is read from the two members the normative
+    // sentence names, and presence alone counts: an `inputResponses` map a
+    // client has not filled yet still makes the request a retry.
+    const first_call =
+        \\{"name":"echo","arguments":{"message":"hello"}}
+    ;
+    try testing.expectEqual(CacheLeg.original, try decodeCacheLeg(first_call, &scratch));
+    // Nothing but those two members puts a request on the retry leg, and an
+    // empty params object is not a retry.
+    try testing.expectEqual(CacheLeg.original, try decodeCacheLeg("{}", &scratch));
+    const both =
+        \\{"name":"echo","inputResponses":{},"requestState":"st"}
+    ;
+    try testing.expectEqual(CacheLeg.mrtr_retry, try decodeCacheLeg(both, &scratch));
+    const responses =
+        \\{"name":"echo","inputResponses":{}}
+    ;
+    try testing.expectEqual(CacheLeg.mrtr_retry, try decodeCacheLeg(responses, &scratch));
+    const state =
+        \\{"name":"echo","requestState":"st"}
+    ;
+    try testing.expectEqual(CacheLeg.mrtr_retry, try decodeCacheLeg(state, &scratch));
 }
 
 test "server/discover is the only mandatory method" {
@@ -2255,6 +2471,34 @@ test "the four parameter rows resolve to one verdict each" {
     );
 }
 
+test "only the two rows the authority rejects are a refusal" {
+    var converted: [64]u8 = undefined;
+    var scratch: [128]u8 = undefined;
+
+    // PROTOCOLS.md 4.2 rejects "on mismatch", and the normative table's last
+    // row adds the missing header for a value the body carries. Those two.
+    try testing.expect(ParamVerdict.accepted.isAcceptable());
+    try testing.expect(!ParamVerdict.mismatch.isAcceptable());
+    try testing.expect(!ParamVerdict.missing_header.isAcceptable());
+
+    // The two rows that read "MUST NOT expect the header" — a value that is
+    // `null`, and a parameter not in `arguments` — state what the server must
+    // not *expect*, and the table names no outcome for either. The server does
+    // not act on the header, which is what the row requires; the codec does
+    // not turn a sentence about expectations into a rejection it cannot cite.
+    // The verdict is still reported, so a server that does want to refuse one
+    // has the fact by name.
+    try testing.expect(ParamVerdict.unexpected_header.isAcceptable());
+
+    // Reached the way a caller reaches it. `checkParamBinding` takes one null
+    // for "the body omits the key" and "the body carries JSON null" alike, so
+    // this is both of those two rows at once: reported as the extra-header
+    // row, and not gating the request.
+    const verdict = try checkParamBinding("7", null, &converted, &scratch);
+    try testing.expectEqual(ParamVerdict.unexpected_header, verdict);
+    try testing.expect(verdict.isAcceptable());
+}
+
 test "an unbindable value or schema is refused, not sent" {
     var names: [64]u8 = undefined;
     var values: [128]u8 = undefined;
@@ -2580,4 +2824,177 @@ test "extension method sets are the specified ones" {
             try testing.expect(!std.mem.eql(u8, info.name, name));
         }
     }
+}
+
+/// The writer [`ResultType`] has no library encoder for.
+///
+/// PROTOCOLS.md section 2 makes an encoder the exact inverse of its decoder,
+/// which for a type this library only decodes is a property of the pair. This
+/// is the writer `testkit` round-trips the type through, and it writes the
+/// members the type carries: a member [`decodeResultType`] does not govern is
+/// skipped by design and no writer built from the decoded value could put it
+/// back, so the byte-for-byte half of the round trip is asserted on a document
+/// carrying only the members the type keeps.
+fn writeResultType(result: ResultType, writer: *json.Writer) EncodeError!void {
+    try writer.byte('{');
+    if (result.value) |value| {
+        try writer.slice("\"resultType\":");
+        try writer.string(value);
+    }
+    try writer.byte('}');
+}
+
+/// The writer [`InputRequiredResult`] has no library encoder for. See
+/// [`writeResultType`]; this is the writer `testkit` round-trips the type
+/// through.
+fn writeInputRequiredResult(
+    result: InputRequiredResult,
+    writer: *json.Writer,
+) EncodeError!void {
+    try writer.byte('{');
+    // The separator goes in front of every member after the first rather than
+    // baked into each one, because `resultType` is optional: a comma where
+    // that member stood is a document no reader is right to accept, and the
+    // member was the caller's to omit.
+    var separator: []const u8 = "";
+    if (result.result_type.value) |value| {
+        try writer.slice(separator);
+        try writer.slice("\"resultType\":");
+        try writer.string(value);
+        separator = ",";
+    }
+    if (result.input_requests) |requests| {
+        try writer.slice(separator);
+        try writer.slice("\"inputRequests\":");
+        try writer.slice(requests);
+        separator = ",";
+    }
+    if (result.request_state) |state| {
+        try writer.slice(separator);
+        try writer.slice("\"requestState\":");
+        try writer.string(state);
+    }
+    try writer.byte('}');
+}
+
+test "a result object with a trailing byte is refused, not truncated" {
+    var scratch: [128]u8 = undefined;
+    var out: [128]u8 = undefined;
+
+    // The document is one result and the tail is a second one. Accepting it
+    // lost the tail silently: the bytes that came back still decoded, so
+    // nothing downstream ever reported an error, and `encode(decode(b)) != b`
+    // for a `b` the decoder had called a whole document.
+    try testing.expectError(
+        error.MalformedJson,
+        decodeResultType("{\"resultType\":\"complete\",\"tools\":[]} trailing", &scratch),
+    );
+    // `{}` is the other accepted shape, and the check stands for it as well:
+    // an empty object skips the member loop, not the check.
+    try testing.expectError(error.MalformedJson, decodeResultType("{} trailing", &scratch));
+
+    // The round trip the tail would have broken, on documents the decoder
+    // accepts whole. The member the type does not govern is in the refusal
+    // above rather than here, because a skipped member is gone by design and
+    // says nothing about the tail.
+    const complete = try decodeResultType("{\"resultType\":\"complete\"}", &scratch);
+    var writer = json.Writer.init(&out);
+    try writeResultType(complete, &writer);
+    try testing.expectEqualStrings("{\"resultType\":\"complete\"}", writer.written());
+    const empty = try decodeResultType("{}", &scratch);
+    writer = json.Writer.init(&out);
+    try writeResultType(empty, &writer);
+    try testing.expectEqualStrings("{}", writer.written());
+
+    // `Cacheable` has no encoder at all, so a tail costs no bytes on the way
+    // out. The decoder must refuse the document anyway: it is not one.
+    try testing.expectError(
+        error.MalformedJson,
+        decodeCacheable("{\"ttlMs\":0,\"cacheScope\":\"public\"} trailing", &scratch),
+    );
+
+    // Whitespace after the value is not a second document, and a result
+    // written across lines is the ordinary case, so it still decodes.
+    const spaced = try decodeResultType("{\"resultType\":\"complete\"} \n\t ", &scratch);
+    try testing.expectEqualStrings(result_type_value.complete, spaced.value.?);
+    const cacheable = try decodeCacheable("{\"ttlMs\":0,\"cacheScope\":\"public\"}\n", &scratch);
+    try testing.expectEqual(@as(u64, 0), cacheable.ttl_ms);
+}
+
+test "an InputRequiredResult with a trailing byte is refused" {
+    var scratch: [128]u8 = undefined;
+    var out: [128]u8 = undefined;
+
+    // The tail is dropped whichever arm took the last member, so the case is
+    // stated against the `requestState` arm, which takes a lexeme and is the
+    // one a check written inside the arm would pass. The `inputRequests` arm
+    // takes a `rawValue` and is the second half of the same claim.
+    const interim = "{\"resultType\":\"input_required\",\"requestState\":\"x\"}";
+    try testing.expectError(
+        error.MalformedJson,
+        decodeInputRequiredResult(
+            "{\"resultType\":\"input_required\",\"requestState\":\"x\"} trailing",
+            &scratch,
+        ),
+    );
+    const requests =
+        "{\"resultType\":\"input_required\",\"inputRequests\":{\"a\":{\"method\":\"tools/call\"}}}";
+    try testing.expectError(
+        error.MalformedJson,
+        decodeInputRequiredResult(
+            "{\"resultType\":\"input_required\",\"inputRequests\":{\"a\":{\"method\":\"tools/call\"}}} trailing",
+            &scratch,
+        ),
+    );
+    // A document that is malformed at its end is malformed whatever else is
+    // wrong with it, so this answers the tail rather than the presence rule
+    // that sits below the check.
+    try testing.expectError(
+        error.MalformedJson,
+        decodeInputRequiredResult("{\"resultType\":\"input_required\"} trailing", &scratch),
+    );
+
+    // The round trip the tail would have broken, on the documents that are
+    // accepted. A client answers the interim result with a retry, so this pair
+    // is one a caller really writes.
+    const state_decoded = try decodeInputRequiredResult(interim, &scratch);
+    var writer = json.Writer.init(&out);
+    try writeInputRequiredResult(state_decoded, &writer);
+    try testing.expectEqualStrings(interim, writer.written());
+    const request_decoded = try decodeInputRequiredResult(requests, &scratch);
+    writer = json.Writer.init(&out);
+    try writeInputRequiredResult(request_decoded, &writer);
+    try testing.expectEqualStrings(requests, writer.written());
+
+    // Whitespace after the value is not a second document.
+    const spaced = try decodeInputRequiredResult(
+        "{\"resultType\":\"input_required\",\"requestState\":\"x\"} \n",
+        &scratch,
+    );
+    try testing.expectEqualStrings("x", spaced.request_state.?);
+}
+
+test "params with a trailing byte are refused before the leg is read" {
+    var scratch: [128]u8 = undefined;
+
+    // `CacheLeg` has no encoder either, so this is a validation hole rather
+    // than a lost byte. It is on the leg that decides whether a result may be
+    // cached at all, which is the one place a truncated read is not visible.
+    try testing.expectError(
+        error.MalformedJson,
+        decodeCacheLeg("{\"name\":\"echo\",\"requestState\":\"st\"} trailing", &scratch),
+    );
+    // The empty object is the other accepted shape, and it takes the check as
+    // well: it skips the member loop, not the check.
+    try testing.expectError(error.MalformedJson, decodeCacheLeg("{} trailing", &scratch));
+
+    // Whitespace after the value is not a second document.
+    try testing.expectEqual(
+        CacheLeg.mrtr_retry,
+        try decodeCacheLeg("{\"name\":\"echo\",\"requestState\":\"st\"} \n", &scratch),
+    );
+    try testing.expectEqual(
+        CacheLeg.original,
+        try decodeCacheLeg("{\"name\":\"echo\",\"arguments\":{\"message\":\"hi\"}} \n", &scratch),
+    );
 }

@@ -62,11 +62,43 @@ pub const Envelope = struct {
     inner_method: []const u8,
     /// The inner MCP params, as borrowed JSON text. Absent means absent.
     inner_params: ?[]const u8 = null,
+    /// The outer `_meta`, as borrowed JSON text, beside `serverId`.
+    ///
+    /// `research/normative/acp-v1-v2.md` table 10b, verbatim: "An optional
+    /// outer `_meta` object alongside `serverId` is ACP envelope metadata.
+    /// Omission and `null` are equivalent." PROTOCOLS.md section 7 names only
+    /// `serverId`, `requestId` and the outer `id`, so that row fills a silence
+    /// in the authority rather than contradicting it, and it is recorded
+    /// here.
+    ///
+    /// This is the *envelope* `_meta`, the one beside `serverId`. It is not
+    /// the inner MCP `_meta` that lives inside `params`, which
+    /// [`Envelope.inner_params`] already carries.
+    ///
+    /// The text is spliced verbatim rather than decoded into a shape. A shape
+    /// cannot round-trip a member it does not model, which is the defect this
+    /// field exists to remove, so borrowing the lexeme is both the cheaper and
+    /// the more faithful representation.
+    meta: ?[]const u8 = null,
     /// Which way this envelope is travelling.
     ///
     /// Derived from the outer ACP `id`, which the params object excludes, so a
     /// caller reading the params bytes alone cannot determine it.
     direction: Direction,
+
+    /// Whether this envelope carries inner MCP parameters.
+    ///
+    /// The same normative row types `params` as "object | `null`" and says
+    /// "Omission and `null` both mean no inner parameters", so a non-null
+    /// [`Envelope.inner_params`] holding the four bytes `null` is not the fact
+    /// the specification means by carrying parameters. The field keeps those
+    /// bytes so the envelope re-encodes to what arrived; this is where the
+    /// equivalence is applied. Normalising the member away instead would
+    /// trade a semantic wrinkle for a broken `encode(decode(b)) == b`.
+    pub fn carriesParams(self: Envelope) bool {
+        const params = self.inner_params orelse return false;
+        return !std.mem.eql(u8, params, "null");
+    }
 };
 
 /// Decode a `mcp/message` params object.
@@ -82,6 +114,19 @@ pub const Envelope = struct {
 /// and the provider-to-agent message is a notification and does not. Deriving
 /// the direction inside the decoder instead would report a request for every
 /// envelope, including the notifications.
+///
+/// A member this module does not model is skipped, and re-encoding an
+/// envelope therefore drops it — the same stated consequence
+/// [`jsonrpc.decode`] records, and it remains open for an *unrecognised*
+/// member. `_meta` is the one the RFD defines, so it is carried rather than
+/// skipped; the RFD names no other member of this object.
+///
+/// The walk is ordered, so a document wrong in more than one way reports the
+/// first fault the walk reaches. A `params` shape fault is detected inside
+/// the member loop and is therefore reported ahead of a trailing tail, which
+/// is only examined once the loop has closed. A trailing tail is in turn
+/// reported ahead of the required-member and empty-member checks, which run
+/// after it. [`decodeOutcome`] orders its walk the same way.
 pub fn decodeEnvelope(
     raw: []const u8,
     scratch: []u8,
@@ -114,11 +159,36 @@ pub fn decodeEnvelope(
             envelope.inner_method = try reader.string(scratch);
             saw_method = true;
         } else if (std.mem.eql(u8, key, "params")) {
+            // `research/normative/acp-v1-v2.md` table 10b types this member
+            // "object | `null`" and says "positional arrays are invalid", which
+            // the same document's table 10d and PROTOCOLS.md section 7 both map
+            // to the outer `-32602` of [`BindingError.invalid_request`].
+            //
+            // `rawValue` delegates to `skipValue`, which accepts `[`, so
+            // nothing on this path distinguished an object from an array and
+            // `bridge_session.Provider.serve` forwarded an envelope it is
+            // required to refuse. The shape is checked before the lexeme is
+            // taken; `n` is the `null` the same row allows, and `skipValue`
+            // is what rejects a malformed literal under it.
+            reader.skipWhitespace();
+            const byte = reader.peek() orelse return error.Truncated;
+            if (byte != '{' and byte != 'n') return error.InvalidField;
             envelope.inner_params = try reader.rawValue(scratch);
+        } else if (std.mem.eql(u8, key, "_meta")) {
+            // Carried verbatim so `encodeEnvelope` can put it back. See
+            // [`Envelope.meta`] for why it is borrowed text and not a shape.
+            envelope.meta = try reader.rawValue(scratch);
         } else {
             try reader.skipValue(scratch);
         }
     }
+
+    // The params object is one JSON value. Bytes after the closing brace are
+    // a second document the transport did not split, or a peer that disagrees
+    // with it about where a frame ends, and a codec that accepted them would
+    // re-encode the envelope without them — the silent truncation
+    // `jsonrpc.decode` refuses for the same reason.
+    if (!reader.atEnd()) return error.MalformedJson;
 
     if (!saw_server or !saw_request or !saw_method) return error.MissingField;
     // `encodeEnvelope` refuses an empty member, so the decoder refuses one
@@ -131,6 +201,11 @@ pub fn decodeEnvelope(
 }
 
 /// Encode a `mcp/message` params object.
+///
+/// Members are written in the order table 10b lists them, so a byte sequence
+/// that already reads in that order comes back unchanged and one that does not
+/// comes back with the same members in it. `_meta` is written last, which is
+/// where the table puts it.
 pub fn encodeEnvelope(envelope: Envelope, writer: *json.Writer) EncodeError!void {
     if (envelope.server_id.len == 0) return error.InvalidField;
     if (envelope.request_id.len == 0) return error.InvalidField;
@@ -146,48 +221,100 @@ pub fn encodeEnvelope(envelope: Envelope, writer: *json.Writer) EncodeError!void
         try writer.slice(",\"params\":");
         try writer.slice(params);
     }
+    if (envelope.meta) |meta| {
+        try writer.slice(",\"_meta\":");
+        try writer.slice(meta);
+    }
     try writer.byte('}');
 }
+
+/// One inner MCP outcome and the ACP metadata travelling beside it.
+///
+/// Both halves are borrowed JSON text and both are spliced verbatim. The
+/// payload is never re-serialised because a codec does not rebuild a value it
+/// did not produce, and the carrier `_meta` is carried the same way because a
+/// typed shape cannot write back a member it does not model, which is the
+/// defect carrying it fixes.
+pub const OutcomePayload = struct {
+    /// The inner MCP payload under the `result` or `error` member.
+    text: []const u8,
+    /// The carrier `_meta`, if the response carried one.
+    ///
+    /// `research/normative/acp-v1-v2.md` table 10c, verbatim: "An optional
+    /// carrier `_meta` contains ACP metadata and is separate from the inner
+    /// outcome's metadata." PROTOCOLS.md section 7 names only the outcome
+    /// member itself, so that row fills a silence in the authority rather than
+    /// contradicting it, and it is recorded here.
+    meta: ?[]const u8 = null,
+};
 
 /// The inner MCP outcome carried by a successful outer response.
 ///
 /// Exactly one of `result` or `error` is present. An inner error is still a
 /// successful outer response, which is why this is a union rather than a flag.
 pub const Outcome = union(enum) {
-    result: []const u8,
-    /// The inner MCP error object, as borrowed JSON text. Quoted because
-    /// `error` is a Zig keyword.
-    @"error": []const u8,
+    result: OutcomePayload,
+    /// The inner MCP error object. Quoted because `error` is a Zig keyword.
+    @"error": OutcomePayload,
 };
 
 /// Decode the inner outcome of a successful outer response.
+///
+/// A member this module does not model is skipped, and re-encoding an outcome
+/// therefore drops it — the same stated consequence [`jsonrpc.decode`]
+/// records, and it remains open for an *unrecognised* member. The carrier
+/// `_meta` is the one table 10c defines, so it is carried rather than skipped.
 pub fn decodeOutcome(raw: []const u8, scratch: []u8) DecodeError!Outcome {
     var reader = json.Reader.init(raw);
-    var outcome: ?Outcome = null;
+    // The outcome member and the carrier metadata are collected apart and
+    // joined after the walk. A peer may write `_meta` before or after the
+    // outcome, and a payload built the moment the member is read would carry
+    // whichever half arrived first and drop the other.
+    var text: ?[]const u8 = null;
+    var is_error = false;
+    var carrier_meta: ?[]const u8 = null;
 
     if (try reader.beginObject()) return error.MissingField;
 
     while (try reader.nextKey(scratch)) |key| {
         if (std.mem.eql(u8, key, "result")) {
-            if (outcome != null) return error.InvalidField;
+            // A payload is borrowed text and is never null, so a non-null
+            // `text` is the "an outcome is already present" test the flag was.
+            if (text != null) return error.InvalidField;
             // Deliberately not checked. A result carries whatever the MCP
             // operation returned, and an explicit `null` is a result.
-            outcome = .{ .result = try reader.rawValue(scratch) };
+            text = try reader.rawValue(scratch);
         } else if (std.mem.eql(u8, key, "error")) {
-            if (outcome != null) return error.InvalidField;
+            if (text != null) return error.InvalidField;
             // The lexeme is taken around the check rather than by `rawValue`,
             // which consumes the value before anything can look at it.
             reader.skipWhitespace();
             const start = reader.pos;
             try checkInnerError(&reader, scratch);
-            outcome = .{ .@"error" = reader.input[start..reader.pos] };
+            text = reader.input[start..reader.pos];
+            is_error = true;
+        } else if (std.mem.eql(u8, key, "_meta")) {
+            // Carried verbatim so `encodeOutcome` can put it back. See
+            // [`OutcomePayload.meta`] for why it is borrowed text and not a
+            // shape.
+            carrier_meta = try reader.rawValue(scratch);
         } else {
             try reader.skipValue(scratch);
         }
     }
 
+    // The carrier is one JSON value, and the same reasoning as in
+    // `decodeEnvelope`: trailing bytes are a second document the transport
+    // did not split, and accepting them would re-encode an outcome without
+    // them.
+    if (!reader.atEnd()) return error.MalformedJson;
+
     // Exactly one inner MCP outcome, per the specification.
-    return outcome orelse error.MissingField;
+    const payload = OutcomePayload{
+        .text = text orelse return error.MissingField,
+        .meta = carrier_meta,
+    };
+    return if (is_error) .{ .@"error" = payload } else .{ .result = payload };
 }
 
 /// Check the shape of the inner MCP `error` object, leaving the reader after
@@ -200,8 +327,14 @@ pub fn decodeOutcome(raw: []const u8, scratch: []u8) DecodeError!Outcome {
 /// the same way, because it carries any JSON value.
 fn checkInnerError(reader: *json.Reader, scratch: []u8) DecodeError!void {
     // `null`, a string, an array, a number, a boolean: none is the error
-    // object, and a caller cannot tell which of them it was handed.
-    if (reader.peek() != '{') return error.InvalidField;
+    // object, and a caller cannot tell which of them it was handed. Input
+    // that ended is none of those six: PROTOCOLS.md 2.1 calls that `Truncated`,
+    // and the two members below already say so, so one short read cannot be
+    // `InvalidField` here and `Truncated` on the closing-brace path. A
+    // consumer that separates "short read" from "bad peer" needs it named one
+    // way.
+    reader.skipWhitespace();
+    if ((reader.peek() orelse return error.Truncated) != '{') return error.InvalidField;
     if (try reader.beginObject()) return error.MissingField;
 
     var saw_code = false;
@@ -245,21 +378,37 @@ fn checkInnerError(reader: *json.Reader, scratch: []u8) DecodeError!void {
 /// `null`, is written as it stands. Checking it here instead would make the
 /// encoder refuse bytes its own decoder accepted.
 ///
+/// The carrier `_meta` is spliced the same way, for the same reason: it is a
+/// member this module does not model, so it is written back as it arrived
+/// rather than rebuilt from a shape that could not hold it.
+///
 /// A raw newline inside the payload is written as it stands too. The framer
 /// refuses such a frame on its way to the wire, because a message carrying one
 /// has already broken the framing.
 pub fn encodeOutcome(outcome: Outcome, writer: *json.Writer) EncodeError!void {
     switch (outcome) {
-        .result => |text| {
+        .result => |arm| {
             try writer.slice("{\"result\":");
-            try writer.slice(text);
+            try writer.slice(arm.text);
+            try writeCarrierMeta(arm.meta, writer);
         },
-        .@"error" => |text| {
+        .@"error" => |arm| {
             try writer.slice("{\"error\":");
-            try writer.slice(text);
+            try writer.slice(arm.text);
+            try writeCarrierMeta(arm.meta, writer);
         },
     }
     try writer.byte('}');
+}
+
+/// Write the optional ACP carrier `_meta` member, if there is one.
+///
+/// Written after the outcome member, so a response that already reads in that
+/// order re-encodes to the bytes it arrived as.
+fn writeCarrierMeta(meta: ?[]const u8, writer: *json.Writer) EncodeError!void {
+    const text = meta orelse return;
+    try writer.slice(",\"_meta\":");
+    try writer.slice(text);
 }
 
 /// The binding-level failures, which are *outer* ACP errors.
@@ -278,6 +427,11 @@ pub const BindingError = enum(i32) {
     /// The backend or transport failed without producing a valid MCP outcome.
     backend_failed = -33002,
 
+    /// The binding failure a wire code names, or null for a code this binding
+    /// does not allocate.
+    ///
+    /// A bare code does not say which space it was read from; see
+    /// [`ErrorLevel`] and [`isBindingFailure`].
     pub fn fromCode(code: i32) ?BindingError {
         return switch (code) {
             -32602 => .invalid_request,
@@ -406,6 +560,74 @@ test "an envelope with no inner params is valid" {
     try testing.expectEqual(@as(?[]const u8, null), envelope.inner_params);
 }
 
+test "envelope params must be an object or null" {
+    var scratch: [128]u8 = undefined;
+    // Table 10b types `params` as "object | `null`" and says "positional
+    // arrays are invalid". `rawValue` delegates to `skipValue`, which accepts
+    // `[`, so before the shape check `{"params":[1,2]}` decoded and
+    // `bridge_session.Provider.serve` forwarded an envelope the binding is
+    // required to refuse. Table 10d and PROTOCOLS.md section 7 both map a
+    // malformed envelope to the outer `-32602`, which is the caller's to
+    // answer; the codec's part is to refuse the bytes.
+    try testing.expectError(error.InvalidField, decodeEnvelope(
+        \\{"serverId":"s","requestId":"r","method":"tools/call","params":[1,2]}
+    , &scratch, null));
+    try testing.expectError(error.InvalidField, decodeEnvelope(
+        \\{"serverId":"s","requestId":"r","method":"tools/call","params":[{"name":"echo"}]}
+    , &scratch, null));
+    // The type is "object | null", so a scalar is no more permitted than an
+    // array is.
+    try testing.expectError(error.InvalidField, decodeEnvelope(
+        \\{"serverId":"s","requestId":"r","method":"tools/call","params":"echo"}
+    , &scratch, null));
+    try testing.expectError(error.InvalidField, decodeEnvelope(
+        \\{"serverId":"s","requestId":"r","method":"tools/call","params":7}
+    , &scratch, null));
+
+    // An object is what the RFD worked example carries, and `null` is the
+    // other half of the type, so both still decode.
+    const object = try decodeEnvelope(
+        \\{"serverId":"s","requestId":"r","method":"tools/call","params":{"name":"echo"}}
+    , &scratch, null);
+    try testing.expect(object.carriesParams());
+
+    // Input that ended is a short read, not a wrong type.
+    try testing.expectError(error.Truncated, decodeEnvelope(
+        \\{"serverId":"s","requestId":"r","method":"tools/call","params":
+    , &scratch, null));
+}
+
+test "omitted and null inner params mean the same thing, and both re-encode" {
+    var scratch: [128]u8 = undefined;
+    // "Omission and `null` both mean no inner parameters", so a caller asking
+    // whether this envelope carries parameters is told no for both. A
+    // non-null `inner_params` holding four bytes is not that answer.
+    const omitted = try decodeEnvelope(
+        \\{"serverId":"s","requestId":"r","method":"tools/call"}
+    , &scratch, null);
+    try testing.expect(!omitted.carriesParams());
+
+    const explicit_null = try decodeEnvelope(
+        \\{"serverId":"s","requestId":"r","method":"tools/call","params":null}
+    , &scratch, null);
+    try testing.expect(!explicit_null.carriesParams());
+
+    // The bytes are kept rather than normalised to an absent member. Dropping
+    // them would make `encode(decode(b)) != b` for an envelope that arrived
+    // with the member written out, and the encoding contract is not
+    // negotiable per protocol. The equivalence lives in `carriesParams`
+    // instead, where a caller reaches it by name.
+    try testing.expectEqual(@as(?[]const u8, null), omitted.inner_params);
+    try testing.expectEqualStrings("null", explicit_null.inner_params.?);
+
+    var buffer: [128]u8 = undefined;
+    var writer = json.Writer.init(&buffer);
+    try encodeEnvelope(explicit_null, &writer);
+    try testing.expectEqualStrings(
+        \\{"serverId":"s","requestId":"r","method":"tools/call","params":null}
+    , writer.written());
+}
+
 test "an envelope round-trips through the encoder" {
     var scratch: [256]u8 = undefined;
     const raw =
@@ -417,6 +639,57 @@ test "an envelope round-trips through the encoder" {
     var writer = json.Writer.init(&buffer);
     try encodeEnvelope(envelope, &writer);
     try testing.expectEqualStrings(raw, writer.written());
+}
+
+test "an envelope round-trips its outer _meta byte for byte" {
+    var scratch: [256]u8 = undefined;
+    var buffer: [256]u8 = undefined;
+
+    // The ACP envelope metadata a peer sent has to survive a proxy's decode
+    // and re-encode. Before the member was carried, this wrote the three
+    // members the encoder knew and dropped the fourth, and nothing reported
+    // it: what came back still decoded cleanly.
+    const bare =
+        \\{"serverId":"s","requestId":"r","method":"tools/call","_meta":{"trace":"abc"}}
+    ;
+    const envelope = try decodeEnvelope(bare, &scratch, .{ .integer = 7 });
+    var writer = json.Writer.init(&buffer);
+    try encodeEnvelope(envelope, &writer);
+    try testing.expectEqualStrings(bare, writer.written());
+
+    // The same beside `params`, which is the member order table 10b lists and
+    // the one this encoder writes.
+    const with_params =
+        \\{"serverId":"s","requestId":"r","method":"tools/call","params":{"name":"echo"},"_meta":{"a":1}}
+    ;
+    const both = try decodeEnvelope(with_params, &scratch, .{ .integer = 7 });
+    var second = json.Writer.init(&buffer);
+    try encodeEnvelope(both, &second);
+    try testing.expectEqualStrings(with_params, second.written());
+}
+
+test "an envelope carries the outer _meta as the lexeme that arrived" {
+    var scratch: [256]u8 = undefined;
+
+    // Borrowed, not modelled. A shape would have to name every key a peer or a
+    // proxy may put in ACP metadata, and one it did not name could not be
+    // written back, which is the defect the borrowed lexeme removes.
+    const envelope = try decodeEnvelope(
+        \\{"serverId":"s","requestId":"r","method":"tools/call","_meta":{"trace":"abc","n":1}}
+    , &scratch, .{ .integer = 7 });
+    try testing.expectEqualStrings("{\"trace\":\"abc\",\"n\":1}", envelope.meta.?);
+
+    // This is the envelope `_meta`, beside `serverId`. The inner MCP `_meta`
+    // is a different member in a different place — it lives inside `params`,
+    // which is carried as text and is untouched by any of this.
+    try testing.expectEqual(@as(?[]const u8, null), envelope.inner_params);
+
+    // The member is read wherever it is written. A peer may put it before
+    // `serverId` or after `method`, and both arrive with it attached.
+    const leading = try decodeEnvelope(
+        \\{"_meta":{"trace":"abc"},"serverId":"s","requestId":"r","method":"tools/call"}
+    , &scratch, .{ .integer = 7 });
+    try testing.expectEqualStrings("{\"trace\":\"abc\"}", leading.meta.?);
 }
 
 test "the outer id is what tells a request from a notification" {
@@ -545,8 +818,38 @@ test "an inner error must be a non-null object with a code and a message" {
     try testing.expect(failure == .@"error");
     try testing.expectEqualStrings(
         "{\"code\":-32602,\"message\":\"unknown tool\",\"data\":{\"name\":\"echo\"}}",
-        failure.@"error",
+        failure.@"error".text,
     );
+}
+
+test "a short read is Truncated wherever in the error object it lands" {
+    var scratch: [128]u8 = undefined;
+    // PROTOCOLS.md 2.1: `Truncated` is "Input ended before the value was
+    // complete". The byte check read `reader.peek()` against `'{'` without
+    // the `orelse` its two siblings carry, so a reader at end of input
+    // compared null against a byte and answered `InvalidField`. One short
+    // read was then reported two ways depending on where it landed, and a
+    // consumer that separates "short read" from "bad peer" could not.
+    try testing.expectError(error.Truncated, decodeOutcome(
+        \\{"error":
+    , &scratch));
+    // The same short read on the closing-brace path, which already said
+    // `Truncated`, so both halves of one input now agree.
+    try testing.expectError(error.Truncated, decodeOutcome(
+        \\{"error":{"code":-32602,"message":"m"
+    , &scratch));
+
+    // A value that is present and is not an error object is still a field the
+    // protocol does not permit. Only input that *ended* is a short read.
+    try testing.expectError(error.InvalidField, decodeOutcome(
+        \\{"error":null}
+    , &scratch));
+    try testing.expectError(error.InvalidField, decodeOutcome(
+        \\{"error":"boom"}
+    , &scratch));
+    try testing.expectError(error.InvalidField, decodeOutcome(
+        \\{"error":[1]}
+    , &scratch));
 }
 
 test "a result is any JSON value, an explicit null included" {
@@ -557,12 +860,12 @@ test "a result is any JSON value, an explicit null included" {
         \\{"result":null}
     , &scratch);
     try testing.expect(nulled == .result);
-    try testing.expectEqualStrings("null", nulled.result);
+    try testing.expectEqualStrings("null", nulled.result.text);
 
     const empty = try decodeOutcome(
         \\{"result":{}}
     , &scratch);
-    try testing.expectEqualStrings("{}", empty.result);
+    try testing.expectEqualStrings("{}", empty.result.text);
 }
 
 test "the result arm round-trips through the encoder" {
@@ -581,7 +884,7 @@ test "the result arm round-trips through the encoder" {
 
     const again = try decodeOutcome(writer.written(), &scratch);
     try testing.expect(again == .result);
-    try testing.expectEqualStrings(outcome.result, again.result);
+    try testing.expectEqualStrings(outcome.result.text, again.result.text);
 
     // Every one of these is a result `decodeOutcome` accepted, so every one
     // is written as it stands. A bare string, a number and `null` are results
@@ -595,7 +898,7 @@ test "the result arm round-trips through the encoder" {
     for (cases) |case| {
         var each_buffer: [64]u8 = undefined;
         var each = json.Writer.init(&each_buffer);
-        try encodeOutcome(.{ .result = case.payload }, &each);
+        try encodeOutcome(.{ .result = .{ .text = case.payload } }, &each);
         try testing.expectEqualStrings(case.framed, each.written());
     }
 }
@@ -616,7 +919,119 @@ test "the error arm round-trips through the encoder" {
 
     const again = try decodeOutcome(writer.written(), &scratch);
     try testing.expect(again == .@"error");
-    try testing.expectEqualStrings(outcome.@"error", again.@"error");
+    try testing.expectEqualStrings(outcome.@"error".text, again.@"error".text);
+}
+
+test "an outcome round-trips its carrier _meta byte for byte" {
+    var scratch: [256]u8 = undefined;
+    var buffer: [256]u8 = undefined;
+
+    // The carrier `_meta` of a successful outer response, which the outcome
+    // payload alone could not carry. Before the member was carried this wrote
+    // `{"result":{"resultType":"complete"}}`, and the loss was invisible: what
+    // came back still decoded, so nothing downstream ever reported an error.
+    const result_raw = "{\"result\":{\"resultType\":\"complete\"},\"_meta\":{\"x\":1}}";
+    const result_outcome = try decodeOutcome(result_raw, &scratch);
+    var result_writer = json.Writer.init(&buffer);
+    try encodeOutcome(result_outcome, &result_writer);
+    try testing.expectEqualStrings(result_raw, result_writer.written());
+
+    // The same on the error arm, so a rejection cannot reach the peer stripped
+    // of the metadata the caller put beside it.
+    const error_raw =
+        \\{"error":{"code":-32602,"message":"unknown tool"},"_meta":{"x":1}}
+    ;
+    const error_outcome = try decodeOutcome(error_raw, &scratch);
+    var error_writer = json.Writer.init(&buffer);
+    try encodeOutcome(error_outcome, &error_writer);
+    try testing.expectEqualStrings(error_raw, error_writer.written());
+}
+
+test "an outcome carries the carrier _meta wherever it was written" {
+    var scratch: [256]u8 = undefined;
+    var buffer: [128]u8 = undefined;
+
+    // Borrowed text, spliced verbatim. A shape would have to name every key a
+    // peer or a proxy may put in ACP metadata, and one it did not name could
+    // not be written back — which is the defect the borrowed lexeme removes.
+    const leading = try decodeOutcome(
+        \\{"_meta":{"x":1},"result":{"resultType":"complete"}}
+    , &scratch);
+    try testing.expectEqualStrings("{\"resultType\":\"complete\"}", leading.result.text);
+    try testing.expectEqualStrings("{\"x\":1}", leading.result.meta.?);
+
+    // An explicit `null` is ACP metadata the same way an empty object is: the
+    // normative row types the member as an object and says omission and
+    // `null` are equivalent. It is carried as the bytes that arrived and
+    // written back as they were, because the carrier is not modelled.
+    const nulled = try decodeOutcome(
+        \\{"result":1,"_meta":null}
+    , &scratch);
+    try testing.expectEqualStrings("null", nulled.result.meta.?);
+    var writer = json.Writer.init(&buffer);
+    try encodeOutcome(nulled, &writer);
+    try testing.expectEqualStrings("{\"result\":1,\"_meta\":null}", writer.written());
+}
+
+test "trailing bytes are refused, not silently truncated" {
+    var scratch: [256]u8 = undefined;
+
+    // Both decoders walk one object and stop at its closing brace. Bytes after
+    // it are a second document the transport did not split, and accepting them
+    // re-encodes an envelope or a carrier without them — the same silent loss
+    // a dropped `_meta` was, and the reason `jsonrpc.decode`, `acp_session`
+    // and `mcp_session` all ask `atEnd`.
+    try testing.expectError(error.MalformedJson, decodeEnvelope(
+        \\{"serverId":"s","requestId":"r","method":"m"} trailing
+    , &scratch, null));
+    try testing.expectError(error.MalformedJson, decodeOutcome(
+        \\{"result":{"a":1}} trailing
+    , &scratch));
+    // A second whole message spliced on, which is what the transport failed
+    // to split, is the same refusal.
+    try testing.expectError(error.MalformedJson, decodeOutcome(
+        \\{"result":{"a":1}}{"result":{"a":2}}
+    , &scratch));
+    // The `error` arm takes its lexeme around a validation call rather than
+    // through `rawValue`, so it is the one arm where a check written inside
+    // the arm, or before the member loop closes, would pass on a tail as long
+    // as the inner object itself parsed. The check is after the loop, so the
+    // tail is refused here too.
+    try testing.expectError(error.MalformedJson, decodeOutcome(
+        \\{"error":{"code":-1,"message":"m"}} trailing
+    , &scratch));
+    // The same with a `_meta` sibling after the outcome member, so the
+    // refusal cannot be an artefact of `_meta` being where the tail is.
+    try testing.expectError(error.MalformedJson, decodeOutcome(
+        \\{"error":{"code":-1,"message":"m"},"_meta":{"b":1}} trailing
+    , &scratch));
+    // An envelope that carries `params`, so the tail follows a lexeme the
+    // decoder borrowed rather than one it walked.
+    try testing.expectError(error.MalformedJson, decodeEnvelope(
+        \\{"serverId":"s","requestId":"r","method":"m","params":{"a":1}} trailing
+    , &scratch, null));
+
+    // Trailing whitespace is not trailing data: a frame that arrived padded
+    // still decodes, which is the reason `atEnd` skips whitespace first.
+    const padded = try decodeOutcome("{\"result\":{\"a\":1}}\n", &scratch);
+    try testing.expectEqualStrings("{\"a\":1}", padded.result.text);
+    const padded_envelope = try decodeEnvelope(
+        "{\"serverId\":\"s\",\"requestId\":\"r\",\"method\":\"m\"}  \n",
+        &scratch,
+        null,
+    );
+    try testing.expectEqualStrings("m", padded_envelope.inner_method);
+    // Which fault is reported when a document is wrong in two ways. The walk
+    // is ordered, so the answer is whichever fault it reaches first. The
+    // `params` shape check is inside the member loop and `atEnd` is after it,
+    // so a wrong shape beside a tail reports the shape. A tail is in turn
+    // ahead of the required-member check, which runs after it.
+    try testing.expectError(error.InvalidField, decodeEnvelope(
+        \\{"serverId":"s","requestId":"r","method":"m","params":[1,2]} trailing
+    , &scratch, null));
+    try testing.expectError(error.MalformedJson, decodeEnvelope(
+        \\{"serverId":"s","requestId":"r"} trailing
+    , &scratch, null));
 }
 
 test "an outcome round-trips through a whole outer response" {
@@ -630,7 +1045,7 @@ test "an outcome round-trips through a whole outer response" {
     // call failed and the exchange did not. The outer `error` member would
     // tell the client the transport failed, and it would retry a tool failure.
     try encodeOutcome(.{
-        .@"error" = "{\"code\":-32602,\"message\":\"unknown tool\"}",
+        .@"error" = .{ .text = "{\"code\":-32602,\"message\":\"unknown tool\"}" },
     }, &inner);
     try jsonrpc.encode(.{
         .kind = .response,
@@ -653,7 +1068,7 @@ test "an outcome round-trips through a whole outer response" {
     try testing.expect(back == .@"error");
     try testing.expectEqualStrings(
         "{\"code\":-32602,\"message\":\"unknown tool\"}",
-        back.@"error",
+        back.@"error".text,
     );
 }
 

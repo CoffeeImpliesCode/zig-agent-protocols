@@ -168,10 +168,30 @@ pub fn nextFrame(input: []const u8) DecodeError!Frame {
 }
 
 /// Append a frame and its delimiter.
+///
+/// This is the exact inverse of [`nextFrame`], as PROTOCOLS.md section 2
+/// requires: a byte sequence this accepts is one `nextFrame` reads back
+/// unchanged, and a sequence this refuses is one `nextFrame` refuses too. The
+/// bytes reach the wire, so a message this library itself could not decode is a
+/// failure the peer discovers and this library cannot.
+///
+/// The UTF-8 check belongs here rather than being left to `json.Writer.string`,
+/// which documents that an unvalidated value is a programming error. That
+/// position holds for a decoded value, whose bytes a decoder already checked.
+/// This function takes raw bytes rather than a decoded value, so there is no
+/// such guarantee behind them and the encoder is the last place that can refuse.
+///
+/// Both refusals are `error.InvalidField`, which is what an `EncodeError` can
+/// say: `error.InvalidUtf8` belongs to `DecodeError`, and a caller of this
+/// function is asking what may be written, not what was read.
 pub fn writeFrame(bytes: []const u8, writer: *json.Writer) EncodeError!void {
     // A caller that handed us a raw newline has already broken the framing, and
     // writing it would split one message into two on the wire.
     if (std.mem.findScalar(u8, bytes, frame_delimiter) != null) return error.InvalidField;
+    // A frame that is not text is not a message, which is what `nextFrame`
+    // already says. Both checks precede the first write, so a refusal leaves
+    // the writer untouched and a caller can retry with a different buffer.
+    if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidField;
     try writer.slice(bytes);
     try writer.byte(frame_delimiter);
 }
@@ -229,7 +249,15 @@ pub const v1_agent_methods = [_]MethodInfo{
     // uses these four spellings, so a gate and its capability agree.
     .{ .name = "session/list", .side = .agent, .gate = "session.list" },
     .{ .name = "session/delete", .side = .agent, .gate = "session.delete" },
-    .{ .name = "session/resume", .side = .agent, .gate = "session.resume" },
+    // The two sources name two different gates for this one method.
+    // PROTOCOLS.md section 6.5 gives `loadSession` the pair `session/load`,
+    // `session/resume`, while `research/normative/acp-v1-v2.md` line 67 gates
+    // `session/resume` on `sessionCapabilities.resume` and line 64 restricts
+    // `loadSession` to `session/load`. PROTOCOLS.md is the authority and the
+    // conflict is recorded here: both spellings are read as alternatives, so a
+    // peer that advertises either one is a peer this library does not report as
+    // unable to resume.
+    .{ .name = "session/resume", .side = .agent, .gate = "loadSession", .gate2 = "session.resume" },
     .{ .name = "session/close", .side = .agent, .gate = "session.close" },
     .{ .name = "logout", .side = .agent, .gate = "auth.logout" },
 };
@@ -320,10 +348,15 @@ pub fn lookupMethod(version: WireVersion, name: []const u8) DecodeError!MethodIn
 ///
 /// A method with no gate is baseline and always callable. A method with one
 /// gate needs that capability. A method with two gates needs either of them,
-/// because `gate2` exists for the per-mode gates of `elicitation/create`:
-/// PROTOCOLS.md section 6.5 makes each advertised mode enable the method, so a
-/// peer that advertises `elicitation.url` and not `elicitation.form` supports
-/// it.
+/// because `gate2` is an alternative spelling of the same requirement rather
+/// than a second one.
+///
+/// `elicitation/create` is the case the schema forces. PROTOCOLS.md section 6.5
+/// gates it per mode, so form mode and URL mode each enable it; one gate field
+/// could name only one of them, and a peer advertising URL mode alone would be
+/// reported as not supporting a method it does support. `session/resume` is the
+/// other, where the two sources name different gates for one method rather than
+/// one gate covering two.
 ///
 /// Omission means unsupported, so an empty `advertised` set supports only the
 /// ungated methods.
@@ -632,8 +665,7 @@ pub fn classifySessionConfigOptionType(version: WireVersion, tag: []const u8) Ta
 /// the catch-all: a mode outside the pair is undefined at v1 and the schema's
 /// `other` branch at v2.
 pub fn classifyElicitationMode(version: WireVersion, tag: []const u8) TagClass {
-    const modes = [_][]const u8{ "form", "url" };
-    return classifyTag(version, &modes, tag);
+    return classifyTag(version, &elicitation_modes, tag);
 }
 
 // --- Session config options and `replayFrom`, section 6.4 -----------------------
@@ -705,6 +737,12 @@ pub fn decodeReplayFrom(raw: []const u8, scratch: []u8) DecodeError!ReplayFrom {
             try reader.skipValue(scratch);
         }
     }
+
+    // A `ReplayFrom` is one JSON value. Bytes after the closing brace are a
+    // second document the transport did not split, or a peer that disagrees
+    // with it about where a frame ends, and `jsonrpc.decode` refuses them for
+    // the same reason.
+    if (!reader.atEnd()) return error.MalformedJson;
 
     const kind = tag orelse return error.MissingField;
     if (std.mem.eql(u8, kind, replay_from_type.start)) return .start;
@@ -867,16 +905,22 @@ const CapabilityWalk = struct {
                 try reader.skipValue(self.scratch);
                 continue;
             }
-            const path = try self.appendPath(parent, key);
-            try self.walkValue(reader, path, depth);
+            try self.walkMember(reader, parent, key, depth);
         }
     }
 
-    /// Read the value of the member whose path is `path`.
-    fn walkValue(
+    /// Read the member named `key`, whose own path would be `parent.key`.
+    ///
+    /// The path is built only for a member that records one, because the value
+    /// decides that and the record needs the path. A member that records
+    /// nothing — an explicit `null`, a string, a number, an array — therefore
+    /// costs the caller no region of `paths`, so a caller who sized that buffer
+    /// by the paths the entries borrow is not asked for bytes no entry borrows.
+    fn walkMember(
         self: *CapabilityWalk,
         reader: *json.Reader,
-        path: []const u8,
+        parent: []const u8,
+        key: []const u8,
         depth: u32,
     ) DecodeError!void {
         // The reader bounds its own containers at `json.max_depth`; this bounds
@@ -892,11 +936,12 @@ const CapabilityWalk = struct {
             },
             't', 'f' => {
                 const value = try reader.boolean();
-                try self.record(path, .boolean, value);
+                try self.record(try self.appendPath(parent, key), .boolean, value);
             },
             '{' => {
                 // A presence object advertises by being there, so it is
                 // recorded whether or not it also carries members of its own.
+                const path = try self.appendPath(parent, key);
                 try self.record(path, .presence_object, null);
                 if (try reader.beginObject()) return;
                 try self.walkMembers(reader, childPath(self.version, path), depth + 1);
@@ -986,7 +1031,10 @@ fn childPath(version: WireVersion, path: []const u8) []const u8 {
 /// allocates, and every buffer belongs to the caller. `paths` must hold the sum
 /// of every path recorded, not the longest one, because each entry borrows its
 /// own region and no region is recycled; a buffer that cannot is
-/// `error.BufferTooSmall`.
+/// `error.BufferTooSmall`. At v2 it must also hold the `capabilities` root,
+/// which is written ahead of the first member and forms the head of that
+/// member's region rather than a path of its own. A member that records nothing
+/// costs no region at all.
 ///
 /// Every object member is recorded, not only the empty ones, because a presence
 /// object advertises by existing: a `elicitation.form` object that also carries
@@ -1024,9 +1072,21 @@ pub fn decodeCapabilityObject(
         .end = prefix.len,
     };
     // An empty object is a peer that advertises nothing, which is a fact
-    // rather than an error, so it yields an empty set marked present.
-    if (try reader.beginObject()) return .{ .entries = out[0..0], .present = true };
-    try walk.walkMembers(&reader, paths[0..prefix.len], 1);
+    // rather than an error, so it yields an empty set marked present. The
+    // walk is skipped and the check below is not, because the check is the
+    // one thing every path out of this function has to make.
+    if (!(try reader.beginObject())) {
+        try walk.walkMembers(&reader, paths[0..prefix.len], 1);
+    }
+
+    // A capability object is one JSON value. Bytes after the closing brace
+    // are a second document, and reading the set as though only the walked
+    // members had arrived describes a peer this library was not sent. No
+    // encoder here would put those bytes back, so nothing downstream would
+    // ever see the loss; `jsonrpc.decode` refuses the same document for the
+    // same reason.
+    if (!reader.atEnd()) return error.MalformedJson;
+
     return .{ .entries = out[0..walk.count], .present = true };
 }
 
@@ -1063,23 +1123,33 @@ pub fn decodeInitializeCapabilities(
 ) DecodeError!CapabilitySet {
     const member = try capabilityMemberName(version, side);
     var reader = json.Reader.init(raw);
-    if (try reader.beginObject()) return .{ .entries = out[0..0], .present = false };
-    while (try reader.nextKey(scratch)) |key| {
-        if (std.mem.eql(u8, key, member)) {
-            // The nested decode runs on a borrowed slice of this document, so
-            // it costs no scratch and the outer reader is left alone. The
-            // keys it read are dead by then, which is why both may share one
-            // buffer.
-            return decodeCapabilityObject(
-                version,
-                side,
-                try reader.rawValue(scratch),
-                out,
-                paths,
-                scratch,
-            );
+    var capabilities: ?[]const u8 = null;
+    // The member is carried out of the loop rather than returned from inside
+    // it, so the reader is walked to the closing brace and the check below is
+    // one every path out of this function makes. The first occurrence wins,
+    // as it did when the loop returned on it.
+    if (!(try reader.beginObject())) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, member) and capabilities == null) {
+                // The nested decode runs on a borrowed slice of this document,
+                // so it costs no scratch and the outer reader is left alone.
+                // The keys it read are dead by then, which is why both may
+                // share one buffer.
+                capabilities = try reader.rawValue(scratch);
+            } else {
+                try reader.skipValue(scratch);
+            }
         }
-        try reader.skipValue(scratch);
+    }
+
+    // The `initialize` body is one JSON value, and so is the capability
+    // member inside it. Bytes after the outer closing brace are a second
+    // document the transport did not split, and `jsonrpc.decode` refuses them
+    // for the same reason.
+    if (!reader.atEnd()) return error.MalformedJson;
+
+    if (capabilities) |lexeme| {
+        return decodeCapabilityObject(version, side, lexeme, out, paths, scratch);
     }
     return .{ .entries = out[0..0], .present = false };
 }
@@ -1163,6 +1233,14 @@ pub fn decodePermissionOutcome(
             try reader.skipValue(scratch);
         }
     }
+
+    // An outcome is one JSON value, and this is the one decoder in this file
+    // with a matching encoder. Bytes behind the closing brace would be
+    // dropped by `encodePermissionOutcome` on the way back out, so accepting
+    // them breaks `encode(decode(b)) == b` silently: the truncated bytes
+    // still decode. `jsonrpc.decode` refuses the same document for the same
+    // reason.
+    if (!reader.atEnd()) return error.MalformedJson;
 
     const resolved = branch orelse return error.MissingField;
     if (resolved == .cancelled) {
@@ -1271,6 +1349,13 @@ pub fn decodePermissionSubject(
             try reader.skipValue(scratch);
         }
     }
+
+    // A subject is one JSON value, and the arms above borrowed their lexemes
+    // out of it, so a tail behind the closing brace is bytes this function
+    // has read and not part of the document. The check is here rather than in
+    // the loop so that a document carrying a lexeme member refuses it too.
+    // `jsonrpc.decode` refuses the same document for the same reason.
+    if (!reader.atEnd()) return error.MalformedJson;
 
     const kind = tag orelse return error.MissingField;
     if (std.mem.eql(u8, kind, permission_subject_type.tool_call)) {
@@ -1424,6 +1509,13 @@ pub fn decodePermissionRequest(
         }
     }
 
+    // A request is one JSON value, and the `toolCall` and `subject` lexemes
+    // above are sub-slices of it, so a tail behind the closing brace is a
+    // second document this function would answer as though it had not
+    // arrived. The check is here rather than in the loop for that reason.
+    // `jsonrpc.decode` refuses the same document for the same reason.
+    if (!reader.atEnd()) return error.MalformedJson;
+
     const id = session_id orelse return error.MissingField;
     if (!saw_options) return error.MissingField;
     const options = out_options[0..option_count];
@@ -1542,6 +1634,15 @@ fn decodeSubjectMember(
 
 // --- 6.7 Elicitation -----------------------------------------------------------
 
+/// The elicitation `mode` values, in the spelling the classify tables take.
+///
+/// This is the only place the pair is written. [`classifyElicitationMode`] reads
+/// it, `ElicitationMode.fromString` scans it and `ElicitationMode.string`
+/// indexes it, so a mode added to the enum is classified and encoded without a
+/// second list to keep in step. The check below is what makes the indexing
+/// sound: it fails the build rather than reading past the end of the table.
+pub const elicitation_modes = [_][]const u8{ "form", "url" };
+
 /// The elicitation `mode` values.
 ///
 /// ACP deliberately diverges from MCP: each supported mode must be advertised
@@ -1553,15 +1654,22 @@ pub const ElicitationMode = enum {
     url,
 
     pub fn fromString(text: []const u8) ?ElicitationMode {
-        if (std.mem.eql(u8, text, "form")) return .form;
-        if (std.mem.eql(u8, text, "url")) return .url;
+        for (elicitation_modes, 0..) |name, index| {
+            if (std.mem.eql(u8, text, name)) return @enumFromInt(index);
+        }
         return null;
     }
 
     pub fn string(self: ElicitationMode) []const u8 {
-        return @tagName(self);
+        return elicitation_modes[@intFromEnum(self)];
     }
 };
+
+comptime {
+    if (elicitation_modes.len != @typeInfo(ElicitationMode).@"enum".fields.len) {
+        @compileError("elicitation_modes and ElicitationMode must name the same modes");
+    }
+}
 
 /// The elicitation response actions.
 pub const ElicitationAction = enum {
@@ -1650,11 +1758,12 @@ pub const v1_stop_reasons = [_][]const u8{
 
 /// Whether a version admits a batch array on the wire.
 ///
-/// v2 permits batch arrays and v1 does not. A v2 batch must hold at least one
-/// entry, so an empty array is a single `Invalid Request` with a null id rather
-/// than an empty response. No code in this library counts batch entries, so
-/// that minimum is written here rather than beside the answer as a constant:
-/// the only batch decision here is a transport refusing every array.
+/// v2 permits batch arrays and v1 does not. The one-entry minimum a v2 batch
+/// carries is a fact about a batch decoder, and this module has none: it does
+/// not decode a batch, does not count its entries and does not decide what an
+/// empty array answers, so a constant here would bound nothing. The only batch
+/// decision this module makes is the one below, and [`no_batch_methods`] is
+/// advice to a caller rather than a rule anything here applies.
 pub fn permitsBatch(version: WireVersion) bool {
     return version == .draft;
 }
@@ -1754,6 +1863,53 @@ test "a message written as a frame cannot contain a raw newline" {
     // delimiter stays unambiguous.
     try writeFrame("{\"a\":\"\\n\"}", &writer);
     try testing.expectEqualStrings("{\"a\":\"\\n\"}\n", writer.written());
+}
+
+test "writeFrame and nextFrame accept and refuse the same byte sequences" {
+    // Each case is a delimiter-free byte sequence, which is what one message
+    // is; a raw delimiter would split it in two before either function could
+    // read it, and the test above covers that one refusal.
+    const cases = [_][]const u8{
+        "",
+        "{}",
+        "{\"a\":1}",
+        // Text that is not ASCII is text, so the two-byte sequence survives the
+        // round trip rather than being refused for not being ASCII.
+        "{\"a\":\"caf\xc3\xa9\"}",
+        // An escaped newline is a delimiter in neither direction.
+        "{\"a\":\"\\n\"}",
+        // 0xff never appears in well-formed UTF-8 and starts no sequence.
+        "\xff}",
+        // A lead byte that promises two more and does not deliver them.
+        "\xe2\x82",
+        // A surrogate half, which no well-formed UTF-8 encodes.
+        "\xed\xa0\x80",
+        // An over-long spelling of `/`, the byte every ASCII text starts with.
+        "\xc0\xaf",
+        // A lone continuation byte where a lead byte belongs.
+        "{\"a\":\"\x80\"}",
+    };
+    for (cases) |message| {
+        var buffer: [64]u8 = undefined;
+        var writer = json.Writer.init(&buffer);
+
+        if (nextFrame(message)) |_| {
+            // Readable, so writable: bytes put on the wire have to read back as
+            // the same message, because a peer failing on what this library
+            // emitted is the failure PROTOCOLS.md section 2 rules out.
+            try writeFrame(message, &writer);
+            const again = try nextFrame(writer.written());
+            try testing.expectEqualStrings(message, again.bytes);
+            try testing.expect(!again.unterminated);
+            try testing.expectEqualStrings("", again.rest);
+        } else |_| {
+            // Unreadable, so unwritable: bytes this library refuses to decode
+            // must not reach the wire, and the refusal comes before the first
+            // write, so the writer is left untouched.
+            try testing.expectError(error.InvalidField, writeFrame(message, &writer));
+            try testing.expectEqual(@as(usize, 0), writer.len);
+        }
+    }
 }
 
 test "the v1 registry names exactly the methods section 6.3 lists" {
@@ -1990,7 +2146,8 @@ test "every gated v1 method names a capability its own side declares" {
     for (v1_agent_methods) |info| {
         if (info.gate.len == 0) continue;
         try testing.expect(isKnownV1AgentCapability(info.gate));
-        try testing.expectEqualStrings("", info.gate2);
+        if (info.gate2.len == 0) continue;
+        try testing.expect(isKnownV1AgentCapability(info.gate2));
     }
     for (v1_client_methods) |info| {
         if (info.gate.len == 0) continue;
@@ -2003,6 +2160,35 @@ test "every gated v1 method names a capability its own side declares" {
     // so the other form is not a capability this library accepts.
     try testing.expect(!isKnownV1AgentCapability("sessionCapabilities.delete"));
     try testing.expect(isKnownV1AgentCapability("session.delete"));
+}
+
+test "v1 session/resume answers to either gate the two sources give it" {
+    // PROTOCOLS.md section 6.5 gives `loadSession` the pair `session/load`,
+    // `session/resume`. `research/normative/acp-v1-v2.md` line 67 gates
+    // `session/resume` on `sessionCapabilities.resume` and line 64 restricts
+    // `loadSession` to `session/load`. PROTOCOLS.md is the authority and the
+    // conflict is recorded in the registry, so either spelling enables the
+    // method: a peer that advertises one of them does resume.
+    const info = try lookupMethod(.stable, "session/resume");
+    try testing.expectEqualStrings("loadSession", info.gate);
+    try testing.expectEqualStrings("session.resume", info.gate2);
+
+    try testing.expect(isMethodSupported(info, &[_][]const u8{"loadSession"}));
+    try testing.expect(isMethodSupported(info, &[_][]const u8{"session.resume"}));
+    try testing.expect(isMethodSupported(info, &v1_agent_capabilities));
+
+    // Neither gate is no resume, and a capability that belongs to another
+    // method is not this gate by accident.
+    try testing.expect(!isMethodSupported(info, &[_][]const u8{}));
+    try testing.expect(!isMethodSupported(info, &[_][]const u8{"session.list"}));
+    try testing.expect(!isMethodSupported(info, &[_][]const u8{"promptCapabilities.image"}));
+
+    // The alternative is confined to this method. The other three session
+    // gates have one spelling each, so none of them grew a second.
+    for ([_][]const u8{ "session/list", "session/delete", "session/close" }) |name| {
+        const sibling = try lookupMethod(.stable, name);
+        try testing.expectEqualStrings("", sibling.gate2);
+    }
 }
 
 test "elicitation/create is gated per mode, not on one mode alone" {
@@ -2143,6 +2329,29 @@ test "a permission outcome round-trips through the encoder" {
     try testing.expectEqualStrings(outcome.selected, again.selected);
 }
 
+test "a permission outcome with a second document behind it is refused" {
+    var scratch: [128]u8 = undefined;
+    // This is the one decoder in this file with a matching encoder, so the
+    // tail here is a real `encode(decode(b)) != b` rather than only a
+    // validation hole, and the loss is silent: what the encoder writes still
+    // decodes, so nothing downstream would report it.
+    const tailed = "{\"outcome\":\"selected\",\"optionId\":\"opt-1\"} trailing";
+    try testing.expectError(error.MalformedJson, decodePermissionOutcome(tailed, &scratch));
+    try testing.expectError(error.MalformedJson, decodePermissionOutcome(
+        \\{"outcome":"cancelled"} trailing
+    , &scratch));
+
+    // The accepted document round-trips byte for byte, and the encoder cannot
+    // reach the tail, which is what makes refusing it the only way to keep
+    // `encode(decode(b)) == b` for every accepted input.
+    const source = "{\"outcome\":\"selected\",\"optionId\":\"opt-1\"}";
+    var buffer: [128]u8 = undefined;
+    var writer = json.Writer.init(&buffer);
+    try encodePermissionOutcome(try decodePermissionOutcome(source, &scratch), &writer);
+    try testing.expectEqualStrings(source, writer.written());
+    try testing.expect(writer.written().len < tailed.len);
+}
+
 test "an absolute path starts at the root" {
     try testing.expect(isAbsolutePath("/"));
     try testing.expect(isAbsolutePath("/srv/work"));
@@ -2229,6 +2438,23 @@ test "an unknown subject type is the schema's catch-all, not an error" {
     , &scratch));
 }
 
+test "a permission subject with a second document behind it is refused" {
+    var scratch: [256]u8 = undefined;
+    // Both arms that carry a lexeme are exercised here, because a check
+    // placed inside the member loop would pass as soon as the member it
+    // guards had parsed and the tail would slip through behind it.
+    try testing.expectError(error.MalformedJson, decodePermissionSubject(
+        \\{"type":"tool_call","toolCall":{"toolCallId":"t1","title":"Build"}} trailing
+    , &scratch));
+    try testing.expectError(error.MalformedJson, decodePermissionSubject(
+        \\{"type":"command","command":"rm -rf build","cwd":"/srv/work"} trailing
+    , &scratch));
+    // The catch-all arm reads the same document and refuses the same tail.
+    try testing.expectError(error.MalformedJson, decodePermissionSubject(
+        \\{"type":"review"} trailing
+    , &scratch));
+}
+
 test "elicitation modes and actions are the stated sets" {
     try testing.expectEqual(ElicitationMode.form, ElicitationMode.fromString("form").?);
     try testing.expectEqual(ElicitationMode.url, ElicitationMode.fromString("url").?);
@@ -2256,6 +2482,29 @@ test "elicitation modes and actions are the stated sets" {
         const value: ElicitationAction = @field(ElicitationAction, field.name);
         try testing.expectEqual(value, ElicitationAction.fromString(value.string()).?);
     }
+}
+
+test "the elicitation mode table and the typed set are one set" {
+    // `classifyElicitationMode` reads the table `ElicitationMode` is built
+    // from, so every mode the type names is a mode the classifier names at the
+    // same index. While the two were separate, a mode added to the enum would
+    // have been classified as `undefined_tag` at v1 and as `other` at v2 — the
+    // exact reading the version rule is about.
+    for (elicitation_modes, 0..) |name, index| {
+        const mode = ElicitationMode.fromString(name).?;
+        try testing.expectEqual(name, mode.string());
+        try testing.expectEqual(mode, @as(ElicitationMode, @enumFromInt(index)));
+        for ([_]WireVersion{ .stable, .draft }) |version| {
+            switch (classifyElicitationMode(version, name)) {
+                .named => |found| try testing.expectEqual(index, found),
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    // Outside the pair the version rule still applies, so the classifier is not
+    // simply reporting every mode as named.
+    try testing.expect(classifyElicitationMode(.stable, "markdown") == .undefined_tag);
+    try testing.expect(classifyElicitationMode(.draft, "markdown") == .other);
 }
 
 test "a v2 currency is three upper-case letters and nothing else" {
@@ -2349,6 +2598,24 @@ test "a v1 permission request needs its three required members" {
     try testing.expectError(error.InvalidField, decodePermissionRequest(.stable,
         \\{"sessionId":"s1","toolCall":"t1","options":[]}
     , &options, &scratch));
+}
+
+test "a permission request with a second document behind it is refused" {
+    var scratch: [256]u8 = undefined;
+    var options: [1]PermissionOption = undefined;
+    // v1 takes its tool call as a lexeme and v2 its subject, so both arms
+    // borrow bytes out of the document the tail sits behind.
+    try testing.expectError(error.MalformedJson, decodePermissionRequest(.stable,
+        \\{"sessionId":"s1","toolCall":{},"options":[]} trailing
+    , &options, &scratch));
+    const draft = "{\"sessionId\":\"s1\",\"title\":\"t\",\"options\":[" ++
+        "{\"optionId\":\"a\",\"name\":\"A\",\"kind\":\"allow_once\"}]} trailing";
+    try testing.expectError(error.MalformedJson, decodePermissionRequest(
+        .draft,
+        draft,
+        &options,
+        &scratch,
+    ));
 }
 
 test "an option needs its optionId, its name and its kind" {
@@ -2559,6 +2826,106 @@ test "replayFrom is start or the schema's catch-all" {
     , &scratch));
 }
 
+test "a second document behind a replayFrom is refused" {
+    var scratch: [64]u8 = undefined;
+    // A JSON document is one value. Nothing here encodes a replay point, so
+    // there is no second chance to put the bytes back, and the caller would
+    // be handed a replay position the peer did not send.
+    try testing.expectError(error.MalformedJson, decodeReplayFrom(
+        \\{"type":"start"} trailing
+    , &scratch));
+    // The catch-all arm reads the same document the same way.
+    try testing.expectError(error.MalformedJson, decodeReplayFrom(
+        \\{"type":"checkpoint","cursor":42} trailing
+    , &scratch));
+}
+
+test "a paths buffer sized to the recorded paths is enough" {
+    // `need` is exactly the sum of the path lengths the entries borrow, plus
+    // the `capabilities` root at v2, which is written ahead of the first
+    // member and forms the head of that member's region. A member that records
+    // nothing is not a capability — an explicit `null` is the absent case for a
+    // nested object, and a string, a number or an array is a form neither
+    // schema declares — so it must cost the caller nothing: a buffer that does
+    // not stretch reports `BufferTooSmall` for bytes no entry borrows.
+    const cases = [_]struct {
+        version: WireVersion,
+        side: Side,
+        source: []const u8,
+        need: usize,
+        entries: usize,
+    }{
+        // One boolean, one path of eight bytes.
+        .{ .version = .stable, .side = .client, .source = "{\"terminal\":true}", .need = 8, .entries = 1 },
+        // An explicit `null` records nothing, so it needs no bytes at all.
+        .{ .version = .stable, .side = .client, .source = "{\"fs\":null}", .need = 0, .entries = 0 },
+        // A value neither schema declares is stepped over, and costs nothing.
+        .{ .version = .stable, .side = .client, .source = "{\"vendor\":[\"a\"]}", .need = 0, .entries = 0 },
+        // A member that records nothing must not eat into the one after it.
+        .{
+            .version = .stable,
+            .side = .client,
+            .source = "{\"fs\":null,\"terminal\":true}",
+            .need = 8,
+            .entries = 1,
+        },
+        // A presence object records itself and then its own members: `fs` and
+        // `fs.readTextFile`.
+        .{
+            .version = .stable,
+            .side = .client,
+            .source = "{\"fs\":{\"readTextFile\":true}}",
+            .need = 2 + 16,
+            .entries = 2,
+        },
+        // v2 keeps the `capabilities` root in the head of every path, and the
+        // caller has to have paid for that root before the first member.
+        .{
+            .version = .draft,
+            .side = .agent,
+            .source = "{\"session\":{\"delete\":{}}}",
+            .need = 12 + 20 + 27,
+            .entries = 2,
+        },
+    };
+    inline for (cases) |each| {
+        var paths: [each.need]u8 = undefined;
+        var out: [4]Capability = undefined;
+        var scratch: [128]u8 = undefined;
+        const set = try decodeCapabilityObject(
+            each.version,
+            each.side,
+            each.source,
+            &out,
+            &paths,
+            &scratch,
+        );
+        try testing.expect(set.present);
+        try testing.expectEqual(each.entries, set.entries.len);
+        // Every entry still borrows a region of its own, so a caller can hold
+        // them all at once and read each path after the decode has returned.
+        for (set.entries) |entry| {
+            const start = @intFromPtr(entry.path.ptr) - @intFromPtr(paths[0..].ptr);
+            try testing.expect(start + entry.path.len <= each.need);
+            try testing.expectEqualStrings(entry.path, paths[start..][0..entry.path.len]);
+        }
+    }
+
+    // One byte short of the bound is one byte short, and nothing a caller
+    // already holds is the reason.
+    var paths: [7]u8 = undefined;
+    var out: [4]Capability = undefined;
+    var scratch: [128]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, decodeCapabilityObject(
+        .stable,
+        .client,
+        "{\"terminal\":true}",
+        &out,
+        &paths,
+        &scratch,
+    ));
+}
+
 test "a v1 client capability object decodes to known and unknown members" {
     var scratch: [512]u8 = undefined;
     var paths: [256]u8 = undefined;
@@ -2617,6 +2984,23 @@ test "a capability sent in a form its version does not declare is refused" {
     , &out, &paths, &scratch));
     try testing.expectError(error.InvalidField, decodeCapabilityObject(.draft, .client,
         \\{"vendor":{"flag":false}}
+    , &out, &paths, &scratch));
+}
+
+test "a second document behind a capability object is refused" {
+    var scratch: [512]u8 = undefined;
+    var paths: [256]u8 = undefined;
+    var out: [12]Capability = undefined;
+    // No encoder writes a capability set back, so nothing downstream would
+    // ever see the bytes go missing: the set would name the walked members
+    // and read as though the peer had advertised those alone.
+    try testing.expectError(error.MalformedJson, decodeCapabilityObject(.stable, .client,
+        \\{"terminal":true} trailing
+    , &out, &paths, &scratch));
+    // An empty object leaves the walk before it runs, and it refuses the same
+    // tail rather than returning ahead of the check.
+    try testing.expectError(error.MalformedJson, decodeCapabilityObject(.stable, .client,
+        \\{} trailing
     , &out, &paths, &scratch));
 }
 
@@ -2751,6 +3135,22 @@ test "the initialize capability member is optional in every version" {
     , &empty_out, &empty_paths, &scratch));
 }
 
+test "a second document behind an initialize body is refused" {
+    var scratch: [512]u8 = undefined;
+    var paths: [128]u8 = undefined;
+    var out: [8]Capability = undefined;
+    // The capability member is read and the loop breaks rather than returning
+    // from inside it, so the refusal does not depend on the member being
+    // there: a body that carries it and a body that does not refuse the same
+    // tail.
+    try testing.expectError(error.MalformedJson, decodeInitializeCapabilities(.stable, .client,
+        \\{"protocolVersion":1,"clientCapabilities":{"terminal":true}} trailing
+    , &out, &paths, &scratch));
+    try testing.expectError(error.MalformedJson, decodeInitializeCapabilities(.stable, .client,
+        \\{"protocolVersion":1} trailing
+    , &out, &paths, &scratch));
+}
+
 test "every gated v2 method names a capability its own side declares" {
     for (v2_agent_methods) |info| {
         if (info.gate.len == 0) continue;
@@ -2767,6 +3167,61 @@ test "every gated v2 method names a capability its own side declares" {
     // classifies at both.
     try testing.expect(isKnownV1AgentCapability("mcpCapabilities.acp"));
     try testing.expect(isKnownV2Capability(.agent, "capabilities.session.mcp.acp"));
+}
+
+test "trailing whitespace is not a second document" {
+    // `json.Reader.atEnd` skips the four bytes JSON calls whitespace before it
+    // answers, so a document with a space, a tab, a carriage return or a
+    // newline behind it still decodes. What the six decoders above refuse is a
+    // second value, and a frame delimiter is not one: the stdio framing of
+    // section 6.2 hands a frame its bytes with the delimiter already stripped.
+    var scratch: [512]u8 = undefined;
+    var paths: [256]u8 = undefined;
+    var out: [12]Capability = undefined;
+    var options: [1]PermissionOption = undefined;
+    var buffer: [128]u8 = undefined;
+
+    for ([_][]const u8{ "", " ", "\t", "\r", "\n", " \t\r\n" }) |tail| {
+        const replay = try std.fmt.bufPrint(&buffer, "{{\"type\":\"start\"}}{s}", .{tail});
+        try testing.expect((try decodeReplayFrom(replay, &scratch)) == .start);
+
+        const outcome = try std.fmt.bufPrint(&buffer, "{{\"outcome\":\"cancelled\"}}{s}", .{tail});
+        try testing.expect((try decodePermissionOutcome(outcome, &scratch)) == .cancelled);
+
+        const subject = try std.fmt.bufPrint(
+            &buffer,
+            "{{\"type\":\"tool_call\",\"toolCall\":{{\"toolCallId\":\"t1\"}}}}{s}",
+            .{tail},
+        );
+        try testing.expect((try decodePermissionSubject(subject, &scratch)) == .tool_call);
+
+        const request = try std.fmt.bufPrint(
+            &buffer,
+            "{{\"sessionId\":\"s1\",\"toolCall\":{{}},\"options\":[]}}{s}",
+            .{tail},
+        );
+        const decoded = try decodePermissionRequest(.stable, request, &options, &scratch);
+        try testing.expect(decoded == .stable);
+
+        const object = try std.fmt.bufPrint(&buffer, "{{\"terminal\":true}}{s}", .{tail});
+        const walked = try decodeCapabilityObject(.stable, .client, object, &out, &paths, &scratch);
+        try testing.expect(walked.present);
+
+        const initialize = try std.fmt.bufPrint(
+            &buffer,
+            "{{\"protocolVersion\":1,\"clientCapabilities\":{{\"terminal\":true}}}}{s}",
+            .{tail},
+        );
+        const advertised = try decodeInitializeCapabilities(
+            .stable,
+            .client,
+            initialize,
+            &out,
+            &paths,
+            &scratch,
+        );
+        try testing.expect(advertised.present);
+    }
 }
 
 fn contains(set: []const []const u8, needle: []const u8) bool {

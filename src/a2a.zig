@@ -105,8 +105,19 @@ pub const version_parameter = "A2A-Version";
 /// The service parameter carrying activated extension URIs.
 pub const extensions_parameter = "A2A-Extensions";
 
-/// The lowercase prefix the specification gives every service parameter it
-/// defines, so they can coexist with transport-defined ones.
+/// The prefix the specification gives every service parameter it defines, so
+/// they can coexist with transport-defined ones, section 5.1.
+///
+/// `research/normative/a2a-1.0.0.md` section 5.3 quotes the rendered
+/// specification verbatim: "all service parameters defined by this
+/// specification will be prefixed with `a2a-`". The prefix is the lowercase
+/// spelling and the two names above are the mixed-case ones, so neither
+/// carries these bytes literally; the match is case-insensitive, because an
+/// HTTP field name is case-insensitive and gRPC lowercases a metadata key.
+///
+/// Do not compose a parameter name from it. `a2a-version` is the gRPC metadata
+/// spelling the section 10.2 example prints, not the name the JSON-RPC and
+/// REST bindings send: those send `version_parameter`.
 pub const service_parameter_prefix = "a2a-";
 
 /// The core protocol binding identifiers, which are bare tokens rather than
@@ -507,8 +518,11 @@ pub const Task = struct {
     id: []const u8,
     /// 2.
     context_id: []const u8 = "",
-    /// 3.
-    status: TaskStatus = .{ .state = .unspecified },
+    /// 3. Required, and it carries no default: section 2.2 of
+    /// `research/normative/a2a-1.0.0.md` marks it REQUIRED, and PROTOCOLS.md
+    /// section 5.4 leaves its note empty, so the normative artifact is the only
+    /// thing that says so. A defaulted `status` is a task the proto forbids.
+    status: TaskStatus,
     /// 4.
     artifacts: []const Artifact = &.{},
     /// 5. Soft-deprecated in favour of a timeline, retained through 1.x.
@@ -682,8 +696,10 @@ comptime {
 pub const TaskStatusUpdateEvent = struct {
     /// 1.
     task_id: []const u8,
-    /// 2.
-    context_id: []const u8 = "",
+    /// 2. Required, and it carries no default for the same reason: section 2.4
+    /// marks `context_id` REQUIRED and PROTOCOLS.md section 5.4 leaves its note
+    /// empty. An empty `context_id` is a value the proto does not allow.
+    context_id: []const u8,
     /// 3.
     status: TaskStatus,
     /// 4.
@@ -706,8 +722,10 @@ comptime {
 pub const TaskArtifactUpdateEvent = struct {
     /// 1.
     task_id: []const u8,
-    /// 2.
-    context_id: []const u8 = "",
+    /// 2. Required, and it carries no default for the same reason: section 2.8
+    /// marks `context_id` REQUIRED and PROTOCOLS.md section 5.4 leaves its note
+    /// empty. An empty `context_id` is a value the proto does not allow.
+    context_id: []const u8,
     /// 3.
     artifact: Artifact,
     /// 4.
@@ -2461,6 +2479,19 @@ test "the interrupted set is the two stated states" {
     try testing.expect(!isInterrupted(.working));
 }
 
+test "the service parameter prefix is not the stem of the parameter names" {
+    // The specification writes both names mixed case and declares the lowercase
+    // `a2a-` prefix for coexistence with transport-defined parameters, so the
+    // prefix is a family the names belong to, not a stem they are built from.
+    // Composing one from it would send `a2a-version` where the registered name
+    // is `A2A-Version`, and that is a name no primary source establishes.
+    try testing.expectEqualStrings("a2a-", service_parameter_prefix);
+    try testing.expectEqualStrings("A2A-Version", version_parameter);
+    try testing.expectEqualStrings("A2A-Extensions", extensions_parameter);
+    try testing.expect(!std.mem.eql(u8, service_parameter_prefix ++ "version", version_parameter));
+    try testing.expect(!std.mem.eql(u8, service_parameter_prefix ++ "extensions", extensions_parameter));
+}
+
 test "an empty A2A-Version means 0.3" {
     const version = try parseVersion("");
     try testing.expectEqual(@as(u16, 0), version.major);
@@ -2942,6 +2973,43 @@ test "the AgentCard requires exactly the eight fields the proto marks required" 
     try testing.expectEqual(@as(u16, 1), (try parseVersion(card.version)).major);
     try testing.expectEqual(@as(u16, 0), (try parseVersion(card.version)).minor);
     try testing.expectError(error.InvalidField, parseVersion("1.0.0"));
+}
+
+/// Whether the field of message `T` named `field` carries a default value.
+///
+/// The check reads the type and not an instance, because a default is invisible
+/// on any value that happens to set the field. A name `T` does not carry is a
+/// compile error rather than a false, so a renamed field cannot pass as an
+/// absent default.
+fn hasDefault(comptime T: type, comptime field: []const u8) bool {
+    return comptime blk: {
+        for (@typeInfo(T).@"struct".fields) |candidate| {
+            if (std.mem.eql(u8, candidate.name, field)) {
+                break :blk candidate.default_value_ptr != null;
+            }
+        }
+        @compileError(std.fmt.comptimePrint(
+            "{s} has no field named '{s}'",
+            .{ @typeName(T), field },
+        ));
+    };
+}
+
+test "a REQUIRED field carries no default and an optional one still does" {
+    // The proto marks `Task.status`, `TaskStatusUpdateEvent.context_id` and
+    // `TaskArtifactUpdateEvent.context_id` REQUIRED, so a default on any of them
+    // is a message the specification does not describe: a caller who omits one
+    // gets a value filled in silently rather than told the field is missing.
+    // The `AgentCard` eight already follow this rule, and these three did not.
+    try testing.expect(!hasDefault(Task, "status"));
+    try testing.expect(!hasDefault(TaskStatusUpdateEvent, "context_id"));
+    try testing.expect(!hasDefault(TaskArtifactUpdateEvent, "context_id"));
+
+    // The over-correction is to strip the two `context_id` fields that the same
+    // tables mark optional, which would make an absent context an error on a
+    // message the proto says may omit it.
+    try testing.expect(hasDefault(Task, "context_id"));
+    try testing.expect(hasDefault(Message, "context_id"));
 }
 
 test "the device code flow is variant 5 and carries its own authorization URL" {
