@@ -37,12 +37,26 @@
 //!   the two must not be the same thing. [`answerPermission`] then checks the
 //!   chosen id against the options *this* request offered, so an id carried over
 //!   from another request answers nothing.
+//!   [`answerPermissionRequest`] is the other door to the same answer, and it
+//!   takes a [`ReadableOutcome`] rather than an option id: a decision, not a
+//!   choice. A decision that grants names no option, and the `selected` outcome
+//!   the specification states does, so that answer goes out as a refusal rather
+//!   than as an approval. Consent still needs an option the user was shown.
 //! - **Receiving** returns a [`PermissionDecision`], a union whose third arm is
 //!   `unreadable`. An outcome this library cannot read never becomes
 //!   `grants = true`: it becomes `unreadable`, carrying the decode error, and a
 //!   two-arm `switch` over `grants` and `cancelled` does not compile against it.
 //!   A wildcard arm is the agent's explicit decision to stop, which is the only
-//!   decision 6.6 leaves it.
+//!   decision 6.6 leaves it. [`Agent.requestPermission`] does the whole of that
+//!   in one call: it sends the request the agent holds and reads the answer
+//!   against that same request, so the option ids on the wire are the ids the
+//!   answer is checked against. [`PermissionDecision.readable`] then takes the
+//!   arms an agent may act on out as a [`ReadableOutcome`], which has no
+//!   `unreadable` arm at all. That is the same rule the two-arm `switch`
+//!   already enforces, stated once more in the type of an answer: an outcome
+//!   this library could not read has no way to become the argument of
+//!   [`answerPermissionRequest`], so the refusal 6.6 requires is a compile
+//!   error rather than a check a caller might forget.
 //!
 //! The two directions are deliberately not symmetrical in what they refuse. The
 //! answering side may name an option whose `kind` is a v2 catch-all, because the
@@ -116,6 +130,12 @@ pub const Error = error{
     /// answer before `initialize` has run: an empty path list supports exactly
     /// the ungated methods.
     NotPermitted,
+    /// The caller's `params` is not a JSON object, so nothing was sent.
+    ///
+    /// ACP params are objects in every version. Omitting the member instead
+    /// would hand the peer a request the caller never wrote, so a non-object
+    /// is refused here rather than framed without it.
+    ParamsNotAnObject,
     /// An `initialize` the pinned version cannot express: v2 requires `info`
     /// and no other member carries it.
     MissingInfo,
@@ -124,6 +144,13 @@ pub const Error = error{
     /// The option list is the only place a permission was ever defined, so an id
     /// from anywhere else answers nothing.
     UnknownPermissionOption,
+    /// A v2 permission request whose `subject` type this library does not model.
+    ///
+    /// The members a v2 catch-all carries are opaque here, so params built from
+    /// one would ask the user about something other than what the agent meant.
+    /// Refused rather than truncated, and nothing was sent. An agent that holds
+    /// the full text sends it with [`Agent.request`] instead.
+    SubjectNotModelled,
     /// The body a peer returned is not a value this layer can read. An
     /// `initialize` result without a usable `protocolVersion` lands here: there
     /// is no version to pin, and inventing one is what the pin exists to stop.
@@ -167,7 +194,10 @@ pub fn classifyFrame(frame: []const u8) FrameAction {
     if (trimmed.len == 0) return .refuse_parse;
     return switch (trimmed[0]) {
         '{' => .dispatch,
-        '[' => .refuse_batch,
+        // Read from the constant rather than spelled out here, so the one
+        // place that says what this session accepts and the answer it gives a
+        // batch frame cannot drift apart when the constant is flipped.
+        '[' => if (accepts_batches) .dispatch else .refuse_batch,
         else => .refuse_parse,
     };
 }
@@ -178,6 +208,11 @@ pub fn classifyFrame(frame: []const u8) FrameAction {
 /// because a frame that is not a request has no id to answer on. This library's
 /// own decoder refuses a `null` id on a message it is *matching* a call against,
 /// which is a different thing: a refusal is never matched, it is written.
+/// A builder cannot produce this one, and that is why it is written here. Every
+/// other answer in the tree is an answer to a `jsonrpc.Request`, and a frame
+/// that is a batch or is not JSON at all is not one: `jsonrpc.Id` has no null
+/// arm and `encodeResponse` refuses a response with no id. The specification
+/// names `null` as the id for both refusals, so the member is written.
 pub fn refusalBody(action: FrameAction, out: []u8) root.EncodeError![]const u8 {
     const code: []const u8, const message: []const u8 = switch (action) {
         .dispatch => return error.InvalidField,
@@ -258,26 +293,6 @@ pub fn capabilityPaths(
     return out[0..set.entries.len];
 }
 
-/// What a call came back with.
-///
-/// The error code stays on the reply rather than becoming a Zig error: the ACP
-/// binding has its own error codes (PROTOCOLS.md section 7), a caller usually
-/// wants the message, and collapsing "the peer answered with an error" into a Zig
-/// error would make a remote `-32601` and a local `error.NotPermitted`
-/// indistinguishable at the call site.
-pub const Reply = struct {
-    /// The `result` member as raw JSON, or the `error` member as raw JSON when
-    /// the peer answered with an error. Borrows the caller's result buffer.
-    body: []const u8,
-    /// The JSON-RPC error code, or null when the call succeeded.
-    error_code: ?i32,
-
-    /// Whether the peer answered with an error rather than a result.
-    pub fn failed(self: Reply) bool {
-        return self.error_code != null;
-    }
-};
-
 // --- The client side ----------------------------------------------------------
 
 /// A client bound to one negotiated wire version.
@@ -288,8 +303,10 @@ pub const Client = struct {
     /// call is checked against what the two sides actually agreed on.
     version: acp.WireVersion,
     /// The agent's advertised capability paths, as produced by
-    /// [`capabilityPaths`]. Empty until the handshake, and empty means every
-    /// gated method is refused.
+    /// [`capabilityPaths`]. `initialize` does not fill this in: it reports the
+    /// agent's capability object in [`Handshake.capabilities`] and leaves the
+    /// recording to [`setAgentCapabilities`], because the paths a client keeps
+    /// are the caller's own. Empty means every gated method is refused.
     agent_capabilities: []const []const u8 = &.{},
     /// Whether the agent advertised a non-empty `authMethods`, which is what
     /// makes `auth/login` and `auth/logout` callable at v2.
@@ -328,15 +345,21 @@ pub const Client = struct {
     }
 
     /// Call an agent method, gated locally.
+    ///
+    /// The error code stays on the reply rather than becoming a Zig error: the
+    /// ACP binding has its own error codes (PROTOCOLS.md section 7), a caller
+    /// usually wants the message, and collapsing "the peer answered with an
+    /// error" into a Zig error would make a remote `-32601` and a local
+    /// `error.NotPermitted` indistinguishable at the call site.
     pub fn request(
         self: *Client,
         method: []const u8,
         params: ?[]const u8,
         result: []u8,
         out: []u8,
-    ) Error!Reply {
+    ) Error!conn.Response {
         _ = try self.gate(method, .request);
-        const answer = try self.connection.call(method, requireObject(params), result, out);
+        const answer = try self.connection.call(method, try requireObject(params), result, out);
         return .{ .body = answer.body, .error_code = answer.error_code };
     }
 
@@ -348,7 +371,7 @@ pub const Client = struct {
         out: []u8,
     ) Error!void {
         _ = try self.gate(method, .notification);
-        return self.connection.notify(method, requireObject(params), out);
+        return self.connection.notify(method, try requireObject(params), out);
     }
 
     /// Run the `initialize` handshake and pin the session to its outcome.
@@ -385,8 +408,13 @@ pub const Client = struct {
         const params = try initializeParams(asked, requested, info, capabilities, params_out);
         const answer = try self.connection.call("initialize", params, result, out);
         if (answer.error_code != null) {
-            // The agent refused. Nothing is pinned, because nothing was agreed,
-            // and reporting the refusal beats inventing a version.
+            // The agent refused, so nothing was agreed and the refusal is
+            // reported rather than a version invented for it. The session's own
+            // pin is untouched and still holds the version `init` was given, so
+            // a caller that goes on using this session sends that version's
+            // method names to an agent that agreed to nothing: the null
+            // `version` here is the only thing that says so, and the caller
+            // must check it before the first call.
             return .{
                 .version = null,
                 .body = answer.body,
@@ -502,10 +530,10 @@ pub const Agent = struct {
     ///
     /// On `echoed` and `downgraded` the session is pinned to the version the agent
     /// just answered with, because that is what the two sides agreed and the rest
-    /// of the session has to act as it. `agent_supports_nothing` leaves the
-    /// session unpinned and reports `error.NotPermitted`: there is no version to
-    /// pin, and pinning the client's own number would claim the agent speaks
-    /// something it does not.
+    /// of the session has to act as it. `agent_supports_nothing` and
+    /// `unsupported` leave the session on the version it was built with and
+    /// report `error.NotPermitted`: there is no version to pin, and pinning the
+    /// client's own number would claim the agent speaks something it does not.
     pub fn negotiate(
         self: *Agent,
         requested: u16,
@@ -571,16 +599,68 @@ pub const Agent = struct {
     }
 
     /// Call a client method, gated locally against what the client advertised.
+    ///
+    /// The error code stays on the reply rather than becoming a Zig error: the
+    /// ACP binding has its own error codes (PROTOCOLS.md section 7), a caller
+    /// usually wants the message, and collapsing "the peer answered with an
+    /// error" into a Zig error would make a remote `-32601` and a local
+    /// `error.NotPermitted` indistinguishable at the call site.
     pub fn request(
         self: *Agent,
         method: []const u8,
         params: ?[]const u8,
         result: []u8,
         out: []u8,
-    ) Error!Reply {
+    ) Error!conn.Response {
         _ = try self.gate(method, .request);
-        const answer = try self.connection.call(method, requireObject(params), result, out);
+        const answer = try self.connection.call(method, try requireObject(params), result, out);
         return .{ .body = answer.body, .error_code = answer.error_code };
+    }
+
+    /// Ask the client for a permission, and read the answer against the request
+    /// this agent sent.
+    ///
+    /// `permission` is the `acp.PermissionRequest` the agent means to ask with,
+    /// and it is not the JSON-RPC request [`answerPermissionRequest`] answers:
+    /// that one is the frame that arrived, this one is what the frame must say.
+    /// `params` receives the `session/request_permission` body, built here from
+    /// `permission`, and the answer is read against that same `permission`. So
+    /// the option ids on the wire are the ids the answer is checked against:
+    /// they line up because they are one set of ids, not because a caller
+    /// handed over two texts it expected to agree. `permission` outlives this
+    /// call, and the option ids in it must have been decoded into
+    /// `request_scratch`.
+    ///
+    /// `request_scratch` and `outcome_scratch` must not share a byte, and a
+    /// caller that hands over one buffer for both is refused before a byte goes
+    /// out, for the reason [`readOutcome`] gives: the escape offset a
+    /// `json.Reader` keeps is per reader and not per buffer, so the reader
+    /// decoding this answer would start at offset 0 again and write an option id
+    /// over one the request borrowed from that buffer, and `findOption` would
+    /// then match an id against itself. That is a grant for an option the client
+    /// never chose, so the call stops here rather than sending a request whose
+    /// answer it may not be able to read.
+    ///
+    /// An outcome this library cannot parse is [`PermissionDecision.unreadable`]
+    /// and not a Zig error, so the two-arm `switch` PROTOCOLS.md 6.6 requires
+    /// still fails to compile without an `unreadable` arm. A client that
+    /// answered with a JSON-RPC error is `unreadable` too: an error object
+    /// carries no outcome, and reading one as an approval would be inventing it.
+    pub fn requestPermission(
+        self: *Agent,
+        permission: *const acp.PermissionRequest,
+        result: []u8,
+        out: []u8,
+        params: []u8,
+        request_scratch: []u8,
+        outcome_scratch: []u8,
+    ) Error!PermissionDecision {
+        if (overlaps(request_scratch, outcome_scratch)) {
+            return .{ .unreadable = error.InvalidField };
+        }
+        const body = try permissionParams(permission, params);
+        const answer = try self.request("session/request_permission", body, result, out);
+        return readOutcome(answer.body, permission, request_scratch, outcome_scratch);
     }
 
     /// Notify a client method, gated locally.
@@ -591,7 +671,7 @@ pub const Agent = struct {
         out: []u8,
     ) Error!void {
         _ = try self.gate(method, .notification);
-        return self.connection.notify(method, requireObject(params), out);
+        return self.connection.notify(method, try requireObject(params), out);
     }
 
     /// Whether a method the client called is one this agent serves at the pinned
@@ -637,6 +717,22 @@ pub const PermissionAnswer = union(enum) {
     selected: []const u8,
 };
 
+/// What an agent may act on, with the refusal taken out.
+///
+/// [`PermissionDecision`] carries a third arm so that a reader who only wants
+/// the two arms a client could have meant must say what they do with the third.
+/// This union says it once: an outcome this library could not read is absent
+/// here, and an absent outcome has no way to become the argument of an answer.
+/// That is the same rule a `switch` over `grants` and `cancelled` already
+/// enforces on the decision, restated in the type of what a caller passes on.
+pub const ReadableOutcome = union(enum) {
+    /// The client chose an option this request offered, and that option's `kind`
+    /// resolves to whether it grants.
+    grants: bool,
+    /// The client cancelled.
+    cancelled,
+};
+
 /// What an agent may do with the outcome a client returned.
 ///
 /// The `unreadable` arm is not decoration. PROTOCOLS.md 6.6 makes it normative
@@ -656,24 +752,54 @@ pub const PermissionDecision = union(enum) {
     ///
     /// Never `grants = true`, and there is no way to make it so from the wire.
     unreadable: root.DecodeError,
+    /// The arms an agent may act on, or null when the outcome was unreadable.
+    ///
+    /// Null rather than a value meaning "did not grant": PROTOCOLS.md 6.6 makes
+    /// it normative that an outcome an agent does not understand MUST NOT be
+    /// treated as approval, and a third arm here would carry the same consent
+    /// `grants` carries. This is the same refusal a `switch` over `grants` and
+    /// `cancelled` alone already forces, so an agent that ignores the wire can
+    /// no more turn an unreadable outcome into an answer than it can leave the
+    /// arm out.
+    pub fn readable(self: PermissionDecision) ?ReadableOutcome {
+        return switch (self) {
+            .grants => |grants| .{ .grants = grants },
+            .cancelled => .cancelled,
+            .unreadable => null,
+        };
+    }
 };
 
 /// Read the outcome an agent received, without ever defaulting to approval.
 ///
 /// `body` is the `result` member of the client's answer, so the nesting
-/// `{"outcome":{...}}` that PROTOCOLS.md 6.6 specifies is peeled here rather than
-/// demanded of the caller. `request` is the request the outcome answers, and it
-/// is what the option id is checked against: the option list is the only place a
-/// permission was defined, so an id that is not on it is consent to nothing and is
-/// reported rather than read as a grant.
+/// `{"outcome":{...}}` that PROTOCOLS.md 6.6 specifies is peeled here rather
+/// than demanded of the caller. `request` is the request the outcome answers,
+/// and it is what the option id is checked against: the option list is the only
+/// place a permission was defined, so an id that is not on it is consent to
+/// nothing and is reported rather than read as a grant.
+///
+/// `request_scratch` and `outcome_scratch` must not share a byte, and a caller
+/// that hands over one buffer for both is refused rather than believed. The
+/// escape offset `json.Reader` keeps is per reader and not per buffer, so the
+/// reader decoding this answer starts at offset 0 again and writes over
+/// whatever the reader that decoded the request left there: an answer carrying
+/// an escape in its option id lands exactly on an option id the request
+/// borrowed from that buffer, `findOption` matches one id against itself, and
+/// `grants` is true for an option the client never chose. The id is
+/// peer-controlled, so that is a grant no user made.
 pub fn readOutcome(
     body: []const u8,
     request: *const acp.PermissionRequest,
-    scratch: []u8,
+    request_scratch: []u8,
+    outcome_scratch: []u8,
 ) PermissionDecision {
-    const outcome_text = memberText(body, "outcome", scratch) orelse
+    if (overlaps(request_scratch, outcome_scratch)) {
+        return .{ .unreadable = error.InvalidField };
+    }
+    const outcome_text = memberText(body, "outcome", outcome_scratch) orelse
         return .{ .unreadable = error.MissingField };
-    const outcome = acp.decodePermissionOutcome(outcome_text, scratch) catch |err| {
+    const outcome = acp.decodePermissionOutcome(outcome_text, outcome_scratch) catch |err| {
         return .{ .unreadable = err };
     };
     return switch (outcome) {
@@ -719,6 +845,46 @@ pub fn answerPermission(
     return writer.written();
 }
 
+/// The whole response that answers a `session/request_permission` request.
+///
+/// A decision, not a choice. `decision` is what the client settled on, and it
+/// carries no option id, so a cancellation is the one permission outcome the
+/// specification states without one: `{"outcome":{"outcome":"cancelled"}}`.
+/// The envelope around it is the connection's, because [`conn.respond`] echoes
+/// the id the agent chose and refuses an answer with a result and no error
+/// beside it.
+///
+/// A decision that grants is answered with a refusal rather than with a
+/// `selected` outcome. PROTOCOLS.md 6.6 writes that outcome as
+/// `{"outcome":{"outcome":"selected","optionId}}`, the id is required, and a
+/// decision has none: naming an option here would choose for the user, which is
+/// the consent [`PermissionAnswer`] exists to keep a caller from producing by
+/// accident. So the grant goes out as the error the other of the connection's
+/// two builders writes, and the agent that receives it reads `unreadable`
+/// rather than an approval. A caller holding an option id answers with
+/// [`answerPermission`] and [`conn.respond`], which is the path that can grant.
+pub fn answerPermissionRequest(
+    request: jsonrpc.Request,
+    decision: ReadableOutcome,
+    out: []u8,
+) conn.Error![]const u8 {
+    return switch (decision) {
+        .cancelled => try conn.respond(
+            request,
+            "{\"outcome\":{\"outcome\":\"cancelled\"}}",
+            out,
+        ),
+        .grants => try conn.errorResponse(
+            request,
+            .{
+                .code = @intFromEnum(jsonrpc.StandardError.internal_error),
+                .message = "a granting answer needs an option id",
+            },
+            out,
+        ),
+    };
+}
+
 /// A caller policy that may auto-decide a permission request.
 pub const Policy = struct {
     ctx: ?*anyopaque = null,
@@ -755,29 +921,18 @@ fn findOption(request: *const acp.PermissionRequest, option_id: []const u8) ?acp
     return null;
 }
 
+/// Whether two caller-supplied regions share a byte.
+///
+/// Pointer arithmetic rather than a content comparison, because the question is
+/// where the bytes are and not what is in them. An empty region overlaps
+/// nothing, because its end is its start.
+fn overlaps(a: []const u8, b: []const u8) bool {
+    const a_start = @intFromPtr(a.ptr);
+    const b_start = @intFromPtr(b.ptr);
+    return a_start < b_start + b.len and b_start < a_start + a.len;
+}
+
 // --- Bodies -------------------------------------------------------------------
-
-/// The error body an agent sends for a method it does not have at this version,
-/// or a gate the caller did not satisfy.
-pub fn methodNotFound(id: jsonrpc.Id, out: []u8) root.EncodeError![]const u8 {
-    var writer = json.Writer.init(out);
-    try writer.slice("{\"jsonrpc\":\"2.0\",\"id\":");
-    try writeId(id, &writer);
-    try writer.slice(",\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}");
-    return writer.written();
-}
-
-fn writeId(id: jsonrpc.Id, writer: *json.Writer) root.EncodeError!void {
-    switch (id) {
-        .integer => |value| {
-            var digits: [24]u8 = undefined;
-            const text = std.fmt.bufPrint(&digits, "{d}", .{value}) catch
-                return error.BufferTooSmall;
-            try writer.slice(text);
-        },
-        .string => |text| try writer.string(text),
-    }
-}
 
 fn initializeParams(
     version: acp.WireVersion,
@@ -814,6 +969,115 @@ fn initializeParams(
     }
     writer.byte('}') catch return error.BufferTooSmall;
     return writer.written();
+}
+
+/// The `session/request_permission` params for `request`, in `out`.
+///
+/// Built from the request rather than taken as text so that the request an agent
+/// sends and the request it reads the answer against are one value. An option
+/// id this body lost is then an id `readOutcome` never held, and it can be
+/// matched against nothing: the alternative is a caller passing the text it is
+/// about to send beside a decoded copy of a request that may not be the same
+/// one, and a grant resolved against the wrong option list is a grant no user
+/// chose.
+///
+/// Every member both versions require is written, and every member neither
+/// declares is omitted rather than written `null`, because an omitted member and
+/// a `null` one mean the same in both schemas.
+fn permissionParams(
+    request: *const acp.PermissionRequest,
+    out: []u8,
+) Error![]const u8 {
+    const session_id: []const u8 = switch (request.*) {
+        .stable => |value| value.session_id,
+        .draft => |value| value.session_id,
+    };
+    const options: []const acp.PermissionOption = switch (request.*) {
+        .stable => |value| value.options,
+        .draft => |value| value.options,
+    };
+    var writer = json.Writer.init(out);
+    writer.slice("{\"sessionId\":") catch return error.BufferTooSmall;
+    writer.string(session_id) catch return error.BufferTooSmall;
+    switch (request.*) {
+        .stable => |value| {
+            writer.slice(",\"toolCall\":") catch return error.BufferTooSmall;
+            // Verbatim, because a `ToolCallUpdate` is not modelled here and this
+            // is the one member an agent cannot afford to have re-shaped.
+            writer.slice(value.tool_call) catch return error.BufferTooSmall;
+        },
+        .draft => |value| {
+            writer.slice(",\"title\":") catch return error.BufferTooSmall;
+            writer.string(value.title) catch return error.BufferTooSmall;
+            if (value.description) |text| {
+                writer.slice(",\"description\":") catch return error.BufferTooSmall;
+                writer.string(text) catch return error.BufferTooSmall;
+            }
+            if (value.subject) |subject| {
+                writer.slice(",\"subject\":") catch return error.BufferTooSmall;
+                try writePermissionSubject(subject, &writer);
+            }
+        },
+    }
+    writer.slice(",\"options\":[") catch return error.BufferTooSmall;
+    for (options, 0..) |option, index| {
+        if (index != 0) writer.byte(',') catch return error.BufferTooSmall;
+        writer.slice("{\"optionId\":") catch return error.BufferTooSmall;
+        writer.string(option.option_id) catch return error.BufferTooSmall;
+        writer.slice(",\"name\":") catch return error.BufferTooSmall;
+        writer.string(option.name) catch return error.BufferTooSmall;
+        writer.slice(",\"kind\":") catch return error.BufferTooSmall;
+        switch (option.kind) {
+            .known => |kind| {
+                writer.string(kind.string()) catch return error.BufferTooSmall;
+            },
+            // The tag a v2 catch-all carries, written as it arrived. This library
+            // named the four kinds, so it knows every other one by its text.
+            .other => |text| {
+                writer.string(text) catch return error.BufferTooSmall;
+            },
+        }
+        writer.byte('}') catch return error.BufferTooSmall;
+    }
+    writer.slice("]}") catch return error.BufferTooSmall;
+    return writer.written();
+}
+
+/// The v2 `subject` member, or `error.SubjectNotModelled`.
+///
+/// The two arms this library models carry every member the schema requires of
+/// them, so each one decodes back to what it was built from.
+fn writePermissionSubject(subject: acp.PermissionSubject, writer: *json.Writer) Error!void {
+    switch (subject) {
+        .tool_call => |call| {
+            writer.slice(
+                "{\"type\":\"" ++ acp.permission_subject_type.tool_call ++ "\",\"toolCall\":",
+            ) catch return error.BufferTooSmall;
+            writer.slice(call) catch return error.BufferTooSmall;
+            writer.byte('}') catch return error.BufferTooSmall;
+        },
+        .command => |command| {
+            writer.slice(
+                "{\"type\":\"" ++ acp.permission_subject_type.command ++ "\",\"command\":",
+            ) catch return error.BufferTooSmall;
+            writer.string(command.command) catch return error.BufferTooSmall;
+            writer.slice(",\"cwd\":") catch return error.BufferTooSmall;
+            writer.string(command.cwd) catch return error.BufferTooSmall;
+            if (command.tool_call_id) |id| {
+                writer.slice(",\"toolCallId\":") catch return error.BufferTooSmall;
+                writer.string(id) catch return error.BufferTooSmall;
+            }
+            if (command.terminal_id) |id| {
+                writer.slice(",\"terminalId\":") catch return error.BufferTooSmall;
+                writer.string(id) catch return error.BufferTooSmall;
+            }
+            writer.byte('}') catch return error.BufferTooSmall;
+        },
+        // Refused rather than written as the tag alone: the members a v2
+        // catch-all carries were never decoded here, so a body without them
+        // would ask the user about a permission the agent did not describe.
+        .other => return error.SubjectNotModelled,
+    }
 }
 
 fn readProtocolVersion(body: []const u8, scratch: []u8) root.DecodeError!u16 {
@@ -868,16 +1132,17 @@ fn memberText(body: []const u8, name: []const u8, scratch: []u8) ?[]const u8 {
     return found;
 }
 
-/// The params a call is allowed to send.
+/// The params a call is allowed to send, or `error.ParamsNotAnObject`.
 ///
 /// ACP params are objects in every version; a batch array is the one thing this
 /// session refuses, and it is refused above, before a body is built. Checking
-/// here means an array cannot reach the connection and become a frame the peer
-/// fails to decode three layers away.
-fn requireObject(params: ?[]const u8) ?[]const u8 {
+/// here means an array, a string or a number cannot reach the connection. A
+/// refusal rather than a null, because the connection omits an absent `params`
+/// member entirely: the peer would answer a request the caller never wrote.
+fn requireObject(params: ?[]const u8) error{ParamsNotAnObject}!?[]const u8 {
     const value = params orelse return null;
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    if (trimmed.len == 0 or trimmed[0] != '{') return null;
+    if (trimmed.len == 0 or trimmed[0] != '{') return error.ParamsNotAnObject;
     return value;
 }
 
@@ -984,16 +1249,85 @@ test "arity and side are checked against the registry" {
     try testing.expect(!agent.accepts("session/load"));
 }
 
+test "a session is pinned to the version it was built with" {
+    var connection: conn.Conn = undefined;
+    // The pin is what every later gate is decided against, so a constructor
+    // sets it rather than leaving a session to settle on its first call.
+    const client = Client.init(&connection, .stable);
+    try testing.expectEqual(acp.WireVersion.stable, client.version);
+    try testing.expectEqual(@as(u16, 1), client.versionNumber());
+
+    // The other version, and the number the wire actually carries.
+    const v2 = Client.init(&connection, .draft);
+    try testing.expectEqual(@as(u16, 2), v2.versionNumber());
+
+    // The agent pins the same way, and its gate reads the pin alone: a v1
+    // method the draft removed is refused without a round trip.
+    const agent = Agent.init(&connection, .draft);
+    try testing.expectEqual(acp.WireVersion.draft, agent.version);
+    try testing.expect(agent.accepts("session/request_permission"));
+    try testing.expect(!agent.accepts("terminal/create"));
+}
+
+test "the inbound client-side gate is the capability this client claimed" {
+    var client: Client = .{ .connection = undefined, .version = .stable };
+    // Nothing claimed yet, so every gated client method is refused. An agent
+    // that asks for a terminal this client never advertised support for must
+    // not be answered by a session that pretends otherwise.
+    try testing.expect(!client.accepts("terminal/create"));
+
+    const claimed = [_][]const u8{"terminal"};
+    client.setClientCapabilities(&claimed);
+    try testing.expect(client.accepts("terminal/create"));
+    try testing.expect(client.accepts("terminal/release"));
+    // One capability claimed is not all of them, so the gate stays per method.
+    try testing.expect(!client.accepts("fs/write_text_file"));
+    try testing.expect(!client.accepts("elicitation/create"));
+    // An ungated client method was never gated at all.
+    try testing.expect(client.accepts("session/request_permission"));
+}
+
+test "a notification is sent as a notification and a request as a request" {
+    var connection: conn.Conn = undefined;
+    var out: [128]u8 = undefined;
+    var result: [128]u8 = undefined;
+    var client: Client = .{ .connection = &connection, .version = .stable };
+    var agent: Agent = .{ .connection = &connection, .version = .stable };
+
+    // Each is refused by the arity check alone, so the connection is never
+    // reached: a notification sent as a request leaves the sender waiting for
+    // an answer the peer will never send, and a request sent as a notification
+    // loses the session id with nothing to notice it.
+    try testing.expectError(
+        error.WrongArity,
+        client.notify("session/new", "{\"cwd\":\"/tmp\"}", &out),
+    );
+    try testing.expectError(
+        error.WrongArity,
+        client.request("session/cancel", "{\"sessionId\":\"s1\"}", &result, &out),
+    );
+    try testing.expectError(
+        error.WrongArity,
+        agent.notify("session/request_permission", "{\"sessionId\":\"s1\"}", &out),
+    );
+    try testing.expectError(
+        error.WrongArity,
+        agent.request("session/update", "{\"sessionId\":\"s1\"}", &result, &out),
+    );
+}
+
 test "an outcome this library cannot read is never approval" {
     var options: [2]acp.PermissionOption = undefined;
+    var request_scratch: [512]u8 = undefined;
     const request = try decodeRequest(
         .stable,
         "{\"sessionId\":\"s1\",\"toolCall\":{},\"options\":[" ++
             "{\"optionId\":\"yes\",\"name\":\"Yes\",\"kind\":\"allow_once\"}," ++
             "{\"optionId\":\"no\",\"name\":\"No\",\"kind\":\"reject_once\"}]}",
         &options,
+        &request_scratch,
     );
-    var scratch: [256]u8 = undefined;
+    var outcome_scratch: [256]u8 = undefined;
 
     // The shapes a newer or hostile client could send. None may read as a grant,
     // and each carries the reason so an agent can log why it stopped.
@@ -1004,24 +1338,33 @@ test "an outcome this library cannot read is never approval" {
         "{\"outcome\":{}}",
         "{\"outcome\":[]}",
         "{\"outcome\":null}",
+        // What `answerPermissionRequest` writes for a decision that grants: an
+        // error object, which carries no outcome at all.
+        "{\"code\":-32603,\"message\":\"a granting answer needs an option id\"}",
     }) |body| {
-        const decision = readOutcome(body, &request, &scratch);
+        const decision = readOutcome(body, &request, &request_scratch, &outcome_scratch);
         switch (decision) {
             .unreadable => |err| try testing.expect(err != error.BufferTooSmall),
             else => return error.TestUnexpectedResult,
         }
+
+        // The refusal is not decoration, and it is not a value an answer can
+        // take: there is nothing to hand on from an outcome nobody could read.
+        try testing.expectEqual(@as(?ReadableOutcome, null), decision.readable());
     }
 }
 
 test "an outcome naming an option the request never offered is consent to nothing" {
     var options: [1]acp.PermissionOption = undefined;
+    var request_scratch: [512]u8 = undefined;
     const request = try decodeRequest(
         .stable,
         "{\"sessionId\":\"s1\",\"toolCall\":{},\"options\":[" ++
             "{\"optionId\":\"yes\",\"name\":\"Yes\",\"kind\":\"allow_once\"}]}",
         &options,
+        &request_scratch,
     );
-    var scratch: [256]u8 = undefined;
+    var outcome_scratch: [256]u8 = undefined;
 
     // An `allow_once` option was on the table somewhere, so a caller could
     // plausibly reach for an id from another request. It is not this request's
@@ -1029,15 +1372,91 @@ test "an outcome naming an option the request never offered is consent to nothin
     // shown.
     const wrong = readOutcome(
         \\{"outcome":{"outcome":"selected","optionId":"other-request"}}
-    , &request, &scratch);
+    , &request, &request_scratch, &outcome_scratch);
     try testing.expect(wrong == .unreadable);
+    // Which is the whole of the refusal in its type: an outcome naming an id
+    // this request never offered cannot become the argument of an answer.
+    try testing.expectEqual(@as(?ReadableOutcome, null), wrong.readable());
 
     // The same shape, naming the option this request did offer, does grant. So
     // the refusal is about the id and not about the decoder failing.
     const right = readOutcome(
         \\{"outcome":{"outcome":"selected","optionId":"yes"}}
-    , &request, &scratch);
+    , &request, &request_scratch, &outcome_scratch);
     try testing.expectEqual(true, right.grants);
+    try testing.expectEqual(ReadableOutcome{ .grants = true }, right.readable().?);
+}
+
+test "an answer read through the request's own buffer is refused, not granted" {
+    // An option id carrying an escape is the one value a decoded request
+    // borrows from the caller's buffer rather than from the input, and the
+    // first one starts at offset 0. Without the escape below the request would
+    // borrow this fixture and the test would prove nothing.
+    var options: [2]acp.PermissionOption = undefined;
+    var request_scratch: [512]u8 = undefined;
+    const request = try decodeRequest(
+        .stable,
+        "{\"sessionId\":\"s1\",\"toolCall\":{},\"options\":[" ++
+            "{\"optionId\":\"\\u0041LLOW\",\"name\":\"Yes\",\"kind\":\"allow_once\"}," ++
+            "{\"optionId\":\"never\",\"name\":\"No\",\"kind\":\"reject_once\"}]}",
+        &options,
+        &request_scratch,
+    );
+    var outcome_scratch: [256]u8 = undefined;
+
+    // The answer names an id the request never offered, and read through its
+    // own region that is a refusal: consent to an option nobody was shown.
+    try testing.expect(readOutcome(
+        \\{"outcome":{"outcome":"selected","optionId":"\u0061LLLW"}}
+    , &request, &request_scratch, &outcome_scratch) == .unreadable);
+
+    // Read through the buffer the request was decoded into, the same answer is
+    // still a refusal and never a grant. The escape offset is per reader, so
+    // this decode starts at 0 again and its five bytes land on the first
+    // option's five, leaving `findOption` comparing one id with itself. The
+    // reason travels with the refusal, so an agent can log why it stopped.
+    const reason: root.DecodeError = error.InvalidField;
+    switch (readOutcome(
+        \\{"outcome":{"outcome":"selected","optionId":"\u0061LLLW"}}
+    , &request, &request_scratch, &request_scratch)) {
+        .unreadable => |err| try testing.expectEqual(reason, err),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "one buffer for both scratches is refused before a byte is sent" {
+    // The connection is `undefined` on purpose: the refusal happens before the
+    // agent reaches it, so a caller that got past it would fault here rather
+    // than quietly reading an answer it cannot trust.
+    var agent: Agent = .{ .connection = undefined, .version = .stable };
+    var options: [1]acp.PermissionOption = undefined;
+    var request_scratch: [512]u8 = undefined;
+    const request = try decodeRequest(.stable, permission_params, &options, &request_scratch);
+    var result: [128]u8 = undefined;
+    var out: [128]u8 = undefined;
+    var params: [512]u8 = undefined;
+
+    // The same request, and one buffer for both scratches. The escape offset a
+    // `json.Reader` keeps is per reader and not per buffer, so the reader
+    // decoding the answer would start at offset 0 again and write an option id
+    // over one this request borrowed from there: `findOption` would then match
+    // an id against itself and read a refusal as a grant. So nothing is sent,
+    // the reason travels with the refusal, and there is nothing to turn into an
+    // answer.
+    const reason: root.DecodeError = error.InvalidField;
+    const decision = try agent.requestPermission(
+        &request,
+        &result,
+        &out,
+        &params,
+        &request_scratch,
+        &request_scratch,
+    );
+    switch (decision) {
+        .unreadable => |err| try testing.expectEqual(reason, err),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(?ReadableOutcome, null), decision.readable());
 }
 
 test "a v2 catch-all option kind is unreadable, not a grant and not a refusal" {
@@ -1045,8 +1464,9 @@ test "a v2 catch-all option kind is unreadable, not a grant and not a refusal" {
     const source = "{\"sessionId\":\"s1\",\"title\":\"Run\",\"subject\":null,\"options\":[" ++
         "{\"optionId\":\"a\",\"name\":\"Run\",\"kind\":\"allow_once\"}," ++
         "{\"optionId\":\"ext\",\"name\":\"Always via policy\",\"kind\":\"_vendor\"}]}";
-    const request = try decodeRequest(.draft, source, &options);
-    var scratch: [512]u8 = undefined;
+    var request_scratch: [512]u8 = undefined;
+    const request = try decodeRequest(.draft, source, &options, &request_scratch);
+    var outcome_scratch: [256]u8 = undefined;
 
     // The schema defines the fifth string, so the option is real and a client may
     // legitimately offer it. What the library may not do is claim what choosing
@@ -1054,42 +1474,53 @@ test "a v2 catch-all option kind is unreadable, not a grant and not a refusal" {
     // would claim the client refused a choice it made.
     const decision = readOutcome(
         \\{"outcome":{"outcome":"selected","optionId":"ext"}}
-    , &request, &scratch);
+    , &request, &request_scratch, &outcome_scratch);
     switch (decision) {
         .unreadable => |err| try testing.expectEqual(@as(root.DecodeError, error.UnknownTag), err),
         else => return error.TestUnexpectedResult,
     }
+    // The same refusal in its type: an option whose kind this library cannot
+    // resolve to a direction is nothing an answer could be built from either.
+    try testing.expectEqual(@as(?ReadableOutcome, null), decision.readable());
 
     // The named option next to it still resolves, so the refusal is about the
     // kind and not about the request.
     const known = readOutcome(
         \\{"outcome":{"outcome":"selected","optionId":"a"}}
-    , &request, &scratch);
+    , &request, &request_scratch, &outcome_scratch);
     try testing.expectEqual(true, known.grants);
 }
 
 test "a cancellation is read as a cancellation and never as a grant" {
     var options: [1]acp.PermissionOption = undefined;
+    var request_scratch: [512]u8 = undefined;
     const request = try decodeRequest(
         .stable,
         "{\"sessionId\":\"s1\",\"toolCall\":{},\"options\":[" ++
             "{\"optionId\":\"yes\",\"name\":\"Yes\",\"kind\":\"allow_always\"}]}",
         &options,
+        &request_scratch,
     );
-    var scratch: [256]u8 = undefined;
-    try testing.expect(readOutcome(
+    var outcome_scratch: [256]u8 = undefined;
+    const decision = readOutcome(
         \\{"outcome":{"outcome":"cancelled"}}
-    , &request, &scratch) == .cancelled);
+    , &request, &request_scratch, &outcome_scratch);
+    try testing.expect(decision == .cancelled);
+    // An agent may act on it, and what it may act on is the cancellation: the
+    // arms a `ReadableOutcome` has are exactly the ones 6.6 leaves it.
+    try testing.expectEqual(ReadableOutcome{ .cancelled = {} }, decision.readable().?);
 }
 
 test "answering a permission request writes the nested outcome the spec states" {
     var options: [2]acp.PermissionOption = undefined;
+    var request_scratch: [512]u8 = undefined;
     const request = try decodeRequest(
         .stable,
         "{\"sessionId\":\"s1\",\"toolCall\":{},\"options\":[" ++
             "{\"optionId\":\"yes\",\"name\":\"Yes\",\"kind\":\"allow_once\"}," ++
             "{\"optionId\":\"no\",\"name\":\"No\",\"kind\":\"reject_once\"}]}",
         &options,
+        &request_scratch,
     );
     var out: [128]u8 = undefined;
 
@@ -1123,13 +1554,158 @@ test "answering a permission request writes the nested outcome the spec states" 
     );
 }
 
+test "the answer frame is the connection's, and it refuses a grant it cannot name" {
+    // The shape a handler receives: a decoded request, which is what an answer
+    // is built against.
+    var key_scratch: [256]u8 = undefined;
+    const call = try jsonrpc.decodeRequest(
+        \\{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{"sessionId":"s9"}}
+    , &key_scratch);
+    var out: [256]u8 = undefined;
+
+    // The cancellation, in the envelope the connection writes: the id the agent
+    // chose, echoed by the shared builder rather than assembled here.
+    try testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"outcome\":" ++
+            "{\"outcome\":\"cancelled\"}}}",
+        try answerPermissionRequest(call, .cancelled, &out),
+    );
+
+    // A decision that grants names no option, and the protocol's grant is a
+    // `selected` outcome that carries one. So the answer is the other of the two
+    // shapes `jsonrpc.encodeResponse` accepts: a result with no error, or an
+    // error with no result. This one is the error.
+    const refused = try answerPermissionRequest(call, .{ .grants = true }, &out);
+    try testing.expect(std.mem.indexOf(u8, refused, "\"result\"") == null);
+    try testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":-32603," ++
+            "\"message\":\"a granting answer needs an option id\"}}",
+        refused,
+    );
+
+    // And an agent that receives it reads a refusal rather than an approval: an
+    // error object carries no outcome, so there is nothing there to be one.
+    var options: [1]acp.PermissionOption = undefined;
+    var request_scratch: [512]u8 = undefined;
+    const request = try decodeRequest(.stable, permission_params, &options, &request_scratch);
+    var outcome_scratch: [256]u8 = undefined;
+    const decision = readOutcome(refused, &request, &request_scratch, &outcome_scratch);
+    try testing.expectEqual(@as(?ReadableOutcome, null), decision.readable());
+
+    // A short buffer is the caller's own fault, and it is reported rather than
+    // leaving half an answer behind.
+    try testing.expectError(
+        error.ResponseTooLarge,
+        answerPermissionRequest(call, .cancelled, out[0..8]),
+    );
+}
+
+test "the request an agent sends is the one the answer is checked against" {
+    // Typed, the way an agent builds one, so nothing here is a text a caller has
+    // to keep in step by hand.
+    var options = [_]acp.PermissionOption{
+        .{ .option_id = "yes", .name = "Yes", .kind = .{ .known = .allow_once } },
+        .{ .option_id = "no", .name = "No", .kind = .{ .known = .reject_once } },
+    };
+    const request: acp.PermissionRequest = .{ .stable = .{
+        .session_id = "s9",
+        .tool_call = "{\"toolCallId\":\"t1\"}",
+        .options = &options,
+    } };
+
+    var params: [256]u8 = undefined;
+    const body = try permissionParams(&request, &params);
+
+    // A client reads back what the agent holds, so an option id the params lost
+    // is an id nothing can match. Both of them, in the order they were offered.
+    var read_back: [2]acp.PermissionOption = undefined;
+    var scratch: [256]u8 = undefined;
+    const sent = try acp.decodePermissionRequest(.stable, body, &read_back, &scratch);
+    try testing.expectEqual(@as(usize, 2), sent.stable.options.len);
+    try testing.expectEqualStrings("yes", sent.stable.options[0].option_id);
+    try testing.expectEqualStrings("no", sent.stable.options[1].option_id);
+
+    // A short buffer writes nothing at all, so a caller that mishandles the
+    // error cannot find a request already sitting in its own memory.
+    var small: [8]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, permissionParams(&request, &small));
+}
+
+test "a v2 permission request keeps its subject and refuses one it cannot rebuild" {
+    var options = [_]acp.PermissionOption{
+        .{ .option_id = "a", .name = "Run", .kind = .{ .known = .allow_once } },
+    };
+    const call_text = "{\"toolCallId\":\"t1\"}";
+    var out: [512]u8 = undefined;
+    var scratch: [256]u8 = undefined;
+    var read_back: [1]acp.PermissionOption = undefined;
+
+    // A command subject carries every member the schema requires of it, so it
+    // comes back whole: the user is asked about the same command in the same
+    // directory, or not at all.
+    const command: acp.PermissionRequest = .{ .draft = .{
+        .session_id = "s9",
+        .title = "Run a command",
+        .description = "before the build",
+        .subject = .{ .command = .{
+            .command = "ls -l",
+            .cwd = "/tmp",
+            .tool_call_id = "t1",
+            .terminal_id = null,
+        } },
+        .options = &options,
+    } };
+    const body = try permissionParams(&command, &out);
+    const sent = try acp.decodePermissionRequest(.draft, body, &read_back, &scratch);
+    try testing.expectEqualStrings("Run a command", sent.draft.title);
+    try testing.expectEqualStrings("before the build", sent.draft.description.?);
+    switch (sent.draft.subject orelse return error.TestUnexpectedResult) {
+        .command => |value| {
+            try testing.expectEqualStrings("ls -l", value.command);
+            try testing.expectEqualStrings("/tmp", value.cwd);
+            try testing.expectEqualStrings("t1", value.tool_call_id.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // A tool call subject is carried as raw text, because a `ToolCallUpdate` is
+    // not modelled here and an agent cannot afford to have it re-shaped.
+    const call: acp.PermissionRequest = .{ .draft = .{
+        .session_id = "s9",
+        .title = "Run",
+        .description = null,
+        .subject = .{ .tool_call = call_text },
+        .options = &options,
+    } };
+    const call_body = try permissionParams(&call, &out);
+    const seen = try acp.decodePermissionRequest(.draft, call_body, &read_back, &scratch);
+    switch (seen.draft.subject orelse return error.TestUnexpectedResult) {
+        .tool_call => |value| try testing.expectEqualStrings(call_text, value),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // A catch-all `type` carries members this library never decoded, and a
+    // request without them would ask the user about a permission the agent did
+    // not describe. Nothing is sent.
+    const other: acp.PermissionRequest = .{ .draft = .{
+        .session_id = "s9",
+        .title = "Run",
+        .description = null,
+        .subject = .{ .other = "_vendor" },
+        .options = &options,
+    } };
+    try testing.expectError(error.SubjectNotModelled, permissionParams(&other, &out));
+}
+
 test "a policy with no decision refuses rather than approves" {
     var options: [1]acp.PermissionOption = undefined;
+    var request_scratch: [512]u8 = undefined;
     const request = try decodeRequest(
         .stable,
         "{\"sessionId\":\"s1\",\"toolCall\":{},\"options\":[" ++
             "{\"optionId\":\"yes\",\"name\":\"Yes\",\"kind\":\"allow_always\"}]}",
         &options,
+        &request_scratch,
     );
 
     // No policy at all, and a policy that declines. Neither may reach a
@@ -1292,12 +1868,53 @@ test "a batch frame is refused loudly, at either version" {
 }
 
 test "params that are not an object are refused before they are framed" {
-    try testing.expectEqual(@as(?[]const u8, null), requireObject("[1,2]"));
-    try testing.expectEqual(@as(?[]const u8, null), requireObject("\"a string\""));
-    try testing.expectEqual(@as(?[]const u8, null), requireObject(""));
-    try testing.expectEqual(@as(?[]const u8, null), requireObject(null));
-    try testing.expectEqualStrings("{\"a\":1}", requireObject("{\"a\":1}").?);
-    try testing.expectEqualStrings(" {\"a\":1} ", requireObject(" {\"a\":1} ").?);
+    // Every one of these is a refusal rather than an absent member, because the
+    // connection omits an absent `params` entirely and the peer would then
+    // answer a request the caller never wrote.
+    try testing.expectError(error.ParamsNotAnObject, requireObject("[1,2]"));
+    try testing.expectError(error.ParamsNotAnObject, requireObject("\"a string\""));
+    try testing.expectError(error.ParamsNotAnObject, requireObject("7"));
+    try testing.expectError(error.ParamsNotAnObject, requireObject(""));
+    // An absent params member is a request that declares none, which is a
+    // request the schema allows and the connection writes as written.
+    try testing.expectEqual(@as(?[]const u8, null), try requireObject(null));
+    try testing.expectEqualStrings("{\"a\":1}", (try requireObject("{\"a\":1}")).?);
+    try testing.expectEqualStrings(" {\"a\":1} ", (try requireObject(" {\"a\":1} ")).?);
+}
+
+test "a non-object params is refused at the entry point, before a byte is written" {
+    var connection: conn.Conn = undefined;
+    const blank: [128]u8 = [_]u8{0} ** 128;
+    var out: [128]u8 = blank;
+    var result: [128]u8 = blank;
+    var client: Client = .{ .connection = &connection, .version = .stable };
+    var agent: Agent = .{ .connection = &connection, .version = .stable };
+
+    // Each method is one this side may send in the shape this side sends it in,
+    // so the gate passes and the refusal is the params and nothing else. The
+    // connection is never reached, which is what leaves the peer without a
+    // request the caller never wrote.
+    try testing.expectError(
+        error.ParamsNotAnObject,
+        client.request("session/new", "[1,2]", &result, &out),
+    );
+    try testing.expectError(
+        error.ParamsNotAnObject,
+        client.notify("session/cancel", "\"cancelled\"", &out),
+    );
+    try testing.expectError(
+        error.ParamsNotAnObject,
+        agent.request("session/request_permission", "7", &result, &out),
+    );
+    try testing.expectError(
+        error.ParamsNotAnObject,
+        agent.notify("session/update", "[]", &out),
+    );
+    // Both buffers are as the test left them: a refused call writes nothing, so
+    // a caller that mishandles the error cannot find a half-framed request
+    // already sitting in its memory.
+    try testing.expectEqualSlices(u8, &blank, &out);
+    try testing.expectEqualSlices(u8, &blank, &result);
 }
 
 test "capability paths are collected in the spelling a gate uses" {
@@ -1322,20 +1939,6 @@ test "capability paths are collected in the spelling a gate uses" {
     try testing.expectError(error.BufferTooSmall, capabilityPaths(set, &one));
 }
 
-test "method-not-found is a well-formed JSON-RPC error" {
-    var out: [128]u8 = undefined;
-    try testing.expectEqualStrings(
-        "{\"jsonrpc\":\"2.0\",\"id\":7," ++
-            "\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}",
-        try methodNotFound(.{ .integer = 7 }, &out),
-    );
-    try testing.expectEqualStrings(
-        "{\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"error\":{\"code\":-32601," ++
-            "\"message\":\"Method not found\"}}",
-        try methodNotFound(.{ .string = "abc" }, &out),
-    );
-}
-
 /// A policy with no decision, for the auto-decide test.
 fn decline(_: ?*anyopaque, _: *const acp.PermissionRequest) ?[]const u8 {
     return null;
@@ -1351,17 +1954,21 @@ fn choose(_: ?*anyopaque, request: *const acp.PermissionRequest) ?[]const u8 {
     return options[0].option_id;
 }
 
-/// Decode a permission request with a scratch of the test's own.
+/// Decode a permission request into a scratch the caller owns.
+///
+/// The result borrows that buffer wherever a value carries an escape, so a
+/// buffer declared in this helper's own frame would be dead before the first
+/// option id was read. A test whose fixture holds an escape needs a scratch
+/// that outlives the request.
 fn decodeRequest(
     version: acp.WireVersion,
     raw: []const u8,
     out_options: []acp.PermissionOption,
+    scratch: []u8,
 ) !acp.PermissionRequest {
-    var scratch: [512]u8 = undefined;
-    return acp.decodePermissionRequest(version, raw, out_options, &scratch);
+    return acp.decodePermissionRequest(version, raw, out_options, scratch);
 }
 
-// --- The loopback exchange ----------------------------------------------------
 // --- The loopback exchange ----------------------------------------------------
 
 /// The params the agent sends for its permission request. The agent decodes this
@@ -1403,6 +2010,11 @@ const Endpoint = struct {
     writer: Io.net.Stream.Writer = undefined,
     stream: Io.net.Stream = undefined,
     connection: conn.Conn = undefined,
+    /// Whether this endpoint's descriptor is gone already.
+    ///
+    /// The task that owns the endpoint hangs up itself, and the pump hangs up
+    /// after it, so the two can both reach for the same stream.
+    closed: bool = false,
 
     fn open(
         self: *Endpoint,
@@ -1423,21 +2035,36 @@ const Endpoint = struct {
         if (handler) |h| self.connection.setHandler(h);
         // Spawned on the group the test joins, because `Io.Group.async` does not
         // promise to run its task until the group is awaited or cancelled.
-        group.async(io, pump, .{&self.connection});
+        group.async(io, pump, .{self});
     }
 
-    /// Hang up. `shutdown` before `close`: closing a descriptor does not interrupt
-    /// a read already blocked on it, so the peer's pump would sit on an open
-    /// description and the group would never finish.
+    /// Hang up, and release the descriptor once.
+    ///
+    /// `shutdown` before `close`: closing a descriptor does not interrupt a read
+    /// already blocked on it, so the peer's pump would sit on an open
+    /// description and the group would never finish. The flag is the guard: the
+    /// endpoint's own task hangs up and then waits for the group, so the pump
+    /// must not close a descriptor that task already released.
     fn hangUp(self: *Endpoint, io: Io) void {
+        if (self.closed) return;
+        self.closed = true;
         self.stream.shutdown(io, .both) catch {};
         self.stream.close(io);
     }
-};
 
-fn pump(c: *conn.Conn) void {
-    c.pump();
-}
+    /// Drive the connection, then release the descriptor it drained.
+    ///
+    /// A pump that returns has seen the end of the stream, and a descriptor left
+    /// to the process at exit is one the peer has nothing to shut down: in the
+    /// permission exchange the serving side hangs up and then waits for the
+    /// group, so a pump that only returned would leave the group waiting on a
+    /// descriptor nobody had released. `hangUp` is idempotent, so an endpoint
+    /// whose task already hung up is not closed twice.
+    fn pump(self: *Endpoint) void {
+        self.connection.pump();
+        self.hangUp(self.connection.io);
+    }
+};
 
 /// What a side reports back to the test after its exchange.
 const Outcome = struct {
@@ -1488,80 +2115,67 @@ fn agentHandler(ctx: ?*anyopaque, frame: []const u8, scratch: []u8) conn.Error!?
     // be able to read.
     const key_scratch = scratch[0..128];
     const body = scratch[128..];
-    const message = jsonrpc.decode(frame, key_scratch) catch return null;
-    if (message.kind != .request) return null;
+    // The request shape, so the answer carries the id the client chose and the
+    // envelope is the shared builder's. A response is not a request and never
+    // reaches a builder.
+    const request = jsonrpc.decodeRequest(frame, key_scratch) catch return null;
     state.agent_calls += 1;
 
-    const id = message.id orelse return null;
-    var writer = json.Writer.init(body);
-    writer.slice("{\"jsonrpc\":\"2.0\",\"id\":") catch return null;
-    var digits: [24]u8 = undefined;
-    const id_text = std.fmt.bufPrint(&digits, "{d}", .{id.integer}) catch return null;
-    writer.slice(id_text) catch return null;
-    if (message.method) |method| {
-        if (std.mem.eql(u8, method.text, "initialize")) {
-            // `loadSession` and nothing else, so exactly one gated method is open
-            // to the client and exactly one is refused.
-            writer.slice(
-                ",\"result\":{\"protocolVersion\":1," ++
-                    "\"agentCapabilities\":{\"loadSession\":true}," ++
-                    "\"agentInfo\":{\"name\":\"test-agent\"}}}",
-            ) catch return null;
-        } else {
-            writer.slice(",\"result\":{\"sessionId\":\"s9\"}}") catch return null;
-        }
+    if (std.mem.eql(u8, request.method.text, "initialize")) {
+        // `loadSession` and nothing else, so exactly one gated method is open
+        // to the client and exactly one is refused.
+        return conn.respond(
+            request,
+            "{\"protocolVersion\":1," ++
+                "\"agentCapabilities\":{\"loadSession\":true}," ++
+                "\"agentInfo\":{\"name\":\"test-agent\"}}",
+            body,
+        ) catch null;
     }
-    // The connection writes the body before returning from the dispatch, so a
-    // stack buffer is enough and the handler allocates nothing.
-    return writer.written();
+    return conn.respond(request, "{\"sessionId\":\"s9\"}", body) catch null;
 }
 
 /// The client answers the agent's permission request. Runs inline on the client's
 /// reader task, so it may encode a body but must not call back on the same
 /// connection.
 fn clientPermissionHandler(
-    ctx: ?*anyopaque,
+    _: ?*anyopaque,
     frame: []const u8,
     scratch: []u8,
 ) conn.Error!?[]const u8 {
-    const state: *Outcome = @ptrCast(@alignCast(ctx.?));
     // Four regions of the buffer the connection lends, none of them a local. The
-    // decoded message, the request and the answer are all live at once, and the
-    // answer has to stay readable for the write the connection does next.
+    // decoded message, the request, the answer and the envelope are all live at
+    // once, and the answer has to stay readable for the write the connection
+    // does next.
     const key_scratch = scratch[0..128];
     const request_scratch = scratch[128..1152];
     const outcome_buffer = scratch[1152..1280];
     const body = scratch[1280..];
 
-    const message = jsonrpc.decode(frame, key_scratch) catch return null;
-    if (message.kind != .request) return null;
-    const method = message.method orelse return null;
-    if (!std.mem.eql(u8, method.text, "session/request_permission")) return null;
-    const params: []const u8 = switch (message.params) {
+    // The request shape, so the answer carries the id the agent chose and the
+    // envelope is the shared builder's rather than an assembly of members here.
+    const call = jsonrpc.decodeRequest(frame, key_scratch) catch return null;
+    if (!std.mem.eql(u8, call.method.text, "session/request_permission")) return null;
+    const params: []const u8 = switch (call.params) {
         .value => |value| value,
         else => return null,
     };
 
+    // The params the agent built from the request it holds, read the way a
+    // client reads them. The option answered here is named by an id that
+    // arrived over the socket, so an agent whose own copy of the request
+    // disagreed with these bytes would find no such option and would read the
+    // answer as unreadable rather than as a grant.
     var options: [4]acp.PermissionOption = undefined;
     const request = acp.decodePermissionRequest(.stable, params, &options, request_scratch) catch
         return null;
-
-    // The one answer this test's client will make without asking anyone, and it
-    // is a refusal. Reaching an approval here would take a chosen option id, and
-    // no branch supplies one.
-    const outcome = answerPermission(&request, .cancelled, outcome_buffer) catch return null;
-
-    const id = message.id orelse return null;
-    var writer = json.Writer.init(body);
-    writer.slice("{\"jsonrpc\":\"2.0\",\"id\":") catch return null;
-    var digits: [24]u8 = undefined;
-    const id_text = std.fmt.bufPrint(&digits, "{d}", .{id.integer}) catch return null;
-    writer.slice(id_text) catch return null;
-    writer.slice(",\"result\":") catch return null;
-    writer.slice(outcome) catch return null;
-    writer.byte('}') catch return null;
-    state.permission = readOutcome(outcome, &request, request_scratch);
-    return writer.written();
+    if (request.stable.options.len == 0) return null;
+    const outcome = answerPermission(
+        &request,
+        .{ .selected = request.stable.options[0].option_id },
+        outcome_buffer,
+    ) catch return null;
+    return conn.respond(call, outcome, body) catch null;
 }
 
 test "a client negotiates and gates against an agent over a real socket" {
@@ -1621,8 +2235,10 @@ test "a client negotiates and gates against an agent over a real socket" {
 
 test "an agent reads a permission outcome a client returned over a real socket" {
     // The other direction, and the one the safety rule lives in. The agent asks
-    // for a permission, the client answers it without being asked, and the agent
-    // reads what came back as a cancellation rather than as approval.
+    // for a permission, the client answers with an option id it read off the
+    // wire, and the agent reads what came back as a grant. It can only read it as
+    // a grant because the request it sent and the request it checks the answer
+    // against are the same value.
     var threaded: Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -1657,9 +2273,12 @@ test "an agent reads a permission outcome a client returned over a real socket" 
 
     try testing.expect(!state.failed);
     try testing.expectEqual(acp.WireVersion.stable, state.permission_version.?);
-    // The option the agent offered was one that grants, so a cancellation here is
-    // a decision the client made and not the only word this library has for it.
-    try testing.expect(state.permission == .cancelled);
+    // The option the agent offered was one that grants, and the id the client
+    // named came back out of the params the agent built for it. An agent that
+    // sent a request other than the one it holds would have found no such option
+    // and read this as unreadable rather than as approval.
+    try testing.expectEqual(true, state.permission.grants);
+    try testing.expectEqual(ReadableOutcome{ .grants = true }, state.permission.readable().?);
 }
 
 /// A listening Unix socket, with the address that reaches it.
@@ -1817,35 +2436,40 @@ const PermissionCaller = struct {
 
         const side = &self.endpoint.side;
         var agent: Agent = .{ .connection = &self.endpoint.connection, .version = .stable };
-        const reply = agent.request(
-            "session/request_permission",
-            permission_params,
-            &side.call_result,
-            &side.call_out,
-        ) catch {
-            self.state.failed = true;
-            self.state.set(self.io);
-            self.endpoint.hangUp(self.io);
-            return;
-        };
 
-        // Read the answer against the request the agent actually sent, so the
-        // option ids line up and a grant would be recognised if one arrived.
+        // The request the agent means to ask with, decoded once and held. The
+        // two scratches are regions of their own, so the option ids the answer
+        // is checked against cannot be written over by the answer's own decode.
         var options: [1]acp.PermissionOption = undefined;
-        var scratch: [512]u8 = undefined;
+        var request_scratch: [512]u8 = undefined;
         const sent = acp.decodePermissionRequest(
             .stable,
             permission_params,
             &options,
-            &scratch,
+            &request_scratch,
         ) catch {
             self.state.failed = true;
             self.state.set(self.io);
             self.endpoint.hangUp(self.io);
             return;
         };
+        var outcome_scratch: [256]u8 = undefined;
         self.state.permission_version = agent.version;
-        self.state.permission = readOutcome(reply.body, &sent, &scratch);
+        // One call sends the request and reads the answer against it, so the
+        // option ids the client named are the ids this agent checks.
+        self.state.permission = agent.requestPermission(
+            &sent,
+            &side.call_result,
+            &side.call_out,
+            &side.params,
+            &request_scratch,
+            &outcome_scratch,
+        ) catch {
+            self.state.failed = true;
+            self.state.set(self.io);
+            self.endpoint.hangUp(self.io);
+            return;
+        };
         self.endpoint.hangUp(self.io);
         self.state.set(self.io);
     }

@@ -115,9 +115,12 @@ pub const Kind = enum {
 ///
 /// Every slice borrows the caller's input or the caller's scratch buffer, and
 /// none is retained past the decode call. Slices that had to be unescaped took
-/// separate regions of that scratch, so `method` and `rpc_error.message` can be
-/// held at once and neither is clobbered by the members decoded after them.
+/// separate regions of that scratch, so `method`, a string `id` and
+/// `rpc_error.message` can be held at once and none is clobbered by the members
+/// decoded after it.
 pub const Message = struct {
+    /// What this message is. `encode` refuses a kind that disagrees with `id`
+    /// and `method`, because `decode` derives the classification from them.
     kind: Kind,
     id: ?Id = null,
     method: ?Method = null,
@@ -127,6 +130,25 @@ pub const Message = struct {
     /// The `error` member. Named `rpc_error` because `error` is a Zig keyword,
     /// and a quoted field at every access site is worse than one honest name.
     rpc_error: ?Error = null,
+};
+
+/// A decoded request: the shape a caller who intends to answer it wants.
+///
+/// `Message` is the general shape, and a handler reading one decides what it
+/// holds before it does anything else. This is that shape with the members
+/// which make answering meaningless removed, so a notification and a response
+/// are not `Request` values at all. A builder takes a `Request`, so there is
+/// nothing to hand it that it must not answer.
+///
+/// The slices borrow the caller's input and scratch exactly as `Message` does.
+/// See `decodeRequest` for which buffer each one comes from.
+pub const Request = struct {
+    /// The id the answer echoes.
+    id: Id,
+    /// The method the caller called.
+    method: Method,
+    /// The params the caller sent, in the state the caller sent them.
+    params: Params,
 };
 
 /// The standard JSON-RPC 2.0 error codes, table 3.1 of PROTOCOLS.md.
@@ -159,8 +181,9 @@ pub const StandardError = enum(i32) {
 /// `scratch` backs any string carrying a JSON escape; pass a zero-length buffer
 /// when the peer is known to send plain text. It must be large enough for every
 /// escaped string in the message, since each takes its own region of it:
-/// `method`, an error `message` and any escaped key are all still live when the
-/// decode returns, and a shared region would corrupt the first of them.
+/// `method`, a string `id`, an error `message` and any escaped key are all still
+/// live when the decode returns, and a shared region would corrupt the first of
+/// them.
 ///
 /// One call decodes one message and refuses trailing data. A batch array is
 /// therefore split by the transport, not by this function, which is the right
@@ -237,6 +260,42 @@ pub fn decode(input: []const u8, scratch: []u8) DecodeError!Message {
     return message;
 }
 
+/// Decode one message and keep it only if it is a request.
+///
+/// The scan is `decode`'s and this projects the result, so the two cannot
+/// disagree about what a member is, and a request cannot decode one way here
+/// and another way there. The bump-offset scratch discipline is `decode`'s
+/// for the same reason: this function adds no walk of its own that could spend
+/// a region twice.
+///
+/// Two refusals, both members of `DecodeError`. A message with no `id` is
+/// `MissingField`, because a message nobody can match an answer to is a
+/// notification. A message carrying `result` or `error` is `InvalidField`,
+/// because it is a response, and that is read before its absent `method` so a
+/// response is never reported as an incomplete request.
+///
+/// A notification and a response are therefore not `Request` values at all,
+/// which is the point of the type: a builder takes a `Request`, so there is
+/// nothing to hand it that it must not answer.
+///
+/// `method.text` and a string `id` borrow `input`, and an escaped one borrows
+/// `scratch`. The value is live only while both buffers are.
+pub fn decodeRequest(input: []const u8, scratch: []u8) DecodeError!Request {
+    const message = try decode(input, scratch);
+    // Read before the id and the method, because a response carries an id: the
+    // `result` and the `error` are what say what the message is, and the
+    // missing `method` behind them would name a different fault.
+    if (message.result != null or message.rpc_error != null) return error.InvalidField;
+    const id = message.id orelse return error.MissingField;
+    // `decode` has refused every message that carries neither a method nor a
+    // result, and the line above has refused every message that carries a
+    // result, so a message that reaches here has a method. The check is
+    // written out rather than unwrapped because an unwrap is a panic on a path
+    // the two lines above already closed.
+    const method = message.method orelse return error.MissingField;
+    return .{ .id = id, .method = method, .params = message.params };
+}
+
 fn decodeId(reader: *json.Reader, scratch: []u8) DecodeError!Id {
     reader.skipWhitespace();
     const byte = reader.peek() orelse return error.Truncated;
@@ -283,7 +342,16 @@ fn decodeError(reader: *json.Reader, scratch: []u8) DecodeError!Error {
     while (try reader.nextKey(scratch)) |key| {
         if (std.mem.eql(u8, key, "code")) {
             const lexeme = try reader.number();
-            result.code = std.fmt.parseInt(i32, lexeme, 10) catch return error.InvalidField;
+            // A code outside `i32` is the same fault as an id outside `i64`.
+            // PROTOCOLS.md section 2.1 names `LimitExceeded` a numeric bound
+            // the protocol states, which is exactly what an overflow is.
+            result.code = std.fmt.parseInt(i32, lexeme, 10) catch |err| switch (err) {
+                error.Overflow => return error.LimitExceeded,
+                // `parseInt` rejects a fractional or exponent lexeme. That is a
+                // type error rather than an overflow, and `decodeId` reports it
+                // as one.
+                error.InvalidCharacter => return error.InvalidField,
+            };
             saw_code = true;
         } else if (std.mem.eql(u8, key, "message")) {
             result.message = try reader.string(scratch);
@@ -321,18 +389,7 @@ pub fn encode(message: Message, writer: *json.Writer) EncodeError!void {
     // response without one, which is a different thing entirely.
     if (message.id) |id| {
         try writer.slice(",\"id\":");
-        switch (id) {
-            .integer => |number| {
-                // Formatted into a buffer that outlives the write. A helper
-                // returning a slice into its own frame would dangle here.
-                var digits: [24]u8 = undefined;
-                const text = std.fmt.bufPrint(&digits, "{d}", .{number}) catch {
-                    return error.BufferTooSmall;
-                };
-                try writer.slice(text);
-            },
-            .string => |text| try writer.string(text),
-        }
+        try writeId(id, writer);
     }
 
     if (message.method) |method| {
@@ -354,23 +411,7 @@ pub fn encode(message: Message, writer: *json.Writer) EncodeError!void {
         try writer.slice(text);
     }
 
-    if (message.rpc_error) |object| {
-        try writer.slice(",\"error\":{\"code\":");
-        {
-            var digits: [16]u8 = undefined;
-            const text = std.fmt.bufPrint(&digits, "{d}", .{object.code}) catch {
-                return error.BufferTooSmall;
-            };
-            try writer.slice(text);
-        }
-        try writer.slice(",\"message\":");
-        try writer.string(object.message);
-        if (object.data) |data| {
-            try writer.slice(",\"data\":");
-            try writer.slice(data);
-        }
-        try writer.byte('}');
-    }
+    if (message.rpc_error) |object| try writeErrorObject(object, writer);
 
     try writer.byte('}');
 }
@@ -402,10 +443,130 @@ fn validate(message: Message) EncodeError!void {
     if (!has_method and message.result == null and message.rpc_error == null) {
         return error.InvalidField;
     }
+    // `decode` derives the kind from the members and never reads a kind the
+    // caller set, so a message whose kind disagrees comes back classified as
+    // something else and `decode(encode(x)) != x`. A notification carrying an
+    // `id` is the ordinary way to build one: it satisfies every rule above and
+    // encodes to a frame the wire calls a request.
+    const derived: Kind = if (has_method)
+        (if (message.id != null) .request else .notification)
+    else
+        .response;
+    if (message.kind != derived) return error.InvalidField;
 }
 
-// Integer formatting is done inline in `encode` rather than through a helper:
-// a helper returning a slice into its own stack frame would dangle.
+/// Write an id in the arm it arrived in.
+///
+/// PROTOCOLS.md section 3 states that an id is an integer or a string, so both
+/// arms are a form the protocol admits and neither is a fallback for the
+/// other. A string goes through the writer as a JSON string, so a quote or a
+/// control byte in it is escaped rather than spliced into the frame.
+///
+/// The integer is formatted into a buffer that outlives the write. A helper
+/// returning a slice into its own stack frame would dangle here.
+fn writeId(id: Id, writer: *json.Writer) EncodeError!void {
+    switch (id) {
+        .integer => |value| {
+            var digits: [24]u8 = undefined;
+            const text = std.fmt.bufPrint(&digits, "{d}", .{value}) catch
+                return error.BufferTooSmall;
+            try writer.slice(text);
+        },
+        .string => |text| try writer.string(text),
+    }
+}
+
+/// Write the `error` member, with the comma that separates it from the member
+/// before it. The brace that closes the frame is the caller's, because the
+/// frame is not only an error.
+fn writeErrorObject(object: Error, writer: *json.Writer) EncodeError!void {
+    try writer.slice(",\"error\":{\"code\":");
+    var digits: [16]u8 = undefined;
+    const code = std.fmt.bufPrint(&digits, "{d}", .{object.code}) catch {
+        return error.BufferTooSmall;
+    };
+    try writer.slice(code);
+    try writer.slice(",\"message\":");
+    try writer.string(object.message);
+    if (object.data) |data| {
+        try writer.slice(",\"data\":");
+        try writer.slice(data);
+    }
+    try writer.byte('}');
+}
+
+/// Write the answer to `request`: a result or an error, and exactly one.
+///
+/// The two bodies are separate parameters so the rule is expressible. No
+/// result and no error is `InvalidField`, and a result beside an error is
+/// `InvalidField`. That is the same rule `validate` applies to a whole
+/// `Message`, and a builder that took only a result could not enforce the
+/// first half of it. The second half is the one a caller gets wrong: a handler
+/// that puts an error object inside a result has told the peer the call
+/// succeeded, and a client that reads only the result reports a refusal as the
+/// answer.
+///
+/// The rule is applied before a byte is written, so a refused answer leaves the
+/// writer untouched. A short writer is `error.BufferTooSmall`, which is the
+/// caller's own buffer fault rather than a wire condition.
+///
+/// A body is spliced verbatim, the way `Conn.call` splices caller params. A
+/// raw newline inside one is caught by the framer on the way to the wire, as
+/// `Conn` reports it, and is not checked a second time here: the check belongs
+/// in one place and this is not it.
+///
+/// The id is echoed in the arm it arrived in, so an integer id stays an integer
+/// and a string id stays a string. A response carries no `method`, and no
+/// `params` member is written: PROTOCOLS.md section 3 permits one on a
+/// response, and a caller that needs it goes through `encode`.
+pub fn encodeResponse(
+    request: Request,
+    result: ?[]const u8,
+    object: ?Error,
+    writer: *json.Writer,
+) EncodeError!void {
+    if (result == null and object == null) return error.InvalidField;
+    if (result != null and object != null) return error.InvalidField;
+
+    try writer.byte('{');
+    try writer.slice("\"jsonrpc\":");
+    try writer.string(version);
+    try writer.slice(",\"id\":");
+    try writeId(request.id, writer);
+
+    if (result) |text| {
+        try writer.slice(",\"result\":");
+        try writer.slice(text);
+    }
+    if (object) |value| try writeErrorObject(value, writer);
+
+    try writer.byte('}');
+}
+
+/// The answer to `request` that carries `object` as its error, in `out`.
+///
+/// The buffer form of `encodeResponse`, for a caller that holds a buffer
+/// rather than a writer. The returned slice is the prefix of `out` this call
+/// wrote, and it borrows that buffer.
+pub fn errorResponse(request: Request, object: Error, out: []u8) EncodeError![]const u8 {
+    var writer = json.Writer.init(out);
+    try encodeResponse(request, null, object, &writer);
+    return writer.written();
+}
+
+/// The `-32601` answer for a method this peer does not have, in `out`.
+///
+/// The code is `StandardError.method_not_found` and the message is the name
+/// table 3.1 of PROTOCOLS.md gives that code. The bytes are the ones the
+/// hand-written builders in `mcp_session` and `acp_session` write, member for
+/// member and comma for comma, so a cutover to this one changes nothing on the
+/// wire.
+pub fn methodNotFound(request: Request, out: []u8) EncodeError![]const u8 {
+    return errorResponse(request, .{
+        .code = @intFromEnum(StandardError.method_not_found),
+        .message = "Method not found",
+    }, out);
+}
 
 const testing = std.testing;
 
@@ -494,6 +655,25 @@ test "an out-of-range id is LimitExceeded" {
     var scratch: [64]u8 = undefined;
     try testing.expectError(error.LimitExceeded, decode(
         \\{"jsonrpc":"2.0","id":99999999999999999999,"method":"m"}
+    , &scratch));
+}
+
+test "an out-of-range error code is LimitExceeded, as an out-of-range id is" {
+    // Both are the same fault read through the same `DecodeError`: the number
+    // does not fit the width the protocol states for it. Before the two paths
+    // agreed, a peer learned about it from a `code` and from an `id` in two
+    // different ways, and neither way said the bound was a bound.
+    var scratch: [64]u8 = undefined;
+    try testing.expectError(error.LimitExceeded, decode(
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":99999999999999999999,"message":"m"}}
+    , &scratch));
+    try testing.expectError(error.LimitExceeded, decode(
+        \\{"jsonrpc":"2.0","id":99999999999999999999,"method":"m"}
+    , &scratch));
+    // The other arm, which the two paths also share: a fraction is a type
+    // fault rather than an overflow, so it stays `InvalidField`.
+    try testing.expectError(error.InvalidField, decode(
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":1.5,"message":"m"}}
     , &scratch));
 }
 
@@ -637,6 +817,46 @@ test "encode refuses a response with no id" {
     try testing.expectEqual(@as(usize, 0), writer.written().len);
 }
 
+test "encode refuses a kind the members do not agree with, and writes nothing" {
+    // `decode` classifies on `id` and `method` and ignores the kind it is given,
+    // so each of these encodes to a frame the wire calls something else, and
+    // `decode(encode(x)) != x` held for every one before the rule.
+    var buffer: [128]u8 = undefined;
+
+    // The ordinary way to build one: a notification that carries an id. Every
+    // shape rule accepts it, and the wire reads it as a request.
+    var notification_with_id = json.Writer.init(&buffer);
+    try testing.expectError(error.InvalidField, encode(
+        .{
+            .kind = .notification,
+            .id = .{ .integer = 1 },
+            .method = Method.split("notifications/cancelled"),
+        },
+        &notification_with_id,
+    ));
+    try testing.expectEqual(@as(usize, 0), notification_with_id.written().len);
+
+    // The same fault in the other direction: the members say request.
+    var request_called_response = json.Writer.init(&buffer);
+    try testing.expectError(error.InvalidField, encode(
+        .{
+            .kind = .response,
+            .id = .{ .integer = 1 },
+            .method = Method.split("tools/call"),
+        },
+        &request_called_response,
+    ));
+    try testing.expectEqual(@as(usize, 0), request_called_response.written().len);
+
+    // A method-free message with an id is a response whatever it claims.
+    var response_called_notification = json.Writer.init(&buffer);
+    try testing.expectError(error.InvalidField, encode(
+        .{ .kind = .notification, .id = .{ .integer = 1 }, .result = "{}" },
+        &response_called_notification,
+    ));
+    try testing.expectEqual(@as(usize, 0), response_called_notification.written().len);
+}
+
 test "a notification round trips, having no id to write" {
     // A notification is accepted input, so refusing to encode it broke
     // `encode(decode(b)) == b` for a whole class of valid messages.
@@ -752,4 +972,303 @@ test "an unknown top-level member is skipped, not a decode error" {
         \\{"jsonrpc":"2.0","id":1,"method":"m","extensionField":{"a":[1,2]}}
     , &scratch);
     try testing.expectEqual(Kind.request, decoded.kind);
+}
+
+test "decodeRequest refuses a notification and a response" {
+    // The reason the type exists. A builder takes a `Request`, so a message
+    // that is not one never reaches a builder, and each refusal names the
+    // shape the message actually has: a caller handed the wrong one looks for
+    // the wrong fault in its own handler.
+    var scratch: [128]u8 = undefined;
+
+    // A notification has a method and no id, and nothing answers it.
+    try testing.expectError(error.MissingField, decodeRequest(
+        \\{"jsonrpc":"2.0","method":"notifications/cancelled"}
+    , &scratch));
+
+    // A response has an id and no method, and it is already an answer.
+    try testing.expectError(error.InvalidField, decodeRequest(
+        \\{"jsonrpc":"2.0","id":1,"result":{}}
+    , &scratch));
+    // An error response is a response too, so it is refused the same way.
+    try testing.expectError(error.InvalidField, decodeRequest(
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"nope"}}
+    , &scratch));
+    // And a string id, so the refusal does not depend on the arm.
+    try testing.expectError(error.InvalidField, decodeRequest(
+        \\{"jsonrpc":"2.0","id":"a","result":{}}
+    , &scratch));
+}
+
+test "an answer carries the id the request arrived with" {
+    // Both id arms, crossed with the three states of `params`. An answer is a
+    // response, so it carries the id and no method, and the method and the
+    // params are what the handler read rather than what it owes back. The six
+    // expectations pin each half: the params survive the projection, and the
+    // id comes back in the arm it arrived in.
+    const cases = [_]struct {
+        source: []const u8,
+        answer: []const u8,
+        params: Params,
+    }{
+        .{
+            .source = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\"}",
+            .answer = "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}",
+            .params = .absent,
+        },
+        .{
+            .source = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":null}",
+            .answer = "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}",
+            .params = .null_value,
+        },
+        .{
+            .source = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"search\"}}",
+            .answer = "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}",
+            .params = .{ .value = "{\"name\":\"search\"}" },
+        },
+        .{
+            .source = "{\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"method\":\"tools/call\"}",
+            .answer = "{\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"result\":{\"ok\":true}}",
+            .params = .absent,
+        },
+        .{
+            .source = "{\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"method\":\"tools/call\",\"params\":null}",
+            .answer = "{\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"result\":{\"ok\":true}}",
+            .params = .null_value,
+        },
+        .{
+            .source = "{\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"method\":\"tools/call\",\"params\":[1,2]}",
+            .answer = "{\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"result\":{\"ok\":true}}",
+            .params = .{ .value = "[1,2]" },
+        },
+    };
+
+    for (cases) |case| {
+        var scratch: [256]u8 = undefined;
+        const request = try decodeRequest(case.source, &scratch);
+        try testing.expectEqualStrings("tools/call", request.method.text);
+        try testing.expectEqualStrings("tools", request.method.category);
+        try testing.expectEqualStrings("call", request.method.action);
+        switch (case.params) {
+            .absent => try testing.expect(request.params == .absent),
+            .null_value => try testing.expect(request.params == .null_value),
+            .value => |text| {
+                const raw = switch (request.params) {
+                    .value => |value| value,
+                    else => return error.TestUnexpectedResult,
+                };
+                try testing.expectEqualStrings(text, raw);
+            },
+        }
+
+        var out: [256]u8 = undefined;
+        var writer = json.Writer.init(&out);
+        try encodeResponse(request, "{\"ok\":true}", null, &writer);
+        try testing.expectEqualStrings(case.answer, writer.written());
+
+        const answered = try decode(writer.written(), &scratch);
+        try testing.expectEqual(Kind.response, answered.kind);
+        // A response carries no method. One that did would be refused by
+        // `decode` as a document that cannot exist, and the frame above holds
+        // no method member.
+        try testing.expectEqual(@as(?Method, null), answered.method);
+        try testing.expectEqualStrings("{\"ok\":true}", answered.result.?);
+    }
+}
+
+test "a result answer and an error answer are different documents" {
+    // A peer that completes a call and a peer that refuses one send the same
+    // frame around the same id. A handler that writes the error object inside
+    // the result has sent a success with a refusal in it, and a client that
+    // reads only the result reports the refusal as the answer. The two answers
+    // are therefore pinned apart by the member each one carries and the
+    // member each one does not.
+    var scratch: [128]u8 = undefined;
+    const request = try decodeRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call"}
+    , &scratch);
+    var out: [256]u8 = undefined;
+
+    var answered = json.Writer.init(&out);
+    try encodeResponse(request, "{\"content\":[]}", null, &answered);
+    try testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[]}}",
+        answered.written(),
+    );
+    const success = try decode(answered.written(), &scratch);
+    try testing.expectEqualStrings("{\"content\":[]}", success.result.?);
+    try testing.expectEqual(@as(?Error, null), success.rpc_error);
+    try testing.expect(std.mem.indexOf(u8, answered.written(), "\"error\"") == null);
+
+    var refused = json.Writer.init(&out);
+    try encodeResponse(request, null, .{
+        .code = -32602,
+        .message = "unknown tool",
+        .data = "{\"name\":\"nope\"}",
+    }, &refused);
+    try testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32602," ++
+            "\"message\":\"unknown tool\",\"data\":{\"name\":\"nope\"}}}",
+        refused.written(),
+    );
+    const failure = try decode(refused.written(), &scratch);
+    // The member the success carries is absent here, not present and empty.
+    // This is the assertion a builder that wrote the error inside the result
+    // fails.
+    try testing.expectEqual(@as(?[]const u8, null), failure.result);
+    try testing.expect(std.mem.indexOf(u8, refused.written(), "\"result\"") == null);
+    try testing.expectEqual(@as(i32, -32602), failure.rpc_error.?.code);
+    try testing.expectEqualStrings("unknown tool", failure.rpc_error.?.message);
+    try testing.expectEqualStrings("{\"name\":\"nope\"}", failure.rpc_error.?.data.?);
+
+    // Both frames classify as a response, because that is what PROTOCOLS.md
+    // section 3 calls a message with an id and no method, and `Kind` has no
+    // fourth member for a failure. The difference a caller acts on is the
+    // member, and the two lines above are where it is pinned.
+    try testing.expectEqual(Kind.response, success.kind);
+    try testing.expectEqual(Kind.response, failure.kind);
+}
+
+test "an answer with neither body, or with both, is refused and writes nothing" {
+    var scratch: [128]u8 = undefined;
+    const request = try decodeRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call"}
+    , &scratch);
+    var out: [128]u8 = undefined;
+
+    // Neither. A response with no body says nothing, and PROTOCOLS.md
+    // section 3 calls a message this shape unencodable.
+    var silent = json.Writer.init(&out);
+    try testing.expectError(
+        error.InvalidField,
+        encodeResponse(request, null, null, &silent),
+    );
+    // Refused before a byte was written, so there is no half answer to discard.
+    try testing.expectEqual(@as(usize, 0), silent.written().len);
+
+    // Both. A document carrying a result and an error cannot exist, and this
+    // is the shape that writes one inside the other.
+    var both = json.Writer.init(&out);
+    try testing.expectError(error.InvalidField, encodeResponse(
+        request,
+        "{}",
+        .{ .code = -32603, .message = "m" },
+        &both,
+    ));
+    try testing.expectEqual(@as(usize, 0), both.written().len);
+}
+
+test "an answer too long for its buffer is BufferTooSmall and no slice escapes" {
+    // The buffer builders return a slice of the caller's buffer, so a short
+    // one is the only way a truncated document could reach a caller. It does
+    // not: the return is the error, and there is no slice to truncate.
+    var scratch: [128]u8 = undefined;
+    const request = try decodeRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call"}
+    , &scratch);
+
+    var out: [8]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, errorResponse(
+        request,
+        .{ .code = -32603, .message = "internal" },
+        &out,
+    ));
+    try testing.expectError(error.BufferTooSmall, methodNotFound(request, &out));
+}
+
+test "an id is echoed in the arm it arrived in" {
+    // PROTOCOLS.md section 3 admits an integer and a string, and each comes
+    // back as the arm it arrived in. A string id goes through the JSON string
+    // writer, so a quote in it is escaped rather than closing the frame.
+    var numeric_scratch: [128]u8 = undefined;
+    var string_scratch: [128]u8 = undefined;
+    var out: [256]u8 = undefined;
+
+    // A value wider than an f64 holds is not re-spelled on the way out.
+    const numeric = try decodeRequest(
+        "{\"jsonrpc\":\"2.0\",\"id\":-9007199254740993,\"method\":\"m\"}",
+        &numeric_scratch,
+    );
+    var numeric_out = json.Writer.init(&out);
+    try encodeResponse(numeric, "{}", null, &numeric_out);
+    try testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":-9007199254740993,\"result\":{}}",
+        numeric_out.written(),
+    );
+
+    const named = try decodeRequest(
+        "{\"jsonrpc\":\"2.0\",\"id\":\"a\\\"b\",\"method\":\"m\"}",
+        &string_scratch,
+    );
+    // The id decodes to the text the peer sent, unescaped once.
+    try testing.expectEqualStrings("a\"b", named.id.string);
+    var named_out = json.Writer.init(&out);
+    try encodeResponse(named, "{}", null, &named_out);
+    // And the answer carries the same text escaped back.
+    try testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":\"a\\\"b\",\"result\":{}}",
+        named_out.written(),
+    );
+    const answered = try decode(named_out.written(), &string_scratch);
+    try testing.expectEqualStrings("a\"b", answered.id.?.string);
+}
+
+test "errorResponse returns the whole frame in the caller's buffer" {
+    var scratch: [128]u8 = undefined;
+    const request = try decodeRequest(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"}",
+        &scratch,
+    );
+    var out: [256]u8 = undefined;
+    const answer = try errorResponse(request, .{
+        .code = -32021,
+        .message = "needs more",
+        .data = "{\"reason\":\"capabilities\"}",
+    }, &out);
+    // The `data` arm travels as the caller's own JSON, spliced as it stands.
+    try testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32021," ++
+            "\"message\":\"needs more\",\"data\":{\"reason\":\"capabilities\"}}}",
+        answer,
+    );
+}
+
+test "methodNotFound writes the bytes the hand-written builders write" {
+    // The two session layers build this frame by hand, and a cutover to this
+    // one must not move a byte. Both expectations are copied from those
+    // builders, one per id arm.
+    var numeric_scratch: [128]u8 = undefined;
+    var string_scratch: [128]u8 = undefined;
+    var out: [256]u8 = undefined;
+
+    const numeric = try decodeRequest(
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"no/such\"}",
+        &numeric_scratch,
+    );
+    try testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":-32601," ++
+            "\"message\":\"Method not found\"}}",
+        try methodNotFound(numeric, &out),
+    );
+
+    const named = try decodeRequest(
+        "{\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"method\":\"no/such\"}",
+        &string_scratch,
+    );
+    try testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"error\":{\"code\":-32601," ++
+            "\"message\":\"Method not found\"}}",
+        try methodNotFound(named, &out),
+    );
+
+    // A peer that reads the refusal back finds an error object, not a result.
+    const peer = try decodeRequest(
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"no/such\"}",
+        &numeric_scratch,
+    );
+    const refusal = try decode(try methodNotFound(peer, &out), &numeric_scratch);
+    try testing.expectEqual(Kind.response, refusal.kind);
+    try testing.expectEqual(@as(?[]const u8, null), refusal.result);
+    try testing.expectEqual(@as(i32, -32601), refusal.rpc_error.?.code);
+    try testing.expectEqualStrings("Method not found", refusal.rpc_error.?.message);
 }

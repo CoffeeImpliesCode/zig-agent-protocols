@@ -121,8 +121,12 @@ pub fn decodeEnvelope(
     }
 
     if (!saw_server or !saw_request or !saw_method) return error.MissingField;
+    // `encodeEnvelope` refuses an empty member, so the decoder refuses one
+    // too. Without the check a proxy that decodes a forwarded envelope and
+    // re-encodes it cannot emit a byte for an envelope the decoder accepted.
     if (envelope.server_id.len == 0) return error.InvalidField;
     if (envelope.request_id.len == 0) return error.InvalidField;
+    if (envelope.inner_method.len == 0) return error.InvalidField;
     return envelope;
 }
 
@@ -231,6 +235,33 @@ fn checkInnerError(reader: *json.Reader, scratch: []u8) DecodeError!void {
     if (!saw_message) return error.MissingField;
 }
 
+/// Encode the inner MCP outcome of a successful outer response.
+///
+/// The payload is borrowed JSON text, and it is spliced verbatim, exactly as
+/// [`jsonrpc.encode`] splices a `result`. A codec does not re-serialise a value
+/// it did not produce, and the payload came from [`decodeOutcome`], which has
+/// already checked it against the shape its arm requires. So a payload the
+/// `result` arm takes as any JSON value at all, a bare string or a number or
+/// `null`, is written as it stands. Checking it here instead would make the
+/// encoder refuse bytes its own decoder accepted.
+///
+/// A raw newline inside the payload is written as it stands too. The framer
+/// refuses such a frame on its way to the wire, because a message carrying one
+/// has already broken the framing.
+pub fn encodeOutcome(outcome: Outcome, writer: *json.Writer) EncodeError!void {
+    switch (outcome) {
+        .result => |text| {
+            try writer.slice("{\"result\":");
+            try writer.slice(text);
+        },
+        .@"error" => |text| {
+            try writer.slice("{\"error\":");
+            try writer.slice(text);
+        },
+    }
+    try writer.byte('}');
+}
+
 /// The binding-level failures, which are *outer* ACP errors.
 ///
 /// These are distinct from an inner MCP error. A caller that cannot tell them
@@ -278,9 +309,10 @@ pub const ErrorLevel = enum {
 /// disjoint in meaning while sharing a number, and the mistake this module
 /// exists to prevent is exactly the one a bare integer invites: treating an
 /// inner tool failure as a transport failure and retrying it. The binding also
-/// deliberately allocates outside MCP's reserved `-32000` to `-32019` range,
-/// so an inner code in that range can never be mistaken for a binding failure
-/// at any level.
+/// deliberately allocates outside both MCP code ranges, the
+/// implementation-defined `-32000` to `-32019` and the `-32020` to `-32099`
+/// the specification reserves for itself, so an inner code in either range
+/// can never be mistaken for a binding failure at any level.
 pub fn isBindingFailure(code: i32, level: ErrorLevel) bool {
     if (level == .inner) return false;
     return BindingError.fromCode(code) != null;
@@ -303,12 +335,6 @@ pub const server_declaration = struct {
     pub const name = "project-tools";
     pub const server_id = "project-tools:7a72";
 };
-
-/// The binding performs no MCP handshake, so there is no initialize step.
-///
-/// Modelled as a type with no members so that "call it" is a compile error
-/// rather than a runtime surprise.
-pub const NoHandshake = struct {};
 
 const testing = std.testing;
 
@@ -347,6 +373,29 @@ test "an envelope missing any required member is MissingField" {
     try testing.expectError(error.InvalidField, decodeEnvelope(
         \\{"serverId":"","requestId":"r","method":"tools/call"}
     , &scratch, null));
+}
+
+test "decode and encode refuse an empty inner method alike" {
+    var scratch: [128]u8 = undefined;
+    // An empty method names no operation. Without the decode-side check the
+    // decoder hands a proxy an envelope it cannot re-encode, so the
+    // `encode(decode(b))` identity fails for bytes the decoder accepted.
+    try testing.expectError(error.InvalidField, decodeEnvelope(
+        \\{"serverId":"s","requestId":"r","method":""}
+    , &scratch, null));
+
+    // The encoder answers the same envelope with the same error, so both
+    // directions agree on which envelopes are usable.
+    var buffer: [128]u8 = undefined;
+    var writer = json.Writer.init(&buffer);
+    try testing.expectError(error.InvalidField, encodeEnvelope(.{
+        .server_id = "s",
+        .request_id = "r",
+        .inner_method = "",
+        .direction = .agent_to_provider,
+    }, &writer));
+    // The encoder validates before it writes, so nothing reached the buffer.
+    try testing.expectEqual(@as(usize, 0), writer.len);
 }
 
 test "an envelope with no inner params is valid" {
@@ -516,9 +565,103 @@ test "a result is any JSON value, an explicit null included" {
     try testing.expectEqualStrings("{}", empty.result);
 }
 
-test "the binding allocates no code inside MCP's reserved range" {
-    // An inner MCP code in the implementation-defined range means an inner
-    // failure, so a binding code there would make the two spaces ambiguous.
+test "the result arm round-trips through the encoder" {
+    var scratch: [256]u8 = undefined;
+    var buffer: [256]u8 = undefined;
+
+    const raw = "{\"result\":{\"resultType\":\"complete\"}}";
+    const outcome = try decodeOutcome(raw, &scratch);
+    try testing.expect(outcome == .result);
+
+    var writer = json.Writer.init(&buffer);
+    try encodeOutcome(outcome, &writer);
+    // Byte-identical, so the payload is spliced and not rebuilt from a value
+    // this codec never parsed.
+    try testing.expectEqualStrings(raw, writer.written());
+
+    const again = try decodeOutcome(writer.written(), &scratch);
+    try testing.expect(again == .result);
+    try testing.expectEqualStrings(outcome.result, again.result);
+
+    // Every one of these is a result `decodeOutcome` accepted, so every one
+    // is written as it stands. A bare string, a number and `null` are results
+    // the MCP operation may return, not input the encoder second-guesses.
+    const cases = [_]struct { payload: []const u8, framed: []const u8 }{
+        .{ .payload = "null", .framed = "{\"result\":null}" },
+        .{ .payload = "42", .framed = "{\"result\":42}" },
+        .{ .payload = "\"text\"", .framed = "{\"result\":\"text\"}" },
+        .{ .payload = "[1,2]", .framed = "{\"result\":[1,2]}" },
+    };
+    for (cases) |case| {
+        var each_buffer: [64]u8 = undefined;
+        var each = json.Writer.init(&each_buffer);
+        try encodeOutcome(.{ .result = case.payload }, &each);
+        try testing.expectEqualStrings(case.framed, each.written());
+    }
+}
+
+test "the error arm round-trips through the encoder" {
+    var scratch: [256]u8 = undefined;
+    var buffer: [256]u8 = undefined;
+
+    const raw = "{\"error\":{\"code\":-32602,\"message\":\"unknown tool\"}}";
+    const outcome = try decodeOutcome(raw, &scratch);
+    try testing.expect(outcome == .@"error");
+
+    var writer = json.Writer.init(&buffer);
+    try encodeOutcome(outcome, &writer);
+    // The member the union names, and the payload under it verbatim, so a
+    // rejection cannot reach the peer wearing the name of a success.
+    try testing.expectEqualStrings(raw, writer.written());
+
+    const again = try decodeOutcome(writer.written(), &scratch);
+    try testing.expect(again == .@"error");
+    try testing.expectEqualStrings(outcome.@"error", again.@"error");
+}
+
+test "an outcome round-trips through a whole outer response" {
+    var scratch: [256]u8 = undefined;
+    var inner_buffer: [256]u8 = undefined;
+    var outer_buffer: [512]u8 = undefined;
+    var inner = json.Writer.init(&inner_buffer);
+    var outer = json.Writer.init(&outer_buffer);
+
+    // An inner MCP error rides inside the outer `result`, because the MCP
+    // call failed and the exchange did not. The outer `error` member would
+    // tell the client the transport failed, and it would retry a tool failure.
+    try encodeOutcome(.{
+        .@"error" = "{\"code\":-32602,\"message\":\"unknown tool\"}",
+    }, &inner);
+    try jsonrpc.encode(.{
+        .kind = .response,
+        .id = .{ .integer = 7 },
+        .result = inner.written(),
+    }, &outer);
+
+    const wire =
+        \\{"jsonrpc":"2.0","id":7,"result":{"error":{"code":-32602,"message":"unknown tool"}}}
+    ;
+    try testing.expectEqualStrings(wire, outer.written());
+
+    // What the peer reads back: a successful outer response whose result
+    // carries the inner error, and no outer error at all.
+    const message = try jsonrpc.decode(outer.written(), &scratch);
+    try testing.expectEqual(jsonrpc.Kind.response, message.kind);
+    try testing.expect(message.rpc_error == null);
+
+    const back = try decodeOutcome(message.result.?, &scratch);
+    try testing.expect(back == .@"error");
+    try testing.expectEqualStrings(
+        "{\"code\":-32602,\"message\":\"unknown tool\"}",
+        back.@"error",
+    );
+}
+
+test "the binding allocates no code inside either MCP code range" {
+    // An inner MCP code in the implementation-defined range, or in the range
+    // the specification reserves for itself, means an inner failure. A
+    // binding code in either would make the two spaces ambiguous, so all
+    // five binding codes have to fall outside both.
     const codes = [_]i32{
         @intFromEnum(BindingError.invalid_request),
         @intFromEnum(BindingError.operation_cancelled),
@@ -527,8 +670,10 @@ test "the binding allocates no code inside MCP's reserved range" {
         @intFromEnum(BindingError.backend_failed),
     };
     for (codes) |code| {
-        const inside = code >= mcp.legacy_error_min and code <= mcp.legacy_error_max;
-        try testing.expect(!inside);
+        const in_legacy = code >= mcp.legacy_error_min and code <= mcp.legacy_error_max;
+        const in_reserved = code >= mcp.reserved_error_min and code <= mcp.reserved_error_max;
+        try testing.expect(!in_legacy);
+        try testing.expect(!in_reserved);
     }
 }
 

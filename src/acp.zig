@@ -90,10 +90,13 @@ pub const Negotiated = union(enum) {
     agent_supports_nothing,
     /// The agent answered with a version this library does not implement.
     ///
-    /// [`negotiate`] never produces this, because the number it is given is
-    /// the client's request rather than the agent's answer. It is the shape a
-    /// decoded `initialize` response takes when the peer's `protocolVersion`
-    /// is neither wire version.
+    /// Nothing in this library builds it and no decoder here produces it. The
+    /// protocol layer reads a peer's `protocolVersion` into its own handshake
+    /// record and reports `error.NotPermitted` for a number it cannot speak, so
+    /// the agent's answer never reaches this union. A caller that keeps a
+    /// `protocolVersion` itself builds this variant, because it is the only
+    /// way to say "the agent answered, and the answer is not a version I
+    /// implement" without dropping the number the agent sent.
     unsupported: u16,
 };
 
@@ -125,13 +128,10 @@ pub fn negotiate(requested: u16, supported: []const WireVersion) Negotiated {
 
 // --- 6.2 Transport -------------------------------------------------------------
 
-/// The transports the specification names, section 6.2.
-///
-/// stdio is the only normative transport. Streamable HTTP over WebSocket or HTTP
-/// is in discussion and is deliberately not modelled as available.
-pub const Transport = enum {
-    stdio,
-};
+// stdio is the only normative transport, section 6.2, and Streamable HTTP over
+// WebSocket or HTTP is still in discussion. No declaration here takes a
+// transport argument: the framing below is the stdio framing, and `stdio` is
+// the module that opens one.
 
 /// The framing delimiter. Messages are newline-delimited and MUST NOT contain
 /// embedded newlines, so a raw newline is unambiguous.
@@ -1581,9 +1581,14 @@ pub const ElicitationAction = enum {
     }
 };
 
-/// The v2 `Cost.currency` pattern, `^[A-Z]{3}$`, which v1 does not apply.
-pub const v2_currency_pattern = "^[A-Z]{3}$";
-
+/// Whether `currency` is a `Cost.currency` value at v2.
+///
+/// The v2 schema types `Cost.currency` as a string with the pattern
+/// `^[A-Z]{3}$`; v1 leaves the member unconstrained, which is why the rule
+/// takes no version argument. PROTOCOLS.md section 6 does not carry `Cost`, so
+/// the pattern is the deeper source's. It is written here rather than kept
+/// beside the scan as a second constant, because a string nothing reads and a
+/// scan that has a caller drift apart with nothing to tie them.
 pub fn isValidV2Currency(currency: []const u8) bool {
     if (currency.len != 3) return false;
     for (currency) |byte| {
@@ -1643,11 +1648,13 @@ pub const v1_stop_reasons = [_][]const u8{
     "cancelled",
 };
 
-/// v2 permits JSON-RPC batch arrays; v1 does not. A batch must have at least
-/// one entry, so an empty array is a single `Invalid Request` with a null id.
-pub const batch_min_items: usize = 1;
-
 /// Whether a version admits a batch array on the wire.
+///
+/// v2 permits batch arrays and v1 does not. A v2 batch must hold at least one
+/// entry, so an empty array is a single `Invalid Request` with a null id rather
+/// than an empty response. No code in this library counts batch entries, so
+/// that minimum is written here rather than beside the answer as a constant:
+/// the only batch decision here is a transport refusing every array.
 pub fn permitsBatch(version: WireVersion) bool {
     return version == .draft;
 }
@@ -1749,25 +1756,104 @@ test "a message written as a frame cannot contain a raw newline" {
     try testing.expectEqualStrings("{\"a\":\"\\n\"}\n", writer.written());
 }
 
-test "v1 registry has the stated entry counts" {
-    try testing.expectEqual(@as(usize, 13), v1_agent_methods.len);
-    try testing.expectEqual(@as(usize, 11), v1_client_methods.len);
-    try testing.expectEqual(@as(usize, 1), protocol_methods.len);
+test "the v1 registry names exactly the methods section 6.3 lists" {
+    // Sections 6.3 and 6.4 introduce both columns "verbatim", so the table is
+    // the contract and a count is not a check on it: a renamed method, a
+    // dropped one, and a dropped one paired with a filler all leave the count
+    // standing and all break a peer that answers to the name in the table.
+    try testing.expect(namesAre(
+        &v1_agent_methods,
+        &[_][]const u8{
+            "initialize",
+            "authenticate",
+            "session/new",
+            "session/load",
+            "session/set_mode",
+            "session/set_config_option",
+            "session/prompt",
+            "session/cancel",
+            "session/list",
+            "session/delete",
+            "session/resume",
+            "session/close",
+            "logout",
+        },
+    ));
+    try testing.expect(namesAre(
+        &v1_client_methods,
+        &[_][]const u8{
+            "session/request_permission",
+            "session/update",
+            "fs/write_text_file",
+            "fs/read_text_file",
+            "terminal/create",
+            "terminal/output",
+            "terminal/release",
+            "terminal/wait_for_exit",
+            "terminal/kill",
+            "elicitation/create",
+            "elicitation/complete",
+        },
+    ));
+    try testing.expect(namesAre(&protocol_methods, &[_][]const u8{"$/cancel_request"}));
 }
 
-test "v2 registry has the stated entry counts" {
-    try testing.expectEqual(@as(usize, 11), v2_agent_methods.len);
-    try testing.expectEqual(@as(usize, 4), v2_client_methods.len);
+test "the v2 registry names exactly the methods section 6.4 lists" {
+    // The same check on the draft's own table, which is a different list: the
+    // v2 delta renames the auth methods and drops `fs`, `terminal`,
+    // `session/load` and `session/set_mode`, so agreeing with v1 is not a
+    // property this library has.
+    try testing.expect(namesAre(
+        &v2_agent_methods,
+        &[_][]const u8{
+            "initialize",
+            "auth/login",
+            "auth/logout",
+            "session/new",
+            "session/set_config_option",
+            "session/prompt",
+            "session/cancel",
+            "session/list",
+            "session/delete",
+            "session/resume",
+            "session/close",
+        },
+    ));
+    try testing.expect(namesAre(
+        &v2_client_methods,
+        &[_][]const u8{
+            "session/request_permission",
+            "session/update",
+            "elicitation/create",
+            "elicitation/complete",
+        },
+    ));
+    // The draft table carries the same one side-independent method, and it is
+    // a separate table from the v1 one, so it is checked twice.
+    try testing.expect(namesAre(&protocol_methods, &[_][]const u8{"$/cancel_request"}));
 }
 
-test "the three registries are disjoint in wire names within a version" {
-    const v1_sets = [_][]const MethodInfo{ &v1_agent_methods, &v1_client_methods, &protocol_methods };
-    for (v1_sets, 0..) |outer, i| {
-        for (v1_sets, 0..) |inner, j| {
-            if (i >= j) continue;
-            for (outer) |a| {
-                for (inner) |b| {
-                    try testing.expect(!std.mem.eql(u8, a.name, b.name));
+test "the three registries are disjoint in wire names, in both versions" {
+    // `lookupMethod` searches the three sets in order and answers with the
+    // first match, so two sets sharing a name would answer with whichever side
+    // came first. The rule is disjointness "within a version", and v2 is a
+    // version: it reuses nine of the v1 agent names and all four of the v1
+    // client names, so a cross-version check would fail and a per-version one
+    // is what the rule asks for.
+    for ([_]WireVersion{ .stable, .draft }) |version| {
+        const v1_sets = [_][]const MethodInfo{ &v1_agent_methods, &v1_client_methods, &protocol_methods };
+        const v2_sets = [_][]const MethodInfo{ &v2_agent_methods, &v2_client_methods, &protocol_methods };
+        const sets: []const []const MethodInfo = switch (version) {
+            .stable => &v1_sets,
+            .draft => &v2_sets,
+        };
+        for (sets, 0..) |outer, i| {
+            for (sets, 0..) |inner, j| {
+                if (i >= j) continue;
+                for (outer) |a| {
+                    for (inner) |b| {
+                        try testing.expect(!std.mem.eql(u8, a.name, b.name));
+                    }
                 }
             }
         }
@@ -1973,6 +2059,19 @@ test "permission option kinds are the four stated values" {
     try testing.expectEqual(@as(?PermissionOptionKind, null), PermissionOptionKind.fromString("allow"));
     try testing.expect(PermissionOptionKind.allow_once.grants());
     try testing.expect(!PermissionOptionKind.reject_always.grants());
+
+    // `string` renders the spelling the `kind` member carries, and section 6.6
+    // names the four values verbatim. A renderer that emitted `allowOnce` would
+    // write a value its own `fromString` rejects, and nothing in the library
+    // called it, so Zig never type-checked it.
+    try testing.expectEqualStrings("allow_once", PermissionOptionKind.allow_once.string());
+    try testing.expectEqualStrings("allow_always", PermissionOptionKind.allow_always.string());
+    try testing.expectEqualStrings("reject_once", PermissionOptionKind.reject_once.string());
+    try testing.expectEqualStrings("reject_always", PermissionOptionKind.reject_always.string());
+    inline for (@typeInfo(PermissionOptionKind).@"enum".fields) |field| {
+        const value: PermissionOptionKind = @field(PermissionOptionKind, field.name);
+        try testing.expectEqual(value, PermissionOptionKind.fromString(value.string()).?);
+    }
 }
 
 test "an unrecognised permission outcome is UnknownTag, never approval" {
@@ -2139,12 +2238,37 @@ test "elicitation modes and actions are the stated sets" {
     try testing.expectEqual(ElicitationAction.decline, ElicitationAction.fromString("decline").?);
     try testing.expectEqual(ElicitationAction.cancel, ElicitationAction.fromString("cancel").?);
     try testing.expectEqual(@as(?ElicitationAction, null), ElicitationAction.fromString("abort"));
+
+    // `string` renders the spelling the `mode` and action members carry, and
+    // section 6.7 names the two modes and the three actions verbatim. A
+    // renderer that emitted `Accept` would write a value its own `fromString`
+    // rejects, and nothing in the library called either one.
+    try testing.expectEqualStrings("form", ElicitationMode.form.string());
+    try testing.expectEqualStrings("url", ElicitationMode.url.string());
+    inline for (@typeInfo(ElicitationMode).@"enum".fields) |field| {
+        const value: ElicitationMode = @field(ElicitationMode, field.name);
+        try testing.expectEqual(value, ElicitationMode.fromString(value.string()).?);
+    }
+    try testing.expectEqualStrings("accept", ElicitationAction.accept.string());
+    try testing.expectEqualStrings("decline", ElicitationAction.decline.string());
+    try testing.expectEqualStrings("cancel", ElicitationAction.cancel.string());
+    inline for (@typeInfo(ElicitationAction).@"enum".fields) |field| {
+        const value: ElicitationAction = @field(ElicitationAction, field.name);
+        try testing.expectEqual(value, ElicitationAction.fromString(value.string()).?);
+    }
 }
 
-test "the v2 currency pattern is three upper-case letters" {
+test "a v2 currency is three upper-case letters and nothing else" {
+    // The v2 `Cost.currency` pattern, `^[A-Z]{3}$`. A scanner that accepted a
+    // fourth character, a digit or a lower-case letter would take a value the
+    // schema does not define, and one that accepted a short code would take
+    // one a cost report cannot be read back from.
     try testing.expect(isValidV2Currency("USD"));
+    try testing.expect(isValidV2Currency("EUR"));
     try testing.expect(!isValidV2Currency("usd"));
     try testing.expect(!isValidV2Currency("EURO"));
+    try testing.expect(!isValidV2Currency("US"));
+    try testing.expect(!isValidV2Currency("US1"));
     try testing.expect(!isValidV2Currency(""));
 }
 
@@ -2650,6 +2774,27 @@ fn contains(set: []const []const u8, needle: []const u8) bool {
         if (std.mem.eql(u8, item, needle)) return true;
     }
     return false;
+}
+
+/// Whether `set` holds exactly the names `expected` lists.
+///
+/// Both directions, so a duplicate in either list is a failure too. The
+/// registries are transcribed from the specification's own tables, and a count
+/// cannot check that: a renamed method and a dropped one paired with a filler
+/// both leave the count standing.
+fn namesAre(set: []const MethodInfo, expected: []const []const u8) bool {
+    if (set.len != expected.len) return false;
+    for (expected) |name| {
+        var found = false;
+        for (set) |info| {
+            if (std.mem.eql(u8, info.name, name)) found = true;
+        }
+        if (!found) return false;
+    }
+    for (set) |info| {
+        if (!contains(expected, info.name)) return false;
+    }
+    return true;
 }
 
 /// The entry with this path, for the tests that assert on a decoded set.
