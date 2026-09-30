@@ -39,7 +39,7 @@ pub fn main(init: std.process.Init) !void {
 
 /// Run every section in order, reporting a failure rather than abandoning the
 /// rest: the section that stops is the one that would have shown nothing, and
-/// the other eight still say what the decoders produced.
+/// the other nine still say what the decoders produced.
 fn showEverySection(out: *std.Io.Writer) !void {
     decodeAnMcpRequest(out) catch |err| report(out, "decodeAnMcpRequest", err);
     showRevisionGating(out) catch |err| report(out, "showRevisionGating", err);
@@ -48,6 +48,7 @@ fn showEverySection(out: *std.Io.Writer) !void {
     roundTripAStdioStream(out) catch |err| report(out, "roundTripAStdioStream", err);
     showThePermissionSafetyRule(out) catch |err| report(out, "showThePermissionSafetyRule", err);
     parseA2AVersions(out) catch |err| report(out, "parseA2AVersions", err);
+    showA2AFieldNames(out) catch |err| report(out, "showA2AFieldNames", err);
     separateBridgeErrors(out) catch |err| report(out, "separateBridgeErrors", err);
     showThatHostileInputIsAnError(out) catch |err|
         report(out, "showThatHostileInputIsAnError", err);
@@ -267,6 +268,73 @@ fn parseA2AVersions(out: *std.Io.Writer) !void {
     }
 }
 
+fn showA2AFieldNames(out: *std.Io.Writer) !void {
+    try heading(out, "A2A: only five members in the module are not the snake_case of a wire name");
+
+    // `inline for` and not `for`: both lookups take the member index as a
+    // comptime value, because each answers from the table that belongs to the
+    // type rather than from any one message. The Zig name is read from the
+    // declaration, where a reader looks for it, and not from the table that has
+    // to agree with it, because two names from one source would prove nothing.
+    const members = @typeInfo(a2a.AgentCard).@"struct".fields;
+    try out.print("  AgentCard: number, ProtoJSON name, Zig name:\n", .{});
+    inline for (members, 0..) |member, index| {
+        // No member of this message lacks a name. A map entry's key and its
+        // value are the rows that lack one, because ProtoJSON renders that pair
+        // as the one member the key names, and neither half is a member on its
+        // own.
+        try out.print("    {d:>2}  {s:<22} {s}\n", .{
+            a2a.fieldNumber(a2a.AgentCard, index),
+            a2a.jsonName(a2a.AgentCard, index) orelse "-",
+            member.name,
+        });
+    }
+
+    // A map entry has no member name of its own, so the rule does not bend
+    // there; it had no wire name to bend. These five are the members whose Zig
+    // name is not the snake_case of the wire name, and a reader who can count
+    // them can check the table above.
+    try out.print("\n  The only five exceptions in the module, all SecurityScheme arms:\n", .{});
+    // The middle column is what the rule derives, so the gap between that column
+    // and the Zig name is the exception and not a second opinion.
+    try out.print("      {s:<28} {s:<32} {s}\n", .{ "wire name", "rule derives", "zig name" });
+    const arms = @typeInfo(a2a.SecurityScheme).@"union".fields;
+    inline for (arms, 0..) |arm, index| {
+        // `comptime` so the binding is a compile-time value: `snakeCaseName`
+        // takes a comptime parameter, and a `const` bound to a comptime
+        // expression is still a runtime slice to the compiler.
+        const wire = comptime a2a.jsonName(a2a.SecurityScheme, index) orelse "-";
+        try out.print("    {d:>2}  {s:<28} {s:<32} {s}\n", .{
+            a2a.fieldNumber(a2a.SecurityScheme, index),
+            wire,
+            a2a.snakeCaseName(wire),
+            arm.name,
+        });
+    }
+
+    try out.print("\n  findField, the question a decoder asks of a wire name:\n", .{});
+    try showALookup(out, a2a.AgentCard, "supportedInterfaces");
+    try showALookup(out, a2a.AgentCard, "supported_interfaces");
+    try showALookup(out, a2a.SecurityScheme, "apiKeySecurityScheme");
+}
+
+/// Print what `a2a.findField` makes of one member name.
+///
+/// The answer is an index, and the tables above turn that index into a number
+/// and a Zig name. A name no member carries is null rather than a guess, and
+/// that null is what lets a decoder reject a name a peer got wrong: the section
+/// passes the proto's own snake_case spelling of a field that does exist.
+fn showALookup(out: *std.Io.Writer, comptime T: type, comptime name: []const u8) !void {
+    if (a2a.findField(T, name)) |index| {
+        try out.print("    findField({s}, \"{s}\") = {d}\n", .{ @typeName(T), name, index });
+    } else {
+        try out.print("    findField({s}, \"{s}\") = null, and a decoder rejects it\n", .{
+            @typeName(T),
+            name,
+        });
+    }
+}
+
 fn separateBridgeErrors(out: *std.Io.Writer) !void {
     try heading(out, "mcp-over-acp: an inner MCP error is a successful outer response");
     var scratch: [256]u8 = undefined;
@@ -308,7 +376,7 @@ fn showThatHostileInputIsAnError(out: *std.Io.Writer) !void {
         "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"tools/call\"}",
         // Both result and error on one message.
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{},\"error\":{\"code\":1,\"message\":\"m\"}}",
-        // Neither, on a response.
+        // Neither `result` nor `error`, on a message that carries an id.
         "{\"jsonrpc\":\"2.0\",\"id\":1}",
         // Truncated mid-object.
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"a",

@@ -7,18 +7,64 @@
 //!
 //! PROTOCOLS.md section 5.4: "Field numbers are normative, because they are what
 //! a protobuf encoder emits." A struct's field order is not a wire layout, so
-//! each message here pairs a struct with a parallel table of field numbers and
-//! checks the two against each other at comptime. Reordering a struct field
-//! without updating its number is then a compile error rather than a silent
-//! change to what a protobuf encoder emits.
+//! every message here carries a `fields` table of `Field` alongside its own
+//! fields, and `assertFieldTable` checks the two against each other at comptime.
+//! A renamed field, a transposed number and a missing row are then a compile
+//! error rather than a silent change to what a protobuf encoder emits.
+//!
+//! A `oneof` is a `union(enum)`, and its tag ordinal is 0-based and is not the
+//! field number, so a codec reads the number from the table and not from the
+//! ordinal.
 //!
 //! ## Naming
 //!
-//! The proto package is `lf.a2a.v1`, not `a2a.v1`. JSON field names are
-//! camelCase, and enum values serialise as their full SCREAMING_SNAKE proto
-//! names, so `TaskState.completed` is `"TASK_STATE_COMPLETED"` on the wire and
-//! not `"completed"`. The Zig field names are the short forms PROTOCOLS.md
-//! states; `wireName` carries the wire spelling.
+//! The proto package is `lf.a2a.v1`, not `a2a.v1`.
+//!
+//! **An enum value is its full proto name.** `TaskState.completed` is
+//! `"TASK_STATE_COMPLETED"` on the wire and not `"completed"`, and `wireName`
+//! returns that spelling for the two enums that have one, `TaskState` and
+//! `Role`.
+//!
+//! **A struct field name is not a wire name.** The Zig field names are the short
+//! forms PROTOCOLS.md states, and they are snake_case where ProtoJSON is
+//! camelCase. `Task.context_id` is `contextId` on the wire,
+//! `ListTasksRequest.status_timestamp_after` is `statusTimestampAfter` and
+//! `AgentCard.icon_url` is `iconUrl`, while `AgentCard.version` is `version`.
+//! Each message's `fields` table carries the wire name of every one of its
+//! fields, and `jsonName`, `fieldNumber` and `findField` read it.
+//!
+//! **The rule that produces those names.** ProtoJSON spells a field in
+//! camelCase and the proto spells the same field in snake_case, so the Zig name
+//! is the camelCase name with an underscore before every capital.
+//! `snakeCaseName` is that rule, and `assertFieldTable` derives every Zig field
+//! name from its own row and fails the build on a typo in either column. An
+//! override that equals the derivation is rejected, so `zig_name` cannot rot
+//! into a second copy of the rule.
+//!
+//! **The one source.** Every spelling is transcribed from the `JSON name`
+//! column of `research/normative/a2a-1.0.0.md` section 2, which is the normative
+//! artifact cross-verified against the rendered specification's own field
+//! tables. A name this library does not carry is not derived from anything.
+//!
+//! **The one exception.** The `SecurityScheme` arms are the only fields where
+//! the normative name and the Zig name disagree. ProtoJSON spells the first one
+//! `apiKeySecurityScheme`, the derivation gives `api_key_security_scheme`, and
+//! the Zig name is `api_key`; the same happens for the other four arms. Those
+//! five rows carry `zig_name`, and every other row carries none.
+//!
+//! **A map entry is one member, not two.** `SecurityRequirementEntry`,
+//! `SecuritySchemeEntry` and `OAuthScope` model the synthetic protobuf map-entry
+//! message, whose field 1 is the key and field 2 is the value. ProtoJSON renders
+//! one entry as the single member its key names, so those rows carry `json =
+//! null`: there is no member name, because the key is data. `Part.content` is
+//! null for the other reason, that a `oneof` has no member name of its own.
+//!
+//! **This is a name table, not a codec.** The tables say which name and which
+//! number a field has. Nothing here reads or writes ProtoJSON, and the values
+//! a peer sends still need encoding this file does not do: `Part.raw` to
+//! base64, `google.protobuf.Timestamp` to ISO-8601 UTC, and
+//! `google.protobuf.Value` and `google.protobuf.Struct` to arbitrary JSON.
+//! Without those a name table is not a decode or an encode path.
 //!
 //! `TaskState` and `Role` are declared `enum(u8)` because PROTOCOLS.md says so.
 //! The proto states no explicit backing type, and proto3's default is `int32`,
@@ -264,36 +310,195 @@ pub const task_state_max: u8 = 8;
 /// The highest declared `Role` tag.
 pub const role_max: u8 = 2;
 
-// --- 5.4 Field numbers ---------------------------------------------------------
+// --- 5.4 Field numbers and ProtoJSON names ---------------------------------------
 
-/// Assert that a struct's field count matches its field-number table.
+/// One field of a protobuf message.
 ///
-/// Without this the two tables drift apart silently, and the drift is invisible
-/// until a peer decodes a field into the wrong place.
-fn assertFieldCount(comptime T: type, comptime numbers: anytype) void {
-    const declared = @typeInfo(T).@"struct".fields.len;
-    const numbered = numbers.len;
-    if (declared != numbered) {
-        @compileError(std.fmt.comptimePrint(
-            "{s} has {d} fields but {d} field numbers",
-            .{ @typeName(T), declared, numbered },
-        ));
+/// PROTOCOLS.md section 5.4: "Field numbers are normative, because they are what
+/// a protobuf encoder emits." A struct's field order is not a wire layout, so
+/// every message here carries a `fields` table beside its own fields and
+/// `assertFieldTable` checks the two against each other at comptime.
+pub const Field = struct {
+    /// The field number, 1-based and never reused within a message.
+    number: u32,
+    /// The ProtoJSON member name, or null for a field that has no member name of
+    /// its own: a synthetic map entry, which ProtoJSON renders as the one member
+    /// its key names, and a `oneof` the struct holds as a single field.
+    json: ?[]const u8,
+    /// The Zig field name, or null when `snakeCaseName` derives it from `json`.
+    /// It is not null only where the normative name and the Zig name disagree.
+    zig_name: ?[]const u8 = null,
+};
+
+/// The lowercase letters, indexed by `head - 'A'` for a capital `head`.
+const lower_alphabet = "abcdefghijklmnopqrstuvwxyz";
+
+/// The snake_case name a ProtoJSON camelCase member name implies.
+///
+/// PROTOCOLS.md section 5.1: JSON field names are camelCase, and the proto spells
+/// the same field in snake_case. The Zig name is the camelCase name with an
+/// underscore before every capital, so `contextId` gives `context_id`. A digit
+/// takes no underscore, so `oauth2MetadataUrl` gives `oauth2_metadata_url` and
+/// not `oauth_2_metadata_url`.
+///
+/// The result is a comptime string and nothing is allocated at any stage, not
+/// even transiently. The name is built by `++` from a string literal and
+/// one-character slices of one, recursing on the length of a comptime-known
+/// name, so it folds at comptime. There is deliberately no buffer: a slice of a
+/// local escapes as a runtime value, and that is true of a `var`, of a
+/// `comptime var`, and of a local of a `comptime` block alike, so no shape that
+/// writes into a local can return one.
+pub fn snakeCaseName(comptime json_name: []const u8) []const u8 {
+    return comptime blk: {
+        if (json_name.len == 0) break :blk "";
+        const head = json_name[0];
+        if (std.ascii.isUpper(head)) {
+            // `isUpper` is ASCII, so `head` is in `'A'..'Z'` and the index is 0
+            // to 25. Taking the lowercased letter from a literal keeps the
+            // result free of any pointer into a local.
+            const index: usize = @as(usize, head) - 'A';
+            break :blk "_" ++ lower_alphabet[index .. index + 1] ++ snakeCaseName(json_name[1..]);
+        }
+        // Everything else passes through unchanged: a lowercase letter, a digit
+        // and an underscore are all already in their final form. Testing for
+        // `isLower` here instead would turn the digit in `oauth2MetadataUrl`
+        // into an underscore, which is the one thing this function must not do.
+        break :blk json_name[0..1] ++ snakeCaseName(json_name[1..]);
+    };
+}
+
+/// The number that follows a `oneof` holding a message's leading numbers, or 0
+/// when the message does not start with one.
+///
+/// A `oneof` occupies as many numbers as it has members, so the field beside it
+/// is numbered after the last member and not after the field that holds it.
+/// `Part` is the only message here that starts that way: its `content` oneof is
+/// numbers 1 to 4, so `metadata` is 5. A union that is a field in its own right,
+/// `OAuth2SecurityScheme.flows`, is numbered 2 like any other field, which is why
+/// only the first field is examined.
+fn numberAfterLeadingOneof(comptime T: type) u32 {
+    const first = switch (@typeInfo(T)) {
+        .@"struct" => |s| if (s.fields.len == 0) return 0 else s.fields[0],
+        else => return 0,
+    };
+    const oneof = switch (@typeInfo(first.type)) {
+        .@"union" => |u| u,
+        else => return 0,
+    };
+    if (oneof.tag_type == null) return 0;
+    return @intCast(oneof.fields.len + 1);
+}
+
+/// Assert that `T`'s `fields` table agrees with `T`'s own fields.
+///
+/// One row per field, in field order, and three things are checked: the row names
+/// the field, the row carries the number the proto declares, and an override
+/// that restates the derivation is rejected. A renamed field, a misspelled
+/// member name, an override that duplicates the rule, a transposed number and a
+/// missing row are then compile errors rather than a silent change to what a
+/// protobuf encoder emits. The field count, the field names and the numbers are
+/// all covered here, where the old count-and-name pair covered only the first.
+fn assertFieldTable(comptime T: type) void {
+    switch (@typeInfo(T)) {
+        .@"struct" => |s| assertTable(T, s.fields),
+        .@"union" => |u| assertTable(T, u.fields),
+        else => @compileError(std.fmt.comptimePrint(
+            "{s} is neither a struct nor a tagged union, so it is not a message",
+            .{@typeName(T)},
+        )),
     }
 }
 
-/// Assert that struct field `index` has the name the field-number table gives.
-fn assertFieldName(
-    comptime T: type,
-    comptime index: usize,
-    comptime expected: []const u8,
-) void {
-    const info = @typeInfo(T).@"struct".fields[index];
-    if (!std.mem.eql(u8, info.name, expected)) {
+/// The body of `assertFieldTable`, for a struct or for a tagged union.
+///
+/// `members` is `[]const StructField` in one case and `[]const UnionField` in the
+/// other. The loop reads only the name, which both carry, so one body checks
+/// both shapes.
+fn assertTable(comptime T: type, comptime members: anytype) void {
+    const table = T.fields;
+    if (table.len != members.len) {
         @compileError(std.fmt.comptimePrint(
-            "{s} field {d} is named '{s}', but its field number is for '{s}'",
-            .{ @typeName(T), index, info.name, expected },
+            "{s} has {d} fields but its field table has {d} rows",
+            .{ @typeName(T), members.len, table.len },
         ));
     }
+    // `comptime` on the call, for the same reason as in `snakeCaseName`: a
+    // `const` binding is a runtime value, and this one decides a branch.
+    const after_oneof = comptime numberAfterLeadingOneof(T);
+    inline for (table, members, 0..) |entry, member, index| {
+        const derived: ?[]const u8 = if (entry.json) |json_name|
+            snakeCaseName(json_name)
+        else
+            null;
+        // An override that equals the derivation is a second copy of the rule,
+        // and it rots the moment the rule changes.
+        if (entry.zig_name) |zig_name| {
+            if (derived) |expected| {
+                if (comptime std.mem.eql(u8, zig_name, expected)) {
+                    @compileError(std.fmt.comptimePrint(
+                        "{s} field {d} overrides the Zig name to '{s}', which '{s}'" ++
+                            " already derives",
+                        .{ @typeName(T), index, zig_name, entry.json.? },
+                    ));
+                }
+            }
+        }
+        // A row with neither a member name nor a Zig name cannot name its field,
+        // and that is a transcription error rather than a wire fact. This is an
+        // `if` and not an `orelse` because `@compileError` is only legal in a
+        // comptime branch, and an `orelse` operand is a runtime position.
+        if (entry.json == null and entry.zig_name == null) {
+            @compileError(std.fmt.comptimePrint(
+                "{s} field {d} has neither a ProtoJSON name nor a Zig name",
+                .{ @typeName(T), index },
+            ));
+        }
+        const expected_name: []const u8 = entry.zig_name orelse derived.?;
+        if (comptime !std.mem.eql(u8, member.name, expected_name)) {
+            @compileError(std.fmt.comptimePrint(
+                "{s} field {d} is named '{s}', but its table row says '{s}'",
+                .{ @typeName(T), index, member.name, expected_name },
+            ));
+        }
+        const expected_number: u32 = if (index == 0)
+            1
+        else if (index == 1 and after_oneof != 0)
+            after_oneof
+        else
+            table[index - 1].number + 1;
+        if (entry.number != expected_number) {
+            @compileError(std.fmt.comptimePrint(
+                "{s} field {d} is number {d}, but its table row says {d}",
+                .{ @typeName(T), index, expected_number, entry.number },
+            ));
+        }
+    }
+}
+
+/// The ProtoJSON member name of message `T`'s field `index`.
+///
+/// Null for a field with no member name of its own, which is a `oneof` the
+/// struct holds as one field and a synthetic map entry. A map entry's member
+/// name is the map's key, and a key is data rather than a name.
+pub fn jsonName(comptime T: type, comptime index: usize) ?[]const u8 {
+    return T.fields[index].json;
+}
+
+/// The field number of message `T`'s field `index`.
+pub fn fieldNumber(comptime T: type, comptime index: usize) u32 {
+    return T.fields[index].number;
+}
+
+/// The index of the field of message `T` that ProtoJSON spells `json`, or null.
+///
+/// A member no field of `T` carries is null rather than a guess, which is what
+/// lets a decoder reject a name a newer revision added.
+pub fn findField(comptime T: type, json: []const u8) ?usize {
+    inline for (T.fields, 0..) |entry, index| {
+        const name = entry.json orelse continue;
+        if (std.mem.eql(u8, name, json)) return index;
+    }
+    return null;
 }
 
 /// `Task`, field numbers 1 to 6.
@@ -310,18 +515,20 @@ pub const Task = struct {
     history: []const Message = &.{},
     /// 6.
     metadata: ?[]const u8 = null,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "id" },
+        .{ .number = 2, .json = "contextId" },
+        .{ .number = 3, .json = "status" },
+        .{ .number = 4, .json = "artifacts" },
+        .{ .number = 5, .json = "history" },
+        .{ .number = 6, .json = "metadata" },
+    };
 };
 
-pub const task_field_numbers = .{ 1, 2, 3, 4, 5, 6 };
-
 comptime {
-    assertFieldCount(Task, task_field_numbers);
-    assertFieldName(Task, 0, "id");
-    assertFieldName(Task, 1, "context_id");
-    assertFieldName(Task, 2, "status");
-    assertFieldName(Task, 3, "artifacts");
-    assertFieldName(Task, 4, "history");
-    assertFieldName(Task, 5, "metadata");
+    assertFieldTable(Task);
 }
 
 /// `TaskStatus`, field numbers 1 to 3.
@@ -332,15 +539,17 @@ pub const TaskStatus = struct {
     message: ?Message = null,
     /// 3. ISO-8601 UTC in JSON.
     timestamp: ?[]const u8 = null,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "state" },
+        .{ .number = 2, .json = "message" },
+        .{ .number = 3, .json = "timestamp" },
+    };
 };
 
-pub const task_status_field_numbers = .{ 1, 2, 3 };
-
 comptime {
-    assertFieldCount(TaskStatus, task_status_field_numbers);
-    assertFieldName(TaskStatus, 0, "state");
-    assertFieldName(TaskStatus, 1, "message");
-    assertFieldName(TaskStatus, 2, "timestamp");
+    assertFieldTable(TaskStatus);
 }
 
 /// `Message`, field numbers 1 to 8.
@@ -361,26 +570,29 @@ pub const Message = struct {
     extensions: []const []const u8 = &.{},
     /// 8.
     reference_task_ids: []const []const u8 = &.{},
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "messageId" },
+        .{ .number = 2, .json = "contextId" },
+        .{ .number = 3, .json = "taskId" },
+        .{ .number = 4, .json = "role" },
+        .{ .number = 5, .json = "parts" },
+        .{ .number = 6, .json = "metadata" },
+        .{ .number = 7, .json = "extensions" },
+        .{ .number = 8, .json = "referenceTaskIds" },
+    };
 };
 
-pub const message_field_numbers = .{ 1, 2, 3, 4, 5, 6, 7, 8 };
-
 comptime {
-    assertFieldCount(Message, message_field_numbers);
-    assertFieldName(Message, 0, "message_id");
-    assertFieldName(Message, 1, "context_id");
-    assertFieldName(Message, 2, "task_id");
-    assertFieldName(Message, 3, "role");
-    assertFieldName(Message, 4, "parts");
-    assertFieldName(Message, 5, "metadata");
-    assertFieldName(Message, 6, "extensions");
-    assertFieldName(Message, 7, "reference_task_ids");
+    assertFieldTable(Message);
 }
 
 /// The `content` `oneof` of `Part`.
 ///
 /// The discriminator is which member is present, not a `kind` field: the proto
-/// has no `kind`, and a decoder switching on one would drop every part.
+/// has no `kind`, and a decoder switching on one would drop every part. These
+/// four members are the numbers 1 to 4 that `Part` holds in its `content` field.
 pub const PartContent = union(enum) {
     /// Field 1.
     text: []const u8,
@@ -390,9 +602,26 @@ pub const PartContent = union(enum) {
     url: []const u8,
     /// Field 4. Any JSON value.
     data: []const u8,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "text" },
+        .{ .number = 2, .json = "raw" },
+        .{ .number = 3, .json = "url" },
+        .{ .number = 4, .json = "data" },
+    };
 };
 
+comptime {
+    assertFieldTable(PartContent);
+}
+
 /// `Part`, field numbers 1 to 7.
+///
+/// The `content` oneof holds numbers 1 to 4 as one Zig field, so this table has
+/// four rows for four fields. Row 0 is the `oneof` itself and carries no member
+/// name, and a codec writes the member it is holding under the number
+/// `PartContent` gives that member.
 pub const Part = struct {
     /// One of fields 1 to 4.
     content: PartContent,
@@ -402,29 +631,19 @@ pub const Part = struct {
     filename: ?[]const u8 = null,
     /// 7. Available for every part type.
     media_type: ?[]const u8 = null,
-};
 
-pub const part_field_numbers = .{ 1, 2, 3, 4, 5, 6, 7 };
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = null, .zig_name = "content" },
+        .{ .number = 5, .json = "metadata" },
+        .{ .number = 6, .json = "filename" },
+        .{ .number = 7, .json = "mediaType" },
+    };
+};
 
 comptime {
-    // The content oneof occupies the first four numbers as a single Zig field,
-    // so the Zig struct has four fields against seven numbers.
-    if (@typeInfo(Part).@"struct".fields.len != 4) {
-        @compileError("Part must keep content, metadata, filename, media_type");
-    }
-    assertFieldName(Part, 0, "content");
-    assertFieldName(Part, 1, "metadata");
-    assertFieldName(Part, 2, "filename");
-    assertFieldName(Part, 3, "media_type");
+    assertFieldTable(Part);
 }
-
-/// The four `oneof` members, keyed by their field numbers.
-pub const part_content_field_number = struct {
-    pub const text = 1;
-    pub const raw = 2;
-    pub const url = 3;
-    pub const data = 4;
-};
 
 /// `Artifact`, field numbers 1 to 6.
 pub const Artifact = struct {
@@ -440,18 +659,20 @@ pub const Artifact = struct {
     metadata: ?[]const u8 = null,
     /// 6.
     extensions: []const []const u8 = &.{},
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "artifactId" },
+        .{ .number = 2, .json = "name" },
+        .{ .number = 3, .json = "description" },
+        .{ .number = 4, .json = "parts" },
+        .{ .number = 5, .json = "metadata" },
+        .{ .number = 6, .json = "extensions" },
+    };
 };
 
-pub const artifact_field_numbers = .{ 1, 2, 3, 4, 5, 6 };
-
 comptime {
-    assertFieldCount(Artifact, artifact_field_numbers);
-    assertFieldName(Artifact, 0, "artifact_id");
-    assertFieldName(Artifact, 1, "name");
-    assertFieldName(Artifact, 2, "description");
-    assertFieldName(Artifact, 3, "parts");
-    assertFieldName(Artifact, 4, "metadata");
-    assertFieldName(Artifact, 5, "extensions");
+    assertFieldTable(Artifact);
 }
 
 /// `TaskStatusUpdateEvent`, field numbers 1 to 4.
@@ -467,16 +688,18 @@ pub const TaskStatusUpdateEvent = struct {
     status: TaskStatus,
     /// 4.
     metadata: ?[]const u8 = null,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "taskId" },
+        .{ .number = 2, .json = "contextId" },
+        .{ .number = 3, .json = "status" },
+        .{ .number = 4, .json = "metadata" },
+    };
 };
 
-pub const task_status_update_event_field_numbers = .{ 1, 2, 3, 4 };
-
 comptime {
-    assertFieldCount(TaskStatusUpdateEvent, task_status_update_event_field_numbers);
-    assertFieldName(TaskStatusUpdateEvent, 0, "task_id");
-    assertFieldName(TaskStatusUpdateEvent, 1, "context_id");
-    assertFieldName(TaskStatusUpdateEvent, 2, "status");
-    assertFieldName(TaskStatusUpdateEvent, 3, "metadata");
+    assertFieldTable(TaskStatusUpdateEvent);
 }
 
 /// `TaskArtifactUpdateEvent`, field numbers 1 to 6.
@@ -493,18 +716,20 @@ pub const TaskArtifactUpdateEvent = struct {
     last_chunk: ?bool = null,
     /// 6.
     metadata: ?[]const u8 = null,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "taskId" },
+        .{ .number = 2, .json = "contextId" },
+        .{ .number = 3, .json = "artifact" },
+        .{ .number = 4, .json = "append" },
+        .{ .number = 5, .json = "lastChunk" },
+        .{ .number = 6, .json = "metadata" },
+    };
 };
 
-pub const task_artifact_update_event_field_numbers = .{ 1, 2, 3, 4, 5, 6 };
-
 comptime {
-    assertFieldCount(TaskArtifactUpdateEvent, task_artifact_update_event_field_numbers);
-    assertFieldName(TaskArtifactUpdateEvent, 0, "task_id");
-    assertFieldName(TaskArtifactUpdateEvent, 1, "context_id");
-    assertFieldName(TaskArtifactUpdateEvent, 2, "artifact");
-    assertFieldName(TaskArtifactUpdateEvent, 3, "append");
-    assertFieldName(TaskArtifactUpdateEvent, 4, "last_chunk");
-    assertFieldName(TaskArtifactUpdateEvent, 5, "metadata");
+    assertFieldTable(TaskArtifactUpdateEvent);
 }
 
 /// `SendMessageConfiguration`, field numbers 1 to 4.
@@ -526,16 +751,18 @@ pub const SendMessageConfiguration = struct {
     /// "optional bool"; the proto's cardinality wins because absent and false
     /// are the same thing on the wire and no peer sends `null`.
     return_immediately: bool = false,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "acceptedOutputModes" },
+        .{ .number = 2, .json = "taskPushNotificationConfig" },
+        .{ .number = 3, .json = "historyLength" },
+        .{ .number = 4, .json = "returnImmediately" },
+    };
 };
 
-pub const send_message_configuration_field_numbers = .{ 1, 2, 3, 4 };
-
 comptime {
-    assertFieldCount(SendMessageConfiguration, send_message_configuration_field_numbers);
-    assertFieldName(SendMessageConfiguration, 0, "accepted_output_modes");
-    assertFieldName(SendMessageConfiguration, 1, "task_push_notification_config");
-    assertFieldName(SendMessageConfiguration, 2, "history_length");
-    assertFieldName(SendMessageConfiguration, 3, "return_immediately");
+    assertFieldTable(SendMessageConfiguration);
 }
 
 // --- 5.4 Push notification configuration ---------------------------------------
@@ -554,14 +781,16 @@ pub const AuthenticationInfo = struct {
     /// requests: no credential is a scheme sent without a secret, and an empty
     /// credential is a secret that happens to be blank.
     credentials: ?[]const u8 = null,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "scheme" },
+        .{ .number = 2, .json = "credentials" },
+    };
 };
 
-pub const authentication_info_field_numbers = .{ 1, 2 };
-
 comptime {
-    assertFieldCount(AuthenticationInfo, authentication_info_field_numbers);
-    assertFieldName(AuthenticationInfo, 0, "scheme");
-    assertFieldName(AuthenticationInfo, 1, "credentials");
+    assertFieldTable(AuthenticationInfo);
 }
 
 /// `TaskPushNotificationConfig`, field numbers 1 to 6.
@@ -584,18 +813,20 @@ pub const TaskPushNotificationConfig = struct {
     token: ?[]const u8 = null,
     /// 6. Fills the `Authorization` line of the webhook request.
     authentication: ?AuthenticationInfo = null,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "tenant" },
+        .{ .number = 2, .json = "id" },
+        .{ .number = 3, .json = "taskId" },
+        .{ .number = 4, .json = "url" },
+        .{ .number = 5, .json = "token" },
+        .{ .number = 6, .json = "authentication" },
+    };
 };
 
-pub const task_push_notification_config_field_numbers = .{ 1, 2, 3, 4, 5, 6 };
-
 comptime {
-    assertFieldCount(TaskPushNotificationConfig, task_push_notification_config_field_numbers);
-    assertFieldName(TaskPushNotificationConfig, 0, "tenant");
-    assertFieldName(TaskPushNotificationConfig, 1, "id");
-    assertFieldName(TaskPushNotificationConfig, 2, "task_id");
-    assertFieldName(TaskPushNotificationConfig, 3, "url");
-    assertFieldName(TaskPushNotificationConfig, 4, "token");
-    assertFieldName(TaskPushNotificationConfig, 5, "authentication");
+    assertFieldTable(TaskPushNotificationConfig);
 }
 
 /// The `payload` `oneof` of `SendMessageResponse`, field numbers 1 and 2.
@@ -604,7 +835,17 @@ pub const SendMessageResponse = union(enum) {
     task: Task,
     /// 2.
     message: Message,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "task" },
+        .{ .number = 2, .json = "message" },
+    };
 };
+
+comptime {
+    assertFieldTable(SendMessageResponse);
+}
 
 /// The `payload` `oneof` of `StreamResponse`, field numbers 1 to 4.
 pub const StreamResponse = union(enum) {
@@ -616,7 +857,19 @@ pub const StreamResponse = union(enum) {
     status_update: TaskStatusUpdateEvent,
     /// 4.
     artifact_update: TaskArtifactUpdateEvent,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "task" },
+        .{ .number = 2, .json = "message" },
+        .{ .number = 3, .json = "statusUpdate" },
+        .{ .number = 4, .json = "artifactUpdate" },
+    };
 };
+
+comptime {
+    assertFieldTable(StreamResponse);
+}
 
 /// The send RPC's request. `message` is required by the proto.
 pub const SendMessageRequest = struct {
@@ -628,8 +881,19 @@ pub const SendMessageRequest = struct {
     configuration: ?SendMessageConfiguration = null,
     /// 4. Borrowed ProtoJSON `Struct`.
     metadata: ?[]const u8 = null,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "tenant" },
+        .{ .number = 2, .json = "message" },
+        .{ .number = 3, .json = "configuration" },
+        .{ .number = 4, .json = "metadata" },
+    };
 };
-pub const send_message_request_field_numbers = .{ 1, 2, 3, 4 };
+
+comptime {
+    assertFieldTable(SendMessageRequest);
+}
 
 /// Fetch one task, optionally including this many history messages.
 pub const GetTaskRequest = struct {
@@ -639,8 +903,18 @@ pub const GetTaskRequest = struct {
     id: []const u8,
     /// 3. Explicit proto3 presence.
     history_length: ?i32 = null,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "tenant" },
+        .{ .number = 2, .json = "id" },
+        .{ .number = 3, .json = "historyLength" },
+    };
 };
-pub const get_task_request_field_numbers = .{ 1, 2, 3 };
+
+comptime {
+    assertFieldTable(GetTaskRequest);
+}
 
 pub const ListTasksRequest = struct {
     /// 1.
@@ -659,8 +933,23 @@ pub const ListTasksRequest = struct {
     status_timestamp_after: ?[]const u8 = null,
     /// 8. Explicit presence; absent defaults to false.
     include_artifacts: ?bool = null,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "tenant" },
+        .{ .number = 2, .json = "contextId" },
+        .{ .number = 3, .json = "status" },
+        .{ .number = 4, .json = "pageSize" },
+        .{ .number = 5, .json = "pageToken" },
+        .{ .number = 6, .json = "historyLength" },
+        .{ .number = 7, .json = "statusTimestampAfter" },
+        .{ .number = 8, .json = "includeArtifacts" },
+    };
 };
-pub const list_tasks_request_field_numbers = .{ 1, 2, 3, 4, 5, 6, 7, 8 };
+
+comptime {
+    assertFieldTable(ListTasksRequest);
+}
 
 pub const ListTasksResponse = struct {
     /// 1. Required, but may be empty.
@@ -671,8 +960,19 @@ pub const ListTasksResponse = struct {
     page_size: i32,
     /// 4. Required.
     total_size: i32,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "tasks" },
+        .{ .number = 2, .json = "nextPageToken" },
+        .{ .number = 3, .json = "pageSize" },
+        .{ .number = 4, .json = "totalSize" },
+    };
 };
-pub const list_tasks_response_field_numbers = .{ 1, 2, 3, 4 };
+
+comptime {
+    assertFieldTable(ListTasksResponse);
+}
 
 pub const CancelTaskRequest = struct {
     /// 1.
@@ -681,16 +981,35 @@ pub const CancelTaskRequest = struct {
     id: []const u8,
     /// 3. Borrowed ProtoJSON `Struct`.
     metadata: ?[]const u8 = null,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "tenant" },
+        .{ .number = 2, .json = "id" },
+        .{ .number = 3, .json = "metadata" },
+    };
 };
-pub const cancel_task_request_field_numbers = .{ 1, 2, 3 };
+
+comptime {
+    assertFieldTable(CancelTaskRequest);
+}
 
 pub const SubscribeToTaskRequest = struct {
     /// 1.
     tenant: []const u8 = "",
     /// 2. Required.
     id: []const u8,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "tenant" },
+        .{ .number = 2, .json = "id" },
+    };
 };
-pub const subscribe_to_task_request_field_numbers = .{ 1, 2 };
+
+comptime {
+    assertFieldTable(SubscribeToTaskRequest);
+}
 
 pub const GetTaskPushNotificationConfigRequest = struct {
     /// 1.
@@ -699,8 +1018,18 @@ pub const GetTaskPushNotificationConfigRequest = struct {
     task_id: []const u8,
     /// 3. Required.
     id: []const u8,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "tenant" },
+        .{ .number = 2, .json = "taskId" },
+        .{ .number = 3, .json = "id" },
+    };
 };
-pub const get_task_push_notification_config_request_field_numbers = .{ 1, 2, 3 };
+
+comptime {
+    assertFieldTable(GetTaskPushNotificationConfigRequest);
+}
 
 pub const DeleteTaskPushNotificationConfigRequest = struct {
     /// 1.
@@ -709,8 +1038,18 @@ pub const DeleteTaskPushNotificationConfigRequest = struct {
     task_id: []const u8,
     /// 3. Required.
     id: []const u8,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "tenant" },
+        .{ .number = 2, .json = "taskId" },
+        .{ .number = 3, .json = "id" },
+    };
 };
-pub const delete_task_push_notification_config_request_field_numbers = .{ 1, 2, 3 };
+
+comptime {
+    assertFieldTable(DeleteTaskPushNotificationConfigRequest);
+}
 
 /// The source proto declares `tenant` first, but assigns it field 4.
 pub const ListTaskPushNotificationConfigsRequest = struct {
@@ -722,82 +1061,60 @@ pub const ListTaskPushNotificationConfigsRequest = struct {
     page_token: []const u8 = "",
     /// 4.
     tenant: []const u8 = "",
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "taskId" },
+        .{ .number = 2, .json = "pageSize" },
+        .{ .number = 3, .json = "pageToken" },
+        .{ .number = 4, .json = "tenant" },
+    };
 };
-pub const list_task_push_notification_configs_request_field_numbers = .{ 1, 2, 3, 4 };
+
+comptime {
+    assertFieldTable(ListTaskPushNotificationConfigsRequest);
+}
 
 pub const ListTaskPushNotificationConfigsResponse = struct {
     /// 1.
     configs: []const TaskPushNotificationConfig = &.{},
     /// 2. Unlike `ListTasksResponse.next_page_token`, this is not required.
     next_page_token: []const u8 = "",
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "configs" },
+        .{ .number = 2, .json = "nextPageToken" },
+    };
 };
-pub const list_task_push_notification_configs_response_field_numbers = .{ 1, 2 };
+
+comptime {
+    assertFieldTable(ListTaskPushNotificationConfigsResponse);
+}
 
 pub const GetExtendedAgentCardRequest = struct {
     /// 1.
     tenant: []const u8 = "",
-};
-pub const get_extended_agent_card_request_field_numbers = .{1};
 
-/// The `DeleteTaskPushNotificationConfig` response is `google.protobuf.Empty`.
-pub const Empty = struct {};
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "tenant" },
+    };
+};
 
 comptime {
-    assertFieldCount(SendMessageRequest, send_message_request_field_numbers);
-    assertFieldCount(GetTaskRequest, get_task_request_field_numbers);
-    assertFieldCount(ListTasksRequest, list_tasks_request_field_numbers);
-    assertFieldCount(ListTasksResponse, list_tasks_response_field_numbers);
-    assertFieldCount(CancelTaskRequest, cancel_task_request_field_numbers);
-    assertFieldCount(SubscribeToTaskRequest, subscribe_to_task_request_field_numbers);
-    assertFieldCount(
-        GetTaskPushNotificationConfigRequest,
-        get_task_push_notification_config_request_field_numbers,
-    );
-    assertFieldCount(
-        DeleteTaskPushNotificationConfigRequest,
-        delete_task_push_notification_config_request_field_numbers,
-    );
-    assertFieldCount(
-        ListTaskPushNotificationConfigsRequest,
-        list_task_push_notification_configs_request_field_numbers,
-    );
-    assertFieldCount(
-        ListTaskPushNotificationConfigsResponse,
-        list_task_push_notification_configs_response_field_numbers,
-    );
-    assertFieldCount(GetExtendedAgentCardRequest, get_extended_agent_card_request_field_numbers);
-    for (.{ "tenant", "message", "configuration", "metadata" }, 0..) |name, index| {
-        assertFieldName(SendMessageRequest, index, name);
-    }
-    for (.{ "tenant", "id", "history_length" }, 0..) |name, index| {
-        assertFieldName(GetTaskRequest, index, name);
-    }
-    for (.{
-        "tenant",         "context_id",             "status",            "page_size", "page_token",
-        "history_length", "status_timestamp_after", "include_artifacts",
-    }, 0..) |name, index| {
-        assertFieldName(ListTasksRequest, index, name);
-    }
-    for (.{ "tasks", "next_page_token", "page_size", "total_size" }, 0..) |name, index| {
-        assertFieldName(ListTasksResponse, index, name);
-    }
-    for (.{ "tenant", "id", "metadata" }, 0..) |name, index| {
-        assertFieldName(CancelTaskRequest, index, name);
-    }
-    for (.{ "tenant", "id" }, 0..) |name, index| {
-        assertFieldName(SubscribeToTaskRequest, index, name);
-    }
-    for (.{ "tenant", "task_id", "id" }, 0..) |name, index| {
-        assertFieldName(GetTaskPushNotificationConfigRequest, index, name);
-        assertFieldName(DeleteTaskPushNotificationConfigRequest, index, name);
-    }
-    for (.{ "task_id", "page_size", "page_token", "tenant" }, 0..) |name, index| {
-        assertFieldName(ListTaskPushNotificationConfigsRequest, index, name);
-    }
-    for (.{ "configs", "next_page_token" }, 0..) |name, index| {
-        assertFieldName(ListTaskPushNotificationConfigsResponse, index, name);
-    }
-    assertFieldName(GetExtendedAgentCardRequest, 0, "tenant");
+    assertFieldTable(GetExtendedAgentCardRequest);
+}
+
+/// The `DeleteTaskPushNotificationConfig` response is `google.protobuf.Empty`.
+pub const Empty = struct {
+    /// The message declares no field, so the table is empty and a codec writes
+    /// an empty object.
+    pub const fields = [_]Field{};
+};
+
+comptime {
+    assertFieldTable(Empty);
 }
 
 // --- 5.3 Service and bindings --------------------------------------------------
@@ -1201,11 +1518,9 @@ pub fn errorForReason(reason: []const u8) ?A2aError {
 
 // --- 5.5 Agent Card ------------------------------------------------------------
 
-/// The `AgentCard` field-number table. Field 15 is the lowest unused, and the
-/// proto's `// Next ID: 20` marker reserves through 19.
-pub const agent_card_field_numbers = [_]i32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 };
-
-/// The field number the proto reserves for the next `AgentCard` field.
+/// The field number the proto reserves for the next `AgentCard` field. Field 15
+/// is the lowest unused, and the proto's `// Next ID: 20` marker reserves
+/// through 19.
 pub const agent_card_next_id: i32 = 20;
 
 /// A field of `AgentCard` the specification removed in 1.0 relative to 0.3.
@@ -1227,16 +1542,18 @@ pub const AgentInterface = struct {
     tenant: ?[]const u8 = null,
     /// 4. Required. `Major.Minor` only, never a patch.
     protocol_version: []const u8,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "url" },
+        .{ .number = 2, .json = "protocolBinding" },
+        .{ .number = 3, .json = "tenant" },
+        .{ .number = 4, .json = "protocolVersion" },
+    };
 };
 
-pub const agent_interface_field_numbers = .{ 1, 2, 3, 4 };
-
 comptime {
-    assertFieldCount(AgentInterface, agent_interface_field_numbers);
-    assertFieldName(AgentInterface, 0, "url");
-    assertFieldName(AgentInterface, 1, "protocol_binding");
-    assertFieldName(AgentInterface, 2, "tenant");
-    assertFieldName(AgentInterface, 3, "protocol_version");
+    assertFieldTable(AgentInterface);
 }
 
 /// `AgentCardSignature`. The `protected` and `signature` members are required;
@@ -1248,7 +1565,18 @@ pub const AgentCardSignature = struct {
     signature: []const u8,
     /// 3. The JWS unprotected header, as a JSON object rather than base64url.
     header: ?[]const u8 = null,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "protected" },
+        .{ .number = 2, .json = "signature" },
+        .{ .number = 3, .json = "header" },
+    };
 };
+
+comptime {
+    assertFieldTable(AgentCardSignature);
+}
 
 /// `AgentProvider`, field numbers 1 to 2.
 pub const AgentProvider = struct {
@@ -1256,14 +1584,16 @@ pub const AgentProvider = struct {
     url: []const u8,
     /// 2. Required.
     organization: []const u8,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "url" },
+        .{ .number = 2, .json = "organization" },
+    };
 };
 
-pub const agent_provider_field_numbers = .{ 1, 2 };
-
 comptime {
-    assertFieldCount(AgentProvider, agent_provider_field_numbers);
-    assertFieldName(AgentProvider, 0, "url");
-    assertFieldName(AgentProvider, 1, "organization");
+    assertFieldTable(AgentProvider);
 }
 
 /// `AgentCapabilities`, field numbers 1 to 4.
@@ -1280,16 +1610,18 @@ pub const AgentCapabilities = struct {
     extensions: []const AgentExtension = &.{},
     /// 4. Gates `GetExtendedAgentCard`.
     extended_agent_card: ?bool = null,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "streaming" },
+        .{ .number = 2, .json = "pushNotifications" },
+        .{ .number = 3, .json = "extensions" },
+        .{ .number = 4, .json = "extendedAgentCard" },
+    };
 };
 
-pub const agent_capabilities_field_numbers = .{ 1, 2, 3, 4 };
-
 comptime {
-    assertFieldCount(AgentCapabilities, agent_capabilities_field_numbers);
-    assertFieldName(AgentCapabilities, 0, "streaming");
-    assertFieldName(AgentCapabilities, 1, "push_notifications");
-    assertFieldName(AgentCapabilities, 2, "extensions");
-    assertFieldName(AgentCapabilities, 3, "extended_agent_card");
+    assertFieldTable(AgentCapabilities);
 }
 
 /// `AgentExtension`, field numbers 1 to 4.
@@ -1309,16 +1641,18 @@ pub const AgentExtension = struct {
     required: bool = false,
     /// 4. Extension settings, kept as the raw JSON the caller borrowed.
     params: ?[]const u8 = null,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "uri" },
+        .{ .number = 2, .json = "description" },
+        .{ .number = 3, .json = "required" },
+        .{ .number = 4, .json = "params" },
+    };
 };
 
-pub const agent_extension_field_numbers = .{ 1, 2, 3, 4 };
-
 comptime {
-    assertFieldCount(AgentExtension, agent_extension_field_numbers);
-    assertFieldName(AgentExtension, 0, "uri");
-    assertFieldName(AgentExtension, 1, "description");
-    assertFieldName(AgentExtension, 2, "required");
-    assertFieldName(AgentExtension, 3, "params");
+    assertFieldTable(AgentExtension);
 }
 
 /// `AgentSkill`, field numbers 1 to 8.
@@ -1342,24 +1676,25 @@ pub const AgentSkill = struct {
     /// client did not activate is what `ExtensionSupportRequiredError`
     /// follows from.
     security_requirements: []const SecurityRequirement = &.{},
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "id" },
+        .{ .number = 2, .json = "name" },
+        .{ .number = 3, .json = "description" },
+        .{ .number = 4, .json = "tags" },
+        .{ .number = 5, .json = "examples" },
+        .{ .number = 6, .json = "inputModes" },
+        .{ .number = 7, .json = "outputModes" },
+        .{ .number = 8, .json = "securityRequirements" },
+    };
 };
 
-pub const agent_skill_field_numbers = .{ 1, 2, 3, 4, 5, 6, 7, 8 };
-
 comptime {
-    assertFieldCount(AgentSkill, agent_skill_field_numbers);
-    assertFieldName(AgentSkill, 0, "id");
-    assertFieldName(AgentSkill, 1, "name");
-    assertFieldName(AgentSkill, 2, "description");
-    assertFieldName(AgentSkill, 3, "tags");
-    assertFieldName(AgentSkill, 4, "examples");
-    assertFieldName(AgentSkill, 5, "input_modes");
-    assertFieldName(AgentSkill, 6, "output_modes");
-    assertFieldName(AgentSkill, 7, "security_requirements");
+    assertFieldTable(AgentSkill);
 }
 
-/// `AgentCard`, field numbers 1 to 14, checked against
-/// `agent_card_field_numbers`.
+/// `AgentCard`, field numbers 1 to 14, listed in `fields`.
 ///
 /// Eight fields are REQUIRED and six are not, and those eight carry no default
 /// here: a card that omits one is a decode error, not a card the library
@@ -1375,6 +1710,11 @@ pub const AgentCard = struct {
     /// 4.
     provider: ?AgentProvider = null,
     /// 5. Required. Never carries a patch component.
+    ///
+    /// PROTOCOLS.md section 5.1: "Patch versions MUST NOT appear in a request,
+    /// a response, or an Agent Card." A card version is otherwise free text, so
+    /// `parseVersion` is what a consumer reads it with and `1.0.0` is a value no
+    /// peer may send.
     version: []const u8,
     /// 6. `optional` in the proto, so presence is explicit.
     documentation_url: ?[]const u8 = null,
@@ -1395,43 +1735,31 @@ pub const AgentCard = struct {
     signatures: []const AgentCardSignature = &.{},
     /// 14. `optional` in the proto, so presence is explicit.
     icon_url: ?[]const u8 = null,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "name" },
+        .{ .number = 2, .json = "description" },
+        .{ .number = 3, .json = "supportedInterfaces" },
+        .{ .number = 4, .json = "provider" },
+        .{ .number = 5, .json = "version" },
+        .{ .number = 6, .json = "documentationUrl" },
+        .{ .number = 7, .json = "capabilities" },
+        .{ .number = 8, .json = "securitySchemes" },
+        .{ .number = 9, .json = "securityRequirements" },
+        .{ .number = 10, .json = "defaultInputModes" },
+        .{ .number = 11, .json = "defaultOutputModes" },
+        .{ .number = 12, .json = "skills" },
+        .{ .number = 13, .json = "signatures" },
+        .{ .number = 14, .json = "iconUrl" },
+    };
 };
 
 comptime {
-    assertFieldCount(AgentCard, agent_card_field_numbers);
-    assertFieldName(AgentCard, 0, "name");
-    assertFieldName(AgentCard, 1, "description");
-    assertFieldName(AgentCard, 2, "supported_interfaces");
-    assertFieldName(AgentCard, 3, "provider");
-    assertFieldName(AgentCard, 4, "version");
-    assertFieldName(AgentCard, 5, "documentation_url");
-    assertFieldName(AgentCard, 6, "capabilities");
-    assertFieldName(AgentCard, 7, "security_schemes");
-    assertFieldName(AgentCard, 8, "security_requirements");
-    assertFieldName(AgentCard, 9, "default_input_modes");
-    assertFieldName(AgentCard, 10, "default_output_modes");
-    assertFieldName(AgentCard, 11, "skills");
-    assertFieldName(AgentCard, 12, "signatures");
-    assertFieldName(AgentCard, 13, "icon_url");
-}
-
-pub const agent_card_signature_field_numbers = .{ 1, 2, 3 };
-
-comptime {
-    assertFieldCount(AgentCardSignature, agent_card_signature_field_numbers);
-    assertFieldName(AgentCardSignature, 0, "protected");
-    assertFieldName(AgentCardSignature, 1, "signature");
-    assertFieldName(AgentCardSignature, 2, "header");
+    assertFieldTable(AgentCard);
 }
 
 // --- 5.7 Security schemes ------------------------------------------------------
-
-/// The field numbers of a protobuf `map` entry.
-///
-/// A map reaches the wire as a repeated synthetic message whose field 1 is the
-/// key and field 2 is the value, whatever the two types are, so every map entry
-/// in this file is numbered from this one table instead of repeating the pair.
-pub const map_entry_field_numbers = .{ 1, 2 };
 
 /// `StringList`, field 1.
 ///
@@ -1441,42 +1769,60 @@ pub const map_entry_field_numbers = .{ 1, 2 };
 pub const StringList = struct {
     /// 1.
     list: []const []const u8 = &.{},
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "list" },
+    };
 };
 
-pub const string_list_field_numbers = .{1};
-
 comptime {
-    assertFieldCount(StringList, string_list_field_numbers);
-    assertFieldName(StringList, 0, "list");
+    assertFieldTable(StringList);
 }
 
 /// One `SecurityRequirement.schemes` entry: a scheme name and the scopes it
 /// needs.
+///
+/// A protobuf map reaches the wire as a repeated synthetic message whose field
+/// 1 is the key and field 2 is the value. ProtoJSON renders the same entry as
+/// the single member the key names, so neither half of this struct is a member
+/// of its own and `json` is null on both rows.
 pub const SecurityRequirementEntry = struct {
     /// 1, the map key.
     name: []const u8,
     /// 2, the map value.
     list: StringList,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = null, .zig_name = "name" },
+        .{ .number = 2, .json = null, .zig_name = "list" },
+    };
 };
 
 comptime {
-    assertFieldCount(SecurityRequirementEntry, map_entry_field_numbers);
-    assertFieldName(SecurityRequirementEntry, 0, "name");
-    assertFieldName(SecurityRequirementEntry, 1, "list");
+    assertFieldTable(SecurityRequirementEntry);
 }
 
 /// One `AgentCard.security_schemes` entry: a scheme name and its definition.
+///
+/// A map entry is the single member the key names in ProtoJSON, so `json` is
+/// null on both rows. See `SecurityRequirementEntry`.
 pub const SecuritySchemeEntry = struct {
     /// 1, the map key. It is what a `SecurityRequirement` names.
     name: []const u8,
     /// 2, the map value.
     scheme: SecurityScheme,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = null, .zig_name = "name" },
+        .{ .number = 2, .json = null, .zig_name = "scheme" },
+    };
 };
 
 comptime {
-    assertFieldCount(SecuritySchemeEntry, map_entry_field_numbers);
-    assertFieldName(SecuritySchemeEntry, 0, "name");
-    assertFieldName(SecuritySchemeEntry, 1, "scheme");
+    assertFieldTable(SecuritySchemeEntry);
 }
 
 /// `SecurityRequirement`, field 1.
@@ -1487,13 +1833,15 @@ comptime {
 pub const SecurityRequirement = struct {
     /// 1.
     schemes: []const SecurityRequirementEntry = &.{},
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "schemes" },
+    };
 };
 
-pub const security_requirement_field_numbers = .{1};
-
 comptime {
-    assertFieldCount(SecurityRequirement, security_requirement_field_numbers);
-    assertFieldName(SecurityRequirement, 0, "schemes");
+    assertFieldTable(SecurityRequirement);
 }
 
 /// `APIKeySecurityScheme.location`, which the proto leaves unconstrained and
@@ -1516,6 +1864,11 @@ pub const ApiKeyLocation = enum {
 };
 
 /// The `SecurityScheme` `oneof` on `scheme`, section 5.7.
+///
+/// ProtoJSON spells each member with the full `SecurityScheme` suffix and the
+/// Zig member name drops it, so all five rows override the derived name. The
+/// proto spells the first one `api_key_security_scheme`, ProtoJSON spells it
+/// `apiKeySecurityScheme`, and this library calls it `api_key`.
 pub const SecurityScheme = union(enum) {
     /// Variant 1. Requires `location` (2) and `name` (3).
     api_key: ApiKeySecurityScheme,
@@ -1527,7 +1880,20 @@ pub const SecurityScheme = union(enum) {
     open_id_connect: OpenIdConnectSecurityScheme,
     /// Variant 5. Only an optional `description` (1).
     mtls: MutualTlsSecurityScheme,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "apiKeySecurityScheme", .zig_name = "api_key" },
+        .{ .number = 2, .json = "httpAuthSecurityScheme", .zig_name = "http_auth" },
+        .{ .number = 3, .json = "oauth2SecurityScheme", .zig_name = "oauth2" },
+        .{ .number = 4, .json = "openIdConnectSecurityScheme", .zig_name = "open_id_connect" },
+        .{ .number = 5, .json = "mtlsSecurityScheme", .zig_name = "mtls" },
+    };
 };
+
+comptime {
+    assertFieldTable(SecurityScheme);
+}
 
 /// The `OAuthFlows` `oneof` on `flow`, section 5.7.
 pub const OAuthFlows = union(enum) {
@@ -1541,17 +1907,20 @@ pub const OAuthFlows = union(enum) {
     password: PasswordOAuthFlow,
     /// 5.
     device_code: DeviceCodeOAuthFlow,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "authorizationCode" },
+        .{ .number = 2, .json = "clientCredentials" },
+        .{ .number = 3, .json = "implicit" },
+        .{ .number = 4, .json = "password" },
+        .{ .number = 5, .json = "deviceCode" },
+    };
 };
 
-/// The `OAuthFlows` `oneof` field numbers, as a table because a union carries
-/// no field order of its own to check one against.
-pub const oauth_flows_field_number = struct {
-    pub const authorization_code = 1;
-    pub const client_credentials = 2;
-    pub const implicit = 3;
-    pub const password = 4;
-    pub const device_code = 5;
-};
+comptime {
+    assertFieldTable(OAuthFlows);
+}
 
 /// One entry of a flow's `scopes`, which the proto types `map<string, string>`.
 ///
@@ -1559,17 +1928,24 @@ pub const oauth_flows_field_number = struct {
 /// OpenAPI 3.2 Security Scheme Object this proto mirrors. PROTOCOLS.md
 /// section 5.7 does not restate what the value means, so the field names
 /// follow the OpenAPI object rather than a second reading of the proto.
+///
+/// A map entry is the single member the key names in ProtoJSON, so `json` is
+/// null on both rows. See `SecurityRequirementEntry`.
 pub const OAuthScope = struct {
     /// 1, the map key.
     name: []const u8,
     /// 2, the map value.
     description: []const u8,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = null, .zig_name = "name" },
+        .{ .number = 2, .json = null, .zig_name = "description" },
+    };
 };
 
 comptime {
-    assertFieldCount(OAuthScope, map_entry_field_numbers);
-    assertFieldName(OAuthScope, 0, "name");
-    assertFieldName(OAuthScope, 1, "description");
+    assertFieldTable(OAuthScope);
 }
 
 /// `AuthorizationCodeOAuthFlow`, field numbers 1 to 5.
@@ -1587,17 +1963,19 @@ pub const AuthorizationCodeOAuthFlow = struct {
     /// therefore has no presence bit. False is a published flow without PKCE,
     /// which is a weaker flow rather than an absent one.
     pkce_required: bool = false,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "authorizationUrl" },
+        .{ .number = 2, .json = "tokenUrl" },
+        .{ .number = 3, .json = "refreshUrl" },
+        .{ .number = 4, .json = "scopes" },
+        .{ .number = 5, .json = "pkceRequired" },
+    };
 };
 
-pub const authorization_code_oauth_flow_field_numbers = .{ 1, 2, 3, 4, 5 };
-
 comptime {
-    assertFieldCount(AuthorizationCodeOAuthFlow, authorization_code_oauth_flow_field_numbers);
-    assertFieldName(AuthorizationCodeOAuthFlow, 0, "authorization_url");
-    assertFieldName(AuthorizationCodeOAuthFlow, 1, "token_url");
-    assertFieldName(AuthorizationCodeOAuthFlow, 2, "refresh_url");
-    assertFieldName(AuthorizationCodeOAuthFlow, 3, "scopes");
-    assertFieldName(AuthorizationCodeOAuthFlow, 4, "pkce_required");
+    assertFieldTable(AuthorizationCodeOAuthFlow);
 }
 
 /// `ClientCredentialsOAuthFlow`, field numbers 1 to 3.
@@ -1611,15 +1989,17 @@ pub const ClientCredentialsOAuthFlow = struct {
     refresh_url: ?[]const u8 = null,
     /// 3. Required.
     scopes: []const OAuthScope,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "tokenUrl" },
+        .{ .number = 2, .json = "refreshUrl" },
+        .{ .number = 3, .json = "scopes" },
+    };
 };
 
-pub const client_credentials_oauth_flow_field_numbers = .{ 1, 2, 3 };
-
 comptime {
-    assertFieldCount(ClientCredentialsOAuthFlow, client_credentials_oauth_flow_field_numbers);
-    assertFieldName(ClientCredentialsOAuthFlow, 0, "token_url");
-    assertFieldName(ClientCredentialsOAuthFlow, 1, "refresh_url");
-    assertFieldName(ClientCredentialsOAuthFlow, 2, "scopes");
+    assertFieldTable(ClientCredentialsOAuthFlow);
 }
 
 /// `ImplicitOAuthFlow`, field numbers 1 to 3. **Deprecated** in the proto,
@@ -1634,15 +2014,17 @@ pub const ImplicitOAuthFlow = struct {
     refresh_url: ?[]const u8 = null,
     /// 3.
     scopes: []const OAuthScope = &.{},
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "authorizationUrl" },
+        .{ .number = 2, .json = "refreshUrl" },
+        .{ .number = 3, .json = "scopes" },
+    };
 };
 
-pub const implicit_oauth_flow_field_numbers = .{ 1, 2, 3 };
-
 comptime {
-    assertFieldCount(ImplicitOAuthFlow, implicit_oauth_flow_field_numbers);
-    assertFieldName(ImplicitOAuthFlow, 0, "authorization_url");
-    assertFieldName(ImplicitOAuthFlow, 1, "refresh_url");
-    assertFieldName(ImplicitOAuthFlow, 2, "scopes");
+    assertFieldTable(ImplicitOAuthFlow);
 }
 
 /// `PasswordOAuthFlow`, field numbers 1 to 3. **Deprecated** in the proto,
@@ -1658,15 +2040,17 @@ pub const PasswordOAuthFlow = struct {
     refresh_url: ?[]const u8 = null,
     /// 3.
     scopes: []const OAuthScope = &.{},
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "tokenUrl" },
+        .{ .number = 2, .json = "refreshUrl" },
+        .{ .number = 3, .json = "scopes" },
+    };
 };
 
-pub const password_oauth_flow_field_numbers = .{ 1, 2, 3 };
-
 comptime {
-    assertFieldCount(PasswordOAuthFlow, password_oauth_flow_field_numbers);
-    assertFieldName(PasswordOAuthFlow, 0, "token_url");
-    assertFieldName(PasswordOAuthFlow, 1, "refresh_url");
-    assertFieldName(PasswordOAuthFlow, 2, "scopes");
+    assertFieldTable(PasswordOAuthFlow);
 }
 
 /// `DeviceCodeOAuthFlow`, field numbers 1 to 4.
@@ -1683,16 +2067,18 @@ pub const DeviceCodeOAuthFlow = struct {
     refresh_url: ?[]const u8 = null,
     /// 4. Required.
     scopes: []const OAuthScope,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "deviceAuthorizationUrl" },
+        .{ .number = 2, .json = "tokenUrl" },
+        .{ .number = 3, .json = "refreshUrl" },
+        .{ .number = 4, .json = "scopes" },
+    };
 };
 
-pub const device_code_oauth_flow_field_numbers = .{ 1, 2, 3, 4 };
-
 comptime {
-    assertFieldCount(DeviceCodeOAuthFlow, device_code_oauth_flow_field_numbers);
-    assertFieldName(DeviceCodeOAuthFlow, 0, "device_authorization_url");
-    assertFieldName(DeviceCodeOAuthFlow, 1, "token_url");
-    assertFieldName(DeviceCodeOAuthFlow, 2, "refresh_url");
-    assertFieldName(DeviceCodeOAuthFlow, 3, "scopes");
+    assertFieldTable(DeviceCodeOAuthFlow);
 }
 
 pub const ApiKeySecurityScheme = struct {
@@ -1702,15 +2088,17 @@ pub const ApiKeySecurityScheme = struct {
     location: ApiKeyLocation,
     /// 3. Required.
     name: []const u8,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "description" },
+        .{ .number = 2, .json = "location" },
+        .{ .number = 3, .json = "name" },
+    };
 };
 
-pub const api_key_security_scheme_field_numbers = .{ 1, 2, 3 };
-
 comptime {
-    assertFieldCount(ApiKeySecurityScheme, api_key_security_scheme_field_numbers);
-    assertFieldName(ApiKeySecurityScheme, 0, "description");
-    assertFieldName(ApiKeySecurityScheme, 1, "location");
-    assertFieldName(ApiKeySecurityScheme, 2, "name");
+    assertFieldTable(ApiKeySecurityScheme);
 }
 
 pub const HttpAuthSecurityScheme = struct {
@@ -1720,15 +2108,17 @@ pub const HttpAuthSecurityScheme = struct {
     scheme: []const u8,
     /// 3.
     bearer_format: ?[]const u8 = null,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "description" },
+        .{ .number = 2, .json = "scheme" },
+        .{ .number = 3, .json = "bearerFormat" },
+    };
 };
 
-pub const http_auth_security_scheme_field_numbers = .{ 1, 2, 3 };
-
 comptime {
-    assertFieldCount(HttpAuthSecurityScheme, http_auth_security_scheme_field_numbers);
-    assertFieldName(HttpAuthSecurityScheme, 0, "description");
-    assertFieldName(HttpAuthSecurityScheme, 1, "scheme");
-    assertFieldName(HttpAuthSecurityScheme, 2, "bearer_format");
+    assertFieldTable(HttpAuthSecurityScheme);
 }
 
 pub const OAuth2SecurityScheme = struct {
@@ -1738,15 +2128,17 @@ pub const OAuth2SecurityScheme = struct {
     flows: OAuthFlows,
     /// 3.
     oauth2_metadata_url: ?[]const u8 = null,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "description" },
+        .{ .number = 2, .json = "flows" },
+        .{ .number = 3, .json = "oauth2MetadataUrl" },
+    };
 };
 
-pub const oauth2_security_scheme_field_numbers = .{ 1, 2, 3 };
-
 comptime {
-    assertFieldCount(OAuth2SecurityScheme, oauth2_security_scheme_field_numbers);
-    assertFieldName(OAuth2SecurityScheme, 0, "description");
-    assertFieldName(OAuth2SecurityScheme, 1, "flows");
-    assertFieldName(OAuth2SecurityScheme, 2, "oauth2_metadata_url");
+    assertFieldTable(OAuth2SecurityScheme);
 }
 
 pub const OpenIdConnectSecurityScheme = struct {
@@ -1754,26 +2146,30 @@ pub const OpenIdConnectSecurityScheme = struct {
     description: ?[]const u8 = null,
     /// 2. Required.
     open_id_connect_url: []const u8,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "description" },
+        .{ .number = 2, .json = "openIdConnectUrl" },
+    };
 };
 
-pub const open_id_connect_security_scheme_field_numbers = .{ 1, 2 };
-
 comptime {
-    assertFieldCount(OpenIdConnectSecurityScheme, open_id_connect_security_scheme_field_numbers);
-    assertFieldName(OpenIdConnectSecurityScheme, 0, "description");
-    assertFieldName(OpenIdConnectSecurityScheme, 1, "open_id_connect_url");
+    assertFieldTable(OpenIdConnectSecurityScheme);
 }
 
 pub const MutualTlsSecurityScheme = struct {
     /// 1.
     description: ?[]const u8 = null,
+
+    /// The ProtoJSON name of every field, in field order.
+    pub const fields = [_]Field{
+        .{ .number = 1, .json = "description" },
+    };
 };
 
-pub const mutual_tls_security_scheme_field_numbers = .{1};
-
 comptime {
-    assertFieldCount(MutualTlsSecurityScheme, mutual_tls_security_scheme_field_numbers);
-    assertFieldName(MutualTlsSecurityScheme, 0, "description");
+    assertFieldTable(MutualTlsSecurityScheme);
 }
 
 // --- 5.8 Extensions ------------------------------------------------------------
@@ -1834,17 +2230,138 @@ pub const extension_missing_error = A2aError.extension_support_required;
 
 const testing = std.testing;
 
-/// Assert that a field-number table runs 1 to its own length.
+/// Assert that every `oneof` member's field number is its tag ordinal plus one.
 ///
-/// The comptime checks tie a field name to a position. This ties the position
-/// to the number a protobuf encoder emits, which is the half nothing else
-/// checks: a table with a gap or a repeat still passes `assertFieldCount`.
-fn expectContiguousFieldNumbers(comptime numbers: anytype) !void {
-    var expected: i32 = 1;
-    inline for (numbers) |number| {
-        try testing.expectEqual(expected, @as(i32, number));
-        expected += 1;
+/// The comptime guard ties a member to its row. This ties the row to the tag
+/// ordinal a codec switches on, which is the number that looks like the field
+/// number and is not.
+fn expectUnionOrdinals(comptime U: type) !void {
+    // The five `oneof` types are tagged unions, so the unwrap cannot fail here.
+    const tag_type = @typeInfo(U).@"union".tag_type.?;
+    inline for (@typeInfo(tag_type).@"enum".fields, 0..) |tag, index| {
+        const ordinal: usize = @intCast(@intFromEnum(@field(tag_type, tag.name)));
+        try testing.expectEqual(index, ordinal);
+        try testing.expectEqual(index + 1, U.fields[index].number);
     }
+}
+
+test "a oneof field number is the tag ordinal plus one" {
+    // A `union(enum)` tag is 0-based, so the member at ordinal 0 is field 1. A
+    // codec that takes `@intFromEnum(tag)` for the number writes every oneof
+    // field one below where the proto puts it, so a part's `text` arrives as a
+    // part's `raw` and a stream's `artifact_update` as its `task`.
+    try expectUnionOrdinals(PartContent);
+    try expectUnionOrdinals(SendMessageResponse);
+    try expectUnionOrdinals(StreamResponse);
+    try expectUnionOrdinals(SecurityScheme);
+    try expectUnionOrdinals(OAuthFlows);
+
+    // The first member of each union is field 1 and the last is field N, so the
+    // offset is one at both ends rather than somewhere in the middle.
+    try testing.expectEqual(@as(u32, 1), fieldNumber(PartContent, 0));
+    try testing.expectEqual(@as(u32, 4), fieldNumber(PartContent, 3));
+    try testing.expectEqual(@as(u32, 1), fieldNumber(SendMessageResponse, 0));
+    try testing.expectEqual(@as(u32, 1), fieldNumber(StreamResponse, 0));
+    try testing.expectEqual(@as(u32, 4), fieldNumber(StreamResponse, 3));
+    try testing.expectEqual(@as(u32, 1), fieldNumber(SecurityScheme, 0));
+    try testing.expectEqual(@as(u32, 5), fieldNumber(SecurityScheme, 4));
+    try testing.expectEqual(@as(u32, 1), fieldNumber(OAuthFlows, 0));
+    try testing.expectEqual(@as(u32, 5), fieldNumber(OAuthFlows, 4));
+}
+
+test "a field name is the snake_case form of the name ProtoJSON writes" {
+    // The rule is why a row carries a `zig_name` at all: the proto spells a field
+    // in snake_case and ProtoJSON in camelCase, so the Zig name follows from the
+    // member name. A codec that wrote the Zig spelling would send `context_id`
+    // where a peer reads `contextId`.
+    try testing.expectEqualStrings("context_id", snakeCaseName("contextId"));
+    try testing.expectEqualStrings("icon_url", snakeCaseName("iconUrl"));
+    try testing.expectEqualStrings(
+        "status_timestamp_after",
+        snakeCaseName("statusTimestampAfter"),
+    );
+    // A digit takes no underscore, so `oauth2MetadataUrl` gives
+    // `oauth2_metadata_url` and not `oauth_2_metadata_url`.
+    try testing.expectEqualStrings("oauth2_metadata_url", snakeCaseName("oauth2MetadataUrl"));
+    try testing.expectEqualStrings("list", snakeCaseName("list"));
+
+    // Every field of a message follows the rule, with no override in sight.
+    inline for (@typeInfo(AgentCard).@"struct".fields, 0..) |member, index| {
+        try testing.expectEqualStrings(
+            member.name,
+            snakeCaseName(jsonName(AgentCard, index).?),
+        );
+    }
+    inline for (@typeInfo(ListTasksRequest).@"struct".fields, 0..) |member, index| {
+        try testing.expectEqualStrings(
+            member.name,
+            snakeCaseName(jsonName(ListTasksRequest, index).?),
+        );
+    }
+}
+
+test "the five SecurityScheme arms are the only overridden names" {
+    // ProtoJSON spells the arms with the full `SecurityScheme` suffix and the Zig
+    // names drop it, so all five rows override the derivation and no other row
+    // in the file does.
+    try testing.expectEqualStrings("apiKeySecurityScheme", jsonName(SecurityScheme, 0).?);
+    try testing.expectEqualStrings("httpAuthSecurityScheme", jsonName(SecurityScheme, 1).?);
+    try testing.expectEqualStrings("oauth2SecurityScheme", jsonName(SecurityScheme, 2).?);
+    try testing.expectEqualStrings("openIdConnectSecurityScheme", jsonName(SecurityScheme, 3).?);
+    try testing.expectEqualStrings("mtlsSecurityScheme", jsonName(SecurityScheme, 4).?);
+    // The derivation would be `api_key_security_scheme`, which is neither the
+    // normative name nor the Zig one, so the row has to say which it means.
+    try testing.expectEqualStrings(
+        "api_key_security_scheme",
+        snakeCaseName(jsonName(SecurityScheme, 0).?),
+    );
+    // Every other union arm follows the rule with no override.
+    try testing.expectEqualStrings(
+        "authorization_code",
+        snakeCaseName(jsonName(OAuthFlows, 0).?),
+    );
+    try testing.expectEqualStrings(
+        "status_update",
+        snakeCaseName(jsonName(StreamResponse, 2).?),
+    );
+}
+
+test "a map entry has no member name because its key is data" {
+    // ProtoJSON renders one map entry as the single member its key names, so
+    // neither half of the entry is a member of its own and `jsonName` is null on
+    // both rows. A decoder that walked the struct would look for `name` and
+    // `list`, and no peer sends either.
+    try testing.expectEqual(@as(?[]const u8, null), jsonName(SecurityRequirementEntry, 0));
+    try testing.expectEqual(@as(?[]const u8, null), jsonName(SecurityRequirementEntry, 1));
+    try testing.expectEqual(@as(?[]const u8, null), jsonName(SecuritySchemeEntry, 0));
+    try testing.expectEqual(@as(?[]const u8, null), jsonName(SecuritySchemeEntry, 1));
+    try testing.expectEqual(@as(?[]const u8, null), jsonName(OAuthScope, 0));
+    try testing.expectEqual(@as(?[]const u8, null), jsonName(OAuthScope, 1));
+    // The key is field 1 and the value field 2, on all three.
+    try testing.expectEqual(@as(u32, 1), fieldNumber(OAuthScope, 0));
+    try testing.expectEqual(@as(u32, 2), fieldNumber(OAuthScope, 1));
+    // A `oneof` the struct holds as one field is the other null case.
+    try testing.expectEqual(@as(?[]const u8, null), jsonName(Part, 0));
+    try testing.expectEqualStrings("mediaType", jsonName(Part, 3).?);
+}
+
+test "findField resolves a member name and rejects one the message does not carry" {
+    // `findField` returns a 0-based row index and `fieldNumber` returns the
+    // number a protobuf encoder emits, so the two are one apart and are not
+    // interchangeable: `supportedInterfaces` is field 3 and row 2.
+    try testing.expectEqual(@as(?usize, 2), findField(AgentCard, "supportedInterfaces"));
+    try testing.expectEqual(@as(u32, 3), fieldNumber(AgentCard, 2));
+    try testing.expectEqual(@as(?usize, 13), findField(AgentCard, "iconUrl"));
+    try testing.expectEqual(@as(?usize, 6), findField(ListTasksRequest, "statusTimestampAfter"));
+    try testing.expectEqual(@as(?usize, 0), findField(SecurityScheme, "apiKeySecurityScheme"));
+    // The Zig spelling is not the member name, so a decoder that asked for it
+    // gets null rather than the field it meant.
+    try testing.expectEqual(@as(?usize, null), findField(AgentCard, "icon_url"));
+    try testing.expectEqual(@as(?usize, null), findField(AgentCard, "supported_interfaces"));
+    // A name no revision of this protocol carries is null too.
+    try testing.expectEqual(@as(?usize, null), findField(AgentCard, "protocolVersion"));
+    // A row with no member name of its own is found under nothing.
+    try testing.expectEqual(@as(?usize, null), findField(OAuthScope, "name"));
 }
 
 test "the protobuf package carries the lf prefix" {
@@ -2181,6 +2698,20 @@ test "the API key location accepts exactly the three stated values" {
     try testing.expectError(error.UnknownTag, ApiKeyLocation.parse("body"));
 }
 
+test "an API key location renders the spelling the location field carries" {
+    // `parse` accepts three exact strings and nothing else, so a receiver that
+    // writes the location back out, or compares two cards for it, has to render
+    // the same three. A renderer that emitted `Query` or `HEADER` would write a
+    // value its own `parse` rejects.
+    try testing.expectEqualStrings("query", ApiKeyLocation.query.string());
+    try testing.expectEqualStrings("header", ApiKeyLocation.header.string());
+    try testing.expectEqualStrings("cookie", ApiKeyLocation.cookie.string());
+    inline for (@typeInfo(ApiKeyLocation).@"enum".fields) |field| {
+        const value: ApiKeyLocation = @field(ApiKeyLocation, field.name);
+        try testing.expectEqual(value, try ApiKeyLocation.parse(value.string()));
+    }
+}
+
 test "a required extension that is not activated is -32008" {
     const activations = [_][]const u8{"https://example.com/extensions/geolocation/v1"};
     const other = "https://example.com/extensions/citations/v1";
@@ -2197,20 +2728,38 @@ test "a required extension that is not activated is -32008" {
     try testing.expectEqual(@as(i32, -32008), @intFromEnum(extension_missing_error));
 }
 
-test "an AgentInterface version must be Major.Minor" {
+test "an AgentInterface carries a protocol version with no patch component" {
+    try testing.expectEqual(@as(u32, 4), fieldNumber(AgentInterface, 3));
+    try testing.expectEqualStrings("protocolVersion", jsonName(AgentInterface, 3).?);
+    // Field 4 is the `Major.Minor` version, so this is the whole required set:
+    // `url` and `protocol_binding` are the other two, and `tenant` is optional.
+    const interface: AgentInterface = .{
+        .url = "https://api.example.com/a2a/v1",
+        .protocol_binding = binding.jsonrpc,
+        .protocol_version = "1.0",
+    };
+    try testing.expectEqualStrings("JSONRPC", interface.protocol_binding);
+    try testing.expectEqual(@as(?[]const u8, null), interface.tenant);
+    // The version parses, and the patch form the `A2A-Version` header rejects is
+    // the same form an interface must not publish, so both go through the one
+    // parser rather than two rules that can drift.
+    const parsed = try parseVersion(interface.protocol_version);
+    try testing.expectEqual(@as(u16, 1), parsed.major);
+    try testing.expectEqual(@as(u16, 0), parsed.minor);
     try testing.expectError(error.InvalidField, parseVersion("1.0.0"));
-    try testing.expectEqual(@as(u16, 1), (try parseVersion("1.0")).major);
     try testing.expectEqual(@as(u16, 3), (try parseVersion("0.3")).minor);
 }
 
 test "the agent card field range leaves 15 free" {
-    try testing.expectEqual(@as(usize, 14), agent_card_field_numbers.len);
+    try testing.expectEqual(@as(usize, 14), AgentCard.fields.len);
+    // The highest number the card uses is 14, so 15 is the lowest free one.
+    try testing.expectEqual(@as(u32, 14), fieldNumber(AgentCard, 13));
     try testing.expectEqual(@as(i32, 20), agent_card_next_id);
     try testing.expectEqual(@as(usize, 5), removed_agent_card_fields.len);
 }
 
 test "AuthenticationInfo requires a scheme and keeps credentials optional" {
-    try expectContiguousFieldNumbers(authentication_info_field_numbers);
+    try testing.expectEqualStrings("credentials", jsonName(AuthenticationInfo, 1).?);
     // `scheme` is the only REQUIRED field, so it is the only one a minimal
     // value has to set, and a missing credential is not an empty credential.
     const info: AuthenticationInfo = .{ .scheme = "Bearer" };
@@ -2219,7 +2768,9 @@ test "AuthenticationInfo requires a scheme and keeps credentials optional" {
 }
 
 test "TaskPushNotificationConfig numbers the webhook url 4 and its token 5" {
-    try expectContiguousFieldNumbers(task_push_notification_config_field_numbers);
+    // The test name says so, and a codec reads both numbers from the table.
+    try testing.expectEqual(@as(u32, 4), fieldNumber(TaskPushNotificationConfig, 3));
+    try testing.expectEqual(@as(u32, 5), fieldNumber(TaskPushNotificationConfig, 4));
     // `url` is the only REQUIRED field. The rest is what a server fills in on
     // create, so a client that knows only where to post can still build one.
     const config: TaskPushNotificationConfig = .{
@@ -2248,7 +2799,8 @@ test "TaskPushNotificationConfig numbers the webhook url 4 and its token 5" {
 }
 
 test "StringList is field 1 and keeps the singular JSON name" {
-    try expectContiguousFieldNumbers(string_list_field_numbers);
+    try testing.expectEqual(@as(u32, 1), fieldNumber(StringList, 0));
+    try testing.expectEqualStrings("list", jsonName(StringList, 0).?);
     // The proto disables the pluralisation lint on this message, so the wire
     // name is `list`. A decoder that looked for `lists` would read nothing.
     const scopes: StringList = .{ .list = &.{ "openid", "a2a.tasks" } };
@@ -2257,8 +2809,8 @@ test "StringList is field 1 and keeps the singular JSON name" {
 }
 
 test "a security requirement maps a scheme name to the scopes it needs" {
-    try expectContiguousFieldNumbers(security_requirement_field_numbers);
-    try expectContiguousFieldNumbers(map_entry_field_numbers);
+    try testing.expectEqual(@as(u32, 1), fieldNumber(SecurityRequirement, 0));
+    try testing.expectEqual(@as(?[]const u8, null), jsonName(SecurityRequirementEntry, 0));
     const requirement: SecurityRequirement = .{ .schemes = &.{
         .{ .name = "oauth", .list = .{ .list = &.{"a2a.tasks"} } },
     } };
@@ -2268,7 +2820,8 @@ test "a security requirement maps a scheme name to the scopes it needs" {
 }
 
 test "a card scheme entry pairs the name a requirement names with its scheme" {
-    try expectContiguousFieldNumbers(map_entry_field_numbers);
+    try testing.expectEqual(@as(u32, 1), fieldNumber(SecuritySchemeEntry, 0));
+    try testing.expectEqual(@as(?[]const u8, null), jsonName(SecuritySchemeEntry, 1));
     const entries = [_]SecuritySchemeEntry{.{
         .name = "oauth",
         .scheme = .{ .oauth2 = .{
@@ -2284,7 +2837,7 @@ test "a card scheme entry pairs the name a requirement names with its scheme" {
 }
 
 test "AgentProvider requires both a url and an organization" {
-    try expectContiguousFieldNumbers(agent_provider_field_numbers);
+    try testing.expectEqualStrings("organization", jsonName(AgentProvider, 1).?);
     const provider: AgentProvider = .{
         .url = "https://example.com",
         .organization = "Example",
@@ -2293,7 +2846,8 @@ test "AgentProvider requires both a url and an organization" {
 }
 
 test "an unset capability is not a capability of false" {
-    try expectContiguousFieldNumbers(agent_capabilities_field_numbers);
+    try testing.expectEqual(@as(u32, 2), fieldNumber(AgentCapabilities, 1));
+    try testing.expectEqualStrings("extendedAgentCard", jsonName(AgentCapabilities, 3).?);
     // The three booleans are proto3 `optional`, so absent and false are
     // different answers and only presence records which one a peer sent.
     const unset: AgentCapabilities = .{};
@@ -2306,7 +2860,10 @@ test "an unset capability is not a capability of false" {
 }
 
 test "AgentExtension carries required at 3 and its settings at 4" {
-    try expectContiguousFieldNumbers(agent_extension_field_numbers);
+    // The test name says so, and the member names are what a peer sends.
+    try testing.expectEqual(@as(u32, 3), fieldNumber(AgentExtension, 2));
+    try testing.expectEqual(@as(u32, 4), fieldNumber(AgentExtension, 3));
+    try testing.expectEqualStrings("params", jsonName(AgentExtension, 3).?);
     // `required` is a singular bool with no presence bit, so false is the
     // whole of a declaration that does not demand the extension.
     const uri = "https://example.com/extensions/geolocation/v1";
@@ -2323,7 +2880,8 @@ test "AgentExtension carries required at 3 and its settings at 4" {
 }
 
 test "AgentSkill numbers four required fields ahead of four optional ones" {
-    try expectContiguousFieldNumbers(agent_skill_field_numbers);
+    try testing.expectEqual(@as(u32, 4), fieldNumber(AgentSkill, 3));
+    try testing.expectEqualStrings("securityRequirements", jsonName(AgentSkill, 7).?);
     // Fields 1 to 4 are REQUIRED, so a minimal skill says what it is and how
     // to find it. Fields 5 to 8 narrow it or secure it.
     const skill: AgentSkill = .{
@@ -2336,11 +2894,11 @@ test "AgentSkill numbers four required fields ahead of four optional ones" {
     try testing.expectEqual(@as(usize, 0), skill.input_modes.len);
     try testing.expectEqual(@as(usize, 0), skill.output_modes.len);
     try testing.expectEqual(@as(usize, 0), skill.security_requirements.len);
-    try testing.expectEqual(@as(i32, 8), agent_skill_field_numbers[7]);
+    try testing.expectEqual(@as(u32, 8), fieldNumber(AgentSkill, 7));
 }
 
 test "the AgentCard requires exactly the eight fields the proto marks required" {
-    try expectContiguousFieldNumbers(agent_card_field_numbers);
+    try testing.expectEqual(@as(usize, 14), AgentCard.fields.len);
     const interfaces = [_]AgentInterface{.{
         .url = "https://api.example.com/a2a/v1",
         .protocol_binding = "JSONRPC",
@@ -2359,7 +2917,10 @@ test "the AgentCard requires exactly the eight fields the proto marks required" 
         .name = "Weather",
         .description = "Forecasts and observations.",
         .supported_interfaces = &interfaces,
-        .version = "1.0.0",
+        // Field 5 is the card's own version, and PROTOCOLS.md section 5.1 puts
+        // it under the same rule as the header: no patch component, so a
+        // consumer parses it with the one parser and gets a `Major.Minor`.
+        .version = "1.0",
         .capabilities = .{ .streaming = true },
         .default_input_modes = &.{"text/plain"},
         .default_output_modes = &.{"text/plain"},
@@ -2376,12 +2937,16 @@ test "the AgentCard requires exactly the eight fields the proto marks required" 
     // the list the card carries is the list the agent published.
     try testing.expectEqual(@as(usize, 1), card.supported_interfaces.len);
     try testing.expectEqualStrings("JSONRPC", card.supported_interfaces[0].protocol_binding);
-    try testing.expectEqual(@as(i32, 14), agent_card_field_numbers[13]);
+    // The version the card carries is the one the rule allows, so the
+    // declaration and this fixture cannot drift apart unnoticed.
+    try testing.expectEqual(@as(u16, 1), (try parseVersion(card.version)).major);
+    try testing.expectEqual(@as(u16, 0), (try parseVersion(card.version)).minor);
+    try testing.expectError(error.InvalidField, parseVersion("1.0.0"));
 }
 
 test "the device code flow is variant 5 and carries its own authorization URL" {
-    try expectContiguousFieldNumbers(device_code_oauth_flow_field_numbers);
-    try testing.expectEqual(5, oauth_flows_field_number.device_code);
+    try testing.expectEqualStrings("deviceAuthorizationUrl", jsonName(DeviceCodeOAuthFlow, 0).?);
+    try testing.expectEqual(@as(u32, 5), fieldNumber(OAuthFlows, 4));
     const scopes = [_]OAuthScope{
         .{ .name = "a2a.tasks", .description = "Task read and write" },
     };
@@ -2399,8 +2964,8 @@ test "the device code flow is variant 5 and carries its own authorization URL" {
 }
 
 test "the two live OAuth flows require their URLs and their scopes" {
-    try expectContiguousFieldNumbers(authorization_code_oauth_flow_field_numbers);
-    try expectContiguousFieldNumbers(client_credentials_oauth_flow_field_numbers);
+    try testing.expectEqualStrings("pkceRequired", jsonName(AuthorizationCodeOAuthFlow, 4).?);
+    try testing.expectEqualStrings("scopes", jsonName(ClientCredentialsOAuthFlow, 2).?);
     // A machine client is not sent anywhere to log in, so the credentials
     // flow has a token URL and no authorization URL.
     const machine: ClientCredentialsOAuthFlow = .{
@@ -2427,8 +2992,8 @@ test "the two live OAuth flows require their URLs and their scopes" {
 }
 
 test "the two deprecated OAuth flows have no required field" {
-    try expectContiguousFieldNumbers(implicit_oauth_flow_field_numbers);
-    try expectContiguousFieldNumbers(password_oauth_flow_field_numbers);
+    try testing.expectEqualStrings("authorizationUrl", jsonName(ImplicitOAuthFlow, 0).?);
+    try testing.expectEqualStrings("tokenUrl", jsonName(PasswordOAuthFlow, 0).?);
     // Neither carries a REQUIRED annotation, so a peer may send an empty one
     // and a decoder has to hold it rather than reject the whole card.
     const implicit: ImplicitOAuthFlow = .{};
@@ -2438,8 +3003,8 @@ test "the two deprecated OAuth flows have no required field" {
     try testing.expectEqual(@as(?[]const u8, null), password.token_url);
     try testing.expectEqual(@as(usize, 0), password.scopes.len);
     // They are variants 3 and 4, either side of device code at 5.
-    try testing.expectEqual(3, oauth_flows_field_number.implicit);
-    try testing.expectEqual(4, oauth_flows_field_number.password);
+    try testing.expectEqual(@as(u32, 3), fieldNumber(OAuthFlows, 2));
+    try testing.expectEqual(@as(u32, 4), fieldNumber(OAuthFlows, 3));
 }
 
 test "A2A-Extensions splits the specification's example and trims each URI" {
