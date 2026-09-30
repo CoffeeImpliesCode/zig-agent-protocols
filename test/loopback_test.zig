@@ -16,15 +16,19 @@
 //! `Io.Group.async` does not promise to run its task until `await` or `cancel`
 //! is called. A reader parked on a group that nobody joins simply never starts,
 //! and the call waiting for its response waits forever. So the reader is
-//! spawned on the *caller's* group: the test joins one group per side, and
-//! awaiting it drives the call and its reader together, each yielding to the
-//! other at its own blocking point.
+//! spawned on the *caller's* group: each test runs both sides on one group,
+//! and awaiting that group drives the call and both readers together, each
+//! yielding to the other at its own blocking point.
 //!
-//! A connection ends by its peer hanging up. The client's task closes its
-//! stream, both readers see end of file, both pumps return, and both groups
-//! complete on their own. There is no sleep and no arbitrary timeout in this
-//! file, so a pass means the exchange finished rather than that the test waited
-//! long enough to look.
+//! A connection ends by its peer hanging up. The client has to unblock its own
+//! reader to get there, and a `close` does not interrupt a `read` already
+//! blocked on the descriptor, so its task shuts the stream down before it
+//! closes it. Both readers then see end of file and both pumps return. The
+//! accepted side has no caller left to close it, so its reader closes the
+//! stream as it returns, rather than leaving the descriptor to the process.
+//! The group then completes on its own. There is no sleep and no arbitrary
+//! timeout in this file, so a pass means the exchange finished rather than
+//! that the test waited long enough to look.
 
 const std = @import("std");
 const proto = @import("zig-agent-proto");
@@ -42,11 +46,14 @@ const Side = struct {
     pending: [8]conn.Slot = undefined,
     decode_scratch: [1024]u8 = undefined,
     handler_scratch: [1024]u8 = undefined,
+    /// One encode buffer and one result buffer per call, plus a third encode
+    /// buffer for the notification. Two frames or two answers that shared one
+    /// of them would overwrite the bytes an assertion is about.
     out: [1024]u8 = undefined,
-    /// A second encode buffer, so a notification cannot overwrite the request
-    /// the test still wants to assert on.
+    second_out: [1024]u8 = undefined,
     notify_out: [1024]u8 = undefined,
     result: [1024]u8 = undefined,
+    second_result: [1024]u8 = undefined,
 };
 
 /// A peer that answers every request and records what it was asked.
@@ -60,7 +67,6 @@ const TestHandler = struct {
     saw_method: [64]u8 = undefined,
     saw_len: usize = 0,
     notifications: usize = 0,
-    reply: []const u8 = "{\"resultType\":\"complete\"}",
 
     fn handle(ctx: ?*anyopaque, frame: []const u8, scratch: []u8) conn.Error!?[]const u8 {
         const self: *TestHandler = @ptrCast(@alignCast(ctx.?));
@@ -83,15 +89,17 @@ const TestHandler = struct {
         }
 
         // The scratch is this connection's handler buffer, so the answer can
-        // borrow it for as long as the write takes.
+        // borrow it for as long as the write takes. The result carries the id
+        // the peer was asked for, so the two answers this test collects are
+        // different bytes and neither can be mistaken for the other.
         var writer = json.Writer.init(scratch);
         writer.slice("{\"jsonrpc\":\"2.0\",\"id\":") catch return null;
         var id_buffer: [24]u8 = undefined;
         const id_text = std.fmt.bufPrint(&id_buffer, "{d}", .{message.id.?.integer}) catch return null;
         writer.slice(id_text) catch return null;
-        writer.slice(",\"result\":") catch return null;
-        writer.slice(self.reply) catch return null;
-        writer.byte('}') catch return null;
+        writer.slice(",\"result\":{\"resultType\":\"complete\",\"call\":") catch return null;
+        writer.slice(id_text) catch return null;
+        writer.slice("}}") catch return null;
         return writer.written();
     }
 };
@@ -114,6 +122,11 @@ const Endpoint = struct {
     writer: Io.net.Stream.Writer = undefined,
     stream: Io.net.Stream = undefined,
     connection: conn.Conn = undefined,
+    /// Set on the accepted side, which has no caller left to close its stream.
+    /// Its reader closes the stream as it returns, so a test that waits for
+    /// end of file does not also need the process to exit to release the
+    /// descriptor.
+    close_on_end_of_stream: bool = false,
 
     /// Start the connection and spawn its reader on `group`.
     fn open(
@@ -133,11 +146,14 @@ const Endpoint = struct {
             .handler_scratch = &self.side.handler_scratch,
         });
         if (handler) |h| self.connection.setHandler(h);
-        group.async(io, pump, .{&self.connection});
+        group.async(io, Endpoint.pump, .{self});
     }
 
-    fn pump(c: *conn.Conn) void {
-        c.pump();
+    /// Read until the transport ends, then release the stream if this side is
+    /// the one that closes it.
+    fn pump(self: *Endpoint) void {
+        self.connection.pump();
+        if (self.close_on_end_of_stream) self.stream.close(self.connection.io);
     }
 };
 
@@ -145,7 +161,24 @@ fn socketPath(buffer: []u8, id: u64) ![]const u8 {
     return std.fmt.bufPrint(buffer, "/tmp/zig-agent-proto-test-{x}.sock", .{id});
 }
 
-test "a client and a server complete a request over a real socket" {
+/// What the client task leaves for the test, and how much of each encode
+/// buffer is a frame.
+///
+/// The three lengths are the number of bytes the encode really wrote, taken
+/// inside the task right after that encode. An assertion reads an encode
+/// buffer only through the length of the frame in it, so it never reads a
+/// byte the client did not write.
+const Observed = struct {
+    /// The first answer, borrowing the first call's result buffer.
+    first_answer: conn.Response = undefined,
+    /// The second answer, borrowing the second call's own result buffer.
+    second_answer: conn.Response = undefined,
+    first_request: usize = 0,
+    second_request: usize = 0,
+    notification: usize = 0,
+};
+
+test "each answer is matched to its own call over a real socket" {
     var threaded: Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -164,9 +197,8 @@ test "a client and a server complete a request over a real socket" {
 
     var peer_endpoint: Endpoint = .{};
     var client_endpoint: Endpoint = .{};
-    var second_id_is_two: bool = false;
     var handler_state: TestHandler = .{};
-    var answer: conn.Response = undefined;
+    var observed: Observed = .{};
     var call_failed: bool = false;
 
     const Peer = struct {
@@ -183,6 +215,9 @@ test "a client and a server complete a request over a real socket" {
                 self.failed.* = true;
                 return;
             };
+            // The accepted side has no caller left to close it, so its reader
+            // closes it when the client hangs up.
+            self.endpoint.close_on_end_of_stream = true;
             self.endpoint.open(self.io, self.group, stream, self.handler);
         }
     };
@@ -192,12 +227,27 @@ test "a client and a server complete a request over a real socket" {
         group: *Io.Group,
         address: *const Io.net.UnixAddress,
         endpoint: *Endpoint,
-        answer: *conn.Response,
+        observed: *Observed,
         failed: *bool,
         method: []const u8,
         params: ?[]const u8,
         notify_after: bool,
-        second_id_is_two: *bool,
+
+        /// Send the progress notification and record how many bytes the
+        /// encode wrote. A notification that fails writes nothing, so the
+        /// recorded length stays zero and the test reads no bytes rather than
+        /// reads a buffer the client never wrote to.
+        fn notifyProgress(self: *@This()) void {
+            self.endpoint.connection.notify(
+                "notifications/progress",
+                "{\"progress\":1}",
+                &self.endpoint.side.notify_out,
+            ) catch {
+                self.observed.notification = 0;
+                return;
+            };
+            self.observed.notification = self.endpoint.connection.lastEncodedLen();
+        }
 
         fn run(self: *@This()) void {
             const stream = self.address.connect(self.io) catch {
@@ -205,39 +255,47 @@ test "a client and a server complete a request over a real socket" {
                 return;
             };
             self.endpoint.open(self.io, self.group, stream, null);
-            self.answer.* = self.endpoint.connection.call(
+            const side = &self.endpoint.side;
+            self.observed.first_answer = self.endpoint.connection.call(
                 self.method,
                 self.params,
-                &self.endpoint.side.result,
-                &self.endpoint.side.out,
+                &side.result,
+                &side.out,
             ) catch {
                 self.failed.* = true;
                 return;
             };
+            self.observed.first_request = self.endpoint.connection.lastEncodedLen();
             // A second call on the same connection is a genuinely different
             // request. Two calls sharing an id would let one steal the other's
             // answer, and the multi-round-trip rule requires a retry to be a
             // new call, so this is the assertion that keeps a reused id from
-            // passing silently.
-            _ = self.endpoint.connection.call(
+            // passing silently. The second call has its own result and encode
+            // buffers: a shared result buffer would let its answer rewrite the
+            // bytes the first answer still borrows, and the assertion on the
+            // first answer would then read the second answer's bytes.
+            self.observed.second_answer = self.endpoint.connection.call(
                 "tools/list",
                 null,
-                &self.endpoint.side.result,
-                &self.endpoint.side.notify_out,
+                &side.second_result,
+                &side.second_out,
             ) catch {
                 self.failed.* = true;
                 return;
             };
-            const second_request = self.endpoint.side.notify_out[0..self.endpoint
-                .connection.lastEncodedLen()];
-            self.second_id_is_two.* = std.mem.indexOf(u8, second_request, "\"id\":2") != null;
-
+            self.observed.second_request = self.endpoint.connection.lastEncodedLen();
             if (self.notify_after) {
-                self.endpoint.connection.notify(
-                    "notifications/progress",
-                    "{\"progress\":1}",
-                    &self.endpoint.side.notify_out,
-                ) catch {};
+                // Plant an id in the tail of the buffer the notification
+                // encodes into. The frame covers the start of that buffer and
+                // the assertion reads only the frame, so a scan that runs past
+                // the recorded length finds this id and fails, rather than
+                // passes on whatever the stack held in the tail before.
+                const out = &side.notify_out;
+                out[out.len - 1] = '"';
+                out[out.len - 2] = 'd';
+                out[out.len - 3] = 'i';
+                out[out.len - 4] = '"';
+                self.notifyProgress();
             }
             // Hang up. `shutdown` before `close`, because closing a file
             // descriptor does not interrupt a `read` already blocked on it:
@@ -266,46 +324,63 @@ test "a client and a server complete a request over a real socket" {
         .group = &group,
         .address = &address,
         .endpoint = &client_endpoint,
-        .answer = &answer,
+        .observed = &observed,
         .failed = &call_failed,
         .method = "tools/call",
         .params = "{\"name\":\"echo\"}",
         .notify_after = true,
-        .second_id_is_two = &second_id_is_two,
     };
     group.async(io, Peer.run, .{&peer});
     group.async(io, Client.run, .{&client});
     group.await(io) catch {};
 
     try testing.expect(!call_failed);
-    // The response really came back over the socket and was decoded, not
-    // synthesised by the test.
-    try testing.expectEqual(@as(?i32, null), answer.error_code);
-    try testing.expectEqualStrings("{\"resultType\":\"complete\"}", answer.body);
 
-    // The request really went out as one well-formed frame with a real id.
+    // Each answer came back over the socket, matched to the call that asked
+    // for it by its own id. The peer stamps every result with the id it was
+    // asked for, so an answer read out of the other call's buffer would carry
+    // the other id and fail here instead of passing under the wrong name.
+    try testing.expectEqual(@as(?i32, null), observed.first_answer.error_code);
+    try testing.expectEqualStrings(
+        "{\"resultType\":\"complete\",\"call\":1}",
+        observed.first_answer.body,
+    );
+    try testing.expectEqual(@as(?i32, null), observed.second_answer.error_code);
+    try testing.expectEqualStrings(
+        "{\"resultType\":\"complete\",\"call\":2}",
+        observed.second_answer.body,
+    );
+
+    // Each request went out as one well-formed frame with its own id, read
+    // through the length its own encode recorded. A read past that length
+    // would take in bytes that are not part of the frame.
     try testing.expect(std.mem.startsWith(
         u8,
-        client_endpoint.side.out[0..],
+        client_endpoint.side.out[0..observed.first_request],
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"",
     ));
+    try testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}",
+        client_endpoint.side.second_out[0..observed.second_request],
+    );
 
     // The peer really read the method, so its reader ran, decoded, dispatched
     // and answered.
     try testing.expectEqualStrings("tools/call", handler_state.saw_method[0..handler_state.saw_len]);
 
     // Two calls on one connection got two different ids.
-    try testing.expect(second_id_is_two);
     try testing.expectEqual(@as(i64, 3), client_endpoint.connection.nextId());
 
-    // The notification went out as a frame with no id at all. An id here would
-    // make the peer wait for a response that this library never sends.
+    // The notification went out as a frame with no id at all, over the bytes
+    // its own encode wrote. An id here would make the peer wait for a
+    // response this library never sends.
+    const notification = client_endpoint.side.notify_out[0..observed.notification];
     try testing.expect(std.mem.startsWith(
         u8,
-        client_endpoint.side.notify_out[0..],
+        notification,
         "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"",
     ));
-    try testing.expect(std.mem.indexOf(u8, client_endpoint.side.notify_out[0..], "\"id\"") == null);
+    try testing.expect(std.mem.indexOf(u8, notification, "\"id\"") == null);
 
     // The notification was delivered and correctly expected no answer.
     try testing.expectEqual(@as(usize, 1), handler_state.notifications);
@@ -344,6 +419,9 @@ test "a peer error answer is reported as an error, not as a result" {
                 self.failed.* = true;
                 return;
             };
+            // The accepted side has no caller left to close it, so its reader
+            // closes it when the client hangs up.
+            self.endpoint.close_on_end_of_stream = true;
             self.endpoint.open(self.io, self.group, stream, .{ .call = errorReply });
         }
     };

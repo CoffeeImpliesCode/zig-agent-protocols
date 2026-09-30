@@ -17,21 +17,38 @@
 //!   first decode wrote into would compare memory the second decode has
 //!   already overwritten, which is how this kind of test passes for the wrong
 //!   reason.
-//! - **`requiredScratchLen` is an upper bound.** The generated walk is handed
-//!   a buffer of exactly the length that function reports, so a document that
-//!   decodes must decode. A count that under-measured is a `BufferTooSmall` on
-//!   input the caller sized correctly from the number the documentation gives.
+//! - **`requiredScratchLen` is an upper bound, and an exact one.** The
+//!   generated walk is handed a buffer of exactly the length that function
+//!   reports, so a document that decodes must decode. A count that
+//!   under-measured is a `BufferTooSmall` on input the caller sized correctly
+//!   from the number the documentation gives, and a test measures the count
+//!   from the other side as well: one byte short, the same document does not
+//!   decode.
 //! - **Borrowed values stay whole.** A `rawValue` is re-walked from a fresh
-//!   reader, and capability paths are checked for the disjoint regions the
-//!   scratch contract promises. A region that were recycled would leave two
-//!   entries pointing at the same bytes, and `isMethodSupported` would answer a
-//!   question about whichever was written last.
+//!   reader, the reader's own scratch is checked for the distinct regions its
+//!   bump offset promises, and capability paths are checked for the regions
+//!   the capability walk promises. A region that were recycled would leave two
+//!   entries pointing at the same bytes, and `isMethodSupported` would answer
+//!   a question about whichever was written last.
+//! - **A member name can be damaged.** A generator that only rewrites values
+//!   hands the decoders the keys the seed documents spell and nothing else, so
+//!   every rule about an unknown member, a missing member or a renamed one
+//!   would be asserted over documents it cannot emit. The vocabulary therefore
+//!   carries every member name a decoder this harness feeds branches on, and
+//!   one shape renames a member of a real message outright: a renamed `id`
+//!   turns a request into a notification, and a renamed `jsonrpc` is a
+//!   refusal.
 //! - **Differential agreement.** A generated corpus goes through both this
 //!   reader and `std.json.Scanner`, and the two must agree on accept versus
-//!   reject for the whole document and on the top-level classification. Every
-//!   place they legitimately differ is listed by name in [`DivergenceCase`]
-//!   with the reason, so a new disagreement fails the test rather than passing
-//!   unnoticed.
+//!   reject for the whole document and on the top-level classification. The
+//!   corpus is the whole one, hostile bytes and mutated messages included,
+//!   because a comparison run only on documents both parsers must accept never
+//!   sees a disagreement. Every place they legitimately differ is listed by
+//!   name in [`DivergenceCase`] with the reason, so a new disagreement fails
+//!   the test rather than passing unnoticed. A generated document that
+//!   disagrees is excused only by the one difference that table records, the
+//!   leading zero [`hasLeadingZero`] names, and only in the direction the
+//!   table gives it.
 //!
 //! ## Running it
 //!
@@ -185,13 +202,99 @@ const string_forms = [_][]const u8{
     "value",
 };
 
-/// Number lexemes RFC 8259 admits.
+/// The member names a decoder this harness feeds branches on.
+///
+/// Without these in the vocabulary a generated document spells no protocol
+/// member at all, so the decoders only ever meet the keys the seed documents
+/// happen to carry, unedited. Every rule that reads a member name — the
+/// unknown-member skip, the required-member rules, the classification on `id`
+/// and `method`, the `result`/`error` exclusion — would then be asserted over
+/// documents the generator cannot emit.
+///
+/// Only keys a decoder really compares belong here. A capability path is not a
+/// key: `acp.decodeCapabilityObject` turns whatever it reads into a path, so
+/// `terminal` and `loadSession` are reached when a document nests them rather
+/// than spelled on their own, and a dotted path fragment in a table of string
+/// bodies is weight. `test "every member name is in a seed or listed as
+/// grammar-only"` is what keeps this list, the seeds and
+/// [`grammar_only_names`] in step.
+const member_names = [_][]const u8{
+    // `jsonrpc.decode` and the error object it carries.
+    "jsonrpc",
+    "id",
+    "method",
+    "params",
+    "result",
+    "error",
+    "code",
+    "message",
+    "data",
+    // `mcp.decodeResultType` and `mcp.decodeInputRequiredResult`.
+    "resultType",
+    "inputRequests",
+    "requestState",
+    // `acp.decodePermissionOutcome`.
+    "outcome",
+    "optionId",
+    // `acp.decodePermissionRequest` and the option object inside it.
+    "sessionId",
+    "title",
+    "description",
+    "toolCall",
+    "subject",
+    "options",
+    "name",
+    "kind",
+    // `acp.decodePermissionSubject`, which the draft arm of the permission
+    // request reaches through its `subject` member.
+    "type",
+    "command",
+    "cwd",
+    "toolCallId",
+    // The one member the capability walk treats differently: metadata on every
+    // type, and never a capability path.
+    "_meta",
+    // `bridge.decodeEnvelope`.
+    "serverId",
+    "requestId",
+};
+
+/// Member names the grammar generator spells but no seed document carries.
+///
+/// `renameMember` moves a name a seed already contains, so a name here widens
+/// what a mutation can produce as a key and nothing more.
+///
+/// `_meta` is a deliberate gap: a capability object carrying it is a shape this
+/// library does not otherwise produce, nothing in `src/` emits one, and a seed
+/// invented only so the name could be renamed is a document no peer of this
+/// protocol sends. `terminalId` is an ordinary one: no seed spells it, so there
+/// is nothing for a mutation to move, and the subject it belongs to is a
+/// decoder branch nothing else in the corpus reaches.
+const grammar_only_names = [_][]const u8{
+    "_meta",
+    "terminalId",
+};
+
+/// Every string body the generator can write, key or value alike.
+///
+/// `writeObject` draws a member name from here too, so a key is not a special
+/// case: the same table feeds both halves of a document.
+const string_vocabulary = string_forms ++ member_names;
+
+/// Number lexemes the generator writes.
 ///
 /// The last two are past what an `f64` or an `i64` can hold, and a lexeme is
 /// exactly what the reader returns, so both must survive as text.
+///
+/// `01` is the one form RFC 8259 forbids, and it is here because it is the only
+/// shape on which the two parsers are recorded to differ: `Reader.number`
+/// counts the digits and accepts it, `std.json.Scanner` refuses it, and the
+/// differential run has to produce that disagreement to meet it at all. A
+/// recorded divergence the generator cannot emit is a record nothing checks.
 const number_forms = [_][]const u8{
     "0",
     "-0",
+    "01",
     "1",
     "-1",
     "12",
@@ -217,6 +320,13 @@ const hostile_alphabet = [_]u8{
 /// Documents a mutation starts from. Each is a well-formed message of the kind
 /// the protocols actually carry, so a mutation is a change to a real document
 /// rather than a change to noise.
+///
+/// The last two carry members no other seed spells, and they are here for the
+/// decoder arms nothing else reaches: an MRTR interim result is the only
+/// document `mcp.decodeInputRequiredResult` accepts, and a permission request
+/// with a `toolCall` is the only document the stable arm of
+/// `acp.decodePermissionRequest` accepts. Both are real messages at the pinned
+/// revisions, so a mutation of either is a change to a real document.
 const seed_documents = [_][]const u8{
     "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
         "\"params\":{\"name\":\"echo\"}}",
@@ -232,6 +342,13 @@ const seed_documents = [_][]const u8{
     "{\"sessionId\":\"s\",\"title\":\"t\",\"options\":" ++
         "[{\"optionId\":\"o\",\"name\":\"n\",\"kind\":\"allow_once\"}]}",
     "{\"a\":[1,2,{\"b\":[true,false,null]}],\"c\":\"\\u00e9\\ud83d\\ude00\"}",
+    "{\"resultType\":\"input_required\",\"inputRequests\":" ++
+        "{\"r1\":{\"method\":\"tools/call\"}},\"requestState\":\"st-1\"}",
+    "{\"sessionId\":\"s2\",\"title\":\"t\",\"description\":\"d\"," ++
+        "\"toolCall\":{\"toolCallId\":\"tc\"}," ++
+        "\"subject\":{\"type\":\"command\",\"command\":\"ls\",\"cwd\":\"/tmp\"}," ++
+        "\"options\":[{\"optionId\":\"o\",\"name\":\"n\"," ++
+        "\"kind\":\"allow_once\"}]}",
 };
 
 fn hostileByte(rng: std.Random) u8 {
@@ -247,7 +364,7 @@ fn writeString(rng: std.Random, doc: *Doc) void {
     doc.pushByte('"');
     const count = rng.intRangeLessThan(u8, 0, 4);
     for (0..count) |_| {
-        doc.push(string_forms[rng.intRangeLessThan(u8, 0, string_forms.len)]);
+        doc.push(string_vocabulary[rng.intRangeLessThan(usize, 0, string_vocabulary.len)]);
     }
     doc.pushByte('"');
 }
@@ -309,7 +426,11 @@ fn writeArray(rng: std.Random, doc: *Doc, depth: u32) void {
     doc.pushByte(']');
 }
 
-/// A document built from the grammar, so every JSON parser must accept it.
+/// A document built from the grammar, so the borrow reader accepts all of it.
+///
+/// One form is the exception and it is deliberate: `number_forms` carries a
+/// leading zero, which RFC 8259 forbids and `std.json.Scanner` refuses, so a
+/// document that draws it is the one shape on which the two parsers differ.
 fn writeValid(rng: std.Random, doc: *Doc) void {
     writeValue(rng, doc, 0);
 }
@@ -357,6 +478,113 @@ fn writeMutated(rng: std.Random, doc: *Doc) void {
                 doc.push(run);
             },
         }
+    }
+}
+
+/// Replace the first occurrence of `from` in `source` with `to`, appending the
+/// result to `doc`.
+///
+/// Returns false when the name is not there, when the two names are the same
+/// and so nothing would move, or when the result would not fit `doc`. A rename
+/// that changed nothing is not a mutation, and a truncated one is a different
+/// document. The tail is rebuilt rather than patched in place: `to` is a
+/// different width, so everything after the match moves.
+fn renameMember(source: []const u8, from: []const u8, to: []const u8, doc: *Doc) bool {
+    if (std.mem.eql(u8, from, to)) return false;
+    const at = std.mem.indexOf(u8, source, from) orelse return false;
+    if (source.len - from.len + to.len > max_doc_len) return false;
+    doc.push(source[0..at]);
+    doc.push(to);
+    doc.push(source[at + from.len ..]);
+    return true;
+}
+
+/// Whether any seed document spells `name`.
+///
+/// This is the question `renameMember` asks when it draws a name, so the two
+/// answers agree by construction: the first occurrence it would rewrite is the
+/// first one this finds. The needle is `"name"`, so a member that is only a
+/// prefix of a longer one does not count as spelled.
+fn spelledByASeed(comptime name: []const u8) bool {
+    for (seed_documents) |document| {
+        if (std.mem.indexOf(u8, document, "\"" ++ name ++ "\"") != null) return true;
+    }
+    return false;
+}
+
+/// Whether `grammar_only_names` lists `name`.
+fn isGrammarOnly(comptime name: []const u8) bool {
+    for (grammar_only_names) |candidate| {
+        if (std.mem.eql(u8, name, candidate)) return true;
+    }
+    return false;
+}
+
+/// A real message with one of its members renamed to another member name.
+///
+/// `writeMutated` damages bytes, so the key it leaves behind is a key the seed
+/// never spelled and the decoder cannot name. This shape moves a member the
+/// protocol decoder branches on onto a name it does not know, which is the
+/// only mutation that makes the key rules observable: the same document with
+/// `id` renamed is a notification rather than a request, and with `jsonrpc`
+/// renamed it is a refusal.
+fn writeMemberRenamed(rng: std.Random, doc: *Doc) void {
+    const source = seed_documents[rng.intRangeLessThan(usize, 0, seed_documents.len)];
+    const from = member_names[rng.intRangeLessThan(usize, 0, member_names.len)];
+    const to = member_names[rng.intRangeLessThan(usize, 0, member_names.len)];
+    if (renameMember(source, from, to, doc)) return;
+    // A seed that spells neither name, or a rename that would overflow the
+    // document, is not a rename. The seed itself still reaches every decoder,
+    // so this branch costs no coverage.
+    doc.push(source);
+}
+
+/// The document shapes the corpus is built from.
+///
+/// Each one reaches every decoder, so the choice is about which property it
+/// exercises and not about which decoder sees it.
+const Shape = enum {
+    /// Assembled from the grammar, so the borrow reader accepts it. A leading
+    /// zero is the one exception, and it is the divergence the corpus exists
+    /// to produce.
+    composed,
+    /// Bytes no grammar produces.
+    hostile,
+    /// A real document with bytes damaged.
+    mutated,
+    /// A real document with a member renamed.
+    renamed,
+    /// Two damaged documents joined, which is wrong at exactly one seam.
+    spliced,
+};
+
+/// The order the shapes are drawn in. Both harnesses walk this list, so the
+/// property run and the differential run see the same documents.
+const shapes = [_]Shape{
+    .composed,
+    .hostile,
+    .mutated,
+    .renamed,
+    .spliced,
+};
+
+/// Build the `index`-th document of a run into `doc`.
+///
+/// `spare` is the join buffer for the spliced shape alone; every other shape
+/// ignores it.
+fn writeShape(rng: std.Random, doc: *Doc, spare: *Doc, index: usize) void {
+    doc.clear();
+    switch (shapes[index % shapes.len]) {
+        .composed => writeValid(rng, doc),
+        .hostile => writeHostile(rng, doc),
+        .mutated => writeMutated(rng, doc),
+        .renamed => writeMemberRenamed(rng, doc),
+        .spliced => {
+            spare.clear();
+            writeMutated(rng, spare);
+            writeMutated(rng, doc);
+            doc.push(spare.slice());
+        },
     }
 }
 
@@ -539,14 +767,11 @@ fn roundTripEnvelope(
         try testing.expectEqualStrings(envelope.inner_method, again.inner_method);
         try expectSameString(envelope.inner_params, again.inner_params);
         stats.round_trips += 1;
-    } else |err| switch (err) {
-        // One asymmetry is real and it is the only one: `decodeEnvelope`
-        // requires the inner `method` member to be present and
-        // `encodeEnvelope` requires it to be non-empty, so an envelope
-        // carrying `""` decodes and does not re-encode. Anything else is a
-        // harness buffer that is too small.
-        error.InvalidField => try testing.expectEqualStrings("", envelope.inner_method),
-        else => return err,
+    } else |err| {
+        // A decoded envelope carries three non-empty members, which is what
+        // `encodeEnvelope` validates, so the only error left here is a harness
+        // buffer that is too small.
+        return err;
     }
 }
 
@@ -607,16 +832,27 @@ fn roundTripInputRequiredResult(
 ) !void {
     var writer = json.Writer.init(out);
     try writer.byte('{');
+    // The separator is written in front of every member after the first rather
+    // than baked into each one, because `resultType` is optional: a result the
+    // peer left out decodes with a null value, and a comma where that member
+    // stood is a document `takeSeparator` is right to refuse. The harness was
+    // building the malformed document, not the decoder.
+    var separator: []const u8 = "";
     if (result.result_type.value) |value| {
+        try writer.slice(separator);
         try writer.slice("\"resultType\":");
         try writer.string(value);
+        separator = ",";
     }
     if (result.input_requests) |requests| {
-        try writer.slice(",\"inputRequests\":");
+        try writer.slice(separator);
+        try writer.slice("\"inputRequests\":");
         try writer.slice(requests);
+        separator = ",";
     }
     if (result.request_state) |state| {
-        try writer.slice(",\"requestState\":");
+        try writer.slice(separator);
+        try writer.slice("\"requestState\":");
         try writer.string(state);
     }
     try writer.byte('}');
@@ -629,11 +865,14 @@ fn roundTripInputRequiredResult(
 
 /// Every recorded path must own a region no later path overwrote.
 ///
-/// The capability walk builds each path at a high-water mark that only moves
-/// forward, so consecutive entries are strictly increasing in memory and cannot
-/// overlap. A region that were recycled would leave two entries pointing at the
-/// same bytes, and `isMethodSupported` would answer a question about whichever
-/// was written last.
+/// What this proves is narrow and worth naming: every entry points into the
+/// caller's `paths` buffer, and consecutive entries do not overlap, so the
+/// capability walk hands out its regions once each. It says nothing about
+/// `json.Reader`'s own scratch, which is a different allocator with a
+/// different high-water mark; `expectDisjointRegions` is the assertion for
+/// that one. A recycled region would leave two entries pointing at the same
+/// bytes, and `isMethodSupported` would answer a question about whichever was
+/// written last.
 fn expectDisjointPaths(entries: []const acp.Capability, paths: []const u8) !void {
     const testing = std.testing;
     const base = @intFromPtr(paths.ptr);
@@ -648,6 +887,97 @@ fn expectDisjointPaths(entries: []const acp.Capability, paths: []const u8) !void
         const previous = entries[index - 1].path;
         try testing.expect(start >= @intFromPtr(previous.ptr) + previous.len);
     }
+}
+
+/// Every borrowed region must come from `scratch` and no two may overlap.
+///
+/// This is the property `json.Reader` documents for its bump offset, and it is
+/// the one `expectDisjointPaths` cannot see. A region that is outside
+/// `scratch` was borrowed from the input instead, which is a different promise
+/// from the one asserted here, so it is a failure rather than an exemption.
+fn expectDisjointRegions(scratch: []const u8, regions: []const []const u8) !void {
+    const testing = std.testing;
+    const base = @intFromPtr(scratch.ptr);
+    for (regions) |region| {
+        const start = @intFromPtr(region.ptr);
+        try testing.expect(start >= base);
+        try testing.expect(start + region.len <= base + scratch.len);
+    }
+    for (regions, 0..) |region, index| {
+        if (index == 0) continue;
+        for (regions[index + 1 ..]) |later| {
+            const here = @intFromPtr(region.ptr);
+            const there = @intFromPtr(later.ptr);
+            try testing.expect(here + region.len <= there or there + later.len <= here);
+        }
+    }
+}
+
+test "one reader hands out disjoint scratch regions" {
+    const testing = std.testing;
+    // The property AGENTS.md pins for the substrate: two escaped strings read
+    // from one reader take separate regions of the caller's scratch, so the
+    // first is still intact when the second is read. A bump offset that
+    // recycled a region would pass every single-string test there is.
+    const input = "\"a\\nb\" \"c\\nd\" \"plain\"";
+    var scratch: [16]u8 = undefined;
+    var reader = json.Reader.init(input);
+    const first = try reader.string(&scratch);
+    const second = try reader.string(&scratch);
+    // The third string carries no escape, so it borrows the input and costs no
+    // scratch. It is not one of the regions: the assertion is about the two
+    // that took a region, and including this one would compare a borrowed
+    // slice against the buffer it did not come from.
+    const plain = try reader.string(&scratch);
+    try testing.expectEqualStrings("plain", plain);
+    // It points into the input rather than the scratch, which is the promise
+    // the escaped path does not make: a string with no escape borrows the
+    // document and costs nothing.
+    const input_base = @intFromPtr(input.ptr);
+    try testing.expect(@intFromPtr(plain.ptr) >= input_base);
+    try testing.expect(@intFromPtr(plain.ptr) + plain.len <= input_base + input.len);
+
+    try expectDisjointRegions(&scratch, &.{ first, second });
+    // Disjoint is not enough: a reader that handed out two regions in the wrong
+    // order would still be disjoint, and the contents would be swapped.
+    try testing.expectEqualStrings("a\nb", first);
+    try testing.expectEqualStrings("c\nd", second);
+    try testing.expectEqual(@as(usize, 6), reader.bump);
+}
+
+test "requiredScratchLen is exact for a message holding two escaped strings" {
+    const testing = std.testing;
+    // The same quota as the corpus guard, for the same kind of reason: the
+    // measurement below runs at comptime and walks the document twice. One
+    // short document fits inside the default thousand, so this is headroom
+    // rather than a fix, and it is here so that lengthening the document does
+    // not turn a property test into a compile error.
+    @setEvalBranchQuota(20_000);
+
+    // An id and an error message, both escaped, both alive in the returned
+    // message at once. This is the case the scratch contract is written for,
+    // and the count has to cover both: it is a sum, not a maximum.
+    const text = "{\"jsonrpc\":\"2.0\",\"id\":\"a\\nb\"," ++
+        "\"error\":{\"code\":-1,\"message\":\"c\\nd\"}}";
+    // `comptime` and not a plain `const`: the document is a literal, so the
+    // count is computable at compile time, but a `const` bound to a call is a
+    // runtime value to the compiler and the array below would have no type.
+    const measured = comptime json.Reader.requiredScratchLen(text);
+    try testing.expectEqual(@as(usize, 6), measured);
+
+    var scratch: [measured]u8 = undefined;
+    const message = try jsonrpc.decode(text, &scratch);
+    const id = message.id.?.string;
+    const reported = message.rpc_error.?.message;
+    try expectDisjointRegions(&scratch, &.{ id, reported });
+    try testing.expectEqualStrings("a\nb", id);
+    try testing.expectEqualStrings("c\nd", reported);
+
+    // A bound that over-counted would satisfy the decode above and this would
+    // pass with a byte to spare, so the count is measured from the other side
+    // as well: one byte short and the same document does not decode.
+    var tight: [measured - 1]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, jsonrpc.decode(text, &tight));
 }
 
 // --- The decoder battery --------------------------------------------------------
@@ -845,20 +1175,7 @@ fn runPropertyHarness(run_seed: u64, count: usize) !Stats {
     var out: [encode_buf_len]u8 = undefined;
 
     for (0..count) |index| {
-        doc.clear();
-        switch (index % 4) {
-            0 => writeValid(rng, &doc),
-            1 => writeHostile(rng, &doc),
-            2 => writeMutated(rng, &doc),
-            else => {
-                // Two real documents, mutated independently and joined: long,
-                // plausible, and wrong at exactly one seam.
-                splice.clear();
-                writeMutated(rng, &splice);
-                writeMutated(rng, &doc);
-                doc.push(splice.slice());
-            },
-        }
+        writeShape(rng, &doc, &splice, index);
         try exerciseEveryDecoder(doc.slice(), &scratch, &replay, &out, &stats);
     }
 
@@ -877,6 +1194,217 @@ fn runPropertyHarness(run_seed: u64, count: usize) !Stats {
 
 test "every public decoder is total over generated input" {
     _ = try runPropertyHarness(seed, iterations);
+}
+
+test "the generator can spell every member jsonrpc.decode branches on" {
+    // Transcribed from the branches of `jsonrpc.decode` and `decodeError`. The
+    // point is the comparison and not the transcription: a generator whose
+    // vocabulary lacks one of these hands the decoder the keys the seed
+    // documents spell and nothing else, and the unknown-member, missing-member
+    // and classification rules are then asserted over a corpus that cannot
+    // reach them. The wider table is checked against the corpus rather than
+    // against a decoder, because a decoder's key set cannot be read as data
+    // from here; `test "every member name is in a seed or listed as
+    // grammar-only"` is what keeps that table from growing into weight.
+    const decoded_names = [_][]const u8{
+        "jsonrpc",
+        "id",
+        "method",
+        "params",
+        "result",
+        "error",
+        "code",
+        "message",
+        "data",
+    };
+    for (decoded_names) |name| {
+        var reachable = false;
+        for (string_vocabulary) |form| {
+            if (std.mem.eql(u8, form, name)) reachable = true;
+        }
+        if (!reachable) {
+            std.debug.print("\ngenerator: no document can carry the member '{s}'\n", .{name});
+            return error.MemberNameUnreachable;
+        }
+    }
+}
+
+test "every member name is in a seed or listed as grammar-only" {
+    // The quota is the price of the check below, not slack. The loop unrolls,
+    // every comparison runs at comptime, and each name is searched through
+    // every seed, so the work is names times seeds times a substring search
+    // that preprocesses its own skip table. That is more backwards branches
+    // than the default thousand allows by a wide margin, and 20 000 was not
+    // enough either: the compiler reported the same overflow at that figure,
+    // so the number is two orders above the limit rather than one. Deleting
+    // the keyword does not make the check cheaper, it makes the test fail to
+    // compile, so raise the number rather than drop a name.
+    @setEvalBranchQuota(200_000);
+
+    // The table of member names and the two ways the corpus can use one have to
+    // cover each other exactly. A name a seed spells is one a mutation can move;
+    // a name no seed spells is one the grammar generator can emit as a key and
+    // nothing more, and it has to be listed as such or it is corpus weight. A
+    // name in neither place widens every mutation in the corpus and reaches no
+    // rule, so this fails rather than growing.
+    //
+    // `inline for` and not `for`, and the body carries no `continue`, no
+    // `break` and no `return`. The loop unrolls, so a `continue` inside it is
+    // comptime control flow in a runtime block, which Zig refuses. Take the
+    // `inline` away and each name becomes a runtime value, `spelledByASeed`
+    // loses the comptime parameter it is written around, and the table is free
+    // to grow into weight again. So the body records which name failed and the
+    // verdict is reached after the loop, where a `return` is ordinary control
+    // flow. Do not put the `inline` back for speed: there is nothing to speed
+    // up, and the property is what the loop is for.
+    var stale: ?[]const u8 = null;
+    var unexplained: ?[]const u8 = null;
+    inline for (member_names) |name| {
+        // `comptime` for the same reason as the count in the scratch test: a
+        // `const` bound to a call is a runtime value, and these two answers are
+        // the whole assertion.
+        const spelled = comptime spelledByASeed(name);
+        const listed = comptime isGrammarOnly(name);
+        if (stale == null and spelled and listed) stale = name;
+        if (unexplained == null and !spelled and !listed) unexplained = name;
+    }
+    // A listing that names something a seed now spells is stale the other way,
+    // and one loop catches both faults: a name that is both spelled and listed
+    // is the stale case, and a name that is neither is the unexplained one.
+    if (stale) |name| {
+        std.debug.print("\ncorpus: '{s}' is in a seed and listed grammar-only\n", .{name});
+        return error.StaleGrammarOnlyName;
+    }
+    if (unexplained) |name| {
+        std.debug.print("\ncorpus: '{s}' is in no seed and not listed\n", .{name});
+        return error.UnreachableMemberName;
+    }
+}
+
+test "a renamed member reaches the acp and bridge decoders too" {
+    const testing = std.testing;
+    // The rename is not a JSON-RPC trick. These take keys that came from a seed
+    // rather than from the grammar generator, so a decoder outside the base
+    // layer is shown to read a member name a mutation changed.
+    var doc: Doc = .{};
+    var options: [4]acp.PermissionOption = undefined;
+    var scratch: [max_doc_len]u8 = undefined;
+
+    // `outcome` is the discriminator the ACP outcome decoder branches on and
+    // `optionId` is what makes a selected outcome usable, so the untouched
+    // document is a selected outcome carrying an id and either member renamed
+    // leaves the decoder with nothing to answer.
+    switch (try acp.decodePermissionOutcome(seed_documents[6], &scratch)) {
+        .selected => |id| try testing.expectEqualStrings("opt-1", id),
+        .cancelled => return error.TestUnexpectedResult,
+    }
+    doc.clear();
+    try testing.expect(renameMember(seed_documents[6], "outcome", "outcomes", &doc));
+    const no_branch = doc.slice();
+    const refused_outcome = acp.decodePermissionOutcome(no_branch, &scratch);
+    try testing.expectError(error.MissingField, refused_outcome);
+    doc.clear();
+    try testing.expect(renameMember(seed_documents[6], "optionId", "outcomeId", &doc));
+    const no_option = doc.slice();
+    const refused_id = acp.decodePermissionOutcome(no_option, &scratch);
+    try testing.expectError(error.MissingField, refused_id);
+
+    // The draft permission request is the ACP rule with the most member names
+    // behind it: a session, an option list and a title. Renaming the list is a
+    // missing required member, not an extension point.
+    const request = try acp.decodePermissionRequest(.draft, seed_documents[7], &options, &scratch);
+    switch (request) {
+        .draft => |value| {
+            try testing.expectEqualStrings("s", value.session_id);
+            try testing.expectEqual(@as(usize, 1), value.options.len);
+        },
+        .stable => return error.TestUnexpectedResult,
+    }
+    doc.clear();
+    try testing.expect(renameMember(seed_documents[7], "options", "optionz", &doc));
+    const no_options = doc.slice();
+    const refused_request = acp.decodePermissionRequest(.draft, no_options, &options, &scratch);
+    try testing.expectError(error.MissingField, refused_request);
+
+    // The envelope carries the three members both directions validate, so a
+    // renamed one is the missing-field rule one layer down.
+    const envelope = try bridge.decodeEnvelope(seed_documents[4], &scratch, null);
+    try testing.expectEqualStrings("s", envelope.server_id);
+    doc.clear();
+    try testing.expect(renameMember(seed_documents[4], "serverId", "serverID", &doc));
+    const no_server = doc.slice();
+    const refused_envelope = bridge.decodeEnvelope(no_server, &scratch, null);
+    try testing.expectError(error.MissingField, refused_envelope);
+}
+
+test "a renamed member changes what jsonrpc.decode returns" {
+    const testing = std.testing;
+    // `id` is what classifies a request against a notification, so renaming it
+    // is the sharpest mutation the corpus can make: the document differs from
+    // a valid request by one character, and a decoder that read the member
+    // reports a different shape than one that did not. The document is the
+    // corpus's own request, so the test and the generator agree on what a well
+    // formed one is.
+    const request = seed_documents[0];
+    var doc: Doc = .{};
+    try testing.expect(renameMember(request, "id", "ids", &doc));
+    const renamed = doc.slice();
+    // The rename is a rename and not a corruption: the old key is gone and the
+    // new one is where it stood.
+    try testing.expect(std.mem.indexOf(u8, renamed, "\"ids\":") != null);
+    try testing.expect(std.mem.indexOf(u8, renamed, "\"id\":") == null);
+
+    var scratch: [max_doc_len]u8 = undefined;
+    const before = try jsonrpc.decode(request, &scratch);
+    try testing.expect(before.kind == .request);
+    const after = try jsonrpc.decode(renamed, &scratch);
+    try testing.expect(after.kind == .notification);
+    try testing.expect(after.id == null);
+    try testing.expect(after.method != null);
+
+    // The version member is a requirement rather than a classification, so a
+    // renamed one is a refusal. A decoder that read no member name at all would
+    // report a missing field for the wrong reason, which is why the error is
+    // named here rather than counted.
+    doc.clear();
+    try testing.expect(renameMember(request, "jsonrpc", "jsonrp", &doc));
+    try testing.expectError(error.MissingField, jsonrpc.decode(doc.slice(), &scratch));
+
+    // A name the seed does not spell is not a rename, and the harness says so
+    // rather than pretending it made one.
+    doc.clear();
+    try testing.expect(!renameMember(request, "outcome", "result", &doc));
+    try testing.expectEqual(@as(usize, 0), doc.len);
+
+    // A rename onto the name it already has moves nothing, so the harness
+    // refuses it rather than counting an unedited seed as a mutation.
+    try testing.expect(!renameMember(request, "id", "id", &doc));
+}
+
+test "a renamed document is measured before it is decoded" {
+    const testing = std.testing;
+    // The renamed shape is new, so the scratch bound has to hold for it as it
+    // does for every other document: the walk is handed the count
+    // `requiredScratchLen` reports and nothing more.
+    const escaped_key = "m\\u00e9thod";
+    var doc: Doc = .{};
+    try testing.expect(renameMember(seed_documents[1], "method", escaped_key, &doc));
+    const bytes = doc.slice();
+    const measured = json.Reader.requiredScratchLen(bytes);
+    try testing.expect(measured <= max_doc_len);
+
+    var scratch: [max_doc_len]u8 = undefined;
+    try testing.expect(borrowAccepts(bytes, scratch[0..measured]));
+    var reader = json.Reader.init(bytes);
+    try walkValue(&reader, scratch[0..measured]);
+
+    // An escaped member is still a legal JSON name, so the reference parser
+    // takes the document and the two spellings differ only where it matters:
+    // the decoder no longer finds the member it classifies on.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expect(try referenceAccepts(arena.allocator(), bytes));
+    try testing.expectError(error.MissingField, jsonrpc.decode(bytes, &scratch));
 }
 
 // --- Differential testing against std.json --------------------------------------
@@ -1121,6 +1649,94 @@ const divergence_cases = [_]DivergenceCase{
 /// one this family asks.
 const suffix_bytes = [_]u8{ '{', '[', ':', '"' };
 
+fn isDigitByte(byte: u8) bool {
+    return byte >= '0' and byte <= '9';
+}
+
+/// Bytes that can stand immediately before the integer part of a number.
+///
+/// A number starts the document or follows one of these, so a `0` behind one
+/// of them and in front of a digit is the only `0` that begins a number. `-` is
+/// here because a sign opens the number rather than the integer part, so `-01`
+/// is the same fault one byte in. `.`, `e` and `E` are deliberately absent: they
+/// continue a number already under way, which is why `1.02` and `1e0` are
+/// numbers and not leading zeros.
+const number_start_bytes = " \t\n\r:,[-";
+
+/// True when some number in the document carries a leading zero.
+///
+/// RFC 8259 forbids the second digit, and `Reader.number` counts digits without
+/// refusing one, so this is the one document shape on which the two parsers may
+/// legitimately differ, and always in the same direction: the borrow reader
+/// accepts and `std.json` refuses. `divergence_cases` records it three times
+/// over, as a value, as a member and as an id; this is the rule that lets a
+/// generated document carry the same disagreement instead of failing on it. Any
+/// other disagreement is a finding, and the loop that calls this reports it.
+fn hasLeadingZero(input: []const u8) bool {
+    var pos: usize = 0;
+    while (pos < input.len) {
+        const byte = input[pos];
+        if (byte == '"') {
+            // Step over the body rather than the delimiter, because a `\` covers
+            // the byte after it and an escaped quote closes nothing.
+            pos += 1;
+            while (pos < input.len) : (pos += 1) {
+                if (input[pos] == '\\') {
+                    pos += 1;
+                } else if (input[pos] == '"') {
+                    break;
+                }
+            }
+            pos += 1;
+            continue;
+        }
+        if (byte == '0' and pos + 1 < input.len and isDigitByte(input[pos + 1])) {
+            const opens = pos == 0 or
+                std.mem.indexOfScalar(u8, number_start_bytes, input[pos - 1]) != null;
+            if (opens) return true;
+        }
+        pos += 1;
+    }
+    return false;
+}
+
+test "the disagreement rule names the recorded leading zero and nothing else" {
+    const testing = std.testing;
+    // The rule decides whether a generated disagreement is the recorded one or
+    // a finding, so it has to be blind to a zero that is not leading and awake
+    // to one that is. Each recorded `borrow_only` case names a document this
+    // rule must accept, which is what ties it to the table rather than to a
+    // reading of the grammar.
+    for (divergence_cases) |case| {
+        if (case.verdict == .borrow_only) {
+            try testing.expect(hasLeadingZero(case.text));
+        }
+    }
+
+    try testing.expect(hasLeadingZero("01"));
+    try testing.expect(hasLeadingZero("-01"));
+    try testing.expect(hasLeadingZero("{\"id\":-01}"));
+    try testing.expect(hasLeadingZero("00.5"));
+    try testing.expect(hasLeadingZero("{\"a\":[01]}"));
+    // A zero that is not leading is not this fault. `102` is a number and
+    // `1.02` is a number, and both parsers take them.
+    try testing.expect(!hasLeadingZero("0"));
+    try testing.expect(!hasLeadingZero("10"));
+    try testing.expect(!hasLeadingZero("102"));
+    try testing.expect(!hasLeadingZero("1.02"));
+    try testing.expect(!hasLeadingZero("0.5"));
+    // A zero in the fraction or the exponent continues a number under way, so
+    // it is the second digit of that number and not the first of another.
+    try testing.expect(!hasLeadingZero("1e0"));
+    try testing.expect(!hasLeadingZero("1E+0"));
+    try testing.expect(!hasLeadingZero("{\"a\":1.02}"));
+    try testing.expect(!hasLeadingZero("-"));
+    // Text is not a number, so a zero inside a string is a character.
+    try testing.expect(!hasLeadingZero("\"01\""));
+    // An escaped quote does not close the string it is in.
+    try testing.expect(!hasLeadingZero("\"a\\\"01\" 12"));
+}
+
 test "the borrow reader and std.json agree on the hand-written corpus" {
     const testing = std.testing;
     var scratch: [max_doc_len]u8 = undefined;
@@ -1201,10 +1817,13 @@ test "the borrow reader and std.json agree on generated documents" {
     const rng = prng.random();
 
     var doc: Doc = .{};
+    var splice: Doc = .{};
     var tail: Doc = .{};
     var scratch: [max_doc_len]u8 = undefined;
     var text: [2 * max_doc_len + 8]u8 = undefined;
+    var per_shape = [_]usize{0} ** shapes.len;
     var accepted: usize = 0;
+    var leading_zero: usize = 0;
     var prefixes: usize = 0;
     var suffixes: usize = 0;
 
@@ -1217,28 +1836,45 @@ test "the borrow reader and std.json agree on generated documents" {
     defer arena.deinit();
     const scoped = arena.allocator();
 
-    for (0..iterations) |_| {
-        doc.clear();
-        writeValid(rng, &doc);
+    // The whole corpus, not only the documents both parsers must accept. These
+    // are the shapes the property harness walks over the same seed, so the run
+    // that checks totality and the run that compares parsers see one document
+    // stream between them.
+    for (0..iterations) |index| {
+        writeShape(rng, &doc, &splice, index);
         const bytes = doc.slice();
         if (bytes.len == 0) continue;
+        per_shape[@as(usize, @intFromEnum(shapes[index % shapes.len]))] += 1;
 
         const mine = borrowAccepts(bytes, &scratch);
         const theirs = try referenceAccepts(scoped, bytes);
         if (mine != theirs) {
-            std.debug.print(
-                "\ndifferential: a generated document disagrees\n  document:     {s}\n" ++
-                    "  borrow reader: {s}\n  std.json:      {s}\n",
-                .{
-                    escaped(bytes, &text),
-                    if (mine) "accept" else "reject",
-                    if (theirs) "accept" else "reject",
-                },
-            );
-            return error.DifferentialDisagreement;
+            // The one disagreement the corpus records, in the direction
+            // `divergence_cases` gives it: the borrow reader counts the digits
+            // of a leading zero and `std.json` refuses the number. Every other
+            // disagreement is a finding, so it is reported rather than
+            // absorbed, and the direction has to be the recorded one.
+            if (mine and !theirs and hasLeadingZero(bytes)) {
+                leading_zero += 1;
+            } else {
+                std.debug.print(
+                    "\ndifferential: a generated document disagrees\n" ++
+                        "  document:     {s}\n  borrow reader: {s}\n" ++
+                        "  std.json:      {s}\n  leading zero: {}\n",
+                    .{
+                        escaped(bytes, &text),
+                        if (mine) "accept" else "reject",
+                        if (theirs) "accept" else "reject",
+                        hasLeadingZero(bytes),
+                    },
+                );
+                return error.DifferentialDisagreement;
+            }
         }
 
-        if (mine) {
+        // The reference parser is only asked what it is when it read the whole
+        // document. A document it refuses has no classification to give.
+        if (mine and theirs) {
             accepted += 1;
             try testing.expectEqual(borrowKind(bytes), try referenceKind(scoped, bytes));
 
@@ -1248,10 +1884,17 @@ test "the borrow reader and std.json agree on generated documents" {
             // that was never sent. A number is the exception: it has no
             // terminator, so `1.5` is a number in its own right and also a
             // prefix of `1.5e-3`.
-            if (borrowKind(bytes) != .number) {
+            //
+            // The prefix is cut from the significant bytes. Trailing whitespace
+            // is not part of the value, so `{"a":1} ` has a proper prefix that
+            // is the whole document, and a mutation that appends a space would
+            // report the harness's own padding instead of a reader fault.
+            const significant = std.mem.trimEnd(u8, bytes, whitespace[0..]);
+            if (borrowKind(significant) != .number) {
                 for (0..3) |_| {
-                    if (bytes.len < 2) break;
-                    const prefix = bytes[0..rng.intRangeLessThan(usize, 1, bytes.len)];
+                    if (significant.len < 2) break;
+                    const prefix_len = rng.intRangeLessThan(usize, 1, significant.len);
+                    const prefix = significant[0..prefix_len];
                     const mine_prefix = borrowAccepts(prefix, &scratch);
                     const theirs_prefix = try referenceAccepts(scoped, prefix);
                     if (mine_prefix or theirs_prefix) {
@@ -1273,23 +1916,33 @@ test "the borrow reader and std.json agree on generated documents" {
         }
 
         // A value cannot be followed by a value, so a document followed by a
-        // structural byte is two documents rather than one. The document has to
-        // leave room for that byte, or the append is a no-op and the check
-        // would be testing the accepted document against itself.
-        if (bytes.len < max_doc_len) {
+        // structural byte is two documents rather than one.
+        //
+        // The base has to be a document both readers read, because a hostile
+        // or mutated one can stop part way through a value and a byte appended
+        // to that completes it rather than contradicting it: `"tt9` plus a
+        // quote is the document `"tt9"`, which both readers accept, and the
+        // check would be reporting a document that was never malformed. Once
+        // the base is a complete value, every byte in `suffix_bytes` is
+        // illegal after it, so the document is provably two. The base also
+        // has to leave room for the byte, or the append is a no-op and the
+        // check would be testing the document against itself.
+        if (mine and theirs and bytes.len < max_doc_len) {
+            const suffix = suffix_bytes[rng.intRangeLessThan(u8, 0, suffix_bytes.len)];
             tail.clear();
             tail.push(bytes);
-            tail.pushByte(suffix_bytes[rng.intRangeLessThan(u8, 0, suffix_bytes.len)]);
+            tail.pushByte(suffix);
             const two = tail.slice();
             const mine_two = borrowAccepts(two, &scratch);
             const theirs_two = try referenceAccepts(scoped, two);
             if (mine_two or theirs_two) {
                 std.debug.print(
                     "\ndifferential: a trailing structural byte was accepted\n" ++
-                        "  document:     {s}\n  borrow reader: {s}\n" ++
-                        "  std.json:      {s}\n",
+                        "  document:     {s}\n  appended:     0x{X}\n" ++
+                        "  borrow reader: {s}\n  std.json:      {s}\n",
                     .{
-                        escaped(two, &text),
+                        escaped(bytes, &text),
+                        suffix,
                         if (mine_two) "accept" else "reject",
                         if (theirs_two) "accept" else "reject",
                     },
@@ -1303,10 +1956,19 @@ test "the borrow reader and std.json agree on generated documents" {
     }
 
     std.debug.print(
-        "  accepted={d} proper prefixes rejected={d} trailing bytes rejected={d}\n",
-        .{ accepted, prefixes, suffixes },
+        "  accepted={d} leading-zero divergences={d} proper prefixes rejected={d}" ++
+            " trailing bytes rejected={d}\n",
+        .{ accepted, leading_zero, prefixes, suffixes },
     );
+    for (shapes, per_shape) |shape, count| {
+        std.debug.print("  {s}: {d} documents\n", .{ @tagName(shape), count });
+    }
     try testing.expect(accepted != 0);
     try testing.expect(prefixes != 0);
     try testing.expect(suffixes != 0);
+    // A run long enough to have drawn a leading zero must have seen one: a
+    // fifth of the corpus is hostile bytes, a third of that alphabet is digits,
+    // and a leading zero is the only disagreement the recorded cases name. A
+    // short run says nothing either way, so it asserts nothing.
+    if (iterations >= 1000) try testing.expect(leading_zero != 0);
 }

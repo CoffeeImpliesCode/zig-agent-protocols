@@ -1,16 +1,18 @@
 //! Golden-vector decode tests over the specifications' own worked examples.
 //!
 //! Every fixture under `test/golden/` is either a verbatim JSON block lifted
-//! out of `research/normative/`, or a document whose member names are verbatim
-//! from the schema tables in the same files. The source line for each one is
-//! recorded beside the test that decodes it. A hand-written unit test only
-//! catches a regression if the author happened to write the same case twice;
-//! these vectors make the normative examples themselves the regression net, so
-//! a change to a tag, a spelling or a required member moves one of them.
+//! out of `research/normative/`, a verbatim member inside the location its own
+//! section makes normative, or a document whose member names are verbatim
+//! from the schema tables in the same files. The table below records where
+//! each fixture came from. A hand-written unit test only catches a regression
+//! if the author happened to write the same case twice; these vectors make the
+//! normative examples themselves the regression net, so a change to a tag, a
+//! spelling or a required member moves one of them.
 //!
 //! ## Provenance
 //!
-//! Verbatim JSON blocks, copied without reformatting:
+//! Verbatim JSON blocks, copied without reformatting, or a verbatim member
+//! inside the location its own section makes normative:
 //!
 //! | Fixture | Source |
 //! | --- | --- |
@@ -19,6 +21,9 @@
 //! | `a2a_rest_error.json` | `research/normative/a2a-1.0.0.md` 6.4, the HTTP+JSON/REST error envelope |
 //! | `a2a_agent_card_signature.json` | `research/normative/a2a-1.0.0.md` 7.2, the `signatures` shape |
 //! | `mcp_client_capabilities.json` | `research/normative/mcp-2026-07-28.md` 6, `ClientCapabilities` |
+//! | `mcp_client_capabilities_meta.json` | `research/normative/mcp-2026-07-28.md`
+//!   6, the `clientCapabilities` fixture line, inside the `_meta` the
+//!   compatibility matrix in the same section makes normative |
 //! | `mcp_server_capabilities.json` | `research/normative/mcp-2026-07-28.md` 6, `ServerCapabilities` |
 //! | `acp_initialize_capabilities_v1.json` | `research/normative/acp-v1-v2.md` 10e, the v1 RFD fragment |
 //! | `acp_initialize_capabilities_v2.json` | `research/normative/acp-v1-v2.md` 10e, the v2 RFD fragment |
@@ -28,7 +33,7 @@
 //!
 //! | Fixture | Source |
 //! | --- | --- |
-//! | `mcp_mrtr_result.json` | `mcp-2026-07-28.md` 4.7, the `InputRequiredResult` interface |
+//! | `mcp_mrtr_result.json` | `mcp-2026-07-28.md` 10, the `InputRequiredResult` interface |
 //! | `acp_session_new_request.json` | `acp-v1-v2.md` 3a and 10e, the v1 `session/new`
 //!   required list and the server declaration |
 //! | `acp_permission_outcome_selected.json` | `acp-v1-v2.md` 5b, the `selected` branch of `RequestPermissionOutcome` |
@@ -275,9 +280,16 @@ test "a request and a notification classify apart, and a notification re-encodes
     try testing.expectEqual(jsonrpc.Kind.request, request.kind);
     try testing.expectEqual(@as(?i64, 1), integerId(request.id));
     try testing.expectEqualStrings("tools/call", request.method.?.text);
-    // `params` is carried as borrowed text, so the inner object survives the
-    // round trip byte for byte.
-    try testing.expect(std.mem.startsWith(u8, request.params.value, "{"));
+    // `params` is carried as borrowed text, so the value the reader hands back
+    // is the fixture's own bytes: the specification's indentation and member
+    // order, and none of the whitespace it skipped.
+    const expected_params = "{\n" ++
+        "    \"name\": \"echo\",\n" ++
+        "    \"arguments\": {\n" ++
+        "      \"message\": \"hello\"\n" ++
+        "    }\n" ++
+        "  }";
+    try testing.expectEqualStrings(expected_params, request.params.value);
 
     const notification = try jsonrpc.decode(fixture.jsonrpc_notification, try pool.next());
     try testing.expectEqual(jsonrpc.Kind.notification, notification.kind);
@@ -343,12 +355,22 @@ test "the capability objects walk to every member the schema names" {
     try testing.expectEqualStrings("elicitation", client_keys[3]);
     try testing.expectEqualStrings("extensions", client_keys[4]);
 
-    // `roots` is a presence object, and the shape spells it with a space
-    // inside it. A reader that tested for the closing brace without skipping
-    // the whitespace first would call the specification's own example
-    // malformed.
+    // `roots` is a presence object the shape spells with no member and no
+    // whitespace inside it, so the borrowed value is exactly those two bytes.
     const roots = (try rawMember(fixture.mcp_client_capabilities, "roots", try pool.next())).?;
     try testing.expectEqualStrings("{}", roots);
+
+    // `experimental` is the member whose value does carry whitespace inside
+    // it: one after the opening brace, and one between the braces of the empty
+    // object it holds. A reader that expected `}` straight after `{`, or that
+    // trimmed the whitespace out of the value it borrows, would hand back
+    // bytes other than the specification's own example.
+    const experimental = (try rawMember(
+        fixture.mcp_client_capabilities,
+        "experimental",
+        try pool.next(),
+    )).?;
+    try testing.expectEqualStrings("{ \"<key>\": { } }", experimental);
 
     var sampling_keys: [4][]const u8 = undefined;
     const sampling = (try rawMember(
@@ -373,7 +395,12 @@ test "the capability objects walk to every member the schema names" {
         ),
     );
     try testing.expectEqualStrings("experimental", server_keys[0]);
+    try testing.expectEqualStrings("logging", server_keys[1]);
+    try testing.expectEqualStrings("completions", server_keys[2]);
+    try testing.expectEqualStrings("prompts", server_keys[3]);
     try testing.expectEqualStrings("resources", server_keys[4]);
+    try testing.expectEqualStrings("tools", server_keys[5]);
+    try testing.expectEqualStrings("extensions", server_keys[6]);
 
     // v1 and v2 of this protocol disagree about the form, so a boolean here is
     // the value the schema publishes rather than an empty object.
@@ -397,8 +424,9 @@ test "the per-request client capabilities ride in _meta under the reserved key" 
 
     // The compatibility matrix states the normative location: from
     // `2026-07-28` the client capabilities are `params._meta[...]` on every
-    // request, and the value is the extension fixture the specification
-    // publishes for the Apps extension.
+    // request. This fixture is that `_meta` object, and the value under the
+    // key is the extension fixture the specification publishes for the Apps
+    // extension.
     const meta = (try rawMember(fixture.mcp_client_capabilities_meta, "_meta", try pool.next())).?;
     const capabilities = (try rawMember(
         meta,
@@ -457,6 +485,10 @@ test "a session/new request frames, decodes, and resolves in the v1 registry" {
     try testing.expect(!info.notification);
     // Baseline in both versions, so it is callable without a capability.
     try testing.expectEqualStrings("", info.gate);
+    try testing.expectEqualStrings(
+        "",
+        (try acp.lookupMethod(.draft, message.method.?.text)).gate,
+    );
 
     const params = message.params.value;
     const cwd = (try stringMember(params, "cwd", try pool.next())).?;
@@ -547,16 +579,23 @@ test "the v1 permission request decodes to the choices the user is offered" {
     try testing.expectEqualStrings("sess-01", request.session_id);
     try testing.expectEqual(@as(usize, 3), request.options.len);
 
-    // The three fields the user reads and an outcome names back.
+    // The three fields the user reads and an outcome names back, on every
+    // option the fixture offers.
     try testing.expectEqualStrings("opt-allow-once", request.options[0].option_id);
     try testing.expectEqualStrings("Allow once", request.options[0].name);
     try testing.expectEqual(acp.PermissionOptionKind.allow_once, knownKind(request.options[0]).?);
+    try testing.expectEqualStrings("opt-allow-always", request.options[1].option_id);
+    try testing.expectEqualStrings("Always allow", request.options[1].name);
     try testing.expectEqual(acp.PermissionOptionKind.allow_always, knownKind(request.options[1]).?);
+    try testing.expectEqualStrings("opt-reject-once", request.options[2].option_id);
+    try testing.expectEqualStrings("Reject", request.options[2].name);
     try testing.expectEqual(acp.PermissionOptionKind.reject_once, knownKind(request.options[2]).?);
 
-    // v1 is a closed `oneOf`, so a fifth kind is a value the schema does not
-    // define and `grants` is a definite answer for every one of the four.
+    // v1 is a closed `oneOf` of the kinds the schema names, so every option
+    // here decodes to a known kind and `grants` answers for each one instead
+    // of reporting a kind this library does not know.
     try testing.expectEqual(true, request.options[0].grants().?);
+    try testing.expectEqual(true, request.options[1].grants().?);
     try testing.expectEqual(false, request.options[2].grants().?);
 
     // The `ToolCallUpdate` is carried verbatim, so the identifier the agent
@@ -640,10 +679,15 @@ test "a version mismatch inside the outcome carrier is not a binding failure" {
     // thing that tells them apart.
     try testing.expect(bridge.isBindingFailure(-32602, .outer));
     try testing.expect(!bridge.isBindingFailure(-32602, .inner));
-    // The binding allocates outside MCP's reserved range, so an inner code in
-    // it can never be read as a binding failure.
+    // The binding allocates outside both MCP code ranges: the
+    // implementation-defined `-32000` to `-32019` and the `-32020` to `-32099`
+    // the specification reserves for itself. So the first range's two edges,
+    // the second range's first code, and the `-32022` this fixture's carrier
+    // holds are all MCP codes that a binding failure never reports.
     try testing.expect(!bridge.isBindingFailure(-32000, .outer));
     try testing.expect(!bridge.isBindingFailure(-32019, .outer));
+    try testing.expect(!bridge.isBindingFailure(-32020, .outer));
+    try testing.expect(!bridge.isBindingFailure(-32022, .outer));
 
     const success = try bridge.decodeOutcome(fixture.bridge_outcome_result, try pool.next());
     const result_text = switch (success) {
@@ -680,9 +724,20 @@ test "the A2A JSON-RPC error envelope maps to the error its ErrorInfo names" {
     try testing.expect(known == .task_not_found);
     try testing.expectEqualStrings("TASK_NOT_FOUND", known.reason());
     // The A2A-specific codes live in their own range, and `-32001` is the
-    // numerically highest of the nine because the whole range is negative.
-    try testing.expect(object.code >= a2a.error_range_min);
-    try testing.expect(object.code <= a2a.error_range_max);
+    // numerically highest of the nine because the whole range is negative, so
+    // the code this envelope carries is the range's own upper bound and the
+    // ceiling of all nine.
+    try testing.expectEqual(a2a.error_range_max, object.code);
+    var lowest: i32 = a2a.error_range_max;
+    var highest: i32 = a2a.error_range_min;
+    inline for (@typeInfo(a2a.A2aError).@"enum".fields) |field| {
+        const code: i32 = @intFromEnum(@field(a2a.A2aError, field.name));
+        lowest = @min(lowest, code);
+        highest = @max(highest, code);
+    }
+    try testing.expect(lowest >= a2a.error_range_min);
+    try testing.expectEqual(object.code, highest);
+    try testing.expectEqual(@as(i32, -32009), lowest);
 
     // The ErrorInfo inside `data` is what a decoder keys on, and it agrees with
     // the code the envelope carries.
@@ -722,9 +777,10 @@ test "the REST error envelope is not a JSON-RPC message and its status is not th
         (try stringMember(error_object, "status", try pool.next())).?,
     );
 
-    // Six of the nine A2A errors share HTTP 400, so the status cannot pick one
-    // out. The `reason` is the only discriminator, which is why the
-    // specification requires the ErrorInfo object in `details`.
+    // Six of the nine A2A errors collapse onto `FAILED_PRECONDITION` and
+    // `400 Bad Request`, so the status is not discriminating and the `reason`
+    // is the only discriminator, which is why the specification requires the
+    // ErrorInfo object in `details`.
     const detail = (try firstArrayElement(
         (try rawMember(error_object, "details", try pool.next())).?,
         try pool.next(),
@@ -759,6 +815,7 @@ test "the AgentCard signature shape decodes, and its protected header is the one
     // base64url without padding. A standard-alphabet decoder that accepted the
     // bytes would have to have substituted `-` and `_` for `+` and `/`, which
     // would change the signature.
+    try testing.expect(std.mem.findScalar(u8, protected, '=') == null);
     try testing.expect(std.mem.findScalar(u8, signature, '=') == null);
     // The signature carries characters the standard alphabet spells `+` and
     // `/`, so a decoder reading the wrong alphabet either refuses it or
