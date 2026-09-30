@@ -30,19 +30,26 @@
 //! `Mcp-Session-Id` and `Last-Event-ID` were removed at `2026-07-28`
 //! (PROTOCOLS.md 4.2). This transport therefore mints no identifier, echoes
 //! none, and keeps no state between requests on a connection.
-//! [`Headers.removed`] records that a peer sent one, and the request is then
-//! served normally, which is what the specification's legacy handling asks
-//! for. The HTTP+SSE transport, deprecated in `2025-03-26`, is not
-//! implemented at all (section 9).
+//! [`Headers.removed`] records which of the two a peer sent. A request that
+//! carried `Mcp-Session-Id` is refused, because PROTOCOLS.md 4.2 says a peer
+//! that sends it is not speaking this revision. The HTTP+SSE transport,
+//! deprecated in `2025-03-26`, is not implemented at all (section 9).
 //!
 //! ## What is decided here rather than in the caller
 //!
 //! The header rules are the substance of this layer, so they are enforced
 //! here instead of being left to whoever writes the server: the revision
-//! header, `Mcp-Method`, `Mcp-Name`, the derived `Mcp-Param-{Name}` family,
-//! and the two headers removed at the current revision. A gateway that routes
-//! on `Mcp-Method` without checking it against the body is the failure this
-//! file exists to prevent.
+//! header, `Mcp-Method` and `Mcp-Name` checked against the body,
+//! `Content-Type`, `Accept`, a repeated MCP-defined header, and
+//! `Mcp-Session-Id`, which this revision removed and which therefore refuses
+//! the request. A gateway that routes on `Mcp-Method` without checking it
+//! against the body is the failure this file exists to prevent.
+//!
+//! The derived `Mcp-Param-{Name}` family is carried rather than enforced. Only
+//! the tool's own `inputSchema` says what a value in `arguments` must equal,
+//! and that is the caller's to say, so the headers arrive in [`Post.params`]
+//! and are compared one at a time through [`Post.checkParam`], which is
+//! [`mcp.checkParamBinding`] and nothing else.
 //!
 //! Buffers are the caller's throughout, as in `conn.zig`. Nothing here
 //! allocates, and a body a peer sends is read into a buffer the caller sized.
@@ -71,16 +78,22 @@ pub const Error = error{
     /// transport accepts. The specification pairs a malformed request with
     /// `400 Bad Request`.
     MalformedRequest,
-    /// An MCP-defined header arrived more than once.
+    /// An MCP-defined header arrived more than once, which includes one
+    /// `Mcp-Param-{Name}` annotation sent twice.
     ///
     /// HTTP permits a repeated header and the specification is silent, but two
-    /// values for the header that is checked against the body leaves the
-    /// check ambiguous: a gateway and a library can disagree about which one
-    /// the body was compared to, and they would then route and validate one
-    /// request two different ways.
+    /// values for a header that is checked against the body leaves the check
+    /// ambiguous: a gateway and a library can disagree about which one the
+    /// body was compared to, and they would then route and validate one
+    /// request two different ways. A derived header is checked against
+    /// `arguments` the same way, one annotation at a time, by
+    /// [`Post.checkParam`].
     DuplicateHeader,
-    /// `MCP-Protocol-Version` names a revision this library does not decode,
-    /// which the specification pairs with `-32022` and `400 Bad Request`.
+    /// The peer is not speaking a revision this library decodes: it named one
+    /// this library does not know in `MCP-Protocol-Version`, or it sent
+    /// `Mcp-Session-Id`, which PROTOCOLS.md 4.2 says a peer sends only when it
+    /// speaks a revision older than `2026-07-28`. The specification pairs
+    /// both with `-32022` and `400 Bad Request`.
     UnsupportedVersion,
     /// A header the specification requires is absent.
     MissingHeader,
@@ -183,9 +196,10 @@ pub const Accept = struct {
 
 /// Read the response types an `Accept` header allows.
 ///
-/// A wildcard counts for the types it covers, and an unparsable entry is
-/// skipped rather than refused: the list is advisory and this is the layer
-/// that decides whether anything is left.
+/// A wildcard counts for the types it covers, an entry whose `q` parameter is
+/// zero counts for nothing, and an unparsable entry is skipped rather than
+/// refused: the list is advisory and this is the layer that decides whether
+/// anything is left.
 pub fn parseAccept(value: ?[]const u8) Accept {
     const text = value orelse return .{};
     if (std.mem.trim(u8, text, " \t").len == 0) return .{};
@@ -193,9 +207,16 @@ pub fn parseAccept(value: ?[]const u8) Accept {
     var entries = std.mem.splitSequence(u8, text, ",");
     while (entries.next()) |entry| {
         const media = std.mem.trim(u8, entry, " \t");
-        const slash = std.mem.indexOfScalar(u8, media, '/') orelse continue;
-        const major = media[0..slash];
-        const minor = media[slash + 1 ..];
+        // The parameters are read before the type, because one of them decides
+        // whether the entry counts at all. `mediaType` drops them, so an entry
+        // that arrived as `application/json;q=0` would otherwise be read as a
+        // request for the one type this transport answers most.
+        const stop = std.mem.indexOfScalar(u8, media, ';') orelse media.len;
+        if (refusedByQuality(media[stop..])) continue;
+        const bare = media[0..stop];
+        const slash = std.mem.indexOfScalar(u8, bare, '/') orelse continue;
+        const major = bare[0..slash];
+        const minor = bare[slash + 1 ..];
         const any_major = std.mem.eql(u8, major, "*");
         if (std.mem.eql(u8, minor, "*")) {
             if (any_major) {
@@ -208,12 +229,32 @@ pub fn parseAccept(value: ?[]const u8) Accept {
             }
             continue;
         }
-        if (mediaType(media)) |kind| switch (kind) {
+        if (mediaType(bare)) |kind| switch (kind) {
             .json => accept.json = true,
             .event_stream => accept.event_stream = true,
         };
     }
     return accept;
+}
+
+/// Whether an entry's own parameters refuse it, which `q=0` and nothing else
+/// does.
+///
+/// RFC 9110 gives a quality of zero exactly one meaning: the type is not
+/// acceptable. `q=0.0` and `q=0.000` are that same refusal written longer, so
+/// the value is read as a number rather than compared as text. A `q` that is
+/// not a number is not a quality, so it refuses nothing.
+fn refusedByQuality(params: []const u8) bool {
+    var fields = std.mem.splitSequence(u8, params, ";");
+    while (fields.next()) |field| {
+        const one = std.mem.trim(u8, field, " \t");
+        const equals = std.mem.indexOfScalar(u8, one, '=') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, one[0..equals], " \t"), "q")) continue;
+        const text = std.mem.trim(u8, one[equals + 1 ..], " \t");
+        const quality = std.fmt.parseFloat(f64, text) catch continue;
+        return quality == 0;
+    }
+    return false;
 }
 
 // --- 4.2 HTTP headers -----------------------------------------------------------
@@ -244,8 +285,14 @@ pub const Headers = struct {
     /// it, so it is carried through rather than dropped.
     origin: ?[]const u8 = null,
     authorization: ?[]const u8 = null,
-    /// A header removed at `2026-07-28` arrived. It is recorded and then
-    /// ignored, and this transport never mints or echoes one.
+    /// A header removed at `2026-07-28` arrived, and which of the two it was.
+    ///
+    /// Recorded because a caller can then see that a peer sent a header this
+    /// revision has no use for. It is never echoed, and this transport mints
+    /// no identifier. `checkPost` refuses a request that carried
+    /// `Mcp-Session-Id` and serves one that carried `Last-Event-ID`, because
+    /// PROTOCOLS.md 4.2 says only of the first that a peer sending it is not
+    /// speaking this revision.
     removed: ?mcp.HeaderKind = null,
     /// The derived parameter headers, in the order they arrived.
     params: []const ParamHeader = &.{},
@@ -272,7 +319,6 @@ pub fn readHeaders(head: []const u8, params: []ParamHeader, scratch: []u8) Error
     // not check would be a panic rather than an error. Every byte here is
     // attacker-controlled, so the shape is verified before it is walked.
     if (!std.mem.endsWith(u8, head, "\r\n\r\n")) return error.MalformedRequest;
-    if (std.mem.indexOf(u8, head, "\r\n") == null) return error.MalformedRequest;
 
     var headers: Headers = .{};
     var count: usize = 0;
@@ -294,9 +340,19 @@ pub fn readHeaders(head: []const u8, params: []ParamHeader, scratch: []u8) Error
                 headers.name = try decodeValue(field.value, &cursor);
             },
             .param => {
+                const annotation = field.name[mcp.param_header_prefix.len..];
+                // A derived header is checked against `arguments` by
+                // `Post.checkParam`, so two of them for one annotation leave
+                // that check as ambiguous as a repeated `Mcp-Method`, and a
+                // header name is case-insensitive on the wire.
+                for (params[0..count]) |seen| {
+                    if (std.ascii.eqlIgnoreCase(seen.annotation, annotation)) {
+                        return error.DuplicateHeader;
+                    }
+                }
                 if (count == params.len) return error.BufferTooSmall;
                 params[count] = .{
-                    .annotation = field.name[mcp.param_header_prefix.len..],
+                    .annotation = annotation,
                     .value = try decodeValue(field.value, &cursor),
                 };
                 count += 1;
@@ -306,8 +362,9 @@ pub fn readHeaders(head: []const u8, params: []ParamHeader, scratch: []u8) Error
             .origin => headers.origin = field.value,
             .authorization => headers.authorization = field.value,
             .session_id_removed, .last_event_id_removed => {
-                // Ignored, and never echoed. Recorded so a caller can see that
-                // a peer is sending a header this revision removed.
+                // Never read into a field and never echoed. Recorded so a
+                // caller can see that a peer sent a header this revision
+                // removed, and so `checkPost` can refuse the request.
                 if (headers.removed == null) headers.removed = mcp.headerKind(field.name);
             },
             .schema_keyword => headers.schema_keyword_sent = field.value,
@@ -361,6 +418,16 @@ pub fn revisionOf(headers: Headers) Error!mcp.Revision {
 /// `params.uri` once the header was shown to agree with it, and the
 /// parameter headers are compared against `arguments` by the caller through
 /// [`Post.checkParam`], which is [`mcp.checkParamBinding`] and nothing else.
+///
+/// Nothing here is copied out of the buffers the request was read into, so
+/// every slice borrows. `body` is the buffer it was read into, `origin` the
+/// header block, and `params` the caller's array, whose entries borrow the
+/// header block or the scratch [`readHeaders`] was given. `method` borrows
+/// that scratch as well when the peer sent the value base64-wrapped, and
+/// `name` borrows the decode scratch when the body's own string had to be
+/// unescaped. A `Post` from [`Server.receive`] is therefore valid only until
+/// the next `receive` on the same server, because every buffer it borrows is
+/// the server's own.
 pub const Post = struct {
     /// The revision `MCP-Protocol-Version` named.
     revision: mcp.Revision,
@@ -441,9 +508,8 @@ pub fn requiresName(method: []const u8) bool {
 /// anything; then the headers that duplicate body values, each of which
 /// either agrees or is `-32020` and `400 Bad Request`.
 ///
-/// `scratch` backs the body decode. Nothing from it is retained in the
-/// result, so it may be reused freely afterwards; the `Post` borrows the
-/// header block and the scratch [`readHeaders`] was given.
+/// `scratch` backs the body decode, and the [`Post`] returned may borrow it,
+/// so [`Post`] says which buffer each field lives in.
 pub fn checkPost(headers: Headers, body: []const u8, scratch: []u8) Error!Post {
     // `x-mcp-header` is a JSON Schema keyword. A peer that sent it as a
     // header is either confused about which side of the wire it is on or
@@ -451,6 +517,18 @@ pub fn checkPost(headers: Headers, body: []const u8, scratch: []u8) Error!Post {
     if (headers.schema_keyword_sent != null) return error.NotAHeader;
 
     const revision = try revisionOf(headers);
+
+    // PROTOCOLS.md 4.2: `Mcp-Session-Id` was removed at `2026-07-28` and "a
+    // peer that sends it is not speaking this revision", so the request is
+    // refused here. The compatibility matrix in the normative source instead
+    // asks for legacy handling — "an `Mcp-Session-Id` header on a request:
+    // ignore it" — and PROTOCOLS.md wins where the two disagree, so the
+    // conflict is recorded here rather than resolved silently. A peer that
+    // sent `Last-Event-ID` is served, because PROTOCOLS.md says no such thing
+    // of that header.
+    if (headers.removed) |removed| {
+        if (removed == .session_id_removed) return error.UnsupportedVersion;
+    }
 
     if (mediaType(headers.content_type orelse return error.MissingHeader) != .json) {
         return error.UnsupportedMediaType;
@@ -707,6 +785,12 @@ pub const Exchange = struct {
 };
 
 /// What a peer answered to a call.
+///
+/// `message` and `body` borrow the buffer the exchange read into, which is
+/// [`Client.Buffers`] `out` for a single body and the caller's event buffer
+/// for a stream, and `body` is either that message or a slice of it. Nothing
+/// here is copied, so a `Reply` is valid exactly as long as those buffers
+/// are. `error_code` is the one member that owns its value.
 pub const Reply = struct {
     /// The HTTP status. Not folded into an error: the specification pairs
     /// `-32601` with `404` and `-32020` with `400`, so a caller that cannot
@@ -952,14 +1036,17 @@ pub const Stream = struct {
     pub fn send(self: *Stream, event: []u8, message: []const u8) Error!void {
         const framed = try writeEvent(event, message);
         self.body.writer.writeAll(framed) catch return error.Transport;
-        // `BodyWriter.flush` is not the flush this needs. It flushes for `end`,
-        // `none`, `content_length` and `chunk_len`, and the state an event
-        // stream spends its whole life in is `chunked`, which it does not
-        // cover. With only that call, a stream that never ends delivered
-        // nothing: the reader took the head and then waited for an event that
-        // had been written. Flushing the body writer and then the protocol
-        // output is what puts an event on the wire while the stream is still
-        // open, which is the whole of a subscription.
+        // Two levels are flushed, and both are needed. `BodyWriter.flush`
+        // reaches the `chunk_len` state an event stream spends its whole life
+        // in, so that is not what is missing; what it flushes is
+        // `http_protocol_output`, and the framed event is still sitting in
+        // `body.writer`'s own staging buffer, which nothing else drains.
+        // Draining that first is what writes the chunk header and the event
+        // out of it, and flushing the protocol output after that is what puts
+        // the chunk on the wire while the stream is still open, which is the
+        // whole of a subscription. With only the first flush a stream that
+        // never ends delivered nothing: the reader took the head and then
+        // waited for an event that had been written.
         self.body.writer.flush() catch return error.Transport;
         self.body.http_protocol_output.flush() catch return error.Transport;
     }
@@ -1026,7 +1113,10 @@ pub const Server = struct {
     /// Null when the peer hung up between requests, which is how a connection
     /// ends and is not a failure. The body is not read until the headers have
     /// been checked, so a request this library will refuse never has its body
-    /// taken off the socket.
+    /// read here. Those bytes stay on the socket, and `std.http` drains them
+    /// when the request is answered, so a connection is reusable after an
+    /// answer; a caller that answers nothing must hang up rather than call
+    /// `receive` again.
     pub fn receive(self: *Server) Error!?Post {
         const request = self.http.receiveHead() catch |err| switch (err) {
             error.HttpConnectionClosing => return null,
@@ -1044,6 +1134,11 @@ pub const Server = struct {
         );
         if (headers.schema_keyword_sent != null) return error.NotAHeader;
         _ = try revisionOf(headers);
+        // A peer that sent `Mcp-Session-Id` is refused before its body is
+        // taken off the socket, for the reason `checkPost` gives.
+        if (headers.removed) |removed| {
+            if (removed == .session_id_removed) return error.UnsupportedVersion;
+        }
         if (mediaType(headers.content_type orelse return error.MissingHeader) != .json) {
             return error.UnsupportedMediaType;
         }
@@ -1145,9 +1240,17 @@ pub const Server = struct {
     }
 
     /// The body reader reads through `transfer`, and the reader for it may be
-    /// created once per request, so the length comes from the head rather than
-    /// from an attempt to read until the socket says stop.
+    /// created once per request, so the length comes from `content-length`
+    /// rather than from an attempt to read until the socket says stop.
+    ///
+    /// A `transfer-encoding: chunked` POST is refused rather than read. There
+    /// is no `content-length` to take the length from, and a body this
+    /// transport does not read stays on the socket, so a caller that leaves the
+    /// refusal unanswered has its next `receive` parse chunk data as a request
+    /// line. Refusing it here is what keeps a connection reused across
+    /// requests from dying after one legal request.
     fn readBody(self: *Server, request: http.Server.Request) Error![]const u8 {
+        if (request.head.transfer_encoding == .chunked) return error.MalformedRequest;
         const length = request.head.content_length orelse 0;
         if (length > self.buffers.body.len) return error.BodyTooLarge;
         if (length == 0) return self.buffers.body[0..0];
@@ -1204,34 +1307,43 @@ test "a header block that is not one is refused, not walked" {
     try testing.expectError(error.MalformedRequest, readHeaders("", &params, &scratch));
 }
 
-test "the session id the current revision removed is ignored, not honoured" {
+test "a peer that sends the session id this revision removed is refused" {
     var params: [2]ParamHeader = undefined;
-    var scratch: [64]u8 = undefined;
+    var scratch: [256]u8 = undefined;
     const head = "POST /mcp HTTP/1.1\r\n" ++
         "MCP-Protocol-Version: 2026-07-28\r\n" ++
         "Mcp-Method: tools/list\r\n" ++
         "Mcp-Session-Id: 5eed\r\n" ++
         "Last-Event-ID: 11\r\n" ++
+        "Content-Type: application/json\r\n" ++
         "\r\n";
     const headers = try readHeaders(head, &params, &scratch);
     try testing.expectEqual(mcp.HeaderKind.session_id_removed, headers.removed.?);
-    // The request is still servable. The specification's legacy handling is
-    // to ignore the header, and refusing the request would break a peer for
-    // sending a header it is entitled to send.
-    try testing.expectEqual(mcp.Revision.current, try revisionOf(headers));
-    // Nothing read it into a field, so nothing can echo it back.
-    try testing.expectEqual(@as(?[]const u8, null), headers.name);
+    // PROTOCOLS.md 4.2 says a peer that sends `Mcp-Session-Id` is not speaking
+    // this revision, so the request is refused. The compatibility matrix in
+    // the normative source asks for the opposite, and the two disagree, so
+    // this is the refusal PROTOCOLS.md requires.
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}";
+    try testing.expectError(error.UnsupportedVersion, checkPost(headers, body, &scratch));
 }
 
-test "Last-Event-ID alone is recorded too" {
+test "Last-Event-ID alone is recorded, and the request it arrived on is served" {
     var params: [2]ParamHeader = undefined;
-    var scratch: [64]u8 = undefined;
+    var scratch: [256]u8 = undefined;
     const head = "POST /mcp HTTP/1.1\r\n" ++
         "MCP-Protocol-Version: 2026-07-28\r\n" ++
+        "Mcp-Method: tools/list\r\n" ++
         "Last-Event-ID: 11\r\n" ++
+        "Content-Type: application/json\r\n" ++
         "\r\n";
     const headers = try readHeaders(head, &params, &scratch);
     try testing.expectEqual(mcp.HeaderKind.last_event_id_removed, headers.removed.?);
+    // PROTOCOLS.md 4.2 says of `Mcp-Session-Id` that a peer sending it is not
+    // speaking this revision, and says no such thing of this header, so a
+    // request that carried only this one is served. Nothing echoes it back and
+    // there is no resumption to resume.
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}";
+    try testing.expectEqualStrings("tools/list", (try checkPost(headers, body, &scratch)).method);
 }
 
 test "a repeated control header is refused rather than resolved by order" {
@@ -1245,6 +1357,33 @@ test "a repeated control header is refused rather than resolved by order" {
         "MCP-Protocol-Version: 2025-11-25\r\n" ++
         "\r\n";
     try testing.expectError(error.DuplicateHeader, readHeaders(head, &params, &scratch));
+}
+
+test "one derived annotation sent twice is refused, because only one value is checked" {
+    var params: [4]ParamHeader = undefined;
+    var scratch: [128]u8 = undefined;
+    // Section 4.2 makes a server validate the derived header against
+    // `arguments` and reject on mismatch, so two headers for one annotation
+    // leave that check as ambiguous as a repeated `Mcp-Method`. A header name
+    // is case-insensitive on the wire, so the repeat below arrives under
+    // another casing and is not a second annotation.
+    const head = "POST /mcp HTTP/1.1\r\n" ++
+        "MCP-Protocol-Version: 2026-07-28\r\n" ++
+        "Mcp-Param-city: Bern\r\n" ++
+        "Mcp-Param-unit: metric\r\n" ++
+        "MCP-PARAM-CITY: Geneva\r\n" ++
+        "\r\n";
+    try testing.expectError(error.DuplicateHeader, readHeaders(head, &params, &scratch));
+
+    // Two annotations for two members are two derived headers, and they are
+    // carried rather than refused. Without this half the assertion above would
+    // also pass for a server that refused every second header.
+    const two = "POST /mcp HTTP/1.1\r\n" ++
+        "MCP-Protocol-Version: 2026-07-28\r\n" ++
+        "Mcp-Param-city: Bern\r\n" ++
+        "Mcp-Param-unit: metric\r\n" ++
+        "\r\n";
+    try testing.expectEqual(@as(usize, 2), (try readHeaders(two, &params, &scratch)).params.len);
 }
 
 test "x-mcp-header sent as a header is refused, because it is a schema keyword" {
@@ -1457,6 +1596,31 @@ test "the reply type is bounded by what the client said it accepts" {
     try testing.expect(!parseAccept("text/plain").allows(.json));
 }
 
+test "a media type the peer refused with q=0 is one this transport may not answer with" {
+    // RFC 9110 gives a quality of zero one meaning, and `respondJson` reads
+    // this header. Without the rule `application/json;q=0` is read as a
+    // request for a JSON body, and the answer is a media type the peer said it
+    // will not read.
+    const refused = parseAccept("application/json;q=0");
+    try testing.expect(!refused.allows(.json));
+    try testing.expect(!refused.allows(.event_stream));
+    try testing.expect(!refused.isAcceptable());
+
+    // A quality of zero written longer is that same refusal, and any other
+    // quality accepts. A `q` that is not a number is not a quality, so it
+    // refuses nothing.
+    try testing.expect(!parseAccept("application/json;q=0.000").allows(.json));
+    try testing.expect(parseAccept("application/json;q=0.5").allows(.json));
+    try testing.expect(parseAccept("application/json;q=1").allows(.json));
+    try testing.expect(parseAccept("application/json; charset=utf-8").allows(.json));
+
+    // One refused entry does not refuse the others, so a peer that refused the
+    // body and kept the stream is answered with the stream.
+    const mixed = parseAccept("application/json;q=0, text/event-stream");
+    try testing.expect(!mixed.allows(.json));
+    try testing.expect(mixed.allows(.event_stream));
+}
+
 test "a POST that accepts no reply this transport can send is refused" {
     var params: [2]ParamHeader = undefined;
     var scratch: [256]u8 = undefined;
@@ -1465,6 +1629,23 @@ test "a POST that accepts no reply this transport can send is refused" {
         "Mcp-Method: tools/list\r\n" ++
         "Content-Type: application/json\r\n" ++
         "Accept: text/plain\r\n" ++
+        "\r\n";
+    const headers = try readHeaders(head, &params, &scratch);
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}";
+    try testing.expectError(error.NotAcceptable, checkPost(headers, body, &scratch));
+}
+
+test "a POST whose only acceptable type arrived with q=0 is refused" {
+    var params: [2]ParamHeader = undefined;
+    var scratch: [256]u8 = undefined;
+    // Naming a type this transport cannot send and refusing a type it can are
+    // the same answer to the server, so they are refused the same way and the
+    // request never reaches a handler.
+    const head = "POST /mcp HTTP/1.1\r\n" ++
+        "MCP-Protocol-Version: 2026-07-28\r\n" ++
+        "Mcp-Method: tools/list\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "Accept: application/json;q=0\r\n" ++
         "\r\n";
     const headers = try readHeaders(head, &params, &scratch);
     const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}";
@@ -1683,8 +1864,22 @@ const Serve = struct {
     shape: ResponseShape,
     /// How many POSTs to answer before hanging up.
     count: usize,
+    /// The failure the first request must be refused with, or null when it is
+    /// one to serve.
+    ///
+    /// A refused request is answered and the connection then carries the next
+    /// one, which is the point: the body was refused before it was read, so
+    /// `std.http` can drain it and the connection stays in step.
+    refuse_first: ?anyerror = null,
+    /// The status a refused request is answered with.
+    refuse_status: std.http.Status = .bad_request,
+    /// Whether a request was refused, so a test can tell a refusal from a
+    /// result.
+    refused: ?*bool = null,
     /// The status of each answer, in order.
     statuses: []std.http.Status,
+    /// How many requests this connection answered. A request refused is not
+    /// counted, which is the only way a test can tell the two apart.
     answered: *usize,
     /// The revision the accepted POST named, so a test can assert the header
     /// really was read rather than assumed.
@@ -1722,19 +1917,40 @@ const Serve = struct {
 
         var index: usize = 0;
         while (index < self.count) : (index += 1) {
-            const post = self.side.server.receive() catch {
-                self.failed.* = true;
-                return;
+            const expected: ?anyerror = if (index == 0) self.refuse_first else null;
+            const post = self.side.server.receive() catch |err| {
+                // A refusal this server was not told to expect is a failure,
+                // and so is a request that arrived with nothing to refuse.
+                const wanted = expected orelse {
+                    self.failed.* = true;
+                    return;
+                };
+                if (err != wanted) {
+                    self.failed.* = true;
+                    return;
+                }
+                self.side.server.reject(self.refuse_status, "") catch {
+                    self.failed.* = true;
+                    return;
+                };
+                if (self.refused) |slot| slot.* = true;
+                continue;
             } orelse {
                 self.failed.* = true;
                 return;
             };
+            // A request that was to be refused and reached a handler instead
+            // is a server that answered what it was told not to.
+            if (expected != null) {
+                self.failed.* = true;
+                return;
+            }
             const status = self.side.server.answer(post, self.handler, self.shape) catch {
                 self.failed.* = true;
                 return;
             };
             self.statuses[index] = status;
-            self.answered.* = index + 1;
+            self.answered.* += 1;
             if (self.revision) |slot| slot.* = post.revision;
         }
     }
@@ -1846,6 +2062,89 @@ const Listen = struct {
             if (self.messages == 2) break;
         }
         self.got.* = true;
+    }
+};
+
+/// POSTs one message with `transfer-encoding: chunked`, then POSTs a second
+/// message on the same connection.
+///
+/// Chunked is a legal framing and one this transport does not read, so the
+/// first request is answered rather than served. The second request is the
+/// proof that the refusal left the connection in step: a body the server read
+/// past, or one it never drained, leaves the next request head to be parsed
+/// out of chunk data.
+const Chunked = struct {
+    io: Io,
+    http: *http.Client,
+    endpoint: *const Endpoint,
+    side: *Side,
+    /// The status the chunked request came back with.
+    first: std.http.Status = .ok,
+    /// The answer to the request after it, which is proof that one was served.
+    answer: ?Reply = null,
+    failed: *bool,
+
+    fn run(self: *@This()) void {
+        var client = openClient(self.http, self.endpoint) orelse {
+            self.failed.* = true;
+            return;
+        };
+        const spec: PostHeaders = .{ .method = "tools/list" };
+        const headers = client.requestHeaders(spec, &self.side.head) catch {
+            self.failed.* = true;
+            return;
+        };
+        var request = self.http.request(.POST, client.uri, .{
+            .extra_headers = headers,
+            .headers = .{
+                .content_type = .{ .override = mcp.uri_and_media.json_media_type },
+                .accept_encoding = .omit,
+            },
+            .redirect_behavior = .not_allowed,
+            .connection = client.connection,
+        }) catch {
+            self.failed.* = true;
+            return;
+        };
+        // This request is not deinited: the connection belongs to this task
+        // and the request after it goes out on the same one.
+        request.transfer_encoding = .{ .chunked = {} };
+        var out = request.sendBodyUnflushed(&self.side.transfer) catch {
+            self.failed.* = true;
+            return;
+        };
+        out.writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}") catch {
+            self.failed.* = true;
+            return;
+        };
+        // `end` writes the last chunk and flushes, so the whole request is on
+        // the wire before the reply is waited for.
+        out.end() catch {
+            self.failed.* = true;
+            return;
+        };
+        var response = request.receiveHead(&.{}) catch {
+            self.failed.* = true;
+            return;
+        };
+        self.first = response.head.status;
+        // The reply body is drained here rather than by `deinit`, because the
+        // connection is reused rather than released. The refusal carries no
+        // body, so what is expected to be discarded is nothing: a zero
+        // `content-length` is at its end before the first read.
+        _ = response.reader(&self.side.transfer).discardRemaining() catch {
+            self.failed.* = true;
+            return;
+        };
+
+        self.answer = client.call(2, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}", spec, &self.side.head, .{
+            .transfer = &self.side.transfer,
+            .out = &self.side.out,
+            .decode = &self.side.decode,
+        }) catch {
+            self.failed.* = true;
+            return;
+        };
     }
 };
 
@@ -2021,7 +2320,7 @@ test "one POST over a real socket is answered with a single JSON body" {
     try testing.expectEqual(mcp.Revision.current, revision.?);
 }
 
-test "no session id is minted or echoed, because this revision removed it" {
+test "a request carrying the removed session id is refused, and nothing is echoed" {
     var threaded: Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -2038,6 +2337,7 @@ test "no session id is minted or echoed, because this revision removed it" {
     var answer: Answer = .{};
     var got = false;
     var failed = false;
+    var refused = false;
     var answered: usize = 0;
     var statuses = [_]std.http.Status{.ok};
 
@@ -2049,6 +2349,8 @@ test "no session id is minted or echoed, because this revision removed it" {
         .handler = .{ .ctx = &answer, .call = Answer.handle },
         .shape = .single,
         .count = 1,
+        .refuse_first = error.UnsupportedVersion,
+        .refused = &refused,
         .statuses = &statuses,
         .answered = &answered,
         .failed = &failed,
@@ -2061,8 +2363,8 @@ test "no session id is minted or echoed, because this revision removed it" {
         .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}",
         .spec = .{
             .method = "tools/list",
-            // A peer still sending the removed header is served normally, and
-            // the answer must carry no identifier of any kind back.
+            // A peer that sends the header this revision removed is speaking an
+            // earlier revision, and the answer must carry no identifier either.
             .extra = &.{
                 .{ .name = mcp.header_name.session_id, .value = "5eed" },
             },
@@ -2077,9 +2379,9 @@ test "no session id is minted or echoed, because this revision removed it" {
 
     try testing.expect(!failed);
     try testing.expect(got);
-    try testing.expectEqual(@as(usize, 1), answered);
-    // The request really did carry the removed header, so the check below is
-    // about the answer and not about a header that was never sent.
+    try testing.expect(refused);
+    // The request really did carry the removed header, so the refusal below is
+    // about that header and not about something the peer never sent.
     const head = server_side.server.request.?.head_buffer;
     var iterator = http.HeaderIterator.init(head);
     var sent = false;
@@ -2087,11 +2389,79 @@ test "no session id is minted or echoed, because this revision removed it" {
         if (mcp.headerKind(field.name) == .session_id_removed) sent = true;
     }
     try testing.expect(sent);
-    // The request was not refused for it, and the answer minted no session of
-    // its own, because this revision has no session to mint.
-    try testing.expectEqualStrings("tools/list", answer.method_buffer[0..answer.method_len]);
+    // The peer is told the request is one this revision does not speak, the
+    // handler never saw it, and the answer minted no session of its own.
+    try testing.expectEqual(std.http.Status.bad_request, listen.status);
+    try testing.expectEqual(@as(usize, 0), answer.calls);
+    try testing.expectEqual(@as(usize, 0), answered);
     try testing.expect(!listen.session_echoed);
-    try testing.expectEqual(std.http.Status.ok, listen.status);
+    try testing.expectEqual(@as(usize, 0), listen.messages);
+}
+
+test "a chunked POST is refused, and the connection still serves the request after it" {
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var http_client: http.Client = .{ .allocator = testing.allocator, .io = io };
+    defer http_client.deinit();
+
+    var endpoint: Endpoint = .{};
+    try endpoint.open(io);
+    defer endpoint.close(io);
+
+    var server_side: Side = .{};
+    var client_side: Side = .{};
+    var answer: Answer = .{};
+    var failed = false;
+    var refused = false;
+    var answered: usize = 0;
+    var statuses = [_]std.http.Status{ .ok, .ok };
+
+    var group: Io.Group = .init;
+    var serve = Serve{
+        .io = io,
+        .listener = &endpoint.listener,
+        .side = &server_side,
+        .handler = .{ .ctx = &answer, .call = Answer.handle },
+        .shape = .single,
+        .count = 2,
+        .refuse_first = error.MalformedRequest,
+        .refused = &refused,
+        .statuses = &statuses,
+        .answered = &answered,
+        .failed = &failed,
+    };
+    var chunked = Chunked{
+        .io = io,
+        .http = &http_client,
+        .endpoint = &endpoint,
+        .side = &client_side,
+        .failed = &failed,
+    };
+    group.async(io, Serve.run, .{&serve});
+    group.async(io, Chunked.run, .{&chunked});
+    group.await(io) catch {};
+
+    try testing.expect(!failed);
+    try testing.expect(refused);
+    // The body was never read, so the request was refused on the framing this
+    // transport does not read rather than served as an empty one.
+    try testing.expectEqual(std.http.Status.bad_request, chunked.first);
+    // The request after it was answered on the same connection, which is the
+    // proof that the refusal left nothing on the socket for the next request
+    // head to be parsed out of.
+    try testing.expectEqual(std.http.Status.ok, chunked.answer.?.status);
+    // Two requests came off this connection and one of them was answered. The
+    // count is not the loop position: a refused request skips it, and a
+    // counter that recorded the position would report a served request as two
+    // answers the moment a refusal shares the connection with it.
+    try testing.expectEqual(@as(usize, 1), answered);
+    // Only the second request reached a handler, and it was the one the client
+    // asked for.
+    try testing.expectEqual(@as(usize, 1), answer.calls);
+    try testing.expectEqualStrings("tools/list", answer.method_buffer[0..answer.method_len]);
+    try testing.expectEqualStrings("{\"resultType\":\"complete\"}", chunked.answer.?.body);
 }
 
 test "the same request is answered as a stream when the client accepts one" {

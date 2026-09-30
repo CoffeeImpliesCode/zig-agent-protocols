@@ -31,19 +31,20 @@ const std = @import("std");
 pub const delimiter: u8 = '\n';
 
 pub const Error = error{
-    /// A single frame did not fit the caller's buffer.
+    /// The bytes offered did not fit the caller's buffer.
     ///
-    /// The frame is left in the buffer so the caller can read the remainder
-    /// and report how large the offender was.
+    /// Nothing is copied, so the offending bytes are not in the buffer and
+    /// their length cannot be read back from it. What arrived before the
+    /// refusal is still there, and [`Framer.partial`] reports it.
     FrameTooLarge,
 };
 
 /// Assembles frames from a byte stream into one caller-owned buffer.
 ///
-/// The buffer is a ring of three regions: complete frames waiting to be taken,
-/// one partial frame being assembled, and free space. Draining a frame moves
-/// the partial region down, so a long stream does not walk the buffer forward
-/// until it is exhausted.
+/// The buffer is one linear run of three regions: complete frames waiting to
+/// be taken, one partial frame being assembled, and free space. Sliding the
+/// held bytes down to the front reclaims the space behind them, so a long
+/// stream does not walk the buffer forward until it is exhausted.
 pub const Framer = struct {
     buffer: []u8,
     /// Start of the region not yet handed to the caller.
@@ -86,13 +87,19 @@ pub const Framer = struct {
         return frame;
     }
 
-    /// Whether bytes are held that do not yet form a frame.
+    /// Whether any received byte is still held, whether or not it completes
+    /// a frame. A framer with a complete frame the caller has not taken is
+    /// still pending, so a caller cannot use this to ask whether a frame is
+    /// ready.
     pub fn pending(self: *const Framer) bool {
         return self.start != self.end;
     }
 
-    /// The frame currently being assembled, for a size report after
-    /// `error.FrameTooLarge`.
+    /// The bytes received and not yet taken, complete frames included.
+    ///
+    /// This is the size report available after `error.FrameTooLarge`: what
+    /// arrived before the refused push is still here, and the bytes of the
+    /// refused push are nowhere.
     pub fn partial(self: *const Framer) []const u8 {
         return self.buffer[self.start..self.end];
     }
@@ -106,9 +113,11 @@ pub const Framer = struct {
     /// The free region a caller may read into directly.
     ///
     /// Reading straight into the framer avoids a copy per frame, which is the
-    /// whole cost of a byte stream on the hot path. The region is invalidated
-    /// by the next `push`, `next` or `slide`, so the caller must call
-    /// [`Framer.filled`] with what it read before touching the framer again.
+    /// whole cost of a byte stream on the hot path. The next `push` or `slide`
+    /// overwrites the region, and [`Framer.filled`] consumes its front, so the
+    /// caller must record what it read before touching the framer again.
+    /// `next` leaves the region alone: it only advances the start of what has
+    /// already been received.
     pub fn freeSpace(self: *Framer) []u8 {
         return self.buffer[self.end..];
     }
@@ -159,7 +168,13 @@ test "one frame per newline, and several frames in one push" {
     var framer = Framer.init(&buffer);
 
     try framer.push("{\"a\":1}\n{\"b\":2}\n");
+    // Two complete frames are held and neither has been taken, so this is
+    // pending. A framer that reported false until a frame was complete would
+    // report false here. A caller polling it would then read both frames
+    // twice.
+    try testing.expect(framer.pending());
     try testing.expectEqualStrings("{\"a\":1}", framer.next().?);
+    try testing.expect(framer.pending());
     try testing.expectEqualStrings("{\"b\":2}", framer.next().?);
     try testing.expectEqual(@as(?[]const u8, null), framer.next());
     try testing.expect(!framer.pending());
@@ -199,16 +214,24 @@ test "an empty line is an empty frame, not silence" {
     try testing.expectEqualStrings("", framer.next().?);
 }
 
-test "a frame larger than the buffer is refused, and stays readable" {
+test "a frame larger than the buffer is refused, and none of it is kept" {
     var buffer: [16]u8 = undefined;
     var framer = Framer.init(&buffer);
 
     try testing.expectError(error.FrameTooLarge, framer.push("{\"text\":\"far too long for this\"}"));
-    // Nothing was appended, so the caller can still see how much arrived and
-    // then reset rather than retrying a half-written frame.
+    // The push is all-or-nothing, so not one of the offending bytes is in the
+    // buffer. A push that copied first and failed afterwards would leave the
+    // framer holding the start of a frame it can never complete. This
+    // assertion is what catches that.
     try testing.expectEqualStrings("", framer.partial());
     framer.reset();
     try testing.expect(!framer.pending());
+
+    // The refusal leaves the framer usable, which is what lets a caller
+    // resynchronise after one hostile frame instead of tearing the
+    // connection down.
+    try framer.push("{\"a\":1}\n");
+    try testing.expectEqualStrings("{\"a\":1}", framer.next().?);
 }
 
 test "the buffer is reused across many frames without running out" {
@@ -244,9 +267,20 @@ test "freeSpace and filled let a caller read straight into the framer" {
     const space = framer.freeSpace();
     try testing.expectEqual(@as(usize, 64), space.len);
     @memcpy(space[0..3], "abc");
+    // Three bytes went in, so three are recorded. Recording a fourth would
+    // put one byte of uninitialised memory into the region the framer reads
+    // and frames, which is the one thing `filled` exists to prevent.
     framer.filled(3);
+    // `filled` consumed the front of the region it was given, so the slice
+    // the caller still holds is no longer the free space.
+    try testing.expectEqual(@as(usize, 61), framer.freeSpace().len);
 
-    @memcpy(framer.freeSpace()[0..3], "de\n");
-    framer.filled(4);
+    // A push lands in the same region, so a caller still holding the slice
+    // would read its own earlier bytes back as frame data.
+    try framer.push("d");
+    try testing.expectEqual(@as(usize, 60), framer.freeSpace().len);
+
+    @memcpy(framer.freeSpace()[0..2], "e\n");
+    framer.filled(2);
     try testing.expectEqualStrings("abcde", framer.next().?);
 }
