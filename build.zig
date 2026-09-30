@@ -55,6 +55,49 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(runtime_demo);
 
+    // The sessions example drives an ACP session and the mcp-over-acp binding
+    // over one real connection, so it is the proof that the two protocol layers
+    // compose on transport bytes rather than only against each other in a
+    // slice.
+
+    const sessions_mod = b.createModule(.{
+        .root_source_file = b.path("src/sessions_demo.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sessions_mod.addImport("zig-agent-proto", lib_mod);
+
+    const sessions_demo = b.addExecutable(.{
+        .name = "zig-agent-proto-sessions",
+        .root_module = sessions_mod,
+    });
+    b.installArtifact(sessions_demo);
+
+    const run_sessions_cmd = b.addRunArtifact(sessions_demo);
+    const run_sessions_step = b.step("run-sessions", "Run an ACP session and the binding over a socket");
+    run_sessions_step.dependOn(&run_sessions_cmd.step);
+
+    // The HTTP example drives the Streamable HTTP transport over a real
+    // loopback socket, so it is the proof that the second transport works on
+    // real HTTP bytes and not only against header blocks in a slice.
+
+    const http_mod = b.createModule(.{
+        .root_source_file = b.path("src/http_demo.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    http_mod.addImport("zig-agent-proto", lib_mod);
+
+    const http_demo = b.addExecutable(.{
+        .name = "zig-agent-proto-http",
+        .root_module = http_mod,
+    });
+    b.installArtifact(http_demo);
+
+    const run_http_cmd = b.addRunArtifact(http_demo);
+    const run_http_step = b.step("run-http", "Run the Streamable HTTP transport over a socket");
+    run_http_step.dependOn(&run_http_cmd.step);
+
     // running
 
     const run_cmd = b.addRunArtifact(demo);
