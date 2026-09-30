@@ -4,8 +4,8 @@
 //! in this library. Where the source and that document disagree, the source is
 //! wrong.
 //!
-//! The library models three wire protocols and the one defined composition
-//! between them:
+//! The library models three wire protocols, the one defined composition
+//! between them, and a runtime layer above the codec:
 //!
 //!   - [`mcp`]      — Model Context Protocol, revisions `2026-07-28` and
 //!                    `2025-11-25`, decoded separately.
@@ -13,6 +13,16 @@
 //!   - [`acp`]      — Agent Client Protocol, wire version `1` with `2` gated.
 //!   - [`bridge`]   — the `mcp-over-acp` binding.
 //!   - [`jsonrpc`]  — the JSON-RPC 2.0 base that MCP and ACP both sit on.
+//!   - [`json`]     — the borrowing reader and fixed-buffer writer under them.
+//!
+//! Above the codec sit [`framing`], [`conn`] and [`stdio`] for a byte
+//! transport, [`http`] for the Streamable HTTP one, and a session layer per
+//! protocol: [`mcp_session`], [`acp_session`] and [`bridge_session`].
+//!
+//! Two modules under `src/` are deliberately not re-exported. `testkit.zig` is
+//! the property and differential harness, which the `fuzz` step compiles as its
+//! own root so its generated documents never reach a consumer's build. The four
+//! example roots are executables rather than library surface.
 //!
 //! Encoding contract, from PROTOCOLS.md section 2:
 //!
