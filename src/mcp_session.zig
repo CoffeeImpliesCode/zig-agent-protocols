@@ -13,8 +13,16 @@
 //!   wire, so a caller that asks for a method removed at `2026-07-28` learns so
 //!   immediately instead of after a round trip to a peer that may or may not
 //!   have removed it.
+//! - A method is checked for arity and direction as well: a notification is
+//!   never sent as a request, and a method the other side sends is never sent
+//!   from here. A notification sent as a request leaves the caller waiting for
+//!   an answer no conforming peer will send, and `mcp.lookupMethod` resolves
+//!   one as readily as a request, so the pin alone does not refuse it.
 //! - At the current revision every request carries the client capabilities in
-//!   `_meta`, because there is no `initialize` to carry them in.
+//!   `_meta`, because there is no `initialize` to carry them in. A `params`
+//!   that carries `_meta` of its own is merged with it rather than written
+//!   beside it, because PROTOCOLS.md 4.7 puts `_meta` on a multi-round-trip
+//!   retry as well as on the call that opens it.
 //! - A result is classified as complete or `input_required` before the caller
 //!   sees it, so an interim result is never mistaken for a final one.
 //! - A peer that answered with an error comes back as a [`conn.Response`] whose
@@ -29,15 +37,20 @@
 //! [`Server.methodNotFound`] instead of a guess. What the client sends, the
 //! server reads, so [`Server.observe`] returns the method and the capabilities
 //! one request carried from a single decode. What the server sends, the
-//! server checks, so [`Server.checkResult`] refuses a cacheable result that
-//! leaves out a field PROTOCOLS.md 4.6 requires, and
-//! [`Server.inputRequired`] refuses an interim result on a method 4.7 does not
-//! let answer with one.
+//! server checks, so [`Server.checkResult`] refuses a result that leaves out a
+//! member PROTOCOLS.md 4.6 requires, and [`Server.inputRequired`] refuses an
+//! interim result on a method 4.7 does not let answer with one. [`Server.gate`]
+//! refuses the arities the client half does, so a handler is not entered for a
+//! message that expects no answer or for one travelling the other way.
 //!
 //! ## Allocating
 //!
 //! `ARCHITECTURE.md` section 4 lets this layer allocate where state is
 //! genuinely dynamic. Here it does not need to: every buffer is the caller's.
+//! One of them does two jobs, the frame buffer in [`Client.request`], which is
+//! the scratch the `_meta` merge walks with because `conn.call` has not
+//! written into it yet and a buffer that can hold the frame can hold the
+//! member names of the params inside it.
 
 const std = @import("std");
 const conn = @import("conn.zig");
@@ -54,19 +67,35 @@ pub const Error = error{
     /// caller can fix it without a round trip and a peer on another revision
     /// may well still accept it.
     MethodNotInRevision,
-    /// The `params` a caller passed are not a JSON object, so `_meta` cannot
-    /// be added to them.
+    /// The method is part of the revision but is not a request: it is a
+    /// notification, or it is a method the other side sends.
     ///
-    /// Distinct from `BufferTooSmall`: the object is what cannot be wrapped,
-    /// not the buffer, so a caller that doubles the buffer and tries again
-    /// gets this again.
+    /// A notification carries no id and is never answered, so one sent as a
+    /// request leaves the caller waiting for an answer no conforming peer will
+    /// send; a method the other side sends is not this side's to call, and
+    /// answering one is as wrong as calling one. Reported before the wire
+    /// rather than as a peer's `-32601`, because no revision of the method
+    /// table makes one of these a request.
+    ///
+    /// Distinct from `MethodNotInRevision` because the caller's repair differs:
+    /// a removed name is a method again at the other revision, and a
+    /// notification never is.
+    NotARequest,
+    /// The `params` a caller passed are not a single JSON object, so `_meta`
+    /// cannot be added to them.
+    ///
+    /// Also a `params` whose own `_meta` is not an object, which cannot be
+    /// merged with. Distinct from `BufferTooSmall`: the object is what cannot
+    /// be wrapped, not the buffer, so a caller that doubles the buffer and
+    /// tries again gets this again.
     NotAnObject,
     /// A body is not a result this layer can pass on.
     ///
     /// A peer's body that does not decode as one, or one this revision does
     /// not define for the method that must carry it. PROTOCOLS.md 4.6 makes
-    /// three members required on the results it covers, so a body missing one
-    /// is refused whichever side wrote it.
+    /// `resultType` required on every result and adds `ttlMs` and `cacheScope`
+    /// to one the method table marks cacheable, so a body missing one of those
+    /// three is refused whichever side wrote it.
     NotAResult,
     /// An interim result arrived where none could be answered: the method is
     /// one PROTOCOLS.md 4.7 does not let return one, or the caller supplied
@@ -100,9 +129,23 @@ pub const Client = struct {
     ///
     /// `params` is the caller's own JSON object, or null. When this session
     /// has to add the `_meta` wrapper it builds one into `params_out` and sends
-    /// that, leaving the caller's buffer untouched. A `params` that is not an
-    /// object is `error.NotAnObject` rather than `error.BufferTooSmall`, so a
-    /// caller sizing a buffer is not sent looking for one.
+    /// that, leaving the caller's buffer untouched. A `params` that carries
+    /// `_meta` of its own has the capabilities merged into it rather than
+    /// written beside them, so PROTOCOLS.md 4.7's retry travels one `_meta`
+    /// object. A `params` that is not a single JSON object is
+    /// `error.NotAnObject` rather than `error.BufferTooSmall`, so a caller
+    /// sizing a buffer is not sent looking for one.
+    ///
+    /// `out` does two jobs, the frame and the scratch the merge walks with.
+    /// `conn.call` has not written into it yet, and a buffer that can hold the
+    /// frame can hold the decoded width of every member name in the params it
+    /// carries, so a call that fits never fails for want of scratch.
+    ///
+    /// A `params` this session adds nothing to is written as the caller built
+    /// it. The convention the whole tree keeps is that a caller's own JSON is
+    /// spliced verbatim and the framer, not the codec, is what refuses a body
+    /// that does not parse; this layer only walks a `params` it has to rewrite
+    /// anyway, which is what makes that walk free to refuse a malformed one.
     pub fn request(
         self: *Client,
         method: []const u8,
@@ -111,25 +154,24 @@ pub const Client = struct {
         out: []u8,
         params_out: []u8,
     ) Error!conn.Response {
-        // Checked before the wire, so a removed method is refused locally.
-        _ = mcp.lookupMethod(self.revision, method) catch return error.MethodNotInRevision;
+        // Checked before the wire, so a removed method is refused locally and a
+        // notification never goes on the wire as a request.
+        _ = requestMethod(self.revision, method) catch |err| return err;
 
         const payload = if (self.capabilities) |caps| blk: {
             // At the previous revision the capabilities travel in `initialize`,
             // so wrapping every request would be sending something the peer
             // never asked for.
             if (self.revision != .current) break :blk params;
-            if (params) |text| {
-                break :blk injectMeta(text, caps, params_out) catch |err| switch (err) {
-                    // The object is what cannot be wrapped, not the buffer it
-                    // was offered in, so the two are reported apart.
-                    error.InvalidField => return error.NotAnObject,
-                    else => return error.BufferTooSmall,
-                };
-            } else {
-                break :blk emptyParamsWithMeta(caps, params_out) catch
-                    return error.BufferTooSmall;
-            }
+            // A call with no params of its own still carries `_meta`, so the
+            // capabilities go on an empty object rather than on nothing.
+            const text = params orelse "{}";
+            break :blk injectMeta(text, caps, params_out, out) catch |err| switch (err) {
+                // The object is what cannot be wrapped, not the buffer it was
+                // offered in, so the two are reported apart.
+                error.InvalidField => return error.NotAnObject,
+                else => return error.BufferTooSmall,
+            };
         } else params;
 
         const answer = try self.connection.call(method, payload, result, out);
@@ -206,16 +248,22 @@ pub const Client = struct {
         // business inventing.
         const retried = try Client.classify(retry.body, params_out);
         if (retried.isComplete()) return retry;
+        // The value first, on this leg as on the first. A `resultType` the
+        // revision does not define is a fault of the answer whichever leg it
+        // arrived on, and reporting it as a second interim result would send
+        // the caller to look for a method or an answer problem when the fault
+        // is the value — the inversion the first leg's own comment rules out.
+        if (retried.known() == null) return error.UnknownResultType;
         return error.InputRequiredUnexpected;
     }
 };
 
 /// A server bound to one revision.
 ///
-/// The mirror of [`Client`]. Both halves hold the same pin and reach
-/// [`mcp.lookupMethod`] through [`Server.gate`], so a name the client refuses
-/// to send is a name the server refuses to answer, and the two sides agree on
-/// what exists without exchanging a version to find out.
+/// The mirror of [`Client`]. Both halves hold the same pin and read it through
+/// the same gate, so a name the client refuses to send is a name the server
+/// refuses to answer, and the two sides agree on what exists without
+/// exchanging a version to find out.
 pub const Server = struct {
     /// The connection this server answers on.
     ///
@@ -255,20 +303,19 @@ pub const Server = struct {
         return .{ .connection = connection, .revision = revision };
     }
 
-    /// The pinned revision's entry for `method`, or `error.MethodNotInRevision`.
+    /// The pinned revision's entry for a request this server may answer.
+    ///
+    /// `error.MethodNotInRevision` for a name the revision removed or never
+    /// had, and `error.NotARequest` for one that is not a request at all: a
+    /// notification, which expects no answer, or a method the client does not
+    /// send, which is travelling the other way.
     ///
     /// A handler calls this before it reads `params`, so a name this revision
     /// removed costs the peer the `-32601` of [`Server.methodNotFound`] rather
-    /// than whatever the handler would have guessed at for it.
+    /// than whatever the handler would have guessed at for it, and a message
+    /// that expects nothing never reaches a handler at all.
     pub fn gate(self: Server, method: []const u8) Error!mcp.MethodInfo {
-        return mcp.lookupMethod(self.revision, method) catch |err| switch (err) {
-            error.UnknownMethod => error.MethodNotInRevision,
-            // `lookupMethod` walks comptime tables and compares names, so it
-            // reads no caller buffer and no other member of `DecodeError` can
-            // reach here. Reporting the refusal rather than unwrapping keeps a
-            // path that cannot happen from becoming a panic.
-            else => error.MethodNotInRevision,
-        };
+        return requestMethod(self.revision, method);
     }
 
     /// What one request told the server, decided in one pass over it.
@@ -335,10 +382,20 @@ pub const Server = struct {
 
     /// Refuse a result that breaks the rule `info` carries, and accept the rest.
     ///
-    /// PROTOCOLS.md 4.6 makes `ttlMs` and `cacheScope` required on a result
-    /// the method table marks cacheable, so a handler calls this on the body
-    /// it built and learns from a return value whether the body may be sent,
-    /// rather than from a review of whether it remembered the two fields.
+    /// PROTOCOLS.md 4.6 makes `resultType` required on every result and adds
+    /// `ttlMs` and `cacheScope` to one the method table marks cacheable, so a
+    /// handler calls this on the body it built and learns from a return value
+    /// whether the body may be sent, rather than from a review of whether it
+    /// remembered the three members.
+    ///
+    /// `resultType` is required here and absent-tolerant on the reading side,
+    /// which is not an inconsistency: 4.6's "a result from a peer on an
+    /// earlier revision omits `resultType`" is about what this library
+    /// receives, and a body a server built is not that.
+    /// [`Client.classify`] is where such a peer is answered for.
+    /// A value outside the two the revision defines is not refused either: what
+    /// to do with one an extension contributed is the client's decision, and
+    /// this is the sending side.
     ///
     /// No session, because the rule does not depend on one. PROTOCOLS.md 4.6
     /// binds the two caching fields to the method, and [`mcp.lookupMethod`]
@@ -347,9 +404,17 @@ pub const Server = struct {
     /// caller already holding `info` from [`Server.gate`] passes it on
     /// unchanged.
     pub fn checkResult(info: mcp.MethodInfo, result: []const u8, scratch: []u8) Error!void {
+        const kind = mcp.decodeResultType(result, scratch) catch |err| switch (err) {
+            error.BufferTooSmall => return error.BufferTooSmall,
+            else => return error.NotAResult,
+        };
+        // The member is required on a result, so its absence is refused here
+        // even though a peer on an earlier revision may omit one. A body that
+        // is not an object was already reported by the decode above.
+        if (kind.value == null) return error.NotAResult;
         if (!info.cacheable) return;
-        // `mcp.decodeCacheable` is the one implementation of the rule, and
-        // this is where it becomes reachable.
+        // `mcp.decodeCacheable` is the one implementation of the caching rule,
+        // and this is where it becomes reachable.
         _ = mcp.decodeCacheable(result, scratch) catch |err| switch (err) {
             error.BufferTooSmall => return error.BufferTooSmall,
             // Both fields are required, so an absent one and a value of the
@@ -471,54 +536,175 @@ fn writeDecimal(writer: *json.Writer, value: u64) root.EncodeError!void {
     try writer.slice(digits[at..]);
 }
 
+/// The pinned revision's entry for a request this side may send.
+///
+/// A name the revision does not have is `MethodNotInRevision`; a name it has
+/// that is not a request is `NotARequest`. The two are apart because the
+/// caller's repair differs: a removed name is a method again at the other
+/// revision, and a notification never is one at any revision.
+fn requestMethod(revision: mcp.Revision, method: []const u8) Error!mcp.MethodInfo {
+    const info = mcp.lookupMethod(revision, method) catch return error.MethodNotInRevision;
+    // The arity, first. `mcp.lookupMethod` searches the request table and the
+    // notification table alike, so a notification resolves as readily as a
+    // request and the pin alone does not refuse it.
+    if (isNotification(method)) return error.NotARequest;
+    // The direction, second. A method the other side sends is not this side's
+    // to call, and a server answering one is as wrong as a client calling one.
+    if (info.direction != .client_to_server) return error.NotARequest;
+    return info;
+}
+
+/// Whether `name` is a notification at either revision.
+///
+/// The union of both inventories rather than the one the revision resolves,
+/// because a name removed at `2026-07-28` is a method again at `2025-11-25`
+/// and a caller must not learn that by sending one as a request. The wider
+/// union costs no precision at the current revision: a removed name is
+/// refused by [`requestMethod`] as `MethodNotInRevision` before this decides
+/// anything about it.
+fn isNotification(name: []const u8) bool {
+    for (mcp.notifications) |notification| {
+        if (std.mem.eql(u8, notification.name, name)) return true;
+    }
+    for (mcp.removed_methods) |removed| {
+        if (removed.notification and std.mem.eql(u8, removed.name, name)) return true;
+    }
+    return false;
+}
+
 /// Add `_meta` to a params object, keeping the caller's members.
+///
+/// The caller's own `_meta` is merged into the one this writes rather than
+/// written beside it, because two members of one name in one object have no
+/// single meaning: [`json.memberText`] resolves the first and a peer that
+/// resolves the last reads the other, so a duplicate either hides the
+/// caller's `_meta` or hides the capabilities. PROTOCOLS.md 4.7 puts `_meta`
+/// on a multi-round-trip retry as well as on the call that opens it, and 4.3
+/// excepts `progressToken` as a bare `_meta` key, so the case is a retry that
+/// correlates progress rather than an exotic one.
+///
+/// The members are re-emitted, so the bytes may differ from the ones that were
+/// passed while the members do not: a name comes back from the walk decoded
+/// and is written escaped again, whitespace between members is dropped, and
+/// every value is copied as the wire carried it. That walk is also what
+/// decides the params are an object, so a value that is not one, or one with
+/// anything after it, is refused rather than mangled.
+///
+/// `scratch` backs the unescaping of the member names, so it has to hold the
+/// decoded width of every name in the object. [`Client.request`] passes the
+/// frame buffer, which `conn.call` has not written into yet and which is
+/// wider than the params it will carry.
 fn injectMeta(
     params: []const u8,
     caps: []const u8,
     out: []u8,
+    scratch: []u8,
 ) root.EncodeError![]const u8 {
-    // Trimmed before the braces are read. A caller that built its object out of
-    // a frame or a file brings the padding with it, and the sibling layer in
-    // `acp_session.zig` accepts the padded form, so the same bytes must not be
-    // refused here. A value that is not an object is `InvalidField` rather than
-    // `BufferTooSmall`, because the caller's object is what cannot be wrapped,
-    // not the size of the buffer it offered.
-    const trimmed = std.mem.trim(u8, params, " \t\r\n");
-    if (trimmed.len < 2) return error.InvalidField;
-    if (trimmed[0] != '{' or trimmed[trimmed.len - 1] != '}') return error.InvalidField;
-    // The wrapper goes in front of the caller's own members. Parsing and
-    // re-emitting the object would need a decode the caller has already done,
-    // and splicing keeps the caller's bytes exactly as written. Trimmed again
-    // inside, so an object holding only whitespace gains no trailing comma.
-    const body = std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
+    // The wrapper comes first, and the walk below cannot know where the
+    // caller's own `_meta` is until it has been read, so the params are walked
+    // twice: once for that member and once for the rest. One pass would either
+    // close `_meta` before a member the caller put after it, which lands the
+    // rest inside the capabilities object, or write the wrapper last, which is
+    // a different object from the one this layer has always written. Reading
+    // the caller's `_meta` first also means a params that is not an object is
+    // refused before a byte of output exists rather than half-built in it.
+    const own_meta = findMeta(params, scratch) catch |err| return readFailure(err);
 
+    var reader = json.Reader.init(params);
     var writer = json.Writer.init(out);
     try writer.slice("{\"_meta\":{\"");
     try writer.slice(mcp.meta_key.client_capabilities);
     try writer.slice("\":");
     try writer.slice(caps);
-    // Close `_meta` before the caller's members, or they land inside the
+    if (own_meta) |raw| try mergeMeta(raw, &writer, scratch);
+    // Close `_meta` before the caller's other members, or they land inside the
     // capabilities object instead of beside it.
     try writer.byte('}');
-    if (body.len != 0) {
-        // The object has members of its own, so its first needs the comma that
-        // separates it from `_meta`.
-        try writer.byte(',');
-        try writer.slice(body);
+
+    // Everything else the caller sent, beside the wrapper. Padded params need
+    // no trim of their own: the reader skips whitespace before and after the
+    // object, and the sibling layer in `acp_session.zig` accepts the padded
+    // form.
+    if (!(reader.beginObject() catch |err| return readFailure(err))) {
+        while (true) {
+            const next = reader.nextKey(scratch) catch |err| return readFailure(err);
+            const key = next orelse break;
+            const value = reader.rawValue(scratch) catch |err| return readFailure(err);
+            // Its own `_meta` is the one merged above, and writing it again is
+            // the duplicate this whole walk exists to avoid.
+            if (std.mem.eql(u8, key, "_meta")) continue;
+            try writer.byte(',');
+            try writeMember(key, value, &writer);
+        }
     }
+    // Anything after the object is not part of it, and a splice would have
+    // carried it onto the wire behind a valid object.
+    if (!reader.atEnd()) return error.InvalidField;
     try writer.byte('}');
     return writer.written();
 }
 
-/// The params object for a call with none of its own that still needs `_meta`.
-fn emptyParamsWithMeta(caps: []const u8, out: []u8) root.EncodeError![]const u8 {
-    var writer = json.Writer.init(out);
-    try writer.slice("{\"_meta\":{\"");
-    try writer.slice(mcp.meta_key.client_capabilities);
-    try writer.slice("\":");
-    try writer.slice(caps);
-    try writer.slice("}}");
-    return writer.written();
+/// The caller's own top-level `_meta`, as the raw text it was sent as, or null
+/// when it sent none.
+///
+/// A walk of the object rather than a search of the text, because a `_meta`
+/// nested inside another member is not a top-level one, and the first match is
+/// the member every reader of this layer resolves.
+fn findMeta(params: []const u8, scratch: []u8) root.EncodeError!?[]const u8 {
+    var reader = json.Reader.init(params);
+    if (reader.beginObject() catch |err| return readFailure(err)) return null;
+    while (true) {
+        const next = reader.nextKey(scratch) catch |err| return readFailure(err);
+        const key = next orelse break;
+        const value = reader.rawValue(scratch) catch |err| return readFailure(err);
+        if (std.mem.eql(u8, key, "_meta")) return value;
+    }
+    return null;
+}
+
+/// Write the caller's own `_meta` members beside the capabilities.
+///
+/// One member is the precedence this merge defines: a `_meta` that carries
+/// the capabilities key of its own loses it, because
+/// [`Client.capabilities`] is what this layer defines those capabilities to
+/// be, and a second copy beside it is the same ambiguity the merge exists to
+/// remove. Every other member is the caller's and is written as it is.
+fn mergeMeta(raw: []const u8, writer: *json.Writer, scratch: []u8) root.EncodeError!void {
+    var reader = json.Reader.init(raw);
+    // A `_meta` that is not an object cannot be merged with, and splicing it
+    // would put its value beside the capabilities under the one name.
+    if (reader.beginObject() catch |err| return readFailure(err)) return;
+    while (true) {
+        const next = reader.nextKey(scratch) catch |err| return readFailure(err);
+        const key = next orelse break;
+        const value = reader.rawValue(scratch) catch |err| return readFailure(err);
+        if (std.mem.eql(u8, key, mcp.meta_key.client_capabilities)) continue;
+        try writer.byte(',');
+        try writeMember(key, value, writer);
+    }
+}
+
+/// Write one member the caller sent, as `"name":value`.
+fn writeMember(key: []const u8, value: []const u8, writer: *json.Writer) root.EncodeError!void {
+    // The name the walk decoded, escaped again: `{"na\u006de":1}` comes back as
+    // `{"name":1}`, which is the member the peer reads either way.
+    try writer.string(key);
+    try writer.byte(':');
+    try writer.slice(value);
+}
+
+/// How a walk failure reaches a caller of [`injectMeta`], whose error set is
+/// the encode one.
+///
+/// A scratch too small for an escaped member name is `BufferTooSmall` and the
+/// caller's buffer grew, so it says so. Every other failure is the params
+/// themselves: they are not the object this layer has to rewrite, and a
+/// caller that doubles its output buffer and tries again gets the same answer.
+fn readFailure(err: root.DecodeError) root.EncodeError {
+    return switch (err) {
+        error.BufferTooSmall => error.BufferTooSmall,
+        else => error.InvalidField,
+    };
 }
 
 // --- Tests ----------------------------------------------------------------------
@@ -527,7 +713,8 @@ const testing = std.testing;
 
 test "the current revision wraps params in _meta and keeps the caller's members" {
     var out: [256]u8 = undefined;
-    const params = try injectMeta("{\"name\":\"echo\"}", "{\"tools\":{}}", &out);
+    var scratch: [256]u8 = undefined;
+    const params = try injectMeta("{\"name\":\"echo\"}", "{\"tools\":{}}", &out, &scratch);
     try testing.expectEqualStrings(
         "{\"_meta\":{\"io.modelcontextprotocol/clientCapabilities\":{\"tools\":{}}},\"name\":\"echo\"}",
         params,
@@ -536,27 +723,166 @@ test "the current revision wraps params in _meta and keeps the caller's members"
 
 test "a call with no params still carries _meta" {
     var out: [256]u8 = undefined;
-    const params = try emptyParamsWithMeta("{\"tools\":{}}", &out);
+    var scratch: [256]u8 = undefined;
+    // The path `Client.request` takes for a null `params`: the capabilities go
+    // on an empty object rather than on nothing, which is one call rather than
+    // two.
+    const params = try injectMeta("{}", "{\"tools\":{}}", &out, &scratch);
     try testing.expectEqualStrings(
         "{\"_meta\":{\"io.modelcontextprotocol/clientCapabilities\":{\"tools\":{}}}}",
         params,
     );
 }
 
+test "a multi-round-trip retry keeps its own _meta beside the capabilities" {
+    // PROTOCOLS.md 4.7's retry, which carries `_meta` beside the members that
+    // answer the interim result. Written twice before the fix — the
+    // capabilities in front and the caller's own behind them — so a reader
+    // that resolves the first saw no progress token and a reader that
+    // resolved the last saw no capabilities.
+    var out: [512]u8 = undefined;
+    var scratch: [512]u8 = undefined;
+    const retry = "{\"name\":\"echo\",\"arguments\":{},\"inputResponses\":{}," ++
+        "\"requestState\":\"st\",\"_meta\":{\"progressToken\":\"t1\"}}";
+    const params = try injectMeta(retry, "{\"tools\":{}}", &out, &scratch);
+    try testing.expectEqualStrings(
+        "{\"_meta\":{\"io.modelcontextprotocol/clientCapabilities\":{\"tools\":{}}," ++
+            "\"progressToken\":\"t1\"},\"name\":\"echo\",\"arguments\":{}," ++
+            "\"inputResponses\":{},\"requestState\":\"st\"}",
+        params,
+    );
+    // One member of that name, which is what the merge is for: two of them in
+    // one object have no single meaning.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, params, "\"_meta\""));
+    // Read back through the walk this layer and its peer share, so both
+    // members are visible rather than one of them depending on which the
+    // reader resolves first.
+    const meta = json.memberText(params, "_meta", &scratch).?;
+    try testing.expectEqualStrings(
+        "{\"tools\":{}}",
+        json.memberText(meta, mcp.meta_key.client_capabilities, &scratch).?,
+    );
+    try testing.expectEqualStrings(
+        "\"t1\"",
+        json.memberText(meta, mcp.meta_key.progress_token, &scratch).?,
+    );
+}
+
+test "the server half reads the capabilities and the progress token off one request" {
+    // The same merge, through the frame it travels in and the handler that
+    // reads it. Before the fix the capabilities were what `Server.observe`
+    // saw and the progress token was in a second `_meta` it never read.
+    var out: [512]u8 = undefined;
+    var scratch: [512]u8 = undefined;
+    var frame: [1024]u8 = undefined;
+    const params = try injectMeta(
+        "{\"name\":\"echo\",\"_meta\":{\"progressToken\":\"t1\"}}",
+        "{\"tools\":{}}",
+        &out,
+        &scratch,
+    );
+    var writer = json.Writer.init(&frame);
+    try writer.slice("{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":");
+    try writer.slice(params);
+    try writer.byte('}');
+
+    const server: Server = .{ .connection = undefined, .revision = .current };
+    const request = try jsonrpc.decodeRequest(writer.written(), &scratch);
+    const seen = try server.observe(request, &scratch);
+    try testing.expectEqualStrings("tools/call", seen.info.name);
+    try testing.expectEqualStrings("{\"tools\":{}}", seen.client_capabilities.?);
+    // The progress token is in the same `_meta` object and not in a second
+    // member of the same name beside it.
+    const sent = switch (request.params) {
+        .value => |text| text,
+        else => return error.TestUnexpectedResult,
+    };
+    const meta = json.memberText(sent, "_meta", &scratch).?;
+    try testing.expectEqualStrings(
+        "\"t1\"",
+        json.memberText(meta, mcp.meta_key.progress_token, &scratch).?,
+    );
+}
+
+test "a caller's own copy of the capabilities key is not written beside the session's" {
+    // The one precedence the merge defines: `Client.capabilities` is what this
+    // layer defines the capabilities to be, and a second member of that name
+    // beside it is the duplicate the merge exists to remove. Everything else
+    // in the caller's `_meta` is the caller's and survives.
+    var out: [512]u8 = undefined;
+    var scratch: [512]u8 = undefined;
+    const params = try injectMeta(
+        "{\"_meta\":{\"io.modelcontextprotocol/clientCapabilities\":{\"roots\":{}}," ++
+            "\"progressToken\":\"t1\"}}",
+        "{\"tools\":{}}",
+        &out,
+        &scratch,
+    );
+    try testing.expectEqualStrings(
+        "{\"_meta\":{\"io.modelcontextprotocol/clientCapabilities\":{\"tools\":{}}," ++
+            "\"progressToken\":\"t1\"}}",
+        params,
+    );
+    try testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, params, mcp.meta_key.client_capabilities),
+    );
+}
+
+test "a member name carrying an escape is walked and written decoded" {
+    // The walk decodes the name into the scratch and the writer escapes it
+    // again, so `{"na\u006de":1}` travels as `{"name":1}`; the value is copied
+    // as the wire carried it, its own escape and all.
+    var out: [256]u8 = undefined;
+    var scratch: [256]u8 = undefined;
+    try testing.expectEqualStrings(
+        "{\"_meta\":{\"io.modelcontextprotocol/clientCapabilities\":{}}," ++
+            "\"name\":\"echo\",\"arguments\":{\"a\\tb\":1}}",
+        try injectMeta(
+            "{\"na\\u006de\":\"echo\",\"arguments\":{\"a\\tb\":1}}",
+            "{}",
+            &out,
+            &scratch,
+        ),
+    );
+    // A scratch too small to decode the name is the short-buffer error rather
+    // than a refusal: the caller's buffer grew and the same call works again.
+    var tiny_out: [256]u8 = undefined;
+    var tiny_scratch: [1]u8 = undefined;
+    try testing.expectError(
+        error.BufferTooSmall,
+        injectMeta("{\"na\\u006de\":\"echo\"}", "{}", &tiny_out, &tiny_scratch),
+    );
+}
+
 test "params that are not an object are refused rather than mangled" {
     var out: [256]u8 = undefined;
+    var scratch: [256]u8 = undefined;
     // Splicing assumes an object. A caller that passed an array would
     // otherwise get a silent rewrite into something the peer never sent.
-    try testing.expectError(error.InvalidField, injectMeta("[1,2]", "{}", &out));
-    try testing.expectError(error.InvalidField, injectMeta("nope", "{}", &out));
-    try testing.expectError(error.InvalidField, injectMeta("", "{}", &out));
+    try testing.expectError(error.InvalidField, injectMeta("[1,2]", "{}", &out, &scratch));
+    try testing.expectError(error.InvalidField, injectMeta("nope", "{}", &out, &scratch));
+    try testing.expectError(error.InvalidField, injectMeta("", "{}", &out, &scratch));
+    // A first byte and a last byte are not an object. `{}}` came out as a
+    // valid object with a brace hanging off it and `{]}` framed a params the
+    // peer's framer drops, so the caller waited for an answer to a message
+    // that was never a request.
+    try testing.expectError(error.InvalidField, injectMeta("{}}", "{}", &out, &scratch));
+    try testing.expectError(error.InvalidField, injectMeta("{]}", "{}", &out, &scratch));
+    try testing.expectError(error.InvalidField, injectMeta("{\"a\":1} x", "{}", &out, &scratch));
+    // A member the walk cannot read is refused for the same reason, and so is
+    // a `_meta` that cannot be merged with.
+    try testing.expectError(error.InvalidField, injectMeta("{\"a\":}", "{}", &out, &scratch));
+    try testing.expectError(error.InvalidField, injectMeta("{\"_meta\":7}", "{}", &out, &scratch));
 }
 
 test "params padded with whitespace wrap, as the sibling layer allows" {
     // `acp_session.requireObject` trims before it looks for a brace, so an
     // object it accepts must not be refused here for the whitespace around it.
+    // The walk skips that whitespace itself, which is what the trim was for.
     var out: [256]u8 = undefined;
-    const params = try injectMeta(" \n{\"name\":\"echo\"}\t", "{\"tools\":{}}", &out);
+    var scratch: [256]u8 = undefined;
+    const params = try injectMeta(" \n{\"name\":\"echo\"}\t", "{\"tools\":{}}", &out, &scratch);
     try testing.expectEqualStrings(
         "{\"_meta\":{\"io.modelcontextprotocol/clientCapabilities\":{\"tools\":{}}},\"name\":\"echo\"}",
         params,
@@ -568,9 +894,10 @@ test "an object holding only whitespace gains no trailing comma" {
     // out as an object with two members rather than one with a dangling
     // separator the peer cannot parse.
     var out: [256]u8 = undefined;
+    var scratch: [256]u8 = undefined;
     try testing.expectEqualStrings(
         "{\"_meta\":{\"io.modelcontextprotocol/clientCapabilities\":{}}}",
-        try injectMeta("{ }", "{}", &out),
+        try injectMeta("{ }", "{}", &out, &scratch),
     );
 }
 
@@ -610,6 +937,45 @@ test "a method the pinned revision removed never reaches the wire" {
     );
 }
 
+test "a notification is never sent as a request, and a request still passes" {
+    // Both halves refuse before the wire, so the connection is `undefined`: a
+    // notification sent as a request leaves the caller waiting for an answer
+    // no conforming peer will send, which is what this rule is for.
+    var client: Client = .{ .connection = undefined, .revision = .current };
+    var out: [256]u8 = undefined;
+    var result: [256]u8 = undefined;
+    var params_out: [256]u8 = undefined;
+    const server: Server = .{ .connection = undefined, .revision = .current };
+
+    // Every notification PROTOCOLS.md 4.4 lists. `notifications/cancelled` is
+    // the one either side may send, so the direction alone would have let it
+    // through; the rest are a server-to-client method besides.
+    for (mcp.notifications) |notification| {
+        try testing.expectError(
+            error.NotARequest,
+            client.request(notification.name, null, &result, &out, &params_out),
+        );
+        // The same rule read the other way round, so a handler is not entered
+        // for a message that expects no answer or for one travelling the other
+        // way.
+        try testing.expectError(error.NotARequest, server.gate(notification.name));
+    }
+
+    // A request the client does send passes the gate on both sides.
+    try testing.expectEqualStrings("tools/call", (try server.gate("tools/call")).name);
+    try testing.expectEqualStrings("tools/call", (try requestMethod(.current, "tools/call")).name);
+
+    // A notification the current revision removed is a method again at the
+    // previous one, and is still refused there: it takes no id at any revision,
+    // and the direction it does carry is the client's, so the arity is the only
+    // thing left to refuse it on.
+    const before: Server = .{ .connection = undefined, .revision = .previous };
+    try testing.expectError(error.NotARequest, before.gate("notifications/initialized"));
+    // A removed method that is a request is a request at the previous revision,
+    // so nothing but the pin refuses it there.
+    try testing.expectEqualStrings("ping", (try before.gate("ping")).name);
+}
+
 test "a request whose params are not an object never reaches the wire" {
     // Its own error, and not the short-buffer one: a caller that doubled
     // `params_out` and called again would get this again, because the object it
@@ -622,6 +988,18 @@ test "a request whose params are not an object never reaches the wire" {
     try testing.expectError(
         error.NotAnObject,
         client.request("tools/list", "[1,2]", &result, &out, &params_out),
+    );
+    // The two a first byte and a last byte used to let through: `{}}` came out
+    // as an object with a brace hanging off it, and `{]}` framed a params the
+    // peer's framer drops, so the caller waited for an answer to a message
+    // that was never a request.
+    try testing.expectError(
+        error.NotAnObject,
+        client.request("tools/list", "{}}", &result, &out, &params_out),
+    );
+    try testing.expectError(
+        error.NotAnObject,
+        client.request("tools/list", "{]}", &result, &out, &params_out),
     );
 }
 
@@ -671,7 +1049,14 @@ test "the two halves refuse the same name on both sides of a removal" {
             client.request(name, null, &result, &out, &params_out),
         );
         // At the previous revision the same name is a method again, so a
-        // session pinned there does not refuse a call the peer still has.
+        // session pinned there does not refuse a call the peer still has. A
+        // notification is the exception and is refused for its arity instead,
+        // which is a different fault with a different error: a loop that read
+        // the two as one would pass with either half broken.
+        if (isNotification(name)) {
+            try testing.expectError(error.NotARequest, before.gate(name));
+            continue;
+        }
         const info = try before.gate(name);
         try testing.expectEqualStrings(name, info.name);
         try testing.expect(!info.present_at_current);
@@ -781,7 +1166,7 @@ test "the refusal frame is a JSON-RPC error carrying -32601 and no result" {
     try testing.expectEqual(@as(i64, 7), message.id.?.integer);
 }
 
-test "a cacheable result missing a required field is refused by the call" {
+test "a result missing a required field is refused by the call" {
     var scratch: [256]u8 = undefined;
     const server: Server = .{ .connection = undefined, .revision = .current };
 
@@ -789,15 +1174,29 @@ test "a cacheable result missing a required field is refused by the call" {
     try testing.expect(listing.cacheable);
     try Server.checkResult(
         listing,
-        "{\"ttlMs\":1000,\"cacheScope\":\"private\",\"tools\":[]}",
+        "{\"resultType\":\"complete\",\"ttlMs\":1000,\"cacheScope\":\"private\",\"tools\":[]}",
         &scratch,
     );
 
-    // PROTOCOLS.md 4.6 requires both fields, so leaving out either one is the
-    // same fault, and neither is a value a caller may fill in later.
+    // PROTOCOLS.md 4.6 makes `resultType` required on every result and the two
+    // caching fields required on a cacheable one, so leaving out any of the
+    // three is the same fault and none is a value a caller may fill in later.
+    // The caching pair alone is not a result 4.6 describes.
     try testing.expectError(
         error.NotAResult,
         Server.checkResult(listing, "{\"tools\":[]}", &scratch),
+    );
+    try testing.expectError(
+        error.NotAResult,
+        Server.checkResult(
+            listing,
+            "{\"ttlMs\":1000,\"cacheScope\":\"private\",\"tools\":[]}",
+            &scratch,
+        ),
+    );
+    try testing.expectError(
+        error.NotAResult,
+        Server.checkResult(listing, "{\"resultType\":\"complete\",\"tools\":[]}", &scratch),
     );
     try testing.expectError(
         error.NotAResult,
@@ -807,16 +1206,29 @@ test "a cacheable result missing a required field is refused by the call" {
         error.NotAResult,
         Server.checkResult(listing, "{\"tools\":[],\"cacheScope\":\"private\"}", &scratch),
     );
-    // A body that is not an object never was a result, whatever it carries.
+    // A body that is not an object never was a result, whatever it carries,
+    // and neither was one whose `resultType` is not a string.
     try testing.expectError(error.NotAResult, Server.checkResult(listing, "[1,2]", &scratch));
+    try testing.expectError(
+        error.NotAResult,
+        Server.checkResult(listing, "{\"resultType\":5,\"ttlMs\":1,\"cacheScope\":\"public\"}", &scratch),
+    );
 
-    // A method whose result carries no caching hints is not read at all: the
-    // rule does not apply to it, and reading it would refuse a result the
-    // specification allows.
+    // A method whose result carries no caching hints is not read for the two:
+    // that rule does not apply to it, and reading it would refuse a result the
+    // specification allows. `resultType` is required either way, because 4.6
+    // makes it a property of results rather than of the method. The read side
+    // is where an absent one is tolerated, and `Client.classify` is that side
+    // — a peer on an earlier revision omits it and the client treats it as
+    // `complete`, while a body this server built may not leave it out.
     const call = try server.gate("tools/call");
     try testing.expect(!call.cacheable);
     try Server.checkResult(call, "{\"resultType\":\"complete\",\"content\":[]}", &scratch);
     try Server.checkResult(call, "{\"resultType\":\"complete\"}", &scratch);
+    try testing.expectError(
+        error.NotAResult,
+        Server.checkResult(call, "{\"content\":[]}", &scratch),
+    );
 }
 
 test "an interim result is written only for a method PROTOCOLS.md 4.7 allows" {
@@ -1091,8 +1503,9 @@ const Exchange = struct {
     tool_calls: usize = 0,
     resource_list_calls: usize = 0,
     /// The ids the peer saw on its `tools/call` requests. PROTOCOLS.md 4.7:
-    /// each round trip of a multi-round-trip exchange is a new call.
-    ids: [3]i64 = .{ 0, 0, 0 },
+    /// each round trip of a multi-round-trip exchange is a new call. Five
+    /// slots for two exchanges of three round trips and two of two.
+    ids: [5]i64 = .{ 0, 0, 0, 0, 0 },
     /// Whether the peer's first `tools/call` carried the capabilities in
     /// `_meta`, and whether the caller's own members survived beside them.
     meta_on_wire: bool = false,
@@ -1115,6 +1528,9 @@ const Exchange = struct {
     prompt_refused: bool = false,
     resource_list_refused: bool = false,
     retry_refused: bool = false,
+    /// A retry that came back with a `resultType` the revision does not
+    /// define, which is the value's fault on this leg as on the first.
+    retry_value_refused: bool = false,
     final_failed: bool = false,
     final_body: [256]u8 = undefined,
     final_body_len: usize = 0,
@@ -1191,8 +1607,11 @@ fn scriptedHandler(
         exchange.resource_list_calls += 1;
         return conn.respond(request, interim_result, answer) catch null;
     } else if (std.mem.eql(u8, method.text, "tools/call")) {
-        // Two interim answers and then a final one, so a caller that stops
-        // after one round trip is caught handing back an interim result.
+        // Five answers across two exchanges, and which one a call gets is the
+        // fault the call is there to provoke: a caller that stops after one
+        // round trip is caught handing back an interim result, and a retry that
+        // comes back with a value the revision does not define is caught
+        // reporting it as a second interim result.
         exchange.tool_calls += 1;
         if (exchange.tool_calls <= exchange.ids.len) {
             // A `Request` admits a string id as well as an integer one, and this
@@ -1214,10 +1633,12 @@ fn scriptedHandler(
                 std.mem.indexOf(u8, params, mcp.meta_key.client_capabilities) != null;
             exchange.members_kept = std.mem.indexOf(u8, params, "\"name\":\"echo\"") != null;
         }
-        if (exchange.tool_calls < 3) {
-            return conn.respond(request, interim_result, answer) catch null;
-        }
-        return conn.respond(request, final_result, answer) catch null;
+        return conn.respond(request, switch (exchange.tool_calls) {
+            1, 2, 4 => interim_result,
+            3 => final_result,
+            // The answer to the retry of the second exchange.
+            else => "{\"resultType\":\"weird\"}",
+        }, answer) catch null;
     }
     return null;
 }
@@ -1419,6 +1840,23 @@ const Calling = struct {
         self.exchange.final_failed = finished.failed();
         keepBody(&self.exchange.final_body, &self.exchange.final_body_len, finished.body);
 
+        // A second exchange, whose retry comes back with a `resultType` outside
+        // the two the specification defines. The value is the answer's fault
+        // whichever leg it arrived on, so it is reported as the value and not
+        // as a second interim result the caller has to answer.
+        if (session.respond(
+            "tools/call",
+            "{\"name\":\"echo\"}",
+            &side.result,
+            &side.out,
+            &side.params,
+            answers,
+        )) |_| {
+            self.exchange.failed = true;
+        } else |err| {
+            self.exchange.retry_value_refused = err == error.UnknownResultType;
+        }
+
         self.endpoint.hangUp(self.io);
     }
 };
@@ -1479,7 +1917,7 @@ test "a peer error is a failure and an interim result is never the final one" {
     try testing.expectEqual(@as(?i32, -32602), exchange.answered_code);
     try testing.expectEqual(@as(usize, 2), exchange.read_calls);
 
-    // Four refusals, four reasons, one case each.
+    // Five refusals, five reasons, one case each.
     //
     // The value: a `resultType` outside the two the specification defines.
     try testing.expect(exchange.list_refused);
@@ -1496,19 +1934,30 @@ test "a peer error is a failure and an interim result is never the final one" {
     try testing.expectEqual(@as(usize, 1), exchange.resource_list_calls);
 
     // One retry was not enough, so it was refused rather than handed back as
-    // the final result, and the exchange finished on the third round trip.
+    // the final result, and that exchange finished on the third round trip.
     try testing.expect(exchange.retry_refused);
     try testing.expect(!exchange.final_failed);
     try testing.expectEqualStrings(
         "{\"resultType\":\"complete\",\"content\":[{\"type\":\"text\",\"text\":\"echoed\"}]}",
         exchange.final_body[0..exchange.final_body_len],
     );
-    try testing.expectEqual(@as(usize, 3), exchange.tool_calls);
 
-    // Every round trip was a new call, as PROTOCOLS.md 4.7 requires.
+    // A retry answered with a value the revision does not define, on the leg
+    // where a second interim result is what the caller is otherwise told. The
+    // value is the answer's fault, so it is reported as the value and the
+    // exchange stops there: the peer was asked five times in all and not once
+    // more than a round trip costs.
+    try testing.expect(exchange.retry_value_refused);
+    try testing.expectEqual(@as(usize, 5), exchange.tool_calls);
+
+    // Every round trip was a new call, as PROTOCOLS.md 4.7 requires, across
+    // both exchanges.
     try testing.expect(exchange.ids[0] != exchange.ids[1]);
     try testing.expect(exchange.ids[1] != exchange.ids[2]);
     try testing.expect(exchange.ids[0] < exchange.ids[2]);
+    try testing.expect(exchange.ids[2] != exchange.ids[3]);
+    try testing.expect(exchange.ids[3] != exchange.ids[4]);
+    try testing.expect(exchange.ids[2] < exchange.ids[4]);
 
     // The capabilities rode on the request in `_meta`, with the caller's own
     // members beside them.

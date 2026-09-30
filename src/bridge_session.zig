@@ -18,7 +18,11 @@
 //!   which is why `bridge.isBindingFailure` takes one.
 //! - **The binding is MCP `2026-07-28` only.** It does not emulate earlier
 //!   revisions and performs no MCP handshake, so a caller pinned to another
-//!   revision is refused here rather than downstream.
+//!   revision is refused here rather than downstream. The same pin fixes the
+//!   method inventory: [`Client.call`] resolves its `method_name` through
+//!   [`mcp.lookupMethod`] before it hands the envelope to the connection,
+//!   which is the call `mcp_session.Client.request` makes, so a name
+//!   `2026-07-28` removed as a top-level request never reaches the wire.
 //!
 //! ## Both directions
 //!
@@ -37,10 +41,35 @@ const mcp = @import("mcp.zig");
 const root = @import("root.zig");
 const Io = std.Io;
 
+/// What a call, a served request or an outcome read can return here.
+///
+/// The five members below are this binding's own. The rest belong to the
+/// codec and to the connection, which this file does not redefine, so an
+/// `error.InvalidField` off [`Client.call`] says the envelope the caller
+/// handed over is one this binding cannot carry: it is refused here, before
+/// anything reaches the wire, rather than by the peer on the far side.
 pub const Error = error{
     /// The binding carries MCP `2026-07-28` only, and the caller pinned a
     /// session to something else.
     UnsupportedMcpRevision,
+    /// The inner MCP method is not one the bound revision carries, so it was
+    /// not sent.
+    ///
+    /// PROTOCOLS.md 4.4 removes `initialize`, `roots/list`,
+    /// `sampling/createMessage` and `elicitation/create` as top-level
+    /// requests, and [`mcp.lookupMethod`] refuses every one of them. The same
+    /// call `mcp_session.Client.request` makes on the same revision, so the
+    /// binding and the MCP session layer cannot drift into two answers to one
+    /// question.
+    ///
+    /// Reported here rather than left to the peer's inner `-32601`, because
+    /// the caller can fix it without a round trip and because the other end of
+    /// this same library refuses to answer it: a `Provider` is handed the
+    /// method by its `Resolver` and answers `null`, which `serve` writes as
+    /// that inner `-32601` inside a successful outer response. The knowledge
+    /// belongs to the resolver, and only the client side knows it before a
+    /// byte is sent.
+    MethodNotInRevision,
     /// The peer refused this call with an outer error. Every outer refusal
     /// arrives this way whatever the code, because the connection is alive and
     /// carries the next call, and `refusal` says which refusal it was.
@@ -74,6 +103,8 @@ pub const method = "mcp/message";
 
 /// A client that carries MCP calls over an ACP connection.
 pub const Client = struct {
+    /// The connection the call goes out on, which the caller owns and keeps
+    /// alive. Every call this client makes travels over it.
     connection: *conn.Conn,
     /// The MCP revision carried inside. The binding is `2026-07-28` only.
     revision: mcp.Revision = .current,
@@ -117,6 +148,31 @@ pub const Client = struct {
     /// peer's. `error.Transport` and `error.ConnectionClosed` reach a caller
     /// only when `connection.call` itself reports a connection that cannot be
     /// reused, which is what those two errors mean everywhere else.
+    ///
+    /// An envelope the binding cannot carry is refused here, before a byte
+    /// reaches the connection. `bridge.encodeEnvelope` validates before it
+    /// writes, so an empty `server_id`, `request_id` or `method_name` returns
+    /// `error.InvalidField` with nothing encoded and nothing sent. The far
+    /// side would answer the same envelope with an outer `-32602`, so writing
+    /// it first would spend a round trip to learn what this side already
+    /// knows, and would put a frame on the wire that the other end of this
+    /// same library refuses to read.
+    ///
+    /// A method the bound revision does not carry is refused here too, as
+    /// `error.MethodNotInRevision`, and before the connection is touched: the
+    /// envelope is composed into the caller's own `envelope` buffer and no id
+    /// is spent, no frame is written and no peer is asked. The binding carries
+    /// MCP `2026-07-28`, and that revision removed `initialize`, `roots/list`,
+    /// `sampling/createMessage` and `elicitation/create` as top-level
+    /// requests, so a call naming one asks for an operation this wire has no
+    /// answer for. A provider that does carry it answers with an inner
+    /// `-32601` inside a successful outer response, and one that does not is
+    /// entitled to; the round trip buys nothing, and the frame is one the
+    /// other end of this same library refuses to answer.
+    ///
+    /// The two refusals are ordered the way their faults are: an envelope the
+    /// binding cannot carry is condemned first, and an empty `method_name` is
+    /// that fault rather than a method this revision removed.
     pub fn call(
         self: *Client,
         server_id: []const u8,
@@ -132,7 +188,40 @@ pub const Client = struct {
         self.refusal = null;
         if (self.revision != .current) return error.UnsupportedMcpRevision;
 
-        const body = try encodeEnvelope(server_id, request_id, method_name, params, envelope);
+        // One encoder for the binding, so the rule that a member is non-empty
+        // is written down once, in `bridge.encodeEnvelope`, and enforced on
+        // both sides of the boundary rather than once per call site.
+        var writer = json.Writer.init(envelope);
+        try bridge.encodeEnvelope(.{
+            .server_id = server_id,
+            .request_id = request_id,
+            .inner_method = method_name,
+            .inner_params = params,
+            // Not a member of the params object: the outer message carries the
+            // direction, and a call this client makes is a request.
+            .direction = .agent_to_provider,
+        }, &writer);
+        const body = writer.written();
+        // One rule for what a method may be, and it is the rule
+        // `mcp_session.Client.request` reaches for on the same revision, so the
+        // binding and the MCP session layer cannot drift into two answers to
+        // one question. `self.revision` is `.current` here: the check above
+        // refused every other value, which is what makes this
+        // `mcp.lookupMethod(.current, method_name)`.
+        //
+        // After the encoder rather than before it, because the encoder owns
+        // the rule that a member is non-empty and an empty `method_name` is
+        // that fault rather than this one. Running it first would report a
+        // bad envelope as a method this revision does not carry, which is the
+        // second fault of a call the first already condemned.
+        //
+        // `lookupMethod` walks comptime tables and compares names, so it reads
+        // no caller buffer and no member of `DecodeError` but `UnknownMethod`
+        // can reach here. Collapsing the catch reports the refusal rather than
+        // unwrapping a path that cannot happen into a panic.
+        _ = mcp.lookupMethod(self.revision, method_name) catch
+            return error.MethodNotInRevision;
+
         const answer = try self.connection.call(method, body, inner, out);
         if (answer.error_code) |code| {
             // Every outer error is the peer refusing this call, and all of them
@@ -176,29 +265,6 @@ pub const Client = struct {
     }
 };
 
-/// Build the `params` object for one carried MCP request.
-pub fn encodeEnvelope(
-    server_id: []const u8,
-    request_id: []const u8,
-    method_name: []const u8,
-    params: ?[]const u8,
-    out: []u8,
-) root.EncodeError![]const u8 {
-    var writer = json.Writer.init(out);
-    try writer.slice("{\"serverId\":");
-    try writer.string(server_id);
-    try writer.slice(",\"requestId\":");
-    try writer.string(request_id);
-    try writer.slice(",\"method\":");
-    try writer.string(method_name);
-    if (params) |text| {
-        try writer.slice(",\"params\":");
-        try writer.slice(text);
-    }
-    try writer.byte('}');
-    return writer.written();
-}
-
 /// The body a provider returns for a carried MCP request.
 ///
 /// Exactly one of the two members is set. `inner_error` is set for an MCP
@@ -220,8 +286,13 @@ pub const Outcome = struct {
 pub fn classifyOutcome(outer_result: []const u8, scratch: []u8) Error!Outcome {
     const outcome = try Client.readOutcome(outer_result, scratch);
     return switch (outcome) {
-        .result => .{ .inner_result = outcome.result },
-        .@"error" => .{ .inner_error = outcome.@"error" },
+        // The arm carries a `bridge.OutcomePayload`, and `text` is the inner
+        // payload: the result a caller acts on, or the error object it has to
+        // read. The carrier `_meta` beside it belongs to the binding rather
+        // than to the outcome, and a caller that needs it reads the
+        // `bridge.Outcome` [`Client.readOutcome`] returns.
+        .result => .{ .inner_result = outcome.result.text },
+        .@"error" => .{ .inner_error = outcome.@"error".text },
     };
 }
 
@@ -511,7 +582,7 @@ pub const Provider = struct {
             // so it backs the payload here and nothing reads it afterwards.
             const payload = methodNotCarried(envelope.inner_method, inner) catch
                 return error.ResponseTooLarge;
-            bridge.encodeOutcome(.{ .@"error" = payload }, &writer) catch
+            bridge.encodeOutcome(.{ .@"error" = .{ .text = payload } }, &writer) catch
                 return error.ResponseTooLarge;
         }
         const answered = try conn.respond(request, writer.written(), out);
@@ -578,23 +649,241 @@ fn methodNotCarried(
 
 const testing = std.testing;
 
-test "an envelope carries the three members the binding names" {
-    var out: [256]u8 = undefined;
-    const body = try encodeEnvelope("project-tools:7a72", "req-1", "tools/call", "{\"name\":\"echo\"}", &out);
+/// A transport that refuses every byte written to it, over a reader with
+/// nothing on it.
+///
+/// A call that reaches this connection ends at the write with
+/// `error.Transport` instead of waiting for an answer no peer will send. The
+/// message is already in the `out` buffer the caller handed `conn.Conn.call`,
+/// because the connection encodes and frames a request before it writes it,
+/// so `lastEncodedLen` is how much of that buffer the frame occupies.
+///
+/// A writer that cannot write is a connection that is finished, so the failed
+/// write marks it dead and the next call on it is refused in `open` with
+/// `error.Closed` before it claims a slot, takes an id or frames anything.
+/// That is the second half of what this transport measures, and it is the
+/// better of the two signals: `error.Transport` says this write failed, and
+/// `error.Closed` says the connection is done, which is what a caller needs
+/// in order to stop using it.
+///
+/// This is what a refusal is measured against. A call the binding accepts
+/// reaches the writer and reports `error.Transport`; a call it refuses
+/// reports `error.InvalidField` and the writer never sees a byte.
+const DeadTransport = struct {
+    reader: Io.Reader,
+    writer: Io.Writer = Io.Writer.failing,
+
+    fn connection(self: *DeadTransport, side: *Side) conn.Error!conn.Conn {
+        return conn.Conn.init(testing.io, &self.reader, &self.writer, .{
+            .frame_buffer = &side.frame_buffer,
+            .pending = &side.pending,
+            .decode_scratch = &side.decode_scratch,
+            .answer = &side.answer,
+        });
+    }
+};
+
+test "a carried call puts the three envelope members on the wire" {
+    // The params object `Client.call` builds is the one the provider's own
+    // `bridge.decodeEnvelope` reads, so this is the frame it has to be: the
+    // three members the binding names, and the inner params beside them when
+    // there are any. Read from the buffer the connection framed it into,
+    // because that is the byte sequence the peer sees.
+    var side: Side = .{};
+    var inner: [256]u8 = undefined;
+    var out: [512]u8 = undefined;
+    var envelope: [256]u8 = undefined;
+    var transport: DeadTransport = .{ .reader = Io.Reader.fixed("") };
+    var connection = try transport.connection(&side);
+    var client = Client.init(&connection);
+
+    // The write is refused, so the call ends there and the frame is in `out`.
+    try testing.expectError(error.Transport, client.call(
+        "project-tools:7a72",
+        "req-1",
+        "tools/call",
+        "{\"name\":\"echo\"}",
+        &inner,
+        &out,
+        &envelope,
+    ));
     try testing.expectEqualStrings(
-        "{\"serverId\":\"project-tools:7a72\",\"requestId\":\"req-1\"," ++
-            "\"method\":\"tools/call\",\"params\":{\"name\":\"echo\"}}",
-        body,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"mcp/message\",\"params\":" ++
+            "{\"serverId\":\"project-tools:7a72\",\"requestId\":\"req-1\"," ++
+            "\"method\":\"tools/call\",\"params\":{\"name\":\"echo\"}}}",
+        out[0..connection.lastEncodedLen()],
+    );
+
+    // That failed write marked the connection dead, and the next call on it
+    // says so. `error.Closed` rather than a second `error.Transport` is the
+    // answer a caller can act on: the first would read as a write that failed
+    // again, and a caller that believes that retries on a writer that cannot
+    // write, while `error.Closed` is this library's own documented way of
+    // saying the connection cannot be reused and belongs to no other fault.
+    //
+    // The id did not move either. A call refused in `open` is refused before it
+    // claims a slot and takes an id, so the sequence holds at the id the
+    // refused call would have used and the caller's own ids stay predictable.
+    try testing.expectError(error.Closed, client.call(
+        "project-tools:7a72",
+        "req-2",
+        "subscriptions/listen",
+        null,
+        &inner,
+        &out,
+        &envelope,
+    ));
+    try testing.expectEqual(@as(i64, 2), connection.nextId());
+    // And nothing was framed for it, so the bytes still standing in `out` are
+    // the first call's and the refused one put nothing where a peer could read
+    // it.
+    try testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"mcp/message\",\"params\":" ++
+            "{\"serverId\":\"project-tools:7a72\",\"requestId\":\"req-1\"," ++
+            "\"method\":\"tools/call\",\"params\":{\"name\":\"echo\"}}}",
+        out[0..connection.lastEncodedLen()],
+    );
+
+    // The same call with no inner params, where the member is absent rather
+    // than null, on a connection of its own. It needs one: the first is
+    // finished, and a call on a finished connection is refused before it is
+    // framed, so it would put these bytes nowhere. The id starts again on a
+    // fresh connection, which is what the wire says.
+    var second_side: Side = .{};
+    var second_transport: DeadTransport = .{ .reader = Io.Reader.fixed("") };
+    var second_connection = try second_transport.connection(&second_side);
+    var second_client = Client.init(&second_connection);
+    try testing.expectError(error.Transport, second_client.call(
+        "project-tools:7a72",
+        "req-2",
+        "subscriptions/listen",
+        null,
+        &inner,
+        &out,
+        &envelope,
+    ));
+    try testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"mcp/message\",\"params\":" ++
+            "{\"serverId\":\"project-tools:7a72\",\"requestId\":\"req-2\"," ++
+            "\"method\":\"subscriptions/listen\"}}",
+        out[0..second_connection.lastEncodedLen()],
     );
 }
 
-test "an envelope with no inner params is still well formed" {
-    var out: [256]u8 = undefined;
-    const body = try encodeEnvelope("s", "r", "subscriptions/listen", null, &out);
-    try testing.expectEqualStrings(
-        "{\"serverId\":\"s\",\"requestId\":\"r\",\"method\":\"subscriptions/listen\"}",
-        body,
-    );
+test "an envelope with an empty member is refused before a byte is written" {
+    // `bridge.decodeEnvelope` refuses an empty `serverId`, `requestId` or
+    // inner method, and `Provider.serve` answers such an envelope with an
+    // outer `-32602`. An encoder that wrote one would put a frame on the wire
+    // that the far side of this same library refuses to read, and the caller
+    // would learn it from the peer instead of from the call that made it.
+    //
+    // The transport is the one above, so a call that reached it would report
+    // `error.Transport`. `error.InvalidField` is the envelope refused before
+    // the connection was touched, and the sentinel in the envelope buffer
+    // says the encoder wrote none of the object either.
+    var side: Side = .{};
+    var inner: [256]u8 = undefined;
+    var out: [512]u8 = undefined;
+    var envelope: [256]u8 = undefined;
+    @memset(&envelope, 0xa5);
+    var transport: DeadTransport = .{ .reader = Io.Reader.fixed("") };
+    var connection = try transport.connection(&side);
+    var client = Client.init(&connection);
+
+    // Each of the three members the binding names, empty in turn.
+    try testing.expectError(error.InvalidField, client.call(
+        "",
+        "req-1",
+        "tools/list",
+        null,
+        &inner,
+        &out,
+        &envelope,
+    ));
+    try testing.expectError(error.InvalidField, client.call(
+        "project-tools:7a72",
+        "",
+        "tools/list",
+        null,
+        &inner,
+        &out,
+        &envelope,
+    ));
+    try testing.expectError(error.InvalidField, client.call(
+        "project-tools:7a72",
+        "req-1",
+        "",
+        null,
+        &inner,
+        &out,
+        &envelope,
+    ));
+
+    // Nothing was encoded and nothing was framed: every byte of the buffer
+    // the encoder writes into is still the sentinel, and the connection built
+    // no message to write.
+    for (&envelope) |byte| try testing.expectEqual(@as(u8, 0xa5), byte);
+    try testing.expectEqual(@as(usize, 0), connection.lastEncodedLen());
+}
+
+test "a method removed at 2026-07-28 is refused before a byte is written" {
+    // PROTOCOLS.md 4.4 removes these four as top-level requests, and
+    // `mcp.lookupMethod(.current, …)` refuses every one of them: `initialize`
+    // because the revision dropped it, and the other three because a server may
+    // only send them inside `InputRequiredResult.inputRequests`, never as a
+    // request a client makes. The binding is `2026-07-28` only, so all four
+    // are names with no meaning on this wire.
+    //
+    // The transport is the one the empty-member test above uses, so a call
+    // that reached the connection would report `error.Transport`, and the
+    // connection counts what it framed. `error.MethodNotInRevision` is the
+    // refusal, and a framed length of zero across the four says the connection
+    // was never asked: no id spent, no slot taken, no peer troubled. A
+    // conforming provider answers such a call with an inner `-32601` inside a
+    // successful outer response, so sending it costs a whole round trip to
+    // learn what this side already knows.
+    var side: Side = .{};
+    var inner: [256]u8 = undefined;
+    var out: [512]u8 = undefined;
+    var envelope: [256]u8 = undefined;
+    var transport: DeadTransport = .{ .reader = Io.Reader.fixed("") };
+    var connection = try transport.connection(&side);
+    var client = Client.init(&connection);
+
+    for ([_][]const u8{
+        "initialize",
+        "roots/list",
+        "sampling/createMessage",
+        "elicitation/create",
+    }) |removed| {
+        try testing.expectError(error.MethodNotInRevision, client.call(
+            "project-tools:7a72",
+            "req-1",
+            removed,
+            null,
+            &inner,
+            &out,
+            &envelope,
+        ));
+    }
+    // The connection framed nothing at all across the four, so a caller that
+    // reached this gate has not spent an id or a slot either. And no refusal is
+    // recorded: the peer refused nothing, so there is nothing to read.
+    try testing.expectEqual(@as(usize, 0), connection.lastEncodedLen());
+    try testing.expect(client.refusal == null);
+
+    // A method the revision does carry goes out, so the gate is the method
+    // and not a closed client: the write is refused by the transport, which
+    // is the answer the empty-member test above already reads.
+    try testing.expectError(error.Transport, client.call(
+        "project-tools:7a72",
+        "req-2",
+        "tools/list",
+        null,
+        &inner,
+        &out,
+        &envelope,
+    ));
 }
 
 test "a carried result is a success, not a failure" {
@@ -706,18 +995,19 @@ test "the refusal for a method this provider does not carry is a readable outcom
     var message_scratch: [512]u8 = undefined;
     var read_scratch: [512]u8 = undefined;
 
+    var params_writer = json.Writer.init(&params);
+    try bridge.encodeEnvelope(.{
+        .server_id = bridge.server_declaration.server_id,
+        .request_id = "req-1",
+        .inner_method = "resources/list",
+        .inner_params = null,
+        .direction = .agent_to_provider,
+    }, &params_writer);
+
     const request: jsonrpc.Request = .{
         .id = .{ .integer = 7 },
         .method = jsonrpc.Method.split(method),
-        .params = .{
-            .value = try encodeEnvelope(
-                bridge.server_declaration.server_id,
-                "req-1",
-                "resources/list",
-                null,
-                &params,
-            ),
-        },
+        .params = .{ .value = params_writer.written() },
     };
     const frame = (try provider.serve(
         request,
@@ -740,9 +1030,9 @@ test "the refusal for a method this provider does not carry is a readable outcom
     // matched, with the method this provider does not carry named in `data`.
     const outcome = try bridge.decodeOutcome(message.result.?, &read_scratch);
     try testing.expect(outcome == .@"error");
-    try testing.expect(std.mem.indexOf(u8, outcome.@"error", "\"code\":-32601") != null);
+    try testing.expect(std.mem.indexOf(u8, outcome.@"error".text, "\"code\":-32601") != null);
     try testing.expect(
-        std.mem.indexOf(u8, outcome.@"error", "\"method\":\"resources/list\"") != null,
+        std.mem.indexOf(u8, outcome.@"error".text, "\"method\":\"resources/list\"") != null,
     );
 
     // The provider released the pair when it answered, so the same call again
@@ -1451,7 +1741,7 @@ fn resolve(ctx: ?*anyopaque, envelope: bridge.Envelope, out: []u8) Error!?bridge
     const body = "{\"tools\":[{\"name\":\"echo\"}]}";
     if (out.len < body.len) return error.BufferTooSmall;
     @memcpy(out[0..body.len], body);
-    return .{ .result = out[0..body.len] };
+    return .{ .result = .{ .text = out[0..body.len] } };
 }
 
 /// Accepts the one connection and leaves its reader to the group, so this
@@ -1593,14 +1883,17 @@ const ServedCaller = struct {
         // A `mcp/message` notification draws no frame at all, because a
         // message with no id has no answer to give and this direction is one.
         state.step = "the mcp/message notification";
-        const carried_notification = try encodeEnvelope(
-            "project-tools:7a72",
-            "req-2",
-            "tools/list",
-            null,
-            &side.envelope,
-        );
-        try connection.notify(method, carried_notification, &side.out);
+        var notification_writer = json.Writer.init(&side.envelope);
+        try bridge.encodeEnvelope(.{
+            .server_id = "project-tools:7a72",
+            .request_id = "req-2",
+            .inner_method = "tools/list",
+            .inner_params = null,
+            // A notification is the other direction of the binding, and the
+            // direction is not a member of the params object either way.
+            .direction = .provider_to_agent,
+        }, &notification_writer);
+        try connection.notify(method, notification_writer.written(), &side.out);
 
         // And the connection carried the call after it, so the notification
         // cost a frame the provider read and nothing more.
@@ -1628,16 +1921,17 @@ const ServedCaller = struct {
         params: ?[]const u8,
         result: []u8,
     ) Error!conn.Response {
-        const body = encodeEnvelope(
-            server_id,
-            request_id,
-            inner_method,
-            params,
-            &self.endpoint.side.envelope,
-        ) catch return error.ResponseTooLarge;
+        var writer = json.Writer.init(&self.endpoint.side.envelope);
+        try bridge.encodeEnvelope(.{
+            .server_id = server_id,
+            .request_id = request_id,
+            .inner_method = inner_method,
+            .inner_params = params,
+            .direction = .agent_to_provider,
+        }, &writer);
         return self.endpoint.connection.call(
             method,
-            body,
+            writer.written(),
             result,
             &self.endpoint.side.out,
         );

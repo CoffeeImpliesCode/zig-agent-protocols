@@ -92,6 +92,15 @@
 //! and discard it would leave a peer waiting for an answer that was already
 //! refused, which is the one failure mode worse than an error.
 //!
+//! "Observable to the peer" is the whole claim, so it is carried the whole way.
+//! The id of a refusal is `null`, which is what JSON-RPC 2.0 requires where the
+//! id could not be determined from the Request, and `jsonrpc` reads that frame
+//! back rather than refusing it as a value of the wrong type for an id. That
+//! matters because `conn.Conn` decodes every inbound frame before it knows
+//! whether anything will be matched against it: a codec that dropped the
+//! refusal would have this library's own connection drop it, and the peer that
+//! wrote it would never learn what became of the frame it sent.
+//!
 //! ## Allocating
 //!
 //! `ARCHITECTURE.md` section 4 lets the runtime allocate where state is
@@ -101,6 +110,7 @@
 const std = @import("std");
 const acp = @import("acp.zig");
 const conn = @import("conn.zig");
+const framing = @import("framing.zig");
 const json = @import("json.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const root = @import("root.zig");
@@ -151,6 +161,16 @@ pub const Error = error{
     /// Refused rather than truncated, and nothing was sent. An agent that holds
     /// the full text sends it with [`Agent.request`] instead.
     SubjectNotModelled,
+    /// A v2 command subject whose `cwd` is not an absolute path.
+    ///
+    /// `acp.decodePermissionSubject` refuses one with `error.InvalidField`, so
+    /// writing it would put a request on the wire that this library's own
+    /// decoder throws away. PROTOCOLS.md 6.6 requires the path to be absolute
+    /// because a relative one resolves against whatever working directory the
+    /// process that runs the command happens to have, so the user approving a
+    /// command in one directory would approve it in another. Refused here for
+    /// that reason, and nothing is sent.
+    CwdNotAbsolute,
     /// The body a peer returned is not a value this layer can read. An
     /// `initialize` result without a usable `protocolVersion` lands here: there
     /// is no version to pin, and inventing one is what the pin exists to stop.
@@ -178,8 +198,18 @@ pub const FrameAction = enum {
     /// A batch array. Report `Invalid Request` with a null id, which is what the
     /// v2 batch rules require for an array this peer must not have sent.
     refuse_batch,
-    /// Neither an object nor an array, so the frame is not a JSON-RPC value.
-    /// Report `Parse error` with a null id.
+    /// A value that parsed and is not an object: `null`, `42`, `"hi"`, `true`.
+    /// Report `Invalid Request` with a null id.
+    ///
+    /// Its own arm because PROTOCOLS.md 3.1 draws the line at what the peer
+    /// sent rather than at the first byte: `-32700` is for a peer that sent
+    /// invalid JSON, `-32600` is for one that sent valid JSON which is not a
+    /// request object. A peer that sent `null` had its bytes read, and telling
+    /// it its JSON was malformed would be a claim about its encoding that this
+    /// layer has no way to make.
+    refuse_request,
+    /// Neither an object, an array, nor JSON at all. Report `Parse error` with
+    /// a null id.
     refuse_parse,
 };
 
@@ -192,31 +222,56 @@ pub const FrameAction = enum {
 pub fn classifyFrame(frame: []const u8) FrameAction {
     const trimmed = std.mem.trim(u8, frame, " \t\r\n");
     if (trimmed.len == 0) return .refuse_parse;
-    return switch (trimmed[0]) {
-        '{' => .dispatch,
+    switch (trimmed[0]) {
+        '{' => return .dispatch,
         // Read from the constant rather than spelled out here, so the one
         // place that says what this session accepts and the answer it gives a
         // batch frame cannot drift apart when the constant is flipped.
-        '[' => if (accepts_batches) .dispatch else .refuse_batch,
-        else => .refuse_parse,
-    };
+        '[' => return if (accepts_batches) .dispatch else .refuse_batch,
+        else => {},
+    }
+    // An object and an array are decided on the first byte, because either is
+    // answered whatever else it holds. Every other frame has to be read to know
+    // which of the two refusals it is, and reading it is the only way `null`
+    // and `not json` come apart.
+    //
+    // No scratch is needed and none is taken, because `skipValue` writes none:
+    // a skipped value produces no slice, so a frame of any width is decided
+    // without a buffer. What follows the value is not part of it, which is what
+    // `atEnd` is asked about.
+    const no_scratch: [0]u8 = .{};
+    var reader = json.Reader.init(trimmed);
+    reader.skipValue(&no_scratch) catch return .refuse_parse;
+    return if (reader.atEnd()) .refuse_request else .refuse_parse;
 }
 
 /// The JSON-RPC error body a transport sends for a frame it refused.
 ///
-/// The id is `null` because the specification says so for both refusals, and
-/// because a frame that is not a request has no id to answer on. This library's
-/// own decoder refuses a `null` id on a message it is *matching* a call against,
-/// which is a different thing: a refusal is never matched, it is written.
-/// A builder cannot produce this one, and that is why it is written here. Every
-/// other answer in the tree is an answer to a `jsonrpc.Request`, and a frame
-/// that is a batch or is not JSON at all is not one: `jsonrpc.Id` has no null
-/// arm and `encodeResponse` refuses a response with no id. The specification
-/// names `null` as the id for both refusals, so the member is written.
+/// The id is `null`, and that is not a shape this library writes anywhere else.
+/// JSON-RPC 2.0 requires Null for the id of an error response whose id could
+/// not be determined from the Request, which is what all three of these are: a
+/// batch array, a value that is not an object, and a frame that is not JSON.
+/// None of them is a request, so none of them has an id to answer on.
+///
+/// `jsonrpc.decode` reads these bytes back, and that is not a formality. A
+/// refusal this library could not decode would be invisible to a peer running
+/// this library: `conn.Conn` decodes every inbound frame before it knows
+/// whether anything will be matched against it, and a frame it cannot decode
+/// is dropped, because there is no id to answer on and nothing to send. The
+/// codec accepts a `null` id on a response carrying an `error` and nowhere
+/// else, and `conn.Conn.setRefusalHandler` is where such a frame is told rather
+/// than dropped.
+///
+/// A builder cannot produce this one. Every other answer in the tree is an
+/// answer to a `jsonrpc.Request`, and a frame that is a batch, a value that is
+/// not an object, or is not JSON at all is not one.
 pub fn refusalBody(action: FrameAction, out: []u8) root.EncodeError![]const u8 {
     const code: []const u8, const message: []const u8 = switch (action) {
         .dispatch => return error.InvalidField,
-        .refuse_batch => .{ "-32600", "Invalid Request" },
+        // The same answer for both, and PROTOCOLS.md 3.1 is what says so: a
+        // batch array this session declines and a value that is not an object
+        // are both valid JSON that is not a request object.
+        .refuse_batch, .refuse_request => .{ "-32600", "Invalid Request" },
         .refuse_parse => .{ "-32700", "Parse error" },
     };
     var writer = json.Writer.init(out);
@@ -387,6 +442,13 @@ pub const Client = struct {
     /// and treat a null `version` with a null `error_code` as PROTOCOLS.md 6.1
     /// rule 3 says to: a client that cannot speak the returned version SHOULD
     /// disconnect.
+    ///
+    /// The capability object is read out of the answer under the name the
+    /// *answered* version spells, so a downgrade the specification allows is
+    /// read in the version it was answered in. A `scratch` too small to
+    /// unescape a key of the answer is `error.BufferTooSmall` and not
+    /// `error.NotAResult`, because the agent sent a version and the fault is
+    /// the caller's buffer.
     pub fn initialize(
         self: *Client,
         requested: u16,
@@ -424,30 +486,7 @@ pub const Client = struct {
             };
         }
 
-        // Reported rather than guessed at: the version is what everything
-        // downstream depends on, and a body this layer cannot read has none.
-        const number = readProtocolVersion(answer.body, scratch) catch
-            return error.NotAResult;
-        const agreed = acp.WireVersion.fromNumber(number);
-        const caps_member: []const u8 = if (asked == .stable)
-            "agentCapabilities"
-        else
-            "capabilities";
-
-        // Recorded even when the version is unusable, because a caller logging a
-        // refused handshake wants the whole answer and the gate decisions that
-        // follow from it are the caller's to make.
-        self.auth_methods = advertisesAuthMethods(memberText(answer.body, "authMethods", scratch));
-        const advertised = memberText(answer.body, caps_member, scratch);
-        if (agreed) |version| self.version = version else self.agent_capabilities = &.{};
-
-        return .{
-            .version = agreed,
-            .body = answer.body,
-            .error_code = null,
-            .capabilities = advertised,
-            .auth_methods = self.auth_methods,
-        };
+        return readHandshake(self, answer, scratch);
     }
 
     /// The gate check this session applies, exposed so a caller can ask whether a
@@ -469,11 +508,19 @@ pub const Client = struct {
     /// advertised. A client that never records them serves the ungated methods
     /// only, and every gated client method is refused rather than answered on a
     /// capability the client never claimed.
-    pub fn accepts(self: Client, method: []const u8) bool {
+    ///
+    /// `shape` is the arity of the frame that arrived, which a dispatcher reads
+    /// off its id. PROTOCOLS.md 6.3 and 6.4 register `session/update` and
+    /// `elicitation/complete` as client methods that are notifications, and
+    /// `$/cancel_request` as a notification from either side, so asking about
+    /// them as requests refuses every frame the protocol sends them on. The
+    /// same question [`Client.gate`] answers on the outbound side, and this is
+    /// that question on the inbound one.
+    pub fn accepts(self: Client, method: []const u8, shape: Shape) bool {
         _ = checkCall(
             self.version,
             method,
-            .request,
+            shape,
             .client,
             self.client_capabilities,
             true,
@@ -493,8 +540,10 @@ pub const Handshake = struct {
     /// The JSON-RPC error code, or null when the call succeeded.
     error_code: ?i32,
     /// The agent's capability object as raw JSON, ready for
-    /// `acp.decodeCapabilityObject`, or null when the agent advertised none.
-    /// Borrowed from `body`.
+    /// `acp.decodeCapabilityObject`, or null when the agent advertised none:
+    /// no member at all, an explicit `null`, or a version this library cannot
+    /// speak, which has no member name to read one under. Borrowed from
+    /// `body`.
     capabilities: ?[]const u8,
     /// Whether the agent advertised a non-empty `authMethods`.
     auth_methods: bool,
@@ -676,8 +725,15 @@ pub const Agent = struct {
 
     /// Whether a method the client called is one this agent serves at the pinned
     /// version, with the gates the client satisfied.
-    pub fn accepts(self: Agent, method: []const u8) bool {
-        _ = self.gate(method, .request) catch return false;
+    ///
+    /// `shape` is the arity of the frame that arrived, which a dispatcher reads
+    /// off its id, and the same reason [`Client.accepts`] takes one. This agent
+    /// serves client methods, and `session/update` and `elicitation/complete`
+    /// are two of them that are notifications, so asking about them as requests
+    /// refuses the frames the protocol sends them on. The same question
+    /// [`Agent.gate`] answers, as a bool.
+    pub fn accepts(self: Agent, method: []const u8, shape: Shape) bool {
+        _ = self.gate(method, shape) catch return false;
         return true;
     }
 
@@ -797,7 +853,7 @@ pub fn readOutcome(
     if (conn.overlaps(request_scratch, outcome_scratch)) {
         return .{ .unreadable = error.InvalidField };
     }
-    const outcome_text = memberText(body, "outcome", outcome_scratch) orelse
+    const outcome_text = json.memberText(body, "outcome", outcome_scratch) orelse
         return .{ .unreadable = error.MissingField };
     const outcome = acp.decodePermissionOutcome(outcome_text, outcome_scratch) catch |err| {
         return .{ .unreadable = err };
@@ -1032,10 +1088,12 @@ fn permissionParams(
     return writer.written();
 }
 
-/// The v2 `subject` member, or `error.SubjectNotModelled`.
+/// The v2 `subject` member, or the refusal to write one.
 ///
 /// The two arms this library models carry every member the schema requires of
-/// them, so each one decodes back to what it was built from.
+/// them, so each one decodes back to what it was built from. A command subject
+/// whose `cwd` is relative is the one value of either arm that does not, and it
+/// is refused here rather than written for a decoder to throw away.
 fn writePermissionSubject(subject: acp.PermissionSubject, writer: *json.Writer) Error!void {
     switch (subject) {
         .tool_call => |call| {
@@ -1046,6 +1104,16 @@ fn writePermissionSubject(subject: acp.PermissionSubject, writer: *json.Writer) 
             writer.byte('}') catch return error.BufferTooSmall;
         },
         .command => |command| {
+            // Refused before a byte is written, because
+            // `acp.decodePermissionSubject` refuses the same subject with
+            // `error.InvalidField` and a request this library cannot read back
+            // is a request a peer has been asked to approve on words this
+            // library will not stand behind. PROTOCOLS.md 6.6 makes the path
+            // absolute because a relative one resolves against whatever
+            // working directory the process that runs the command happens to
+            // have, so the user approving a command in one directory would
+            // approve it in another.
+            if (!acp.isAbsolutePath(command.cwd)) return error.CwdNotAbsolute;
             writer.slice(
                 "{\"type\":\"" ++ acp.permission_subject_type.command ++ "\",\"command\":",
             ) catch return error.BufferTooSmall;
@@ -1067,6 +1135,66 @@ fn writePermissionSubject(subject: acp.PermissionSubject, writer: *json.Writer) 
         // would ask the user about a permission the agent did not describe.
         .other => return error.SubjectNotModelled,
     }
+}
+
+/// Read the answer to `initialize` and pin the session to what it agreed.
+///
+/// Split out of [`Client.initialize`] so that everything an answer decides — the
+/// version, the capability member, the `authMethods` gate — is one function a
+/// test can drive with a body and no socket behind it. `answer` is what the
+/// connection returned, so `body` is the `result` member in the caller's own
+/// result buffer and `scratch` is the caller's.
+fn readHandshake(client: *Client, answer: conn.Response, scratch: []u8) Error!Handshake {
+    // Reported rather than guessed at: the version is what everything
+    // downstream depends on, and a body this layer cannot read has none. A
+    // scratch too small to unescape one key is the caller's own fault and not a
+    // verdict on the peer, and `NotAResult` would say the agent sent no version
+    // at all, so a caller sent looking for that protocol bug would never find
+    // it, because the peer sent one.
+    const number = readProtocolVersion(answer.body, scratch) catch |err| switch (err) {
+        error.BufferTooSmall => return error.BufferTooSmall,
+        else => return error.NotAResult,
+    };
+    const agreed = acp.WireVersion.fromNumber(number);
+
+    // Recorded even when the version is unusable, because a caller logging a
+    // refused handshake wants the whole answer and the gate decisions that
+    // follow from it are the caller's to make.
+    const auth_methods = json.memberText(answer.body, "authMethods", scratch);
+    client.auth_methods = advertisesAuthMethods(auth_methods);
+
+    // The member is named by the version the agent *answered with*, because that
+    // is the version `Agent.initializeBody` wrote it under. PROTOCOLS.md 6.1
+    // lets the agent answer with its own highest rather than with the one it
+    // was asked for, and a downgrade is a specified outcome that
+    // `Agent.negotiate` reports as one: a client that asked for v2 and was
+    // answered v1 is reading a v1 body and has to look for the v1 spelling, or
+    // every gated method is refused because the answer was read under the wrong
+    // name.
+    var advertised: ?[]const u8 = null;
+    if (agreed) |version| {
+        const caps_member: []const u8 = if (version == .stable)
+            "agentCapabilities"
+        else
+            "capabilities";
+        const text = json.memberText(answer.body, caps_member, scratch);
+        // An explicit `null` is a peer that advertised nothing, and it is
+        // reported as the absence it is: the same answer an omitted member
+        // gives, and the only one a version this library cannot speak has,
+        // because there is no member name to look for.
+        if (text) |value| {
+            if (!std.mem.eql(u8, value, "null")) advertised = value;
+        }
+    }
+    if (agreed) |version| client.version = version else client.agent_capabilities = &.{};
+
+    return .{
+        .version = agreed,
+        .body = answer.body,
+        .error_code = null,
+        .capabilities = advertised,
+        .auth_methods = client.auth_methods,
+    };
 }
 
 fn readProtocolVersion(body: []const u8, scratch: []u8) root.DecodeError!u16 {
@@ -1097,28 +1225,6 @@ fn advertisesAuthMethods(text: ?[]const u8) bool {
     if (std.mem.eql(u8, value, "null")) return false;
     if (std.mem.eql(u8, value, "[]")) return false;
     return true;
-}
-
-/// A member's value as raw JSON, or null when the object does not carry a usable
-/// one.
-///
-/// An explicit `null` is null too: every caller here wants to know whether there
-/// is a value to read, and a `null` member is the schema's way of saying there is
-/// not one.
-fn memberText(body: []const u8, name: []const u8, scratch: []u8) ?[]const u8 {
-    var reader = json.Reader.init(body);
-    if (reader.beginObject() catch return null) return null;
-    var found: ?[]const u8 = null;
-    while (reader.nextKey(scratch) catch return null) |key| {
-        if (std.mem.eql(u8, key, name)) {
-            const value = reader.rawValue(scratch) catch return null;
-            if (std.mem.eql(u8, value, "null")) return null;
-            found = value;
-        } else {
-            reader.skipValue(scratch) catch return null;
-        }
-    }
-    return found;
 }
 
 /// The params a call is allowed to send, or `error.ParamsNotAnObject`.
@@ -1187,7 +1293,7 @@ test "either of the two elicitation gates enables the method" {
     // refused rather than sent to find out.
     const bare: Agent = .{ .connection = undefined, .version = .stable };
     try testing.expectError(error.NotPermitted, bare.gate("elicitation/create", .request));
-    try testing.expect(!bare.accepts("elicitation/create"));
+    try testing.expect(!bare.accepts("elicitation/create", .request));
 }
 
 test "auth/login is gated on a non-empty authMethods, at v2 only" {
@@ -1229,13 +1335,13 @@ test "arity and side are checked against the registry" {
     const advertised = [_][]const u8{"terminal"};
     agent.setClientCapabilities(&advertised);
     _ = try agent.gate("terminal/create", .request);
-    try testing.expect(agent.accepts("terminal/create"));
-    try testing.expect(agent.accepts("terminal/release"));
+    try testing.expect(agent.accepts("terminal/create", .request));
+    try testing.expect(agent.accepts("terminal/release", .request));
     // A capability the client never advertised is refused, whatever the method
     // is: both terminal methods are gated on the same `terminal` boolean, so
     // one of them answering would mean the gate is not per-method.
-    try testing.expect(!agent.accepts("fs/write_text_file"));
-    try testing.expect(!agent.accepts("session/load"));
+    try testing.expect(!agent.accepts("fs/write_text_file", .request));
+    try testing.expect(!agent.accepts("session/load", .request));
 }
 
 test "a session is pinned to the version it was built with" {
@@ -1254,8 +1360,8 @@ test "a session is pinned to the version it was built with" {
     // method the draft removed is refused without a round trip.
     const agent = Agent.init(&connection, .draft);
     try testing.expectEqual(acp.WireVersion.draft, agent.version);
-    try testing.expect(agent.accepts("session/request_permission"));
-    try testing.expect(!agent.accepts("terminal/create"));
+    try testing.expect(agent.accepts("session/request_permission", .request));
+    try testing.expect(!agent.accepts("terminal/create", .request));
 }
 
 test "the inbound client-side gate is the capability this client claimed" {
@@ -1263,17 +1369,48 @@ test "the inbound client-side gate is the capability this client claimed" {
     // Nothing claimed yet, so every gated client method is refused. An agent
     // that asks for a terminal this client never advertised support for must
     // not be answered by a session that pretends otherwise.
-    try testing.expect(!client.accepts("terminal/create"));
+    try testing.expect(!client.accepts("terminal/create", .request));
 
     const claimed = [_][]const u8{"terminal"};
     client.setClientCapabilities(&claimed);
-    try testing.expect(client.accepts("terminal/create"));
-    try testing.expect(client.accepts("terminal/release"));
+    try testing.expect(client.accepts("terminal/create", .request));
+    try testing.expect(client.accepts("terminal/release", .request));
     // One capability claimed is not all of them, so the gate stays per method.
-    try testing.expect(!client.accepts("fs/write_text_file"));
-    try testing.expect(!client.accepts("elicitation/create"));
+    try testing.expect(!client.accepts("fs/write_text_file", .request));
+    try testing.expect(!client.accepts("elicitation/create", .request));
     // An ungated client method was never gated at all.
-    try testing.expect(client.accepts("session/request_permission"));
+    try testing.expect(client.accepts("session/request_permission", .request));
+}
+
+test "a notification is served, and the arity it arrived in is what is asked about" {
+    // PROTOCOLS.md 6.3 and 6.4 register four of these as notifications, and say
+    // `$/cancel_request` arrives from either side. Asked as requests every one
+    // of them is a message the peer will never answer, so a dispatcher that
+    // asked with one shape refused frames the protocol requires it to serve.
+    var client: Client = .{ .connection = undefined, .version = .stable };
+    try testing.expect(client.accepts("session/update", .notification));
+    try testing.expect(client.accepts("elicitation/complete", .notification));
+    try testing.expect(client.accepts("$/cancel_request", .notification));
+    // The other shape is still refused, because the arity is not a detail a
+    // `bool` may drop: a request where a notification was expected waits for an
+    // answer that will never come.
+    try testing.expect(!client.accepts("session/update", .request));
+    try testing.expect(!client.accepts("session/request_permission", .notification));
+    try testing.expect(!client.accepts("terminal/create", .notification));
+
+    var agent: Agent = .{ .connection = undefined, .version = .stable };
+    // An agent serves client methods, so the notifications it is sent are these
+    // three and not the ones a client sends.
+    try testing.expect(agent.accepts("session/update", .notification));
+    try testing.expect(agent.accepts("elicitation/complete", .notification));
+    try testing.expect(agent.accepts("$/cancel_request", .notification));
+    // `session/cancel` is the client's own call, so nothing serves it in this
+    // direction. The side decides that, not the arity, and both shapes say so.
+    try testing.expect(!agent.accepts("session/cancel", .notification));
+    try testing.expect(!agent.accepts("session/cancel", .request));
+    // Nor does the other shape open a capability or a side.
+    try testing.expect(!agent.accepts("terminal/create", .request));
+    try testing.expect(!agent.accepts("session/request_permission", .notification));
 }
 
 test "a notification is sent as a notification and a request as a request" {
@@ -1341,6 +1478,23 @@ test "an outcome this library cannot read is never approval" {
         // take: there is nothing to hand on from an outcome nobody could read.
         try testing.expectEqual(@as(?ReadableOutcome, null), decision.readable());
     }
+}
+
+test "the outcome that is read is the first one the client sent" {
+    // RFC 8259 section 4 says the names in an object should be unique and does
+    // not forbid a repeat, so a peer can send `outcome` twice. The first is what
+    // the body reads as and what every other walk in the tree resolves, and a
+    // walk that kept the last would let a client answer `cancelled` and then
+    // append the option it wanted: the grant would be the one read, and the user
+    // saw the other.
+    var options: [1]acp.PermissionOption = undefined;
+    var request_scratch: [512]u8 = undefined;
+    const request = try decodeRequest(.stable, permission_params, &options, &request_scratch);
+    var outcome_scratch: [256]u8 = undefined;
+    const twice = readOutcome(
+        \\{"outcome":{"outcome":"cancelled"},"outcome":{"outcome":"selected","optionId":"yes"}}
+    , &request, &request_scratch, &outcome_scratch);
+    try testing.expect(twice == .cancelled);
 }
 
 test "an outcome naming an option the request never offered is consent to nothing" {
@@ -1686,6 +1840,33 @@ test "a v2 permission request keeps its subject and refuses one it cannot rebuil
     try testing.expectError(error.SubjectNotModelled, permissionParams(&other, &out));
 }
 
+test "a command subject with a relative cwd is refused rather than written" {
+    // PROTOCOLS.md 6.6 makes the path absolute, and
+    // `acp.decodePermissionSubject` refuses a relative one with
+    // `error.InvalidField`, so writing it would put on the wire a request this
+    // library cannot read back. The path is the whole of the disagreement: a
+    // relative one resolves against whatever working directory the process
+    // that runs the command happens to have, so the user approving a command in
+    // one directory would approve it in another.
+    var options = [_]acp.PermissionOption{
+        .{ .option_id = "a", .name = "Run", .kind = .{ .known = .allow_once } },
+    };
+    const request: acp.PermissionRequest = .{ .draft = .{
+        .session_id = "s9",
+        .title = "Run a command",
+        .description = null,
+        .subject = .{ .command = .{
+            .command = "ls",
+            .cwd = "build",
+            .tool_call_id = null,
+            .terminal_id = null,
+        } },
+        .options = &options,
+    } };
+    var out: [512]u8 = undefined;
+    try testing.expectError(error.CwdNotAbsolute, permissionParams(&request, &out));
+}
+
 test "a policy with no decision refuses rather than approves" {
     var options: [1]acp.PermissionOption = undefined;
     var request_scratch: [512]u8 = undefined;
@@ -1785,6 +1966,85 @@ test "an agent answers initialize in its own version's spelling" {
     );
 }
 
+test "a downgrade is read in the version the agent answered with" {
+    // PROTOCOLS.md 6.1: the agent echoes the version it was asked for or
+    // returns its own highest. A client that asked for v2 and was answered v1 is
+    // reading a v1 body, and the capability member in it is the v1 spelling —
+    // the one `Agent.initializeBody` writes, because `negotiate` pinned the
+    // agent to what it answered. Read under the v2 name the answer carries no
+    // capabilities at all, and every gated method is refused.
+    var client: Client = .{ .connection = undefined, .version = .draft };
+    var scratch: [256]u8 = undefined;
+    const body = "{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":true}}";
+    const handshake = try readHandshake(&client, .{ .body = body, .error_code = null }, &scratch);
+    try testing.expectEqual(acp.WireVersion.stable, handshake.version.?);
+    try testing.expectEqual(acp.WireVersion.stable, client.version);
+
+    // `loadSession` is the gate on `session/load` and on `session/resume`, and
+    // both are open because the answer was read under the name its own version
+    // spells. A capability the answer did not carry is still refused, so what
+    // is being checked is the member the agent wrote and not a gate left open.
+    var entries: [4]acp.Capability = undefined;
+    var paths_buffer: [128]u8 = undefined;
+    var list: [4][]const u8 = undefined;
+    const set = try acp.decodeCapabilityObject(
+        .stable,
+        .agent,
+        handshake.capabilities orelse return error.TestUnexpectedResult,
+        &entries,
+        &paths_buffer,
+        &scratch,
+    );
+    client.setAgentCapabilities(try capabilityPaths(set, &list));
+    _ = try client.gate("session/load", .request);
+    _ = try client.gate("session/resume", .request);
+    try testing.expectError(error.NotPermitted, client.gate("session/delete", .request));
+
+    // The echo, which is the other half of the same rule: the member is the one
+    // the answered version spells, whichever way the negotiation went.
+    const v2 = "{\"protocolVersion\":2,\"capabilities\":{\"session\":{}}}";
+    const echoed = try readHandshake(&client, .{ .body = v2, .error_code = null }, &scratch);
+    try testing.expectEqual(acp.WireVersion.draft, echoed.version.?);
+    try testing.expect(echoed.capabilities != null);
+
+    // A version this library cannot speak has no member name to look for, so
+    // the answer reports none rather than guessing at a spelling: the body is
+    // the caller's to read, and the session keeps no paths.
+    const unknown = "{\"protocolVersion\":9,\"capabilities\":{}}";
+    const unheld = try readHandshake(&client, .{ .body = unknown, .error_code = null }, &scratch);
+    try testing.expect(unheld.version == null);
+    try testing.expect(unheld.capabilities == null);
+
+    // An explicit `null` is a peer that advertised nothing, and it is reported
+    // as the absence it is rather than as the four bytes a decoder refuses.
+    const none = "{\"protocolVersion\":1,\"agentCapabilities\":null}";
+    const bare = try readHandshake(&client, .{ .body = none, .error_code = null }, &scratch);
+    try testing.expect(bare.capabilities == null);
+}
+
+test "a short scratch is the caller's fault and not a verdict on the peer" {
+    // An answer that carries a version, and a key the caller's scratch cannot
+    // unescape. The peer did nothing wrong, and `NotAResult` would say it sent
+    // no version at all, so a caller sent looking for that protocol bug would
+    // never find it, because the peer sent one.
+    var client: Client = .{ .connection = undefined, .version = .draft };
+    const body = "{\"protocolVersion\":1,\"agentCapabilit\\u0069es\":{}}";
+    var small: [2]u8 = undefined;
+    try testing.expectError(
+        error.BufferTooSmall,
+        readHandshake(&client, .{ .body = body, .error_code = null }, &small),
+    );
+    // The pin did not move, because nothing was read.
+    try testing.expectEqual(acp.WireVersion.draft, client.version);
+
+    // The same answer through a scratch that fits reads, and reads as the v1
+    // member it is: the fault was the buffer and not the peer.
+    var roomy: [64]u8 = undefined;
+    const handshake = try readHandshake(&client, .{ .body = body, .error_code = null }, &roomy);
+    try testing.expectEqual(acp.WireVersion.stable, handshake.version.?);
+    try testing.expect(handshake.capabilities != null);
+}
+
 test "negotiation pins the session and refuses to invent a version" {
     var connection: conn.Conn = undefined;
     const both = [_]acp.WireVersion{ .stable, .draft };
@@ -1851,9 +2111,59 @@ test "a batch frame is refused loudly, at either version" {
             "\"message\":\"Parse error\"}}",
         try refusalBody(.refuse_parse, &out),
     );
+
+    // The refusal this session writes is a frame this library's own decoder
+    // reads, which is what makes it observable rather than merely correct: a
+    // peer running this library decodes every inbound frame in `conn.Conn`
+    // before it knows whether anything will be matched against it, and one it
+    // cannot decode is dropped with no id to answer on. The socket test below
+    // is the same claim with a peer on the other end.
+    const batch_refusal = try refusalBody(.refuse_batch, &out);
+    var scratch: [128]u8 = undefined;
+    const refusal = try jsonrpc.decode(batch_refusal, &scratch);
+    try testing.expectEqual(jsonrpc.Kind.response, refusal.kind);
+    try testing.expect(refusal.id_null);
+    try testing.expectEqual(@as(?jsonrpc.Id, null), refusal.id);
+    try testing.expectEqual(@as(i32, -32600), refusal.rpc_error.?.code);
+    try testing.expectEqualStrings("Invalid Request", refusal.rpc_error.?.message);
+    // And it is a value this library holds rather than text it happens to
+    // write: PROTOCOLS.md section 2 asks for `encode(decode(b)) == b`, and the
+    // bytes come back the same way round, member for member.
+    var again: [128]u8 = undefined;
+    var writer = json.Writer.init(&again);
+    try jsonrpc.encode(refusal, &writer);
+    try testing.expectEqualStrings(batch_refusal, writer.written());
+
     // There is no body for a frame that is dispatched: the connection writes that
     // one, and a transport that also wrote one would double-answer.
     try testing.expectError(error.InvalidField, refusalBody(.dispatch, &out));
+}
+
+test "a frame that parsed and is not an object is not a parse error" {
+    // PROTOCOLS.md 3.1 draws the line at what the peer sent: `-32700` is invalid
+    // JSON, `-32600` is valid JSON which is not a request object. Every one of
+    // these parsed, and every one of them is a frame to answer rather than
+    // drop, because a peer is waiting to hear what became of what it wrote.
+    for ([_][]const u8{ "null", "42", "\"hi\"", "true", "false", " -1.5e3 " }) |frame| {
+        try testing.expectEqual(FrameAction.refuse_request, classifyFrame(frame));
+    }
+    // These did not, so the two refusals do not collapse into one another. A
+    // peer told its JSON was malformed when it wrote it correctly would be told
+    // the same about bytes that were not, and would look for the fault in its
+    // own encoder. None of them begins with a brace or a bracket: an object and
+    // an array are decided on that one byte, and what is inside an object is
+    // the connection's to decode.
+    for ([_][]const u8{ "tru", "\"hi", "42x", "nul", "-", "" }) |frame| {
+        try testing.expectEqual(FrameAction.refuse_parse, classifyFrame(frame));
+    }
+
+    var out: [128]u8 = undefined;
+    // The answer a batch gets, and a different one from a parse error.
+    try testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600," ++
+            "\"message\":\"Invalid Request\"}}",
+        try refusalBody(.refuse_request, &out),
+    );
 }
 
 test "params that are not an object are refused before they are framed" {
@@ -2031,16 +2341,20 @@ const Endpoint = struct {
     /// Whatever `conn.Conn.init` refuses is refused here: the buffers are the
     /// test's own, so there is no caller to grow one and a task reports it as a
     /// failed test rather than as a fault the peer committed.
+    ///
+    /// The refusal hook is installed here rather than by the caller afterwards,
+    /// because `open` spawns the reader task: a peer that refuses the instant
+    /// it is connected would be heard by nobody, which is the fault the hook
+    /// exists to remove.
     fn open(
         self: *Endpoint,
         io: Io,
         group: *Io.Group,
         stream: Io.net.Stream,
         handler: ?conn.Handler,
+        refusal: ?conn.RefusalHandler,
     ) conn.Error!void {
-        self.stream = stream;
-        self.reader = Io.net.Stream.Reader.init(stream, io, &self.reader_buffer);
-        self.writer = Io.net.Stream.Writer.init(stream, io, &self.writer_buffer);
+        self.adopt(io, stream);
         self.connection = try conn.Conn.init(io, &self.reader.interface, &self.writer.interface, .{
             .frame_buffer = &self.side.frame_buffer,
             .pending = &self.side.pending,
@@ -2048,9 +2362,22 @@ const Endpoint = struct {
             .answer = &self.side.answer,
         });
         if (handler) |h| self.connection.setHandler(h);
+        if (refusal) |h| self.connection.setRefusalHandler(h);
         // Spawned on the group the test joins, because `Io.Group.async` does not
         // promise to run its task until the group is awaited or cancelled.
         group.async(io, pump, .{self});
+    }
+
+    /// Take the stream and its two interfaces, with no connection over them.
+    ///
+    /// A transport that only writes needs the stream and the framing and
+    /// nothing else. A connection over it would park a reader on a socket no
+    /// peer is writing to, and the group would wait for a task with nothing to
+    /// do.
+    fn adopt(self: *Endpoint, io: Io, stream: Io.net.Stream) void {
+        self.stream = stream;
+        self.reader = Io.net.Stream.Reader.init(stream, io, &self.reader_buffer);
+        self.writer = Io.net.Stream.Writer.init(stream, io, &self.writer_buffer);
     }
 
     /// Hang up, and release the descriptor once.
@@ -2254,7 +2581,7 @@ test "the client's answer is composed beside the outcome it splices in" {
     const asked = try decodeRequest(.stable, params, &agent_options, &agent_request);
     var envelope_scratch: [512]u8 = undefined;
     var outcome_region: [256]u8 = undefined;
-    const result = memberText(envelope, "result", &envelope_scratch) orelse
+    const result = json.memberText(envelope, "result", &envelope_scratch) orelse
         return error.TestUnexpectedResult;
     const decision = readOutcome(result, &asked, &agent_request, &outcome_region);
     try testing.expectEqual(@as(?ReadableOutcome, .{ .grants = true }), decision.readable());
@@ -2363,6 +2690,54 @@ test "an agent reads a permission outcome a client returned over a real socket" 
     try testing.expectEqual(ReadableOutcome{ .grants = true }, state.permission.readable().?);
 }
 
+test "a peer running this library is told of a refusal it sent with a null id" {
+    // The whole round trip the refusal depends on, over a real socket. A peer
+    // sends a batch array; this session's transport classifies it and answers
+    // with the specification's own `Invalid Request` under a `null` id; and a
+    // peer running this library's own reader has to hear it. It did not, and
+    // not because the refusal was suppressed: `jsonrpc` refused the frame as a
+    // value of the wrong type for an id, so `conn.Conn` dropped it in `route`
+    // exactly as it drops any frame it cannot decode, and the peer that wrote
+    // it learned nothing at all.
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var path_buffer: [128]u8 = undefined;
+    var address = try listenOn(io, &path_buffer, 0x5eed_0103);
+    defer address.server.deinit(io);
+    defer std.Io.Dir.cwd().deleteFile(io, address.path) catch {};
+
+    var seen: RefusalSeen = .{ .io = io };
+    var agent_endpoint: Endpoint = .{};
+    var client_endpoint: Endpoint = .{};
+
+    var group: Io.Group = .init;
+    var refusing = RefusingServer{
+        .io = io,
+        .server = &address.server,
+        .endpoint = &agent_endpoint,
+        .seen = &seen,
+    };
+    var listening = RefusingClient{
+        .io = io,
+        .group = &group,
+        .address = &address.address,
+        .endpoint = &client_endpoint,
+        .seen = &seen,
+    };
+    group.async(io, RefusingServer.run, .{&refusing});
+    group.async(io, RefusingClient.run, .{&listening});
+    group.await(io) catch {};
+
+    // Told once, with the code and the message the peer actually wrote rather
+    // than with a guess at which request it belonged to. There is no such
+    // guess here: the id is `null` because the peer could not determine one.
+    try testing.expectEqual(@as(usize, 1), seen.calls);
+    try testing.expectEqual(@as(i32, -32600), seen.code);
+    try testing.expectEqualStrings("Invalid Request", seen.text());
+}
+
 /// A listening Unix socket, with the address that reaches it.
 ///
 /// A Unix socket rather than a TCP port: there is no race over which port the
@@ -2412,7 +2787,7 @@ const ServerTask = struct {
         self.endpoint.open(self.io, self.group, stream, .{
             .ctx = self.state,
             .call = agentHandler,
-        }) catch {
+        }, null) catch {
             self.state.failed = true;
             self.endpoint.hangUp(self.io);
             return;
@@ -2432,7 +2807,7 @@ const ClientTask = struct {
             self.state.failed = true;
             return;
         };
-        self.endpoint.open(self.io, self.group, stream, null) catch {
+        self.endpoint.open(self.io, self.group, stream, null, null) catch {
             self.state.failed = true;
             self.endpoint.hangUp(self.io);
             return;
@@ -2522,7 +2897,7 @@ const PermissionCaller = struct {
             self.state.set(self.io);
             return;
         };
-        self.endpoint.open(self.io, self.group, stream, null) catch {
+        self.endpoint.open(self.io, self.group, stream, null, null) catch {
             self.state.failed = true;
             self.state.set(self.io);
             self.endpoint.hangUp(self.io);
@@ -2587,7 +2962,7 @@ const PermissionServer = struct {
         self.endpoint.open(self.io, self.group, stream, .{
             .ctx = &self.endpoint.side,
             .call = clientPermissionHandler,
-        }) catch {
+        }, null) catch {
             self.state.failed = true;
             self.endpoint.hangUp(self.io);
             return;
@@ -2596,6 +2971,106 @@ const PermissionServer = struct {
         // closing now would race it: the answer would arrive at a connection that
         // no longer existed.
         self.state.wait(self.io);
+        self.endpoint.hangUp(self.io);
+    }
+};
+
+/// What the client saw of a refusal that matched no call.
+///
+/// Its own type because the hook is handed the error object and nothing else:
+/// there is no `Io` to lock with, and the connection's is not reachable from
+/// here. The code and the message are copied out of the connection's decode
+/// region, which the next frame overwrites, so keeping a slice of it would
+/// name whatever was decoded after.
+const RefusalSeen = struct {
+    io: Io,
+    mutex: Io.Mutex = .init,
+    condition: Io.Condition = .init,
+    calls: usize = 0,
+    code: i32 = 0,
+    message: [64]u8 = undefined,
+    message_len: usize = 0,
+
+    fn told(ctx: ?*anyopaque, object: jsonrpc.Error) void {
+        const self: *RefusalSeen = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lock(self.io) catch return;
+        defer self.mutex.unlock(self.io);
+        const n = @min(object.message.len, self.message.len);
+        @memcpy(self.message[0..n], object.message[0..n]);
+        self.message_len = n;
+        self.code = object.code;
+        self.calls += 1;
+        self.condition.broadcast(self.io);
+    }
+
+    /// Block until a refusal has been told. A barrier rather than a sleep: the
+    /// test passes when the frame arrived, not when it waited long enough to
+    /// look as though it had.
+    fn wait(self: *RefusalSeen) void {
+        self.mutex.lock(self.io) catch return;
+        while (self.calls == 0) self.condition.wait(self.io, &self.mutex) catch return;
+        self.mutex.unlock(self.io);
+    }
+
+    fn text(self: *const RefusalSeen) []const u8 {
+        return self.message[0..self.message_len];
+    }
+};
+
+/// Refuses the one frame it is sent, which is what a transport does with a
+/// batch array this session declines.
+///
+/// It reads nothing and answers nothing: the frame it refuses is a constant and
+/// the part under test is what the peer does with the answer. The
+/// classification still runs, because a transport that wrote a refusal for an
+/// action it had not reached would be testing a frame nobody classified.
+const RefusingServer = struct {
+    io: Io,
+    server: *Io.net.Server,
+    endpoint: *Endpoint,
+    seen: *RefusalSeen,
+
+    const batch = "[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/new\"}]";
+
+    fn run(self: *@This()) void {
+        const stream = self.server.accept(self.io) catch return;
+        self.endpoint.adopt(self.io, stream);
+        // Every path out of here releases the descriptor, because a client
+        // waiting on a refusal is waiting on a socket this side holds.
+        defer self.endpoint.hangUp(self.io);
+
+        var out: [128]u8 = undefined;
+        const body = refusalBody(classifyFrame(batch), &out) catch return;
+        framing.writeFrame(body, &self.endpoint.writer.interface) catch return;
+        self.endpoint.writer.interface.flush() catch return;
+        // The client's reader has the frame by the time the hook fires, and
+        // closing before that would race a reader that has not looked at the
+        // bytes yet.
+        self.seen.wait();
+    }
+};
+
+/// Connects, and waits for the refusal it is about to be sent.
+const RefusingClient = struct {
+    io: Io,
+    group: *Io.Group,
+    address: *const Io.net.UnixAddress,
+    endpoint: *Endpoint,
+    seen: *RefusalSeen,
+
+    fn run(self: *@This()) void {
+        const stream = self.address.connect(self.io) catch return;
+        // No handler: the frame that arrives is a response, and a connection
+        // with no handler installed answers nobody, which is the point.
+        self.endpoint.open(self.io, self.group, stream, null, .{
+            .ctx = self.seen,
+            .call = RefusalSeen.told,
+        }) catch {
+            self.endpoint.hangUp(self.io);
+            return;
+        };
+
+        self.seen.wait();
         self.endpoint.hangUp(self.io);
     }
 };
