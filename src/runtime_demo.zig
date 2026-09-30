@@ -10,7 +10,7 @@
 //! prints what came back. Everything is caller-owned buffers, so the example
 //! doubles as a check that the API is usable without an allocator.
 //!
-//! Run it with `zig build run`.
+//! Run it with `zig build run-runtime`.
 
 const std = @import("std");
 const proto = @import("zig-agent-proto");

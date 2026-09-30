@@ -45,12 +45,35 @@ Git.
 - `src/mcp_session.zig` is the protocol layer above the connection. Everything
   in it is revision rules: which methods exist, where capabilities travel, and
   how a result is classified.
+- `src/acp_session.zig` is the ACP protocol layer above the connection. A
+  session is pinned to one wire version for its whole life, because the two
+  versions' method registries, capability spellings and permission shapes are
+  related by no conversion the specification provides. It also makes the
+  approval rule structural rather than a comment: `PermissionAnswer` has no arm
+  that means consent, and `PermissionDecision` carries a third arm, `unreadable`,
+  so an outcome this library cannot read never becomes `grants = true`.
+- `src/bridge_session.zig` carries stateless MCP `2026-07-28` requests over an
+  ACP connection with the one method `mcp/message`. Reading the inner outcome is
+  a separate step from the call, because an inner MCP error arrives inside a
+  successful outer response, and a client that checks only whether the outer
+  call failed reports a tool failure as a transport failure and retries it.
+- `src/http.zig` is the MCP Streamable HTTP transport, `2026-07-28`, the second
+  of the two. It is built on `std.http` and adds no dependency. It mints no
+  session identifier and keeps no state between requests, because
+  `Mcp-Session-Id` and `Last-Event-ID` were removed at that revision.
 - `src/runtime_demo.zig` is the `run-runtime` step: a real MCP client and a
   real server talking to each other over a socket, with the same `conn.Conn` a
   server binary would use.
-- `build.zig` exposes the `zig-agent-proto` module, installs a static library,
-  the codec demonstration and the runtime example, and defines `run`,
-  `run-runtime`, `test`, `fuzz`, and `docs` steps.
+- `src/sessions_demo.zig` is the `run-sessions` step: an ACP session and the
+  `mcp-over-acp` binding over one real connection, which is where the two
+  protocol layers are shown composing on transport bytes rather than only
+  against each other.
+- `src/http_demo.zig` is the `run-http` step: the Streamable HTTP transport over
+  a real loopback socket, answering one POST with a single JSON body and one
+  with an event stream.
+- `build.zig` exposes the `zig-agent-proto` module, installs a static library
+  and the four examples, and defines `run`, `run-runtime`, `run-sessions`,
+  `run-http`, `test`, `fuzz`, and `docs` steps.
 - The library has no dependencies beyond the Zig toolchain and no system library
   dependencies.
 
@@ -107,6 +130,11 @@ style; each one has a failure that is hard to see from the code alone.
   `body` reports a failure as a success.
 - **Request ids are monotonic and never reused.** A retry is a new call, which
   the multi-round-trip rule requires and which `Conn.nextId` reports.
+- **The pending table belongs to the connection.** `Conn.init` clears every
+  slot, so a caller's array declared `undefined` is a table of free slots and
+  not a table of whatever the stack held. ReleaseSafe does not zero a frame, so
+  an uncleared `used` flag answers the first call with `error.TooManyPending`
+  before a single byte reaches the wire, and Debug hides it.
 
 ## Contracts the audit pinned down
 
@@ -130,27 +158,60 @@ style; each one has a failure that is hard to see from the code alone.
   enforced by `enterContainer` and covered by a test, so do not add a second
   guard without removing the first.
 
+## Toolchain traps
+
+Three facts about the pinned Zig `0.16.0`. Each one names neither its cause
+nor its file, so the next reader pays for it twice unless it is written down.
+
+- **`std.http.Client.connectUnix` does not compile.** It names a
+  `std.posix.SocketError` that this `std` no longer defines. A loopback that
+  wants a Unix socket uses `Io.net.UnixAddress` instead, and a real client uses
+  `connectTcp`.
+- **A line is streamed, never taken.** `std.Io.Reader.takeDelimiter` bounds the
+  result by the reader's own buffer rather than the caller's, so an event
+  stream line longer than the transfer buffer fails there. `http.readEvent`
+  uses `streamDelimiter`, which makes the caller's buffer the bound. An SSE line
+  is one message long, and a message is bounded by the caller's buffer.
+- **`BodyWriter.flush` does nothing in the `chunked` state.** It flushes for
+  `end`, `none`, `content_length` and `chunk_len`, and `chunked` is the state a
+  `transfer-encoding: chunked` body stays in for its whole life. An event stream
+  that relies on it delivers nothing until something ends the body, and a
+  stream that never ends never ends it. `http.Stream.send` flushes the body
+  writer and the protocol output itself.
 
 ## Commands
 
 Run at the repository root:
 
-- `zig build` installs the static library, the codec demonstration and the
-  runtime example, and makes the `zig-agent-proto` module available to
-  consumers. `zig build test` runs the unit tests, the golden vectors and the
-  loopback tests. `zig build docs` generates documentation. `zig build run`
+- `zig build` installs the static library and the four examples, and makes the
+  `zig-agent-proto` module available to consumers.
+  `zig build test` runs the unit tests, the golden vectors and the loopback
+  tests. `zig build docs` generates documentation. `zig build run`
   executes the codec demonstration, which prints what each decoder produced
   from real wire bytes; it writes to stdout through one buffered writer, so
   `zig build run > demo.txt` captures the whole report. `zig build run-runtime`
   runs a live MCP client and server against each other over a socket and
   prints the exchange, which is the end-to-end proof that the codec and the
   runtime work together on real transport bytes.
+- `zig build run-sessions` runs an ACP client and agent over a socket, then
+  carries two MCP requests over that same connection and prints the carried
+  result and the carried error. `zig build run-http` runs a Streamable HTTP
+  client and server over a loopback port and prints one single-JSON reply and
+  one event stream. Both are examples rather than tests: they are the proof
+  that the newest layers work on real transport bytes, and CI runs both.
 - `zig build fuzz` runs the property and differential harness on its own. It
   takes `-Dfuzz-seed=<u64>` and `-Dfuzz-iterations=<usize>`, both in decimal, and
   prints them on every run, so a failure is reproducible from the log. It
   inherits `-Doptimize` and must not be run in ReleaseFast: a bounds violation
   is a trap in Debug and ReleaseSafe and nothing at all in ReleaseFast, and
   catching the former is the reason the step exists.
+
+  That step is also the only one that writes an options file, and Zig writes one
+  through `renameat2(RENAME_EXCHANGE)`. A checkout on a filesystem that rejects
+  that call with `EINVAL` — an NFS export, for one — takes the build runner down
+  with a panic instead of reporting a build error, so run the step as
+  `zig build fuzz --cache-dir <directory on a local filesystem>`. No other step
+  writes one, so the rest of the gate is unaffected.
 - `zig fmt --check .` checks formatting. `gate` runs the house gate.
 - `jj st` shows working-copy status. Use `jj`, not raw Git commands.
 
@@ -161,7 +222,8 @@ sha256 the download index publishes, cross-checks `zig version` against the
 pin the way `gate` does, and then runs `zig fmt --check .`, `zig build`,
 `zig build test` in Debug and again in ReleaseSafe, `zig build fuzz`,
 `zig ast-check` over the file set the manifest publishes in `.paths`,
-`zig build run`, `zig build run-runtime`, and `zig build docs`. `zlint` and `zbc` are deliberately not in it: both are
+`zig build run`, `zig build run-runtime`, `zig build run-sessions`,
+`zig build run-http`, and `zig build docs`. `zlint` and `zbc` are deliberately not in it: both are
 builds of personal checkouts under `~/tools`, outside this repository, so CI
 would have to vendor an unpinned third-party build to run them.
 
@@ -175,3 +237,9 @@ Do not install system or development libraries imperatively. Use direnv or
 with a version the manifest does not pin. The shim exits 1 with no output when it
 cannot resolve a toolchain, so `gate` cross-checks `zig version` against the
 manifest pin before running any build step.
+
+It also stages a download inside its appdata directory, which is
+`$XDG_DATA_HOME/anyzig`, and `$HOME` here is an NFS export. The staged archive
+does not survive the round trip and extraction aborts with `illegal file type
+'unknown'`. `devenv.nix` therefore sets `XDG_DATA_HOME` alongside
+`ZIG_GLOBAL_CACHE_DIR`, both under the node-local `/home/tmp` scratch.
