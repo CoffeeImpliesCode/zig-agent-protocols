@@ -151,7 +151,9 @@ const Tools = struct {
 /// `connectUnix` names `std.posix.SocketError`, which this toolchain's
 /// `std.posix` does not define.
 const Endpoint = struct {
+    // SAFETY: `open` assigns it from `listen` before `port` reads it; `close` runs only after that.
     listener: Io.net.Server = undefined,
+    // SAFETY: `open` formats the URI into it before `uri_text` points at a run of it.
     uri_buffer: [64]u8 = undefined,
     uri_text: []const u8 = "",
 
@@ -182,29 +184,46 @@ const Endpoint = struct {
 /// and a local would dangle before the first request. The client half uses
 /// only `head`, `out`, `decode` and `transfer`.
 const Side = struct {
+    // SAFETY: `open` hands it to `Stream.Reader.init`, which refills it before every read it serves.
     reader_buffer: [4096]u8 = undefined,
+    // SAFETY: `open` hands it to `Stream.Writer.init`, which refills it before every write it serves.
     writer_buffer: [4096]u8 = undefined,
+    // SAFETY: `open` assigns it from `Stream.Reader.init` before `http.Server.init` borrows its interface.
     stream_reader: Io.net.Stream.Reader = undefined,
+    // SAFETY: `open` assigns it from `Stream.Writer.init` before `http.Server.init` borrows its interface.
     stream_writer: Io.net.Stream.Writer = undefined,
 
+    // SAFETY: `http.Server.init` borrows it, and `receive` fills one entry per derived header it decoded.
     params: [8]http.ParamHeader = undefined,
+    // SAFETY: borrowed by `http.Server.init` for base64 decoding, and read only as far as it wrote.
     head_scratch: [256]u8 = undefined,
+    // SAFETY: borrowed by `http.Server.init` as the request body buffer, filled as the peer sends it.
     body: [4096]u8 = undefined,
+    // SAFETY: borrowed by `http.Server.init` to decode the body; `Post` borrows only what it wrote.
     body_scratch: [1024]u8 = undefined,
     /// What a handler decodes into, and the region any string it had to
     /// unescape lives in. A separate array from `answer` because
     /// `http.Server.init` proves the two are different memory.
+    // SAFETY: the handler decodes into it and returns slices of it; nothing reads it beforehand.
     decode_scratch: [1024]u8 = undefined,
     /// Where a handler composes the answer it returns, which is borrowed from
     /// it for the length of the write.
+    // SAFETY: the handler composes its answer here and returns a slice of what it wrote.
     answer: [1024]u8 = undefined,
+    // SAFETY: `call` and `post` store it as the exchange's transfer buffer and the reader decodes through it.
     transfer: [64]u8 = undefined,
+    // SAFETY: `Serve.stream` frames each event in it and reads back only the run `send` wrote.
     event: [4096]u8 = undefined,
+    // SAFETY: `http.Server.init` borrows it as the chunked stream's staging buffer `respondStream` writes into.
     stream_buffer: [4096]u8 = undefined,
+    // SAFETY: `open` assigns it last, and `receive`/`answer` are reached only after `open` returned.
     server: http.Server = undefined,
 
+    // SAFETY: `requestHeaders` fills one entry per header it built and returns that prefix.
     head: [8]wire.Header = undefined,
+    // SAFETY: `call` reads the reply into it and `readEvent` fills one event; each returns what it wrote.
     out: [4096]u8 = undefined,
+    // SAFETY: `call` decodes the answer into it before it reads a member of the decode.
     decode: [1024]u8 = undefined,
 
     fn open(self: *Side, io: Io, stream: Io.net.Stream) void {
@@ -255,7 +274,7 @@ const Handoff = struct {
     /// answer to "will there be another connection", because the client
     /// signals on every path out of its task and not only on the one that
     /// succeeded.
-    fn signalDone(self: *@This(), io: Io) void {
+    fn signalDone(self: *Handoff, io: Io) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         self.client_done = true;
@@ -264,7 +283,7 @@ const Handoff = struct {
 
     /// Whether the client is finished. A server that is about to wait does
     /// not begin, and one that is waiting stops.
-    fn isDone(self: *@This(), io: Io) bool {
+    fn isDone(self: *Handoff, io: Io) bool {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         return self.client_done;
@@ -272,7 +291,7 @@ const Handoff = struct {
 
     /// A connection is in the listener's queue, so `accept` returns it
     /// rather than waiting for a client that may never come.
-    fn announceConnection(self: *@This(), io: Io) void {
+    fn announceConnection(self: *Handoff, io: Io) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         self.connection_queued = true;
@@ -286,7 +305,7 @@ const Handoff = struct {
     /// that a client which gives up early would outlive: a listening socket
     /// has no way to be told that no more connections are coming, so the
     /// client is the only side that can say a wait for one is safe.
-    fn waitConnection(self: *@This(), io: Io) void {
+    fn waitConnection(self: *Handoff, io: Io) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         while (!self.connection_queued and !self.client_done) {
@@ -297,7 +316,7 @@ const Handoff = struct {
 
     /// Block until the client has said so. A cancelation ends the wait,
     /// because a task that will never be answered still has to return.
-    fn waitDone(self: *@This(), io: Io) void {
+    fn waitDone(self: *Handoff, io: Io) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         while (!self.client_done) {
@@ -329,16 +348,19 @@ const Serve = struct {
     /// show that it crossed the socket and was compared with the body.
     verdict: *?mcp.ParamVerdict,
     failed: *bool,
+    // SAFETY: `checkParam` renders the body value in here, or leaves it alone; the verdict is a value.
     converted: [mcp.param_value_max_len]u8 = undefined,
+    // SAFETY: borrowed by `checkParam` for the decoded sentinel, and read only as far as it wrote.
     scratch: [256]u8 = undefined,
 
     /// The method of the request the single-JSON plan answered, copied out of
     /// the `Post` because `post.method` borrows the transport's head buffer
     /// and the next request writes over it.
+    // SAFETY: `answer` copies the method in before it sets `method_len`, which starts at 0.
     method_buffer: [64]u8 = undefined,
     method_len: usize = 0,
 
-    fn run(self: *@This()) void {
+    fn run(self: *Serve) void {
         while (self.answered.* < plans.len) {
             // The two waits below fail for different reasons, and each one
             // has its own answer. `receive` waits on a socket this side
@@ -358,7 +380,11 @@ const Serve = struct {
             // the reset discards the bytes, so a client that has not read the
             // reply yet loses it. A shutdown lets the peer drain what is
             // already in flight, and the close then releases the descriptor.
+            // A shutdown that failed leaves the close below to release the
+            // descriptor anyway, and the exchange is over: the client read its
+            // reply and its own pool closed the socket.
             defer {
+                // gate-reviewed-zlint-next-statement: suppressed-errors
                 connection.shutdown(self.io, .both) catch {};
                 connection.close(self.io);
             }
@@ -385,7 +411,7 @@ const Serve = struct {
     /// Answer the POST in the way its plan says. False is a failure, and the
     /// reason is the socket or the peer, so the example stops rather than
     /// invent a status for it.
-    fn answer(self: *@This(), post: http.Post, plan: Plan) bool {
+    fn answer(self: *Serve, post: http.Post, plan: Plan) bool {
         switch (plan) {
             .json_body => {
                 // Recorded here rather than on the handler, because the
@@ -421,7 +447,7 @@ const Serve = struct {
     /// The client stops reading when it holds the events it was told to
     /// expect and then says so on the handoff, and only then does the caller
     /// hang the connection up.
-    fn stream(self: *@This(), post: http.Post) !void {
+    fn stream(self: *Serve, post: http.Post) !void {
         // The same two regions `Server.answer` hands a handler, taken from
         // the server's own buffers because this plan cannot go through it:
         // the notifications below follow the result on one reply, and
@@ -473,18 +499,24 @@ const Client = struct {
 
     /// The derived header's name and value, which the request borrows and
     /// which must therefore outlive it.
+    // SAFETY: `bindParamHeader` derives the header name in before the binding borrows that run.
     names: [64]u8 = undefined,
+    // SAFETY: `bindParamHeader` encodes the header value here and returns `writer.written()`.
     values: [256]u8 = undefined,
+    // SAFETY: borrowed by `bindParamHeader` as base64 scratch, and read only as far as it wrote.
     sentinel: [mcp.sentinelScratchLen(argument.len)]u8 = undefined,
+    // SAFETY: `single` stores the binding in it before `spec.params` borrows the array.
     bindings: [1]mcp.ParamBinding = undefined,
 
     /// The headers each POST carried, as the transport built them.
+    // SAFETY: `single` and `listen` copy the returned headers in before they set `sent_len`.
     sent: [plans.len][8]wire.Header = undefined,
     sent_len: [plans.len]usize = [_]usize{0} ** plans.len,
 
     /// The single-body reply, which borrowed the side's buffers and is
     /// copied out before the second POST reuses them.
     status: wire.Status = .ok,
+    // SAFETY: `single` copies the reply in before it sets `message_len`, which starts at 0.
     message: [2048]u8 = undefined,
     message_len: usize = 0,
     error_code: ?i32 = null,
@@ -494,16 +526,18 @@ const Client = struct {
 
     /// The stream reply's head, copied out before the body reader takes it.
     stream_status: wire.Status = .ok,
+    // SAFETY: `listen` copies the media type in before it sets `content_type_len`, which starts at 0.
     content_type: [64]u8 = undefined,
     content_type_len: usize = 0,
     chunked: bool = false,
+    // SAFETY: `listen` copies each event in before it grows `event_count` and sets `event_len`.
     events: [expected_events][1024]u8 = undefined,
     event_len: [expected_events]usize = [_]usize{0} ** expected_events,
     event_count: usize = 0,
 
     failed: bool = false,
 
-    fn run(self: *@This()) void {
+    fn run(self: *Client) void {
         // The signal covers every path out of this task, not only the one
         // that succeeds. A failure before the first POST leaves the server
         // waiting for a connection, and a failure after one leaves it
@@ -523,7 +557,7 @@ const Client = struct {
     /// `requestHeaders` is called here to record what the transport will put
     /// on the wire, and `post` calls it again over the same array to send it,
     /// so the printed request and the sent request cannot drift apart.
-    fn single(self: *@This()) bool {
+    fn single(self: *Client) bool {
         var wire_client = self.pooledClient();
         defer wire_client.deinit();
         var client = self.openExchange(&wire_client) orelse return false;
@@ -562,7 +596,7 @@ const Client = struct {
 
     /// One `subscriptions/listen` POST answered with a stream that never
     /// ends.
-    fn listen(self: *@This()) bool {
+    fn listen(self: *Client) bool {
         // The handoff is signalled in `run`, so it covers this function's
         // failures as well as its success: a connect that failed, a read
         // that failed, a stream that ended early, and an event too large
@@ -575,6 +609,7 @@ const Client = struct {
         for (headers, 0..) |field, index| self.sent[1][index] = field;
         self.sent_len[1] = headers.len;
 
+        // SAFETY: `post` assigns every member of it before returning, and a failure returns without reading it.
         var exchange: http.Exchange = undefined;
         client.post(&exchange, listen_body, spec, &self.side.head, &self.side.transfer) catch
             return false;
@@ -624,7 +659,7 @@ const Client = struct {
     /// server's `accept` returns it rather than waiting. That is what keeps
     /// the accept from being a wait this task could outlive: a listening
     /// socket cannot be told that no more connections are coming.
-    fn openExchange(self: *@This(), wire_client: *wire.Client) ?http.Client {
+    fn openExchange(self: *Client, wire_client: *wire.Client) ?http.Client {
         const uri = std.Uri.parse(self.endpoint.uri_text) catch return null;
         const host = Io.net.HostName.init("127.0.0.1") catch return null;
         const connection = wire_client.connectTcp(host, self.endpoint.port(), .plain) catch
@@ -642,7 +677,7 @@ const Client = struct {
     /// the socket it holds. A connection left in a pool outlives the task
     /// that made it, so the server would sit in `receive()` on a live
     /// keep-alive connection waiting for a POST that is never coming.
-    fn pooledClient(self: *@This()) wire.Client {
+    fn pooledClient(self: *Client) wire.Client {
         return .{ .allocator = self.allocator, .io = self.io };
     }
 };
@@ -666,7 +701,23 @@ pub fn main(init: std.process.Init) !void {
     var out_buffer: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &out_buffer);
     const out = &stdout.interface;
-    defer stdout.flush() catch {};
+    // Whether this run's last flush has already been made, so the report is
+    // written once and a write that failed is not written again.
+    var final_flush_attempted = false;
+    errdefer {
+        if (!final_flush_attempted) {
+            // Best effort, and only while `main` unwinds. The failure line and
+            // the error that got here are what the reader needs, and a second
+            // failing flush would replace that error with its own. The flush at
+            // the end of this function reports a report that could not be
+            // written, and the guard above is set before it, so nothing here
+            // repeats that attempt.
+            // gate-reviewed-zlint-next-statement: suppressed-errors
+            // ziglint-ignore: Z026
+            // zwanzig-disable-next-line: empty-catch-engine
+            stdout.flush() catch {};
+        }
+    }
 
     try out.print("zig-agent-proto streamable http example\n\n", .{});
     try out.print("  mcp       {s}\n", .{mcp.latest_protocol_version});
@@ -685,7 +736,7 @@ pub fn main(init: std.process.Init) !void {
     var failed = false;
     var handoff: Handoff = .{};
 
-    var serve = Serve{
+    var serve: Serve = .{
         .io = io,
         .listener = &endpoint.listener,
         .side = &server_side,
@@ -695,7 +746,7 @@ pub fn main(init: std.process.Init) !void {
         .failed = &failed,
         .handoff = &handoff,
     };
-    var call = Client{
+    var call: Client = .{
         .io = io,
         // The one allocator in this example, and the one each exchange's
         // `std.http.Client` takes for its own connection pool. Nothing on
@@ -709,15 +760,16 @@ pub fn main(init: std.process.Init) !void {
     // One group drives both ends. Two would deadlock: the client blocks
     // waiting for an answer only the server's task can produce.
     var group: Io.Group = .init;
-    group.async(io, Serve.run, .{&serve});
-    group.async(io, Client.run, .{&call});
-    // Join, do not cancel: cancelling here would stop both tasks before they
-    // ran. The group drains on its own on every path out of either task: the
-    // client closes the socket it opened and sets the handoff flag whether it
-    // finished or failed, and the server stops when it has answered every
-    // plan or when the client is finished. No wait here outlives the peer
-    // that has to satisfy it.
-    group.await(io) catch {};
+    defer group.cancel(io);
+    try group.concurrent(io, Serve.run, .{&serve});
+    try group.concurrent(io, Client.run, .{&call});
+    // Await normal completion; the defer cancels only on an early exit.
+    // The client closes its socket and publishes the handoff on every path.
+    // A cancelled join records a failed exchange rather than dropping it.
+    // zwanzig-disable-next-line: swallowed-error
+    group.await(io) catch {
+        failed = true;
+    };
 
     if (failed or call.failed) {
         try out.print("the exchange failed\n", .{});
@@ -779,6 +831,13 @@ pub fn main(init: std.process.Init) !void {
         });
     }
     try out.print("\nserver handled {d} request(s)\n", .{answered});
+    // The report, flushed once here. Every line above was still buffered, so
+    // a reader given none of them was told nothing about a run that composed
+    // its whole output and then lost it, and that is returned as a failure
+    // rather than swallowed into a zero exit status. The guard is set first,
+    // so the unwinding path above does not attempt this flush a second time.
+    final_flush_attempted = true;
+    try stdout.flush();
 }
 
 const testing = std.testing;
@@ -805,7 +864,7 @@ test "the server stops when the client is finished before it connects" {
     var failed = false;
     var handoff: Handoff = .{};
 
-    var serve = Serve{
+    var serve: Serve = .{
         .io = io,
         .listener = &endpoint.listener,
         .side = &server_side,
@@ -851,7 +910,7 @@ test "a client that stops after its first exchange leaves the server nothing to 
     var failed = false;
     var handoff: Handoff = .{};
 
-    var serve = Serve{
+    var serve: Serve = .{
         .io = io,
         .listener = &endpoint.listener,
         .side = &server_side,
@@ -861,7 +920,7 @@ test "a client that stops after its first exchange leaves the server nothing to 
         .verdict = &verdict,
         .failed = &failed,
     };
-    var call = Client{
+    var call: Client = .{
         .io = io,
         .allocator = testing.allocator,
         .endpoint = &endpoint,
@@ -874,17 +933,25 @@ test "a client that stops after its first exchange leaves the server nothing to 
     const One = struct {
         client: *Client,
 
-        fn run(self: *@This()) void {
+        const Self = @This();
+
+        fn run(self: *Self) void {
             defer self.client.handoff.signalDone(self.client.io);
             if (!self.client.single()) self.client.failed = true;
         }
     };
-    var one = One{ .client = &call };
+    var one: One = .{ .client = &call };
 
     var group: Io.Group = .init;
-    group.async(io, Serve.run, .{&serve});
-    group.async(io, One.run, .{&one});
-    group.await(io) catch {};
+    defer group.cancel(io);
+    try group.concurrent(io, Serve.run, .{&serve});
+    try group.concurrent(io, One.run, .{&one});
+    // The same join and the same one error as `main`: a cancelation here is
+    // this exchange not finishing, which is what `failed` records and what
+    // the check below reports.
+    group.await(io) catch {
+        failed = true;
+    };
 
     try testing.expect(!failed);
     try testing.expect(!call.failed);

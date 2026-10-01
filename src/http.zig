@@ -193,7 +193,7 @@ pub const accept_value = mcp.uri_and_media.json_media_type ++
 /// is the type it names. A value that names neither of the two is null rather
 /// than a guess.
 pub fn mediaType(value: []const u8) ?MediaType {
-    const end = std.mem.indexOfScalar(u8, value, ';') orelse value.len;
+    const end = std.mem.findScalar(u8, value, ';') orelse value.len;
     const text = std.mem.trim(u8, value[0..end], " \t");
     if (std.ascii.eqlIgnoreCase(text, mcp.uri_and_media.json_media_type)) return .json;
     if (std.ascii.eqlIgnoreCase(text, mcp.uri_and_media.event_stream_media_type)) {
@@ -255,10 +255,10 @@ pub fn parseAccept(value: ?[]const u8) Accept {
         // whether the entry counts at all. `mediaType` drops them, so an entry
         // that arrived as `application/json;q=0` would otherwise be read as a
         // request for the one type this transport answers most.
-        const stop = std.mem.indexOfScalar(u8, one, ';') orelse one.len;
+        const stop = std.mem.findScalar(u8, one, ';') orelse one.len;
         const refused = refusedByQuality(one[stop..]);
         const bare = std.mem.trim(u8, one[0..stop], " \t");
-        const slash = std.mem.indexOfScalar(u8, bare, '/') orelse continue;
+        const slash = std.mem.findScalar(u8, bare, '/') orelse continue;
         const major = bare[0..slash];
         const minor = bare[slash + 1 ..];
         for (&decided, 0..) |*slot, index| {
@@ -268,8 +268,8 @@ pub fn parseAccept(value: ?[]const u8) Accept {
             }
         }
     }
-    accept.json = decided[0] != null and decided[0].?.allowed;
-    accept.event_stream = decided[1] != null and decided[1].?.allowed;
+    accept.json = if (decided[0]) |decision| decision.allowed else false;
+    accept.event_stream = if (decided[1]) |decision| decision.allowed else false;
     return accept;
 }
 
@@ -306,7 +306,7 @@ fn precedence(major: []const u8, minor: []const u8, kind: MediaType) ?u2 {
         .json => mcp.uri_and_media.json_media_type,
         .event_stream => mcp.uri_and_media.event_stream_media_type,
     };
-    const slash = std.mem.indexOfScalar(u8, name, '/') orelse return null;
+    const slash = std.mem.findScalar(u8, name, '/') orelse return null;
     if (!std.ascii.eqlIgnoreCase(major, name[0..slash])) return null;
     if (std.mem.eql(u8, minor, "*")) return 1;
     if (!std.ascii.eqlIgnoreCase(minor, name[slash + 1 ..])) return null;
@@ -324,7 +324,7 @@ fn refusedByQuality(params: []const u8) bool {
     var fields = std.mem.splitSequence(u8, params, ";");
     while (fields.next()) |field| {
         const one = std.mem.trim(u8, field, " \t");
-        const equals = std.mem.indexOfScalar(u8, one, '=') orelse continue;
+        const equals = std.mem.findScalar(u8, one, '=') orelse continue;
         if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, one[0..equals], " \t"), "q")) continue;
         const text = std.mem.trim(u8, one[equals + 1 ..], " \t");
         const quality = std.fmt.parseFloat(f64, text) catch continue;
@@ -418,7 +418,7 @@ pub fn readHeaders(head: []const u8, params: []ParamHeader, scratch: []u8) Error
 
     var headers: Headers = .{};
     var count: usize = 0;
-    var cursor = Cursor{ .buffer = scratch };
+    var cursor: Cursor = .{ .buffer = scratch };
 
     var iterator = http.HeaderIterator.init(head);
     while (iterator.next()) |field| {
@@ -482,7 +482,7 @@ pub fn readHeaders(head: []const u8, params: []ParamHeader, scratch: []u8) Error
                 // Never read into a field and never echoed. Recorded so a
                 // caller can see that a peer sent a header this revision
                 // removed, and so `checkPost` can refuse the request.
-                //
+
                 // Its own bit and not a slot the two headers share, so a peer
                 // that wrote `Last-Event-ID` first cannot hide the
                 // `Mcp-Session-Id` that refuses the request. Neither is a
@@ -681,7 +681,7 @@ pub fn checkPost(headers: Headers, body: []const u8, scratch: []u8) Error!Post {
     // `research/normative/mcp-2026-07-28.md` §4 grades that disagreement as
     // `HeaderMismatch` (`-32020`) on `400 Bad Request`, and this is that
     // error.
-    //
+
     // The claim also has to be made at all. PROTOCOLS.md 4.3 records
     // `io.modelcontextprotocol/protocolVersion` as carried "on every request",
     // PROTOCOLS.md 2 says a field the specification marks required but the
@@ -695,7 +695,7 @@ pub fn checkPost(headers: Headers, body: []const u8, scratch: []u8) Error!Post {
     // `HeaderMismatch`, which is a value that is there and disagrees. The
     // three null cases were served before, and none of them is a claim this
     // library can check.
-    //
+
     // A notification is not a request. The same table grades the key on
     // "every client request `_meta`", and PROTOCOLS.md 4.3 says "on every
     // request", so a POST carrying a notification is not required to declare
@@ -717,7 +717,10 @@ pub fn checkPost(headers: Headers, body: []const u8, scratch: []u8) Error!Post {
 
     var name: ?[]const u8 = null;
     if (requiresName(method)) {
-        if (headers.name == null) return error.MissingHeader;
+        // Bound rather than unwrapped a second time: the header is the peer's
+        // own text, so it is read once into a value that cannot be null and
+        // compared from there.
+        const header_name = headers.name orelse return error.MissingHeader;
         const from_body = nameFromParams(method, message.params, scratch) catch |err| switch (err) {
             // The same caller's buffer as above, and the same reason: this
             // shortage is not the peer's request and must not be reported as
@@ -726,7 +729,7 @@ pub fn checkPost(headers: Headers, body: []const u8, scratch: []u8) Error!Post {
             else => return error.MalformedRequest,
         };
         const claimed = from_body orelse return error.HeaderMismatch;
-        if (!std.mem.eql(u8, headers.name.?, claimed)) return error.HeaderMismatch;
+        if (!std.mem.eql(u8, header_name, claimed)) return error.HeaderMismatch;
         name = claimed;
     }
 
@@ -773,7 +776,10 @@ fn nameFromParams(
     // be reported as a header disagreement.
     if (try reader.beginObject()) return null;
     while (try reader.nextKey(scratch)) |key| {
-        if (std.mem.eql(u8, key, wanted)) return try reader.string(scratch);
+        if (std.mem.eql(u8, key, wanted)) {
+            const value = try reader.string(scratch);
+            return value;
+        }
         try reader.skipValue(scratch);
     }
     return null;
@@ -807,7 +813,8 @@ fn metaRevision(params: jsonrpc.Params, scratch: []u8) DecodeError!?[]const u8 {
                 try reader.skipValue(scratch);
                 continue;
             }
-            return try reader.string(scratch);
+            const value = try reader.string(scratch);
+            return value;
         }
         return null;
     }
@@ -937,10 +944,16 @@ pub fn readEvent(reader: *Io.Reader, out: []u8) Error!?[]const u8 {
         // skip would make `data\n\n` invisible, and a dispatched event with
         // an empty value is one this reader has to hand back.
         var value: []const u8 = "";
-        const field = if (std.mem.indexOfScalar(u8, line, ':')) |colon| blk: {
+        const field = if (std.mem.findScalar(u8, line, ':')) |colon| blk: {
             // One leading space after the colon is the field separator, not
             // part of the value.
             value = line[colon + 1 ..];
+            // `value.len != 0` is the guard and it is the left operand of the
+            // `and`: this arm is reached only for a line that carries a colon,
+            // so `value` is a suffix of one, and a byte of it is read only
+            // when it is not empty. The short circuit is the whole proof and
+            // is not repeated here for an analyzer that does not follow it.
+            // zwanzig-disable-next-line: slice-bounds-engine
             if (value.len != 0 and value[0] == ' ') value = value[1..];
             break :blk line[0..colon];
         } else line;
@@ -953,7 +966,7 @@ pub fn readEvent(reader: *Io.Reader, out: []u8) Error!?[]const u8 {
         }
         // `value` lies inside the region the line was read to, and `len` never
         // passes it, so the copy is always forwards and may overlap.
-        std.mem.copyForwards(u8, out[len..][0..value.len], value);
+        @memmove(out[len..][0..value.len], value);
         len += value.len;
         saw_data = true;
     }
@@ -1027,8 +1040,15 @@ pub const Exchange = struct {
     /// ended on it has not ended.
     pub fn nextMessage(self: *Exchange, out: []u8) Error!?[]const u8 {
         if (self.drained) return null;
-        if (self.body == null) self.body = self.response.reader(self.transfer);
-        const reader = self.body.?;
+        // The body reader is taken on the first read and kept, because
+        // `std.http` allows it once. It is read through the field rather than
+        // assigned and unwrapped, so the path that has to create it is the
+        // same path that hands it back.
+        const reader = self.body orelse created: {
+            const fresh = self.response.reader(self.transfer);
+            self.body = fresh;
+            break :created fresh;
+        };
 
         const message: ?[]const u8 = switch (self.kind) {
             .json => blk: {
@@ -1050,6 +1070,7 @@ pub const Exchange = struct {
     /// Release the connection. The exchange cannot be used afterwards.
     pub fn close(self: *Exchange) void {
         self.request.deinit();
+        // SAFETY: `close` is the last call on the exchange; no statement after its `defer` reads it.
         self.* = undefined;
     }
 };
@@ -1215,6 +1236,11 @@ pub const Client = struct {
         var out = exchange.request.sendBodyUnflushed(&.{}) catch return error.Transport;
         out.writer.writeAll(body) catch return error.Transport;
         out.end() catch return error.Transport;
+        // `sendBodyUnflushed` above reached this same connection through the
+        // same optional twice, in `sendHead` and in its own body, so the
+        // request has one here or that call has already panicked. This file
+        // does not add a check for a state a call it depends on cannot return.
+        // zwanzig-disable-next-line: optional-unwrap
         exchange.request.connection.?.flush() catch return error.Transport;
 
         exchange.response = exchange.request.receiveHead(&.{}) catch |err| switch (err) {
@@ -1252,6 +1278,7 @@ pub const Client = struct {
         head: []http.Header,
         buffers: Buffers,
     ) Error!Reply {
+        // SAFETY: `post` fills every field before the `defer` that closes it can run.
         var exchange: Exchange = undefined;
         try self.post(&exchange, body, spec, head, buffers.transfer);
         defer exchange.close();
@@ -1461,7 +1488,8 @@ pub const Server = struct {
         if (!parseAccept(headers.accept).isAcceptable()) return error.NotAcceptable;
 
         const body = try self.readBody(request);
-        return try checkPost(headers, body, self.buffers.body_scratch);
+        const post = try checkPost(headers, body, self.buffers.body_scratch);
+        return post;
     }
 
     /// Answer with one JSON body.
@@ -1564,8 +1592,16 @@ pub const Server = struct {
             },
             .stream => {
                 var stream = try self.respondStream(post);
-                defer stream.close() catch {};
-                try stream.send(self.buffers.event, envelope);
+                stream.send(self.buffers.event, envelope) catch |fault| {
+                    // Close only while a send failure unwinds. A cleanup failure
+                    // must not replace that fault or retry a failed normal close.
+                    // gate-reviewed-zlint-next-statement: suppressed-errors
+                    // ziglint-ignore: Z026
+                    // zwanzig-disable-next-line: empty-catch-engine
+                    stream.close() catch {};
+                    return fault;
+                };
+                try stream.close();
                 return .ok;
             },
         }
@@ -1592,8 +1628,10 @@ pub const Server = struct {
             request.head.transfer_encoding,
             request.head.content_length,
         );
-        reader.readSliceAll(self.buffers.body[0..length]) catch return error.Transport;
-        return self.buffers.body[0..length];
+        // The buffer bound above proves this length fits usize on every target.
+        const body = self.buffers.body[0..@intCast(length)];
+        reader.readSliceAll(body) catch return error.Transport;
+        return body;
     }
 };
 
@@ -2196,7 +2234,7 @@ test "a derived parameter header is checked against the value arguments carries"
         &names,
         &values,
         &encode_scratch,
-    )).?;
+    )) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("Mcp-Param-city", binding.header_name);
 
     var head_buffer: [512]u8 = undefined;
@@ -2467,7 +2505,7 @@ test "a comment and every field but data are not part of an event" {
             "data: {\"b\":2}\n" ++
             "\n",
     );
-    const event = (try readEvent(&reader, &out)).?;
+    const event = (try readEvent(&reader, &out)) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("{\"b\":2}", event);
 }
 
@@ -2507,7 +2545,7 @@ test "an event with no data is an event, and the stream is not over" {
     // length, the dispatched event and the end of the stream were the same
     // number, which is how a client stopped on an empty first event and read
     // nothing of what came after it.
-    const empty = (try readEvent(&reader, &out)).?;
+    const empty = (try readEvent(&reader, &out)) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(usize, 0), empty.len);
     try testing.expectEqualStrings(
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
@@ -2578,8 +2616,11 @@ test "a reply that does not fit the caller's buffer is reported, not truncated" 
 /// define, so the function does not compile. `connectTcp` compiles and is what
 /// a real client uses anyway.
 const Endpoint = struct {
+    // SAFETY: `open` assigns it before `port`, `uri_text` or `close` can read it.
     address: Io.net.IpAddress = undefined,
+    // SAFETY: `open` assigns it, and every test reaches `close` only past the `try open`.
     listener: Io.net.Server = undefined,
+    // SAFETY: `bufPrint` fills it and `uri_text` holds nothing until that call returns.
     uri_buffer: [64]u8 = undefined,
     uri_text: []const u8 = "",
 
@@ -2614,44 +2655,65 @@ const message_size: usize = 4096;
 /// Caller-owned, so a leak in the transport shows up as a leak in the test
 /// rather than being absorbed by an allocator the transport was handed.
 const Side = struct {
+    // SAFETY: `Stream.Reader.init` takes it as the fill buffer and reads back only what it filled.
     reader_buffer: [4096]u8 = undefined,
+    // SAFETY: `Stream.Writer.init` takes it as the drain buffer and writes only what it holds.
     writer_buffer: [4096]u8 = undefined,
+    // SAFETY: `Serve.run` assigns the accepted stream before the reader and writer borrow it.
     stream: Io.net.Stream = undefined,
+    // SAFETY: `Serve.run` assigns it before `Server.init` reads its interface.
     stream_reader: Io.net.Stream.Reader = undefined,
+    // SAFETY: `Serve.run` assigns it before `Server.init` reads its interface.
     stream_writer: Io.net.Stream.Writer = undefined,
 
+    // SAFETY: `readHeaders` fills each `ParamHeader` it hands back a slice into.
     params: [8]ParamHeader = undefined,
+    // SAFETY: the base64 header decode writes it before the decoded value is read.
     head_scratch: [256]u8 = undefined,
+    // SAFETY: `readBody` fills it and returns `[0..content_length]`, or `[0..0]` for none.
     body: [4096]u8 = undefined,
+    // SAFETY: `checkPost` decodes into it and the decoded body is read back out of it.
     body_scratch: [1024]u8 = undefined,
+    // SAFETY: the handler's own decode writes it before the parsed message is read from it.
     decode_scratch: [1024]u8 = undefined,
+    // SAFETY: the handler composes its envelope in and returns that written slice.
     answer: [1024]u8 = undefined,
+    // SAFETY: the chunk reader fills it as `readBody` transfers, and no read precedes a write.
     transfer: [64]u8 = undefined,
+    // SAFETY: `writeEvent` frames each event in before `send` writes the framed slice out.
     event: [4096]u8 = undefined,
+    // SAFETY: `respondStreaming` fills it and returns the writer bound to it.
     stream_buffer: [4096]u8 = undefined,
+    // SAFETY: `Serve.run` assigns `Server.init`'s result before `receive` runs on it.
     server: Server = undefined,
 
+    // SAFETY: `requestHeaders` fills the head before the request reads a header out of it.
     head: [16]http.Header = undefined,
     /// The message read first, or a whole response body.
+    // SAFETY: `nextMessage` fills it and returns `[0..len]`, the reader's own count.
     out: [message_size]u8 = undefined,
     /// The message read after that one.
     ///
     /// A second field and not a second half of `out`, because both are live at
     /// once: the first message is still readable when the second arrives, and
     /// a caller reads both of them afterwards.
+    // SAFETY: the second `nextMessage` fills it; the test reads `[0..second_len]`.
     next_out: [message_size]u8 = undefined,
     /// The message read after that one.
     ///
     /// A third field for the same reason as `next_out`: a caller reads the
     /// messages after the exchange is done, so a message it wants to read
     /// needs a region of its own to have landed in.
+    // SAFETY: the third `nextMessage` fills it; the test reads `[0..third_len]`.
     third_out: [message_size]u8 = undefined,
+    // SAFETY: `jsonrpc.decode` fills it and returns slices borrowed from what it wrote.
     decode: [1024]u8 = undefined,
 };
 
 /// Answers every request with a result, and records what it was asked.
 const Answer = struct {
     calls: usize = 0,
+    // SAFETY: `handle` copies into it and sets `method_len` before the test reads that slice.
     method_buffer: [64]u8 = undefined,
     method_len: usize = 0,
 
@@ -2661,6 +2723,14 @@ const Answer = struct {
         decode_scratch: []u8,
         answer: []u8,
     ) conn.Error!?[]const u8 {
+        // Every test below installs this handler as `.{ .ctx = &answer, .call
+        // = Answer.handle }`, naming the `Answer` it belongs to on the same
+        // line, so a null context is a test wired wrong rather than anything a
+        // peer can bring about. It is deliberately not answered with a null
+        // here: this handler returning null is how it declines a frame, and a
+        // fixture with no fixture behind it would decline every request and
+        // leave the test below it waiting on an answer never composed.
+        // zwanzig-disable-next-line: optional-unwrap
         const self: *Answer = @ptrCast(@alignCast(ctx.?));
         const message = jsonrpc.decode(frame, decode_scratch) catch return null;
         self.calls += 1;
@@ -2724,7 +2794,7 @@ const Serve = struct {
     revision: ?*?mcp.Revision = null,
     failed: *bool,
 
-    fn run(self: *@This()) void {
+    fn run(self: *Serve) void {
         const stream = self.listener.accept(self.io) catch {
             self.failed.* = true;
             return;
@@ -2810,7 +2880,7 @@ const Call = struct {
     got: *bool,
     failed: *bool,
 
-    fn run(self: *@This()) void {
+    fn run(self: *Call) void {
         var client = openClient(self.http, self.endpoint) orelse {
             self.failed.* = true;
             return;
@@ -2879,6 +2949,7 @@ const Listen = struct {
     streamed: bool = false,
     /// The `Content-Type` the reply carried, copied out of the head before
     /// the body reader invalidates it.
+    // SAFETY: the header copy fills it and sets `content_type_len`, zero until then.
     content_type: [64]u8 = undefined,
     content_type_len: usize = 0,
     /// Whether the reply carried a session identifier, which this revision
@@ -2901,12 +2972,13 @@ const Listen = struct {
     /// reading. The test returns it as its own error.
     failure: ?GaveUp = null,
 
-    fn run(self: *@This()) void {
+    fn run(self: *Listen) void {
         var client = openClient(self.http, self.endpoint) orelse {
             self.failed.* = true;
             self.failure = error.NoConnection;
             return;
         };
+        // SAFETY: `post` fills every field before the `defer` that closes it can run.
         var exchange: Exchange = undefined;
         client.post(&exchange, self.body, self.spec, &self.side.head, &self.side.transfer) catch {
             self.failed.* = true;
@@ -2982,7 +3054,7 @@ const Chunked = struct {
     answer: ?Reply = null,
     failed: *bool,
 
-    fn run(self: *@This()) void {
+    fn run(self: *Chunked) void {
         var client = openClient(self.http, self.endpoint) orelse {
             self.failed.* = true;
             return;
@@ -3070,7 +3142,7 @@ const Subscribe = struct {
     /// running. The test returns it as its own error.
     failure: ?GaveUp = null,
 
-    fn run(self: *@This()) void {
+    fn run(self: *Subscribe) void {
         const stream = self.listener.accept(self.io) catch {
             self.failed.* = true;
             self.failure = error.NoAccept;
@@ -3190,9 +3262,10 @@ test "one POST over a real socket is answered with a single JSON body" {
     var statuses = [_]std.http.Status{.ok};
 
     var group: Io.Group = .init;
+    defer group.cancel(io);
     // One group drives both sides. Two would deadlock: the client blocks
     // waiting for an answer only the server's task can produce.
-    var serve = Serve{
+    var serve: Serve = .{
         .io = io,
         .listener = &endpoint.listener,
         .side = &server_side,
@@ -3204,7 +3277,7 @@ test "one POST over a real socket is answered with a single JSON body" {
         .revision = &revision,
         .failed = &failed,
     };
-    var call = Call{
+    var call: Call = .{
         .io = io,
         .http = &http_client,
         .endpoint = &endpoint,
@@ -3218,9 +3291,9 @@ test "one POST over a real socket is answered with a single JSON body" {
         .got = &got,
         .failed = &failed,
     };
-    group.async(io, Serve.run, .{&serve});
-    group.async(io, Call.run, .{&call});
-    group.await(io) catch {};
+    try group.concurrent(io, Serve.run, .{&serve});
+    try group.concurrent(io, Call.run, .{&call});
+    try group.await(io);
 
     try testing.expect(!failed);
     try testing.expect(got);
@@ -3264,7 +3337,8 @@ test "a request carrying the removed session id is refused, and nothing is echoe
     var statuses = [_]std.http.Status{.ok};
 
     var group: Io.Group = .init;
-    var serve = Serve{
+    defer group.cancel(io);
+    var serve: Serve = .{
         .io = io,
         .listener = &endpoint.listener,
         .side = &server_side,
@@ -3277,7 +3351,7 @@ test "a request carrying the removed session id is refused, and nothing is echoe
         .answered = &answered,
         .failed = &failed,
     };
-    var listen = Listen{
+    var listen: Listen = .{
         .io = io,
         .http = &http_client,
         .endpoint = &endpoint,
@@ -3295,9 +3369,9 @@ test "a request carrying the removed session id is refused, and nothing is echoe
         .got = &got,
         .failed = &failed,
     };
-    group.async(io, Serve.run, .{&serve});
-    group.async(io, Listen.run, .{&listen});
-    group.await(io) catch {};
+    try group.concurrent(io, Serve.run, .{&serve});
+    try group.concurrent(io, Listen.run, .{&listen});
+    try group.await(io);
 
     // The step the client reached is this test's own error, so the runner
     // reports which step stopped rather than a test that failed having said
@@ -3309,7 +3383,7 @@ test "a request carrying the removed session id is refused, and nothing is echoe
     try testing.expect(refused);
     // The request really did carry the removed header, so the refusal below is
     // about that header and not about something the peer never sent.
-    const head = server_side.server.request.?.head_buffer;
+    const head = (server_side.server.request orelse return error.TestUnexpectedResult).head_buffer;
     var iterator = http.HeaderIterator.init(head);
     var sent = false;
     while (iterator.next()) |field| {
@@ -3346,7 +3420,8 @@ test "a chunked POST is refused, and the connection still serves the request aft
     var statuses = [_]std.http.Status{ .ok, .ok };
 
     var group: Io.Group = .init;
-    var serve = Serve{
+    defer group.cancel(io);
+    var serve: Serve = .{
         .io = io,
         .listener = &endpoint.listener,
         .side = &server_side,
@@ -3359,16 +3434,16 @@ test "a chunked POST is refused, and the connection still serves the request aft
         .answered = &answered,
         .failed = &failed,
     };
-    var chunked = Chunked{
+    var chunked: Chunked = .{
         .io = io,
         .http = &http_client,
         .endpoint = &endpoint,
         .side = &client_side,
         .failed = &failed,
     };
-    group.async(io, Serve.run, .{&serve});
-    group.async(io, Chunked.run, .{&chunked});
-    group.await(io) catch {};
+    try group.concurrent(io, Serve.run, .{&serve});
+    try group.concurrent(io, Chunked.run, .{&chunked});
+    try group.await(io);
 
     try testing.expect(!failed);
     try testing.expect(refused);
@@ -3412,7 +3487,8 @@ test "the same request is answered as a stream when the client accepts one" {
     var statuses = [_]std.http.Status{.ok};
 
     var group: Io.Group = .init;
-    var serve = Serve{
+    defer group.cancel(io);
+    var serve: Serve = .{
         .io = io,
         .listener = &endpoint.listener,
         .side = &server_side,
@@ -3423,7 +3499,7 @@ test "the same request is answered as a stream when the client accepts one" {
         .answered = &answered,
         .failed = &failed,
     };
-    var listen = Listen{
+    var listen: Listen = .{
         .io = io,
         .http = &http_client,
         .endpoint = &endpoint,
@@ -3436,9 +3512,9 @@ test "the same request is answered as a stream when the client accepts one" {
         .got = &got,
         .failed = &failed,
     };
-    group.async(io, Serve.run, .{&serve});
-    group.async(io, Listen.run, .{&listen});
-    group.await(io) catch {};
+    try group.concurrent(io, Serve.run, .{&serve});
+    try group.concurrent(io, Listen.run, .{&listen});
+    try group.await(io);
 
     if (listen.failure) |step| return step;
     try testing.expect(!failed);
@@ -3465,6 +3541,223 @@ test "the same request is answered as a stream when the client accepts one" {
     );
 }
 
+/// The bytes that end a chunked body: the last chunk is a zero-length one.
+///
+/// An event cannot carry them, because `writeEvent` refuses a message with a
+/// CR in it and so no event payload holds one, and no chunk but the last is
+/// zero-length. That is what lets a test name the bytes rather than the step
+/// that writes them. A response head is a third possibility, and the test
+/// below checks that one against the bytes rather than assuming it.
+const chunk_terminator = "0\r\n\r\n";
+
+test "a stream answer whose terminating chunk cannot be written is a transport fault" {
+    // A buffered writer that records every byte the answer puts out and can
+    // refuse the terminating chunk and nothing else. The staging buffer is
+    // not optional here: `std.http` reserves room for a chunk header in the
+    // writer it is given, and a writer with no room for one aborts.
+    const Wire = struct {
+
+        // The receiver alias every local fixture in this file uses: a struct
+        // declared inside a function cannot name itself, so its own members
+        // reach the container through this rather than through `Wire`.
+        const Self = @This();
+
+        // SAFETY: `bind` hands this to `writer.buffer` before `std.http`
+        // writes through that writer, and it outlives the writer.
+        staging: [1024]u8 = undefined,
+        // SAFETY: `accept` writes each prefix before `len` grows; `written`
+        // reads only that prefix.
+        sent: [4096]u8 = undefined,
+        len: usize = 0,
+        // SAFETY: `record` writes each prefix before `refused_len` grows;
+        // `refusedCall` reads only that prefix.
+        refused: [1024]u8 = undefined,
+        refused_len: usize = 0,
+        refusals: usize = 0,
+        /// Whether a write carrying the terminating chunk is refused.
+        ///
+        /// What it refuses on is `chunk_terminator`, a zero-length chunk: a
+        /// size of `0` with the two CRLFs around it. No event can hold it,
+        /// because `writeEvent` refuses a message with a CR in it and so no
+        /// event payload carries one, and no chunk but the last is
+        /// zero-length. The head this transport writes is checked by the test
+        /// that uses this rather than assumed here.
+        refuse_terminator: bool = false,
+        writer: Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
+
+        /// Hand the writer the staging `std.http` reserves a chunk header in.
+        fn bind(self: *Self) void {
+            self.writer.buffer = self.staging[0..];
+        }
+
+        fn written(self: *const Self) []const u8 {
+            return self.sent[0..self.len];
+        }
+
+        /// The bytes of the one call this writer refused.
+        fn refusedCall(self: *const Self) []const u8 {
+            return self.refused[0..self.refused_len];
+        }
+
+        // Consume staged bytes first. Only data-vector bytes contribute to the result.
+        fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+            const self: *Self = @fieldParentPtr("writer", w);
+            const buffered = w.buffer[0..w.end];
+            const prefix = data[0 .. data.len - 1];
+            const last = data[data.len - 1];
+            if (self.refuse_terminator and self.carries(buffered, data, splat)) {
+                try self.record(buffered);
+                for (prefix) |bytes| try self.record(bytes);
+                for (0..splat) |_| try self.record(last);
+                self.refusals += 1;
+                return error.WriteFailed;
+            }
+            _ = try self.accept(buffered);
+            w.end = 0;
+            var count: usize = 0;
+            for (prefix) |bytes| count += try self.accept(bytes);
+            for (0..splat) |_| count += try self.accept(last);
+            return count;
+        }
+
+        fn accept(self: *Self, bytes: []const u8) Io.Writer.Error!usize {
+            if (bytes.len > self.sent.len - self.len) return error.WriteFailed;
+            @memcpy(self.sent[self.len..][0..bytes.len], bytes);
+            self.len += bytes.len;
+            return bytes.len;
+        }
+
+        fn record(self: *Self, bytes: []const u8) Io.Writer.Error!void {
+            if (bytes.len > self.refused.len - self.refused_len) return error.WriteFailed;
+            @memcpy(self.refused[self.refused_len..][0..bytes.len], bytes);
+            self.refused_len += bytes.len;
+        }
+
+        /// Whether any part of one call carries the terminating chunk. The
+        /// bytes the writer has staged count as much as the ones handed to
+        /// it, because that is where `std.http` builds a chunk header.
+        fn carries(
+            _: *const Self,
+            buffered: []const u8,
+            data: []const []const u8,
+            splat: usize,
+        ) bool {
+            if (std.mem.indexOf(u8, buffered, chunk_terminator) != null) return true;
+            for (data[0 .. data.len - 1]) |bytes| {
+                if (std.mem.indexOf(u8, bytes, chunk_terminator) != null) return true;
+            }
+            return splat != 0 and std.mem.indexOf(u8, data[data.len - 1], chunk_terminator) != null;
+        }
+    };
+
+    // Parse a real POST through std.http, then answer through the controlled writer.
+    const Once = struct {
+        // The same alias as `Wire` above, and for the same reason.
+        const Self = @This();
+
+        side: *Side,
+        handler: conn.Handler,
+        request: []const u8,
+        wire: *Wire,
+
+        fn run(self: *Self) !std.http.Status {
+            var in = Io.Reader.fixed(self.request);
+            var server = Server.init(&in, &self.wire.writer, .{
+                .params = &self.side.params,
+                .head_scratch = &self.side.head_scratch,
+                .body = &self.side.body,
+                .body_scratch = &self.side.body_scratch,
+                .decode_scratch = &self.side.decode_scratch,
+                .answer = &self.side.answer,
+                .transfer = &self.side.transfer,
+                .event = &self.side.event,
+                .stream = &self.side.stream_buffer,
+            });
+            const post = (try server.receive()) orelse return error.TestUnexpectedResult;
+            return server.answer(post, self.handler, .stream);
+        }
+    };
+
+    const post_body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"subscriptions/listen\"," ++
+        "\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":" ++
+        "\"2026-07-28\"}}}";
+    // The head `Client.requestHeaders` composes, spelled out so this test
+    // states the request rather than deriving it from a client it does not
+    // run. The length is computed rather than written, so the header and the
+    // body cannot drift apart.
+    // SAFETY: `bufPrint` fills `request` and returns the slice it wrote.
+    var request: [512]u8 = undefined;
+    const wire_request = try std.fmt.bufPrint(&request, "POST /mcp HTTP/1.1\r\n" ++
+        "Host: 127.0.0.1\r\n" ++
+        mcp.header_name.protocol_version ++ ": " ++ mcp.latest_protocol_version ++ "\r\n" ++
+        mcp.header_name.method ++ ": subscriptions/listen\r\n" ++
+        mcp.header_name.accept ++ ": " ++ accept_value ++ "\r\n" ++
+        mcp.header_name.content_type ++ ": " ++ mcp.uri_and_media.json_media_type ++ "\r\n" ++
+        "Content-Length: {d}\r\n" ++
+        "\r\n" ++
+        "{s}", .{ post_body.len, post_body });
+
+    var side: Side = .{};
+    var refusing_wire: Wire = .{ .refuse_terminator = true };
+    var permissive_wire: Wire = .{};
+    // The staging buffer is bound before either exchange runs, because
+    // `std.http` reserves room for a chunk header in the writer it is handed.
+    refusing_wire.bind();
+    permissive_wire.bind();
+    var answer: Answer = .{};
+    var refusing: Once = .{
+        .side = &side,
+        .handler = .{ .ctx = &answer, .call = Answer.handle },
+        .request = wire_request,
+        .wire = &refusing_wire,
+    };
+    var permissive: Once = .{
+        .side = &side,
+        .handler = .{ .ctx = &answer, .call = Answer.handle },
+        .request = wire_request,
+        .wire = &permissive_wire,
+    };
+
+    try testing.expectError(error.Transport, refusing.run());
+    try testing.expectEqual(std.http.Status.ok, try permissive.run());
+
+    // Both answers reached the same handler and composed the same envelope, so
+    // the two replies differ only in what the writer did with the bytes.
+    try testing.expectEqual(@as(usize, 2), answer.calls);
+
+    const envelope = "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"resultType\":\"complete\"}}";
+    const event = "data: " ++ envelope ++ "\n\n";
+    const head = refusing_wire.written();
+
+    // Exactly one write was refused and it was the terminating chunk, so the
+    // fault is at the end of the stream and nowhere inside it.
+    try testing.expectEqual(@as(usize, 1), refusing_wire.refusals);
+    try testing.expect(std.mem.endsWith(u8, refusing_wire.refusedCall(), chunk_terminator));
+    // The whole event is ahead of it on the wire, which is what says the send
+    // completed and that what could not be written was the ending rather than
+    // the message.
+    try testing.expect(std.mem.indexOf(u8, head, event) != null);
+    // The head the answer promised is there too, so the stream was opened
+    // with the media type a client reads events from and the framing that
+    // carries them.
+    try testing.expect(std.mem.startsWith(u8, head, "HTTP/1.1 200 "));
+    try testing.expect(std.ascii.findIgnoreCase(head, "content-type: " ++
+        mcp.uri_and_media.event_stream_media_type ++ "\r\n") != null);
+    try testing.expect(
+        std.ascii.findIgnoreCase(head, "transfer-encoding: chunked\r\n") != null,
+    );
+    // No terminator reached the peer, so nothing was refused before the end
+    // and no part of the event was lost along with it.
+    try testing.expect(std.mem.indexOf(u8, head, chunk_terminator) == null);
+
+    // The control: the same fixture refusing nothing ends the body on the
+    // wire and answers `200 OK`. The refusal above is therefore the whole
+    // difference between a clean answer and a fault.
+    try testing.expectEqual(@as(usize, 0), permissive_wire.refusals);
+    try testing.expect(std.mem.indexOf(u8, permissive_wire.written(), event) != null);
+    try testing.expect(std.mem.endsWith(u8, permissive_wire.written(), chunk_terminator));
+}
+
 test "a notification POST is answered 202 with no body" {
     var threaded: Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
@@ -3486,7 +3779,8 @@ test "a notification POST is answered 202 with no body" {
     var statuses = [_]std.http.Status{.ok};
 
     var group: Io.Group = .init;
-    var serve = Serve{
+    defer group.cancel(io);
+    var serve: Serve = .{
         .io = io,
         .listener = &endpoint.listener,
         .side = &server_side,
@@ -3497,7 +3791,7 @@ test "a notification POST is answered 202 with no body" {
         .answered = &answered,
         .failed = &failed,
     };
-    var listen = Listen{
+    var listen: Listen = .{
         .io = io,
         .http = &http_client,
         .endpoint = &endpoint,
@@ -3509,9 +3803,9 @@ test "a notification POST is answered 202 with no body" {
         .got = &got,
         .failed = &failed,
     };
-    group.async(io, Serve.run, .{&serve});
-    group.async(io, Listen.run, .{&listen});
-    group.await(io) catch {};
+    try group.concurrent(io, Serve.run, .{&serve});
+    try group.concurrent(io, Listen.run, .{&listen});
+    try group.await(io);
 
     if (listen.failure) |step| return step;
     try testing.expect(!failed);
@@ -3554,7 +3848,9 @@ test "a GET to the endpoint is 405, because this revision serves POST only" {
         rejected: *bool,
         failed: *bool,
 
-        fn run(self: *@This()) void {
+        const Self = @This();
+
+        fn run(self: *Self) void {
             const stream = self.listener.accept(self.io) catch {
                 self.failed.* = true;
                 return;
@@ -3600,7 +3896,8 @@ test "a GET to the endpoint is 405, because this revision serves POST only" {
     };
 
     var group: Io.Group = .init;
-    var serve = Reject{
+    defer group.cancel(io);
+    var serve: Reject = .{
         .io = io,
         .listener = &endpoint.listener,
         .side = &server_side,
@@ -3616,7 +3913,9 @@ test "a GET to the endpoint is 405, because this revision serves POST only" {
         got: *bool,
         failed: *bool,
 
-        fn run(self: *@This()) void {
+        const Self = @This();
+
+        fn run(self: *Self) void {
             const uri = std.Uri.parse(self.endpoint.uri_text) catch {
                 self.failed.* = true;
                 return;
@@ -3642,7 +3941,7 @@ test "a GET to the endpoint is 405, because this revision serves POST only" {
             self.got.* = true;
         }
     };
-    var probe = Probe{
+    var probe: Probe = .{
         .io = io,
         .http = &http_client,
         .endpoint = &endpoint,
@@ -3650,9 +3949,9 @@ test "a GET to the endpoint is 405, because this revision serves POST only" {
         .got = &got,
         .failed = &failed,
     };
-    group.async(io, Reject.run, .{&serve});
-    group.async(io, Probe.run, .{&probe});
-    group.await(io) catch {};
+    try group.concurrent(io, Reject.run, .{&serve});
+    try group.concurrent(io, Probe.run, .{&probe});
+    try group.await(io);
 
     try testing.expect(!failed);
     try testing.expect(got);
@@ -3686,7 +3985,8 @@ test "a stream keeps delivering after the result, which is what a subscription i
     };
 
     var group: Io.Group = .init;
-    var serve = Subscribe{
+    defer group.cancel(io);
+    var serve: Subscribe = .{
         .io = io,
         .listener = &endpoint.listener,
         .side = &server_side,
@@ -3695,7 +3995,7 @@ test "a stream keeps delivering after the result, which is what a subscription i
         .sent = &sent,
         .failed = &failed,
     };
-    var listen = Listen{
+    var listen: Listen = .{
         .io = io,
         .http = &http_client,
         .endpoint = &endpoint,
@@ -3708,9 +4008,9 @@ test "a stream keeps delivering after the result, which is what a subscription i
         .got = &got,
         .failed = &failed,
     };
-    group.async(io, Subscribe.run, .{&serve});
-    group.async(io, Listen.run, .{&listen});
-    group.await(io) catch {};
+    try group.concurrent(io, Subscribe.run, .{&serve});
+    try group.concurrent(io, Listen.run, .{&listen});
+    try group.await(io);
 
     // Both tasks report the step they reached, the server's first: its step
     // is the one that says whether the result ever went out.
@@ -3777,7 +4077,9 @@ test "a body larger than the caller's buffer is refused, not grown for" {
         rejected: *bool,
         failed: *bool,
 
-        fn run(self: *@This()) void {
+        const Self = @This();
+
+        fn run(self: *Self) void {
             const stream = self.listener.accept(self.io) catch {
                 self.failed.* = true;
                 return;
@@ -3823,7 +4125,8 @@ test "a body larger than the caller's buffer is refused, not grown for" {
     };
 
     var group: Io.Group = .init;
-    var serve = Refuse{
+    defer group.cancel(io);
+    var serve: Refuse = .{
         .io = io,
         .listener = &endpoint.listener,
         .side = &server_side,
@@ -3832,7 +4135,7 @@ test "a body larger than the caller's buffer is refused, not grown for" {
     };
     var reply: Reply = undefined;
     var client_failed = false;
-    var call = Call{
+    var call: Call = .{
         .io = io,
         .http = &http_client,
         .endpoint = &endpoint,
@@ -3844,9 +4147,9 @@ test "a body larger than the caller's buffer is refused, not grown for" {
         .got = &got,
         .failed = &client_failed,
     };
-    group.async(io, Refuse.run, .{&serve});
-    group.async(io, Call.run, .{&call});
-    group.await(io) catch {};
+    try group.concurrent(io, Refuse.run, .{&serve});
+    try group.concurrent(io, Call.run, .{&call});
+    try group.await(io);
 
     // The server refused the size and said so, and the client was told the
     // request went unanswered rather than being handed a truncated result.
@@ -3881,10 +4184,12 @@ test "a reply this transport cannot read keeps its status instead of reading as 
         served: *bool,
         failed: *bool,
 
+        const Self = @This();
+
         /// One POST, answered the way a peer in front of the endpoint answers
         /// one it cannot reach: a gateway's own status and a page of HTML
         /// rather than a JSON-RPC body.
-        fn run(self: *@This()) void {
+        fn run(self: *Self) void {
             const stream = self.listener.accept(self.io) catch {
                 self.failed.* = true;
                 return;
@@ -3928,14 +4233,15 @@ test "a reply this transport cannot read keeps its status instead of reading as 
     };
 
     var group: Io.Group = .init;
-    var serve = Gateway{
+    defer group.cancel(io);
+    var serve: Gateway = .{
         .io = io,
         .listener = &endpoint.listener,
         .side = &server_side,
         .served = &served,
         .failed = &failed,
     };
-    var call = Call{
+    var call: Call = .{
         .io = io,
         .http = &http_client,
         .endpoint = &endpoint,
@@ -3949,9 +4255,9 @@ test "a reply this transport cannot read keeps its status instead of reading as 
         .got = &got,
         .failed = &failed,
     };
-    group.async(io, Gateway.run, .{&serve});
-    group.async(io, Call.run, .{&call});
-    group.await(io) catch {};
+    try group.concurrent(io, Gateway.run, .{&serve});
+    try group.concurrent(io, Call.run, .{&call});
+    try group.await(io);
 
     try testing.expect(!failed);
     try testing.expect(served);
