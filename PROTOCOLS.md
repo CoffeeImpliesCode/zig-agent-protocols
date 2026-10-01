@@ -337,20 +337,56 @@ body it answers with. The envelope every one of them carries — `resultType`, a
 `ttlMs`/`cacheScope` where the result is cacheable — is fixed in 4.6 and is not
 repeated per method below.
 
-Transcribed from `schema/2026-07-28/schema.ts`: the `*ResultResponse` interfaces,
-the result interfaces they name, and the `ServerResult` union. Requirement
-language is from `basic/index.md` §Result Responses, `server/tools.md`,
-`server/resources.md`, `server/prompts.md` and `server/utilities/caching.md`.
-The same artifact is transcribed value-by-value
-in [`research/normative/mcp-2026-07-28.md`](research/normative/mcp-2026-07-28.md)
-§5, §8 and §10; every row here was checked against it and against the artifact
-itself. One value disagrees, and the artifact wins:
-`research/normative/mcp-2026-07-28.md` §1a says *"The three list requests
-extend `PaginatedRequest`"*. **Four** do — `ListPromptsRequest`,
-`ListResourcesRequest`, `ListResourceTemplatesRequest` and `ListToolsRequest` —
-and its own method table a few lines above already gives all four
-`params: PaginatedRequestParams`, so the sentence under-counts its own table.
-4.10.2 uses the artifact's count.
+Transcribed from `schema/2026-07-28/schema.ts`, which
+[`research/normative/mcp-2026-07-28-schema.md`](research/normative/mcp-2026-07-28-schema.md)
+reproduces value-by-value with artifact line ranges: the envelope and its two
+bases, the ten `*ResultResponse` interfaces, the ten result interfaces they name,
+`InputRequiredResult`, the `ServerResult` union, `ContentBlock` and its five
+members, `ResourceContents` and its two arms, and the element types those
+reference. Requirement language is from `basic/index.md` §Result Responses,
+`server/tools.md`, `server/resources.md`, `server/prompts.md` and
+`server/utilities/caching.md`. Every row below was checked against that extract
+and against the artifact itself; where the two disagreed, the artifact won.
+
+The sibling document [`research/normative/mcp-2026-07-28.md`](mcp-2026-07-28.md)
+carries the envelope and the MRTR arm of the same artifact and nothing else. Its
+§5 transcribes `ResultType`, `Result`, `EmptyResult`, `CacheableResult`,
+`PaginatedResult`, `PaginatedRequestParams` and `Cursor`, and tabulates the six
+cacheable results against their `extends` clauses; its §8 is Media types and URI
+schemes and carries the five `ContentBlock` discriminator literals and `Role` in
+prose rather than as declarations; its §10 is MRTR and carries
+`InputRequiredResult`, `InputRequests` and `InputResponses`. Outside those three
+sections it has no **declaration** of the ten `*ResultResponse` interfaces, of
+any `ContentBlock` member, or of `ResourceContents`, `Tool`, `PromptMessage`,
+`ServerResult` or `ToolAnnotations` — `Tool` and `Role` are named there in prose
+and nowhere else, which is why the extract exists.
+
+Two values disagree, and the artifact settles both. `mcp-2026-07-28.md` §1a says
+*"The three list requests extend `PaginatedRequest`"* — **four** do
+(`ListPromptsRequest`, `ListResourcesRequest`, `ListResourceTemplatesRequest`,
+`ListToolsRequest`), and its own method table a few lines above gives all four
+`params: PaginatedRequestParams`, so the sentence under-counts its own table;
+4.10.2 uses the artifact's count. And §4.10 contradicted itself inside 4.10.2:
+its `PaginatedResult` row named five results, `DiscoverResult` among them, while
+a paragraph below said the four list results were the only ones carrying
+`nextCursor`. `DiscoverResult extends CacheableResult` (artifact L678) and does
+not extend `PaginatedResult`, so the paginated set is the four, and the row and
+the paragraph now agree. The error was that one cell and nothing else: 4.10.3's
+`DiscoverResult` table, 4.10.5's sequence row for that result, and this
+subsection's own closing paragraph were already right, so an auditor has three
+agreeing places to check the corrected cell against rather than one.
+
+**Provenance, and its limit.** The extract records sha256
+`742750af…2cd` for the artifact and states that it equals the digest recorded
+for the transcription of this section. No digest of this section's source bytes
+is stored anywhere in the repository, so that equality cannot be checked from
+inside the tree: it is the extract's assertion, not a measurement this document
+can reproduce. What *is* checkable is that every declaration the extract quotes
+matches the artifact at the line range it gives, and that every value below
+matches that artifact — so this section agrees with the 3,197-line `schema.ts`
+the URL serves today. Whether its author read those same bytes, or an earlier
+revision of `main` that was six lines longer, is not recoverable here. The one
+count this section got wrong is a count of `extends` clauses, not of lines.
 
 #### 4.10.1 Method to result
 
@@ -384,26 +420,36 @@ no method of its own; it is the `"input_required"` arm of the three rows above.
 
 #### 4.10.2 Cacheable and paginated
 
-Two base interfaces contribute fields. Both are marked `/** @internal */` in
-the schema, so neither has a wire discriminator: a result is cacheable because
-it carries `ttlMs` and `cacheScope`, and paginated because it carries
-`nextCursor`, not because it announced either.
+Two base interfaces contribute fields, and neither has a wire discriminator: a
+result is cacheable because it carries `ttlMs` and `cacheScope`, and paginated
+because it carries `nextCursor`, not because it announced either. The schema
+marks both for internal use, though not in the same way — `PaginatedResult` is
+prefixed with a standalone `/** @internal */` (artifact L1067), while
+`CacheableResult` carries `@internal` as a tag inside its own JSDoc block
+(L1079).
 
 | Base | Contributes | On which results |
 | --- | --- | --- |
-| `CacheableResult` | `ttlMs: number` `@minimum 0`, required; `cacheScope: "public" \| "private"`, required | `DiscoverResult`, `ListToolsResult`, `ListPromptsResult`, `ListResourcesResult`, `ListResourceTemplatesResult`, `ReadResourceResult` |
-| `PaginatedResult` | `nextCursor?: Cursor`, optional; `Cursor = string` | The same six minus `ReadResourceResult`, which is cacheable but **not** paginated |
+| `CacheableResult` | `ttlMs: number` `@minimum 0`, required; `cacheScope: "public" \| "private"`, required | **6** — `DiscoverResult`, `ListToolsResult`, `ListPromptsResult`, `ListResourcesResult`, `ListResourceTemplatesResult`, `ReadResourceResult` |
+| `PaginatedResult` | `nextCursor?: Cursor`, optional; `Cursor = string` | **4** — `ListToolsResult`, `ListPromptsResult`, `ListResourcesResult`, `ListResourceTemplatesResult` |
 
-Those six are exactly the six `server/utilities/caching.md` requires servers to
-return caching hints for, so the schema's `extends` clauses and the caching
-prose agree with no residue. `completion/complete`, `prompts/get`, `tools/call`
-and `subscriptions/listen` are `extends Result` alone.
+The two sets are not the same set. `DiscoverResult` and `ReadResourceResult` are
+cacheable and **not** paginated: each extends `CacheableResult` and nothing else
+(artifact L678 and L1229). The four results that are paginated are exactly the
+four that are also cacheable.
+
+Those six cacheable results are exactly the six `server/utilities/caching.md`
+requires servers to return caching hints for, so the schema's `extends` clauses
+and the caching prose agree with no residue. `completion/complete`, `prompts/get`,
+`tools/call` and `subscriptions/listen` are `extends Result` alone, and so is
+the `input_required` arm.
 
 Only the four list requests take a `cursor`, and only they are declared
-`extends PaginatedRequest` with `params: PaginatedRequestParams`. So a request
-and its result are not both paginated: `resources/read` returns contents that
-are a sequence but has no `nextCursor`, and the four list results are the only
-ones that do.
+`extends PaginatedRequest` with `params: PaginatedRequestParams`. A request and
+its result are therefore paginated together or not at all: the four list methods
+are paginated on both sides, and `resources/read` on neither — it returns a
+sequence of contents with no `nextCursor`. `nextCursor` is declared exactly once
+in the whole artifact, so it is the only pagination member on any of the ten.
 
 #### 4.10.3 Payloads
 
@@ -484,6 +530,17 @@ body is empty apart from `_meta`. Its `_meta` is the one place a result's
 the JSON-RPC `id` of the `subscriptions/listen` request and equals this
 response's own `id`. The result is sent only on a graceful teardown; an abrupt
 transport close carries no response.
+
+`InputRequiredResult` is a result the artifact declares and none of the ten
+methods above names as its own: it is the `"input_required"` arm of three of
+them. Its payload members are `inputRequests?: InputRequests` and
+`requestState?: string`, and the artifact types **both as optional** — while
+requiring one of them in prose, in the type's own doc comment: *"At least one of
+`inputRequests` or `requestState` MUST be present."* (artifact L575). The
+requirement is therefore **established, not silent**, and a decoder that reads
+only the two optional markers will admit a body the artifact forbids;
+`src/mcp.zig` refuses one with `error.MissingField`. The two markers are how the
+member set is written, not a statement that either may be absent.
 
 #### 4.10.4 `ContentBlock`
 
@@ -568,8 +625,8 @@ rather than left to the implementer.
 | --- | --- | --- |
 | Members of any result object | **Open** | `Result` declares `[key: string]: unknown`. `basic/index.md` §Result Responses: *"The `result` **MAY** follow any JSON object structure."* |
 | `ContentBlock.type` | **Closed** — five literals | The union declaration above. No `\| string` arm, no index signature, and the *"this is not a closed set"* sentence appears only on `ClientCapabilities` and `ServerCapabilities` |
-| Members of `TextContent`, `ImageContent`, `AudioContent`, `EmbeddedResource`, `ResourceContents`, `Resource`, `ResourceTemplate`, `Prompt`, `Tool`, `PromptArgument`, `Icon`, `Annotations`, `ToolAnnotations` | **Closed** | None declares an index signature. `_meta` is the one open member, and it is a `MetaObject = Record<string, unknown>` |
-| `Role`, `Icon.theme`, `CacheScope` | **Closed** | Literal unions, 4.6 for `CacheScope` |
+| Members of `TextContent`, `ImageContent`, `AudioContent`, `EmbeddedResource`, `ResourceContents`, `Resource`, `ResourceTemplate`, `Prompt`, `Tool`, `PromptArgument`, `Icon`, `Annotations`, `ToolAnnotations` | **Closed** | None of these interfaces declares an index signature, so the member set of each is exactly the one named. The one open member most of them carry is `_meta`, a `MetaObject = Record<string, unknown>`; `Tool` carries two more of its own — `inputSchema` and `outputSchema`, each `{ …; [key: string]: unknown }` — which is why 4.10.4 and 4.10.5 treat those two as open JSON Schema rather than library types |
+| `Role`, `Icon.theme`, the `cacheScope` literal union | **Closed** | Literal unions. The schema writes `cacheScope: "public" \| "private"` **inline** (artifact L1109) and declares no `CacheScope` alias — the name belongs to `mcp.CacheScope` in `src/mcp.zig`, not to the artifact. 4.6 for the field |
 | `InputRequests` keys | **Open** — server-assigned | 4.7 |
 | `resultType` | **Closed set, open carrier** | `"complete" \| "input_required" \| string` admits any string, and `basic/index.md`: *"A `resultType` of any value unrecognized by the client **MUST** be considered invalid."* |
 

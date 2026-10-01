@@ -605,7 +605,7 @@ excluded; they are listed under `Not verified during research`.
 | https://raw.githubusercontent.com/modelcontextprotocol/registry/main/README.md | MCP | `mcp.md` |
 | https://raw.githubusercontent.com/modelcontextprotocol/registry/main/docs/reference/api/openapi.yaml | MCP | `mcp.md` |
 | https://raw.githubusercontent.com/modelcontextprotocol/specification/main/schema/2026-07-28/schema.json | MCP, normative | `normative/mcp-2026-07-28.md` |
-| https://raw.githubusercontent.com/modelcontextprotocol/specification/main/schema/2026-07-28/schema.ts | MCP, normative | `normative/mcp-2026-07-28.md` |
+| https://raw.githubusercontent.com/modelcontextprotocol/specification/main/schema/2026-07-28/schema.ts | MCP, normative | `normative/mcp-2026-07-28-schema.md`, `normative/mcp-2026-07-28.md` |
 | https://raw.githubusercontent.com/open-telemetry/community/main/README.md | Observability | `observability.md` |
 | https://raw.githubusercontent.com/open-telemetry/semantic-conventions-genai/main/CONTRIBUTING.md | Observability | `observability.md` |
 | https://raw.githubusercontent.com/open-telemetry/semantic-conventions-genai/main/docs/gen-ai/README.md | Instructions and observability, normative | `normative/instructions-observability.md` |
@@ -731,7 +731,7 @@ Distinct URLs cited by each document, and its line count on the research date.
 
 | Document | Distinct URLs | Lines |
 | --- | --- | --- |
-| `PROTOCOLS.md` | 2 | 867 |
+| `PROTOCOLS.md` | 2 | 1242 |
 | `README.md` | 0 | 89 |
 | `a2a.md` | 41 | 685 |
 | `acp-agent-client.md` | 47 | 733 |
@@ -746,7 +746,8 @@ Distinct URLs cited by each document, and its line count on the research date.
 | `normative/acp-v1-v2.md` | 14 | 898 |
 | `normative/commerce.md` | 40 | 1140 |
 | `normative/instructions-observability.md` | 39 | 1412 |
-| `normative/mcp-2026-07-28.md` | 21 | 827 |
+| `normative/mcp-2026-07-28-schema.md` | 1 | 1926 |
+| `normative/mcp-2026-07-28.md` | 21 | 838 |
 | `normative/ui-protocols.md` | 34 | 1118 |
 | `observability.md` | 41 | 602 |
 | `orchestration-hitl.md` | 44 | 1023 |
@@ -759,9 +760,9 @@ Distinct URLs cited by each document, and its line count on the research date.
 
 ## Totals
 
-707 distinct URLs across the 23 research documents and `PROTOCOLS.md`.
-The root `../README.md` cites none. 125 URLs are cited by more than one
-document; 892 document-URL citations in all.
+707 distinct URLs across the 24 research documents and `PROTOCOLS.md`.
+The root `../README.md` cites none. 126 URLs are cited by more than one
+document; 893 document-URL citations in all.
 
 ## Not verified during research
 
