@@ -749,6 +749,35 @@ pub fn decodeReplayFrom(raw: []const u8, scratch: []u8) DecodeError!ReplayFrom {
     return .{ .other = kind };
 }
 
+/// Encode a v2 `ReplayFrom` object.
+///
+/// The exact inverse of [`decodeReplayFrom`]: the two agree on every value one
+/// of them can reach, and a value this refuses is one the decoder could not
+/// have returned.
+///
+/// One byte sequence the pair does not agree on, and it is the decoder's to
+/// answer for. `ReplayFromStart` carries an optional `_meta` that this module
+/// models nowhere, so a document with one decodes to a value that re-encodes
+/// without it. Refusing the value would not help, because the metadata is
+/// gone before any encoder sees the result; the member has to be carried by
+/// [`ReplayFrom`] itself, and that is a change to the shape rather than to
+/// this function.
+pub fn encodeReplayFrom(value: ReplayFrom, writer: *json.Writer) EncodeError!void {
+    switch (value) {
+        .start => try writer.slice("{\"type\":\"" ++ replay_from_type.start ++ "\"}"),
+        .other => |tag| {
+            // Refused before a byte is written. `decodeReplayFrom` gives the
+            // one named tag the `.start` arm, so writing the catch-all's text
+            // here would emit a document that decodes as `.start`: the arm a
+            // caller asked to encode is the one the wire cannot spell.
+            if (std.mem.eql(u8, tag, replay_from_type.start)) return error.InvalidField;
+            try writer.slice("{\"type\":");
+            try writer.string(tag);
+            try writer.byte('}');
+        },
+    }
+}
+
 // --- Capability objects, section 6.5 --------------------------------------------
 
 /// The v2 agent capability gates.
@@ -1011,6 +1040,37 @@ const CapabilityWalk = struct {
     }
 };
 
+/// The v1 object the session gates are nested under, in both spellings.
+///
+/// The schema nests them under `sessionCapabilities` and PROTOCOLS.md
+/// section 6.5 spells the gates `session.*`, so a decoded path crosses
+/// between the two. The crossing happens in each direction — in
+/// [`childPath`] on the way in and in `capabilityChildKey` on the way out —
+/// so both spellings are named here. A rule with a caller on each side that
+/// does not read the same table is a spelling that drifts.
+const v1_session_capabilities = struct {
+    /// The member name on the wire.
+    const object = v2_renames.session_capabilities_v1;
+    /// The spelling the decoded paths use for the object itself.
+    const gate = "session";
+    /// The same, as it prefixes a single gate.
+    const gate_prefix = gate ++ ".";
+};
+
+/// The `capabilities` root every v2 capability path starts with, dot included.
+///
+/// `decodeCapabilityObject` writes the bare member name ahead of the first
+/// path and the walk joins the rest with dots, so the two halves of the
+/// spelling sit in different places. This is the joined form
+/// `capabilityRootKey` takes the head off.
+const v2_capabilities_root = v2_renames.client_capabilities_v2 ++ ".";
+
+/// Whether `path` is one of the v1 session gates inside `parent`.
+fn isV1SessionGate(parent: []const u8, path: []const u8) bool {
+    return std.mem.eql(u8, parent, v1_session_capabilities.object) and
+        std.mem.startsWith(u8, path, v1_session_capabilities.gate_prefix);
+}
+
 /// The path spelling the children of `path` use.
 ///
 /// PROTOCOLS.md section 6.5 spells the v1 session gates `session.*` while the
@@ -1018,8 +1078,8 @@ const CapabilityWalk = struct {
 /// abbreviated spelling, so the decoded paths use it too; otherwise a decoded
 /// set could not answer `isMethodSupported` for the four session gates.
 fn childPath(version: WireVersion, path: []const u8) []const u8 {
-    if (version == .stable and std.mem.eql(u8, path, "sessionCapabilities")) {
-        return "session";
+    if (version == .stable and std.mem.eql(u8, path, v1_session_capabilities.object)) {
+        return v1_session_capabilities.gate;
     }
     return path;
 }
@@ -1090,6 +1150,184 @@ pub fn decodeCapabilityObject(
     return .{ .entries = out[0..walk.count], .present = true };
 }
 
+/// Refuse a member whose form its version does not declare for its path.
+///
+/// The rule `CapabilityWalk.checkForm` applies on the reading side, in one
+/// place rather than written twice. An encoder that did not apply it would
+/// advertise `terminal` as a `{}` at v1 or as a boolean at v2, and
+/// `decodeCapabilityObject` refuses both: at v1 the form is the schema's,
+/// and at v2 a boolean is a shape the draft does not define rather than a
+/// capability this library has not read.
+fn validateCapabilityEntry(version: WireVersion, entry: Capability) EncodeError!void {
+    // The value is the wire spelling of the form and carries nothing else. A
+    // boolean with no value has to be written `null`, and the walk reads an
+    // explicit `null` as the absent case and records no member at all. A
+    // presence object with one has nowhere to put it, because the schema
+    // gives that arm no value to carry.
+    if (entry.form == .boolean and entry.value == null) return error.InvalidField;
+    if (entry.form == .presence_object and entry.value != null) return error.InvalidField;
+    switch (version) {
+        .stable => {
+            // Only a path this library names is checked, because v1 has no
+            // closed capability set and an unknown path is an extension
+            // point that may take either form.
+            if (!isKnownV1Capability(entry.path)) return;
+            if (entry.form != v1CapabilityForm(entry.path)) return error.InvalidField;
+        },
+        .draft => {
+            if (entry.form != v2_capability_form) return error.InvalidField;
+        },
+    }
+}
+
+/// Refuse a set the decoder for `version` and `side` could not have returned.
+///
+/// Separate from [`encodeCapabilityObject`] so that
+/// `encodeInitializeCapabilities` can run it before it writes the member
+/// name: a refusal that reached the caller after `{"capabilities":` had
+/// landed in the buffer would leave a prefix that reads as a member and is
+/// not a document.
+fn validateCapabilitySet(
+    version: WireVersion,
+    side: Side,
+    set: CapabilitySet,
+) EncodeError!void {
+    // Neither schema gives a capability object to a side-independent method,
+    // and `decodeCapabilityObject` refuses that before it reads a byte.
+    if (side == .protocol) return error.InvalidField;
+    for (set.entries) |entry| try validateCapabilityEntry(version, entry);
+}
+
+/// The member name a top-level path takes inside the capability object.
+///
+/// A v2 path keeps the `capabilities` root, because that is the member both
+/// sides carry there, and this function writes the contents of that member
+/// rather than the member itself: the root is the member's name, which
+/// `encodeInitializeCapabilities` writes. A v1 path is relative to the side's
+/// own object already, so it is its own key.
+fn capabilityRootKey(version: WireVersion, path: []const u8) []const u8 {
+    if (version == .draft and std.mem.startsWith(u8, path, v2_capabilities_root)) {
+        return path[v2_capabilities_root.len..];
+    }
+    return path;
+}
+
+/// The member name `path` takes inside the open object `parent`.
+fn capabilityChildKey(
+    version: WireVersion,
+    parent: []const u8,
+    path: []const u8,
+) []const u8 {
+    if (version == .stable and isV1SessionGate(parent, path)) {
+        return path[v1_session_capabilities.gate_prefix.len..];
+    }
+    return path[parent.len + 1 ..];
+}
+
+/// Whether the object at `parent` is still open when `path` is written.
+fn isCapabilityAncestor(
+    version: WireVersion,
+    parent: []const u8,
+    path: []const u8,
+) bool {
+    if (path.len > parent.len and
+        path[parent.len] == '.' and
+        std.mem.startsWith(u8, path, parent))
+    {
+        return true;
+    }
+    // The v1 session gates are recorded under an object whose name is not the
+    // head of the paths inside it, so the crossing `capabilityChildKey` makes
+    // on the way out is the same crossing that has to be read on the way in.
+    return version == .stable and isV1SessionGate(parent, path);
+}
+
+/// Encode a capability object into `writer`.
+///
+/// The exact inverse of [`decodeCapabilityObject`] over the set it returns. A
+/// document the walk can produce re-encodes to the same bytes: the entries
+/// are recorded parent first, so the nesting comes back in the order it went
+/// out, and nothing is written for a member that recorded nothing.
+///
+/// The entries are expected in the order the walk recorded them, which is
+/// what a decoded set carries. The nesting is read from the paths, so a
+/// hand-built set whose paths are not a parent-then-child chain writes a
+/// shape the walk would never have produced.
+///
+/// [`Capability.known`] is read from the path rather than written, because
+/// the decoder derives it from the path and the version and it is not a fact
+/// the wire carries. A caller that set it by hand gets the derived answer
+/// back, which is the one the gate tables are built from.
+pub fn encodeCapabilityObject(
+    version: WireVersion,
+    side: Side,
+    set: CapabilitySet,
+    writer: *json.Writer,
+) EncodeError!void {
+    // A capability object *is* the member, so an absent member is not a value
+    // this can spell: `{}` would decode as a member that was there and
+    // advertised nothing, which is `present = true`.
+    if (!set.present) return error.InvalidField;
+    try validateCapabilitySet(version, side, set);
+
+    // The set is flat, so the nesting is rebuilt from the paths. The object
+    // still open above an entry is its deepest ancestor, which is the last
+    // one recorded before it: a prefix is shorter than what it prefixes, and
+    // the walk records an ancestor before anything inside it. Anything else
+    // has closed already, and closes here.
+    var open: [json.max_depth + 1]usize = undefined;
+    var depth: usize = 0;
+
+    try writer.byte('{');
+    for (set.entries, 0..) |entry, index| {
+        while (depth != 0 and !isCapabilityAncestor(
+            version,
+            set.entries[open[depth - 1]].path,
+            entry.path,
+        )) {
+            depth -= 1;
+            try writer.byte('}');
+        }
+        // A member needs a comma before it when the one before it was not its
+        // own ancestor, and that is the whole rule: an ancestor wrote the
+        // object this one goes inside, so the object is already open and no
+        // separator has been written since its brace. Anything else was a
+        // sibling or the last member of a closed subtree, and both leave a
+        // member already written in the object this one joins.
+        if (index != 0 and !isCapabilityAncestor(
+            version,
+            set.entries[index - 1].path,
+            entry.path,
+        )) {
+            try writer.byte(',');
+        }
+        // Bounded by the same depth `CapabilityWalk` refuses past, so a set
+        // nested deeper than any decode can produce is reported rather than
+        // written past the end of the stack. It is checked before the member
+        // is written, so the refusal is the last thing a caller sees.
+        if (entry.form == .presence_object and depth == open.len) {
+            return error.BufferTooSmall;
+        }
+        const key = if (depth == 0) capabilityRootKey(version, entry.path) else capabilityChildKey(
+            version,
+            set.entries[open[depth - 1]].path,
+            entry.path,
+        );
+        try writer.string(key);
+        try writer.byte(':');
+        switch (entry.form) {
+            .boolean => try writer.slice(if (entry.value.?) "true" else "false"),
+            .presence_object => {
+                open[depth] = index;
+                depth += 1;
+                try writer.byte('{');
+            },
+        }
+    }
+    while (depth != 0) : (depth -= 1) try writer.byte('}');
+    try writer.byte('}');
+}
+
 /// The wire member that carries `side`'s capabilities.
 fn capabilityMemberName(version: WireVersion, side: Side) DecodeError![]const u8 {
     return switch (version) {
@@ -1152,6 +1390,43 @@ pub fn decodeInitializeCapabilities(
         return decodeCapabilityObject(version, side, lexeme, out, paths, scratch);
     }
     return .{ .entries = out[0..0], .present = false };
+}
+
+/// Encode the capability member of an `initialize` request or response.
+///
+/// The inverse of [`decodeInitializeCapabilities`] over the value it returns:
+/// the body written here decodes back to `set`, under the member name this
+/// version gives `side`. It is not the inverse of the whole `initialize`
+/// body, which also carries a protocol version and an info object this
+/// module does not model, so a caller writing one composes the two around
+/// this rather than calling it alone.
+pub fn encodeInitializeCapabilities(
+    version: WireVersion,
+    side: Side,
+    set: CapabilitySet,
+    writer: *json.Writer,
+) EncodeError!void {
+    // The one error `capabilityMemberName` returns is `error.InvalidField`,
+    // and that error is in both sets, so the translation drops nothing.
+    const member = capabilityMemberName(version, side) catch return error.InvalidField;
+    // An absent set is written as an absent member rather than an empty one.
+    // Omission is what the decoder reads back as `present = false`, while an
+    // empty member decodes as present and advertising nothing: that tells a
+    // peer the object was built and the answer was no, where omission says
+    // there was no question.
+    if (!set.present) {
+        try writer.slice("{}");
+        return;
+    }
+    // Ahead of the member name rather than left to the nested call, so a
+    // refused set leaves the buffer untouched rather than holding
+    // `{"capabilities":`.
+    try validateCapabilitySet(version, side, set);
+    try writer.byte('{');
+    try writer.string(member);
+    try writer.byte(':');
+    try encodeCapabilityObject(version, side, set, writer);
+    try writer.byte('}');
 }
 
 // --- 6.6 Permission options ----------------------------------------------------
@@ -1373,6 +1648,110 @@ pub fn decodePermissionSubject(
     return .{ .other = kind };
 }
 
+/// Whether `text` is exactly one JSON value, and that value is an object.
+///
+/// Both halves are the checks `decodePermissionSubject` makes on a `toolCall`
+/// lexeme: `rawValue` proved the value was complete when it took the lexeme,
+/// and the arm's own test is that it is an object. Checking the opening byte
+/// alone would let `{"a":1} {"b":2}` through and splice a second document
+/// into the middle of the member, which the decoder then refuses.
+fn isJsonObject(text: []const u8) bool {
+    var reader = json.Reader.init(text);
+    reader.skipWhitespace();
+    if (reader.peek() != @as(?u8, '{')) return false;
+    // `skipValue` is never written to and takes the scratch only so that one
+    // buffer serves every read, so the empty slice here is a buffer nobody
+    // has to size.
+    reader.skipValue(&.{}) catch return false;
+    return reader.atEnd();
+}
+
+/// Whether `tag` names one of the two arms `PermissionSubject` models.
+fn isNamedSubjectType(tag: []const u8) bool {
+    return std.mem.eql(u8, tag, permission_subject_type.tool_call) or
+        std.mem.eql(u8, tag, permission_subject_type.command);
+}
+
+/// Refuse a subject `decodePermissionSubject` could not have returned.
+///
+/// The two modelled arms carry every member the schema requires of them, so
+/// each one decodes back to what it was built from. The catch-all is the
+/// exception: `type` selects the arm, so a tag that names a modelled arm is
+/// a request for that arm without the members it needs, and it decodes as
+/// `error.MissingField`.
+fn validatePermissionSubject(subject: PermissionSubject) EncodeError!void {
+    switch (subject) {
+        .tool_call => |call| {
+            if (!isJsonObject(call)) return error.InvalidField;
+        },
+        .command => |command| {
+            // Refused before a byte is written, because
+            // `decodePermissionSubject` refuses the same subject with
+            // `error.InvalidField`, and a request this library cannot read
+            // back is a request a peer has been asked to approve on words
+            // this library will not stand behind. PROTOCOLS.md 6.6 makes the
+            // path absolute because a relative one resolves against whatever
+            // working directory the process that runs the command happens to
+            // have, so the user approving a command in one directory would
+            // approve it in another.
+            if (!isAbsolutePath(command.cwd)) return error.InvalidField;
+        },
+        .other => |tag| {
+            if (isNamedSubjectType(tag)) return error.InvalidField;
+        },
+    }
+}
+
+/// Encode a v2 `RequestPermissionSubject` object.
+///
+/// The exact inverse of [`decodePermissionSubject`], and it refuses the three
+/// subjects its decoder refuses before it writes either.
+///
+/// The catch-all arm writes the `type` and nothing else, because the other
+/// members of such an object belong to the peer and this module models none
+/// of them. `acp_session.writePermissionSubject` takes the opposite line and
+/// refuses the arm outright, because there the missing members would be a
+/// request the agent never described. Here the caller holds a
+/// `PermissionSubject` and asked for a subject, so the discriminator is what
+/// it named and the round trip through it is exact.
+pub fn encodePermissionSubject(
+    subject: PermissionSubject,
+    writer: *json.Writer,
+) EncodeError!void {
+    try validatePermissionSubject(subject);
+    switch (subject) {
+        .tool_call => |call| {
+            try writer.slice(
+                "{\"type\":\"" ++ permission_subject_type.tool_call ++ "\",\"toolCall\":",
+            );
+            try writer.slice(call);
+            try writer.byte('}');
+        },
+        .command => |command| {
+            try writer.slice(
+                "{\"type\":\"" ++ permission_subject_type.command ++ "\",\"command\":",
+            );
+            try writer.string(command.command);
+            try writer.slice(",\"cwd\":");
+            try writer.string(command.cwd);
+            if (command.tool_call_id) |id| {
+                try writer.slice(",\"toolCallId\":");
+                try writer.string(id);
+            }
+            if (command.terminal_id) |id| {
+                try writer.slice(",\"terminalId\":");
+                try writer.string(id);
+            }
+            try writer.byte('}');
+        },
+        .other => |tag| {
+            try writer.slice("{\"type\":");
+            try writer.string(tag);
+            try writer.byte('}');
+        },
+    }
+}
+
 /// Encode a permission outcome.
 pub fn encodePermissionOutcome(outcome: PermissionOutcome, writer: *json.Writer) EncodeError!void {
     switch (outcome) {
@@ -1542,6 +1921,108 @@ pub fn decodePermissionRequest(
         .subject = try decodeSubjectMember(subject_text, &reader, scratch),
         .options = options,
     } };
+}
+
+/// Refuse an option the decoder for `version` would not return.
+///
+/// The three members an option requires are all written, so the kind is the
+/// only thing left to refuse. v1 declares a closed `oneOf`, so a fifth kind is
+/// undefined by the schema and `decodePermissionOptionKind` reports it; v2's
+/// `other` branch makes it a value, and the text is written as it arrived.
+fn validatePermissionOption(version: WireVersion, option: PermissionOption) EncodeError!void {
+    switch (option.kind) {
+        .known => {},
+        .other => {
+            if (unknownTagPolicy(version) == .reject) return error.UnknownTag;
+        },
+    }
+}
+
+/// Write one element of the `options` array.
+fn encodePermissionOption(option: PermissionOption, writer: *json.Writer) EncodeError!void {
+    try writer.slice("{\"optionId\":");
+    try writer.string(option.option_id);
+    try writer.slice(",\"name\":");
+    try writer.string(option.name);
+    try writer.slice(",\"kind\":");
+    switch (option.kind) {
+        .known => |kind| try writer.string(kind.string()),
+        .other => |text| try writer.string(text),
+    }
+    try writer.byte('}');
+}
+
+/// Encode `session/request_permission` for the version the value's own tag names.
+///
+/// The exact inverse of [`decodePermissionRequest`]: the two agree on every
+/// value one of them can reach, and every value this refuses is one the
+/// decoder could not have returned.
+///
+/// The whole request is checked before the first byte is written. A refusal
+/// halfway through would leave `{"sessionId":"s1","title":"t` in the caller's
+/// buffer, which is neither a request nor nothing, so a caller that sized the
+/// buffer for the refusal would have to discard what it holds rather than
+/// read it.
+pub fn encodePermissionRequest(
+    request: PermissionRequest,
+    writer: *json.Writer,
+) EncodeError!void {
+    const session_id: []const u8 = switch (request) {
+        .stable => |value| value.session_id,
+        .draft => |value| value.session_id,
+    };
+    const options: []const PermissionOption = switch (request) {
+        .stable => |value| value.options,
+        .draft => |value| value.options,
+    };
+    switch (request) {
+        .stable => |value| {
+            // `ToolCallUpdate` is an object, and `null` here is a missing
+            // tool call wearing a key.
+            if (!isJsonObject(value.tool_call)) return error.InvalidField;
+            for (value.options) |option| try validatePermissionOption(.stable, option);
+        },
+        .draft => |value| {
+            // v2 names `minItems: 1`, so a request the user cannot answer is
+            // not a request at all.
+            if (options.len == 0) return error.InvalidField;
+            if (value.subject) |subject| try validatePermissionSubject(subject);
+            for (value.options) |option| try validatePermissionOption(.draft, option);
+        },
+    }
+
+    try writer.slice("{\"sessionId\":");
+    try writer.string(session_id);
+    switch (request) {
+        .stable => |value| {
+            // Verbatim, because a `ToolCallUpdate` is not modelled here and
+            // this is the one member an agent cannot afford to have
+            // re-shaped.
+            try writer.slice(",\"toolCall\":");
+            try writer.slice(value.tool_call);
+        },
+        .draft => |value| {
+            try writer.slice(",\"title\":");
+            try writer.string(value.title);
+            // Omitted rather than written `null`, because an omitted member
+            // and a `null` one mean the same in both schemas and
+            // `decodePermissionRequest` reads them as one.
+            if (value.description) |text| {
+                try writer.slice(",\"description\":");
+                try writer.string(text);
+            }
+            if (value.subject) |subject| {
+                try writer.slice(",\"subject\":");
+                try encodePermissionSubject(subject, writer);
+            }
+        },
+    }
+    try writer.slice(",\"options\":[");
+    for (options, 0..) |option, index| {
+        if (index != 0) try writer.byte(',');
+        try encodePermissionOption(option, writer);
+    }
+    try writer.slice("]}");
 }
 
 /// Read the `options` array into caller-owned storage, returning the count.
@@ -3222,6 +3703,557 @@ test "trailing whitespace is not a second document" {
         );
         try testing.expect(advertised.present);
     }
+}
+
+test "a replay point round-trips through the encoder" {
+    var scratch: [64]u8 = undefined;
+    var buffer: [64]u8 = undefined;
+    // The discriminator is the only member this shape models, so a document
+    // carrying only that is one the pair reproduces byte for byte.
+    const source = "{\"type\":\"start\"}";
+    var writer = json.Writer.init(&buffer);
+    try encodeReplayFrom(try decodeReplayFrom(source, &scratch), &writer);
+    try testing.expectEqualStrings(source, writer.written());
+
+    // The catch-all keeps the tag it arrived with, which is the member this
+    // library is able to write back. The `cursor` beside it belongs to the
+    // peer and has no arm to land in, so the re-encoded document is the tag.
+    const future = "{\"type\":\"checkpoint\"}";
+    var other = json.Writer.init(&buffer);
+    try encodeReplayFrom(
+        try decodeReplayFrom(
+            \\{"type":"checkpoint","cursor":42}
+        , &scratch),
+        &other,
+    );
+    try testing.expectEqualStrings(future, other.written());
+    // And the shorter document decodes as the same arm, so the round trip is
+    // a round trip rather than a shorter string that happens to parse.
+    try testing.expect((try decodeReplayFrom(other.written(), &scratch)) == .other);
+}
+
+test "a replay point the decoder could not return is refused" {
+    var buffer: [64]u8 = undefined;
+    var writer = json.Writer.init(&buffer);
+    // `decodeReplayFrom` gives the one named tag the `.start` arm, so the
+    // catch-all holding that text re-encodes as a document decoding as the
+    // other arm, and the bytes look fine while saying the opposite.
+    try testing.expectError(
+        error.InvalidField,
+        encodeReplayFrom(.{ .other = replay_from_type.start }, &writer),
+    );
+    // Nothing was written, so a caller sizing a buffer for the refusal is not
+    // holding the prefix of a document.
+    try testing.expectEqual(@as(usize, 0), writer.written().len);
+
+    // Any other tag is the arm the wire spells, and it is written.
+    var other = json.Writer.init(&buffer);
+    try encodeReplayFrom(.{ .other = "checkpoint" }, &other);
+    try testing.expectEqualStrings("{\"type\":\"checkpoint\"}", other.written());
+}
+
+test "a capability object round-trips through the encoder" {
+    var scratch: [512]u8 = undefined;
+    var paths: [256]u8 = undefined;
+    var out: [12]Capability = undefined;
+    var buffer: [512]u8 = undefined;
+    // Every member here is one the walk records, and the document carries no
+    // whitespace, so the re-encoded bytes are the source less the members
+    // that record nothing: an explicit `null` is the absent case, and a value
+    // no schema declares is stepped over.
+    const source = "{\"fs\":{\"readTextFile\":true,\"writeTextFile\":false}," ++
+        "\"terminal\":true,\"auth\":{\"terminal\":true}," ++
+        "\"elicitation\":{\"form\":{},\"url\":null},\"vendor\":{\"custom\":{}}}";
+    const set = try decodeCapabilityObject(.stable, .client, source, &out, &paths, &scratch);
+    var writer = json.Writer.init(&buffer);
+    try encodeCapabilityObject(.stable, .client, set, &writer);
+    try testing.expectEqualStrings(
+        "{\"fs\":{\"readTextFile\":true,\"writeTextFile\":false}," ++
+            "\"terminal\":true,\"auth\":{\"terminal\":true}," ++
+            "\"elicitation\":{\"form\":{}},\"vendor\":{\"custom\":{}}}",
+        writer.written(),
+    );
+
+    // The set the re-encoded bytes decode to is the set they came from, which
+    // is the half of the round trip a byte comparison cannot see.
+    var again_paths: [256]u8 = undefined;
+    var again_out: [12]Capability = undefined;
+    const again = try decodeCapabilityObject(
+        .stable,
+        .client,
+        writer.written(),
+        &again_out,
+        &again_paths,
+        &scratch,
+    );
+    try testing.expectEqual(set.entries.len, again.entries.len);
+    for (set.entries, again.entries) |first, second| {
+        try testing.expectEqualStrings(first.path, second.path);
+        try testing.expectEqual(first.known, second.known);
+        try testing.expectEqual(first.form, second.form);
+        try testing.expectEqual(first.value, second.value);
+    }
+}
+
+test "a v2 capability object round-trips under the capabilities root" {
+    var scratch: [512]u8 = undefined;
+    var paths: [512]u8 = undefined;
+    var out: [12]Capability = undefined;
+    var buffer: [512]u8 = undefined;
+    // A v2 path keeps the `capabilities` root that is the member's own name,
+    // and this writes the contents of that member, so the root comes off the
+    // head of every top-level key. Left on, the document would nest a member
+    // named `capabilities` inside the one already called `capabilities`.
+    const source = "{\"session\":{\"prompt\":{\"image\":{}},\"mcp\":{\"http\":{}}}," ++
+        "\"auth\":{}}";
+    const set = try decodeCapabilityObject(.draft, .agent, source, &out, &paths, &scratch);
+    var writer = json.Writer.init(&buffer);
+    try encodeCapabilityObject(.draft, .agent, set, &writer);
+    try testing.expectEqualStrings(source, writer.written());
+}
+
+test "the v1 session gates re-encode under the object the schema nests them in" {
+    var scratch: [512]u8 = undefined;
+    var paths: [192]u8 = undefined;
+    var out: [10]Capability = undefined;
+    var buffer: [512]u8 = undefined;
+    // The decoded paths spell these gates `session.*` while the member on the
+    // wire is `sessionCapabilities`, and `childPath` is where a decode crosses
+    // that. Writing the children at the root instead re-encodes as
+    // `{"sessionCapabilities":{},"session":{...}}`, which decodes as a set
+    // with one entry more than it had: a `session` capability this peer
+    // never advertised and no side of this library names.
+    const source = "{\"sessionCapabilities\":{\"delete\":{},\"list\":{}}}";
+    const set = try decodeCapabilityObject(.stable, .agent, source, &out, &paths, &scratch);
+    try testing.expect(findCapability(set, "session.delete") != null);
+
+    var writer = json.Writer.init(&buffer);
+    try encodeCapabilityObject(.stable, .agent, set, &writer);
+    try testing.expectEqualStrings(source, writer.written());
+}
+
+test "a capability member the decoder would refuse is not written" {
+    var buffer: [512]u8 = undefined;
+    var refuser = json.Writer.init(&buffer);
+    // `terminal` is a boolean at v1, and a `{}` here is the form the decoder
+    // refuses for a path it names.
+    try testing.expectError(error.InvalidField, encodeCapabilityObject(.stable, .client, .{
+        .entries = &.{.{
+            .path = "terminal",
+            .known = true,
+            .form = .presence_object,
+            .value = null,
+        }},
+        .present = true,
+    }, &refuser));
+    // v2 replaced every boolean with a presence object, on a known path and
+    // on an unknown one.
+    try testing.expectError(error.InvalidField, encodeCapabilityObject(.draft, .agent, .{
+        .entries = &.{
+            .{
+                .path = "capabilities.session.delete",
+                .known = true,
+                .form = .boolean,
+                .value = true,
+            },
+        },
+        .present = true,
+    }, &refuser));
+    // Neither schema gives a capability object to a side-independent method.
+    try testing.expectError(error.InvalidField, encodeCapabilityObject(.draft, .protocol, .{
+        .entries = &.{},
+        .present = true,
+    }, &refuser));
+    // A capability object is the member itself, so an absent member is not a
+    // value this can spell.
+    try testing.expectError(error.InvalidField, encodeCapabilityObject(.stable, .client, .{
+        .entries = &.{},
+        .present = false,
+    }, &refuser));
+    // A boolean with no value has to be written `null`, which the walk reads
+    // as the absent case and records as no member at all.
+    try testing.expectError(error.InvalidField, encodeCapabilityObject(.stable, .client, .{
+        .entries = &.{.{ .path = "terminal", .known = true, .form = .boolean, .value = null }},
+        .present = true,
+    }, &refuser));
+    // A presence object with a value has nowhere to put it: the schema gives
+    // that arm no value to carry.
+    try testing.expectError(error.InvalidField, encodeCapabilityObject(.stable, .client, .{
+        .entries = &.{
+            .{ .path = "elicitation.form", .known = true, .form = .presence_object, .value = true },
+        },
+        .present = true,
+    }, &refuser));
+    // Nothing refused above reached the buffer, so a caller that sized it for
+    // the refusal is not holding the prefix of a document.
+    try testing.expectEqual(@as(usize, 0), refuser.written().len);
+
+    // An unknown v1 path may take either form, so it is the one thing the
+    // form check does not refuse. The set here is the one a walk over
+    // `{"vendor":{"flag":true}}` records: the object and then its member.
+    var writer = json.Writer.init(&buffer);
+    try encodeCapabilityObject(.stable, .client, .{
+        .entries = &.{
+            .{ .path = "vendor", .known = false, .form = .presence_object, .value = null },
+            .{ .path = "vendor.flag", .known = false, .form = .boolean, .value = true },
+        },
+        .present = true,
+    }, &writer);
+    try testing.expectEqualStrings("{\"vendor\":{\"flag\":true}}", writer.written());
+
+    // A dotted path with no recorded object above it is its own key, because
+    // the walk records every object it steps through and this one has none.
+    // That is also the member a peer spells flat, so the pair agrees on it.
+    var flat = json.Writer.init(&buffer);
+    try encodeCapabilityObject(.stable, .client, .{
+        .entries = &.{.{ .path = "vendor.flag", .known = false, .form = .boolean, .value = true }},
+        .present = true,
+    }, &flat);
+    try testing.expectEqualStrings("{\"vendor.flag\":true}", flat.written());
+    var flat_scratch: [64]u8 = undefined;
+    var flat_paths: [64]u8 = undefined;
+    var flat_out: [2]Capability = undefined;
+    const flat_set = try decodeCapabilityObject(
+        .stable,
+        .client,
+        flat.written(),
+        &flat_out,
+        &flat_paths,
+        &flat_scratch,
+    );
+    try testing.expectEqual(@as(usize, 1), flat_set.entries.len);
+    try testing.expectEqualStrings("vendor.flag", flat_set.entries[0].path);
+}
+
+test "the initialize capability member round-trips through the encoder" {
+    var scratch: [512]u8 = undefined;
+    var paths: [128]u8 = undefined;
+    var out: [8]Capability = undefined;
+    var buffer: [512]u8 = undefined;
+    // v1 spells the member `clientCapabilities` and v2 spells it
+    // `capabilities` for both sides, so the same set goes out under two names.
+    const v1 = try decodeInitializeCapabilities(.stable, .client,
+        \\{"protocolVersion":1,"clientCapabilities":{"terminal":true}}
+    , &out, &paths, &scratch);
+    var v1_writer = json.Writer.init(&buffer);
+    try encodeInitializeCapabilities(.stable, .client, v1, &v1_writer);
+    try testing.expectEqualStrings(
+        "{\"clientCapabilities\":{\"terminal\":true}}",
+        v1_writer.written(),
+    );
+
+    var v2_paths: [128]u8 = undefined;
+    var v2_out: [8]Capability = undefined;
+    const v2 = try decodeInitializeCapabilities(.draft, .agent,
+        \\{"protocolVersion":2,"capabilities":{"session":{"delete":{}}}}
+    , &v2_out, &v2_paths, &scratch);
+    var v2_writer = json.Writer.init(&buffer);
+    try encodeInitializeCapabilities(.draft, .agent, v2, &v2_writer);
+    try testing.expectEqualStrings(
+        "{\"capabilities\":{\"session\":{\"delete\":{}}}}",
+        v2_writer.written(),
+    );
+
+    // The body written here decodes back to the set it was built from, which
+    // is the half a byte comparison against a longer source cannot show.
+    var again_out: [8]Capability = undefined;
+    var again_paths: [128]u8 = undefined;
+    const again = try decodeInitializeCapabilities(
+        .draft,
+        .agent,
+        v2_writer.written(),
+        &again_out,
+        &again_paths,
+        &scratch,
+    );
+    try testing.expectEqual(v2.entries.len, again.entries.len);
+    try testing.expect(findCapability(again, "capabilities.session.delete") != null);
+}
+
+test "an initialize that advertises nothing writes no member" {
+    var scratch: [512]u8 = undefined;
+    var paths: [128]u8 = undefined;
+    var out: [8]Capability = undefined;
+    var buffer: [512]u8 = undefined;
+    // Omission means unsupported, so the absent member is written as an
+    // absent member. An empty one would decode as present and advertising
+    // nothing, which tells a peer the question was asked and answered no.
+    const set = try decodeInitializeCapabilities(.stable, .agent,
+        \\{"protocolVersion":1}
+    , &out, &paths, &scratch);
+    try testing.expect(!set.present);
+    var writer = json.Writer.init(&buffer);
+    try encodeInitializeCapabilities(.stable, .agent, set, &writer);
+    try testing.expectEqualStrings("{}", writer.written());
+
+    var again_out: [8]Capability = undefined;
+    var again_paths: [128]u8 = undefined;
+    const again = try decodeInitializeCapabilities(
+        .stable,
+        .agent,
+        writer.written(),
+        &again_out,
+        &again_paths,
+        &scratch,
+    );
+    try testing.expect(!again.present);
+
+    // Neither schema gives a capability member to a side-independent method.
+    var refuser = json.Writer.init(&buffer);
+    try testing.expectError(
+        error.InvalidField,
+        encodeInitializeCapabilities(.stable, .protocol, set, &refuser),
+    );
+    // The form rules reach the member as well: a v2 boolean under
+    // `capabilities` is the shape the draft does not define.
+    const boolean_set: CapabilitySet = .{
+        .entries = &.{
+            .{
+                .path = "capabilities.session.delete",
+                .known = true,
+                .form = .boolean,
+                .value = true,
+            },
+        },
+        .present = true,
+    };
+    try testing.expectError(
+        error.InvalidField,
+        encodeInitializeCapabilities(.draft, .agent, boolean_set, &refuser),
+    );
+    try testing.expectEqual(@as(usize, 0), refuser.written().len);
+}
+
+test "a permission subject round-trips through the encoder" {
+    var scratch: [256]u8 = undefined;
+    var buffer: [256]u8 = undefined;
+    // The tool call is carried as the lexeme it arrived as, so it is written
+    // back byte for byte and is the one member here that is not re-spelled.
+    const call_source = "{\"type\":\"tool_call\"," ++
+        "\"toolCall\":{\"toolCallId\":\"t1\",\"title\":\"Build\"}}";
+    var call_writer = json.Writer.init(&buffer);
+    try encodePermissionSubject(
+        try decodePermissionSubject(call_source, &scratch),
+        &call_writer,
+    );
+    try testing.expectEqualStrings(call_source, call_writer.written());
+
+    // Every member the command arm models is written, in the order the writer
+    // puts them, and the optional ones are omitted when absent rather than
+    // written `null`, which the decoder reads back as the same absent.
+    const command_source = "{\"type\":\"command\",\"command\":\"rm -rf build\"," ++
+        "\"cwd\":\"/srv/work\",\"toolCallId\":\"t1\",\"terminalId\":\"term-1\"}";
+    var command_writer = json.Writer.init(&buffer);
+    try encodePermissionSubject(
+        try decodePermissionSubject(command_source, &scratch),
+        &command_writer,
+    );
+    try testing.expectEqualStrings(command_source, command_writer.written());
+
+    const bare = "{\"type\":\"command\",\"command\":\"ls\",\"cwd\":\"/w\"}";
+    var bare_writer = json.Writer.init(&buffer);
+    try encodePermissionSubject(try decodePermissionSubject(bare, &scratch), &bare_writer);
+    try testing.expectEqualStrings(bare, bare_writer.written());
+}
+
+test "a permission subject the decoder would refuse is not written" {
+    var buffer: [256]u8 = undefined;
+    var writer = json.Writer.init(&buffer);
+    // A relative `cwd` resolves against whatever working directory the
+    // process that runs the command happens to have, so the user approving a
+    // command in one directory would approve it in another. PROTOCOLS.md 6.6
+    // types the member `AbsolutePath` and `decodePermissionSubject` refuses
+    // the same value with `error.InvalidField`, so writing it would put a
+    // request on the wire that this library will not read back.
+    try testing.expectError(error.InvalidField, encodePermissionSubject(.{
+        .command = .{ .command = "rm -rf build", .cwd = "build" },
+    }, &writer));
+    try testing.expectError(error.InvalidField, encodePermissionSubject(.{
+        .command = .{ .command = "ls", .cwd = "./build" },
+    }, &writer));
+    // An empty path is not absolute either, and it is what a caller gets from
+    // a `CommandSubject` it filled in only partly.
+    try testing.expectError(error.InvalidField, encodePermissionSubject(.{
+        .command = .{ .command = "ls", .cwd = "" },
+    }, &writer));
+
+    // A `toolCall` that is not an object is a missing tool call wearing a
+    // key. The second case is the one a first-byte test would miss: a lexeme
+    // with a second value behind it splices a second document into the middle
+    // of the member, and the third is a lexeme the reader never finished.
+    try testing.expectError(error.InvalidField, encodePermissionSubject(.{
+        .tool_call = "null",
+    }, &writer));
+    try testing.expectError(error.InvalidField, encodePermissionSubject(.{
+        .tool_call = "",
+    }, &writer));
+    try testing.expectError(error.InvalidField, encodePermissionSubject(.{
+        .tool_call = "{\"toolCallId\":\"t1\"} {\"toolCallId\":\"t2\"}",
+    }, &writer));
+    try testing.expectError(error.InvalidField, encodePermissionSubject(.{
+        .tool_call = "{\"toolCallId\":\"t1\"",
+    }, &writer));
+
+    // The catch-all may not name a modelled arm. `type` selects the arm, so a
+    // tag naming one is a request for that arm without the members it needs,
+    // and it decodes as `error.MissingField`.
+    try testing.expectError(error.InvalidField, encodePermissionSubject(.{
+        .other = permission_subject_type.command,
+    }, &writer));
+    try testing.expectError(error.InvalidField, encodePermissionSubject(.{
+        .other = permission_subject_type.tool_call,
+    }, &writer));
+
+    // Nothing refused above reached the buffer, so a caller that sized it for
+    // the refusal is not holding the prefix of a document.
+    try testing.expectEqual(@as(usize, 0), writer.written().len);
+
+    // The one command this accepts is the one the existing body writer in
+    // `acp_session` also accepts, and the two write the same bytes.
+    var command_writer = json.Writer.init(&buffer);
+    try encodePermissionSubject(.{
+        .command = .{ .command = "ls", .cwd = "/srv/work" },
+    }, &command_writer);
+    try testing.expectEqualStrings(
+        "{\"type\":\"command\",\"command\":\"ls\",\"cwd\":\"/srv/work\"}",
+        command_writer.written(),
+    );
+}
+
+test "a permission request round-trips through the encoder" {
+    var scratch: [512]u8 = undefined;
+    var options: [2]PermissionOption = undefined;
+    var buffer: [512]u8 = undefined;
+    // v1 carries the tool call as a lexeme and no title, and every member
+    // comes back in the order the writer puts them, which is the order the
+    // decoder reads them in either.
+    const v1_source = "{\"sessionId\":\"s1\",\"toolCall\":{\"toolCallId\":\"t1\"}," ++
+        "\"options\":[{\"optionId\":\"a\",\"name\":\"Allow\",\"kind\":\"allow_once\"}," ++
+        "{\"optionId\":\"b\",\"name\":\"Deny\",\"kind\":\"reject_always\"}]}";
+    var v1_writer = json.Writer.init(&buffer);
+    try encodePermissionRequest(
+        try decodePermissionRequest(.stable, v1_source, &options, &scratch),
+        &v1_writer,
+    );
+    try testing.expectEqualStrings(v1_source, v1_writer.written());
+
+    // v2 requires a title, allows a subject, and refuses an empty choice list.
+    var draft_options: [1]PermissionOption = undefined;
+    const v2_source = "{\"sessionId\":\"s1\",\"title\":\"Run rm -rf\",\"description\":null," ++
+        "\"subject\":{\"type\":\"command\",\"command\":\"rm -rf build\",\"cwd\":\"/srv/work\"}," ++
+        "\"options\":[{\"optionId\":\"a\",\"name\":\"Run\",\"kind\":\"allow_once\"}]}";
+    var v2_writer = json.Writer.init(&buffer);
+    try encodePermissionRequest(
+        try decodePermissionRequest(.draft, v2_source, &draft_options, &scratch),
+        &v2_writer,
+    );
+    // An explicit `null` description is the absent case, so it is omitted
+    // rather than written, and the two agree by design.
+    try testing.expectEqualStrings(
+        "{\"sessionId\":\"s1\",\"title\":\"Run rm -rf\"," ++
+            "\"subject\":{\"type\":\"command\",\"command\":\"rm -rf build\"," ++
+            "\"cwd\":\"/srv/work\"}," ++
+            "\"options\":[{\"optionId\":\"a\",\"name\":\"Run\",\"kind\":\"allow_once\"}]}",
+        v2_writer.written(),
+    );
+
+    // And a v2 request with no subject and no description writes neither.
+    var bare_options: [1]PermissionOption = undefined;
+    const bare_source = "{\"sessionId\":\"s1\",\"title\":\"t\"," ++
+        "\"options\":[{\"optionId\":\"a\",\"name\":\"A\",\"kind\":\"reject_once\"}]}";
+    var bare_writer = json.Writer.init(&buffer);
+    try encodePermissionRequest(
+        try decodePermissionRequest(.draft, bare_source, &bare_options, &scratch),
+        &bare_writer,
+    );
+    try testing.expectEqualStrings(bare_source, bare_writer.written());
+}
+
+test "a permission request the decoder would refuse is not written" {
+    var buffer: [512]u8 = undefined;
+    var writer = json.Writer.init(&buffer);
+    const options = [_]PermissionOption{.{
+        .option_id = "a",
+        .name = "Allow",
+        .kind = .{ .known = .allow_once },
+    }};
+
+    // v1 declares a closed `oneOf` on `kind`, so a fifth value is undefined by
+    // the schema and `decodePermissionOptionKind` reports it rather than
+    // carrying it.
+    try testing.expectError(error.UnknownTag, encodePermissionRequest(.{
+        .stable = .{
+            .session_id = "s1",
+            .tool_call = "{}",
+            .options = &.{.{
+                .option_id = "a",
+                .name = "Allow",
+                .kind = .{ .other = "allow_later" },
+            }},
+        },
+    }, &writer));
+    // v2 names `minItems: 1`, so a request the user cannot answer is not one.
+    try testing.expectError(error.InvalidField, encodePermissionRequest(.{
+        .draft = .{
+            .session_id = "s1",
+            .title = "Run",
+            .description = null,
+            .subject = null,
+            .options = &.{},
+        },
+    }, &writer));
+    // A tool call that is not an object is a missing tool call wearing a key.
+    try testing.expectError(error.InvalidField, encodePermissionRequest(.{
+        .stable = .{ .session_id = "s1", .tool_call = "null", .options = &options },
+    }, &writer));
+    // The subject's rules reach the request. A relative `cwd` is the refusal
+    // this function and `acp_session` now share.
+    try testing.expectError(error.InvalidField, encodePermissionRequest(.{
+        .draft = .{
+            .session_id = "s1",
+            .title = "Run",
+            .description = null,
+            .subject = .{ .command = .{ .command = "ls", .cwd = "build" } },
+            .options = &options,
+        },
+    }, &writer));
+    // And so does a catch-all naming a modelled arm.
+    try testing.expectError(error.InvalidField, encodePermissionRequest(.{
+        .draft = .{
+            .session_id = "s1",
+            .title = "Run",
+            .description = null,
+            .subject = .{ .other = permission_subject_type.command },
+            .options = &options,
+        },
+    }, &writer));
+
+    // Nothing refused above reached the buffer, so a caller that sized it for
+    // the refusal is not holding the prefix of a document that reads as one.
+    try testing.expectEqual(@as(usize, 0), writer.written().len);
+
+    // v2's catch-all makes the same fifth kind a value, and its text is
+    // written as it arrived. This is the write the refused cases above sit
+    // either side of, so a caller can go on using the buffer afterwards.
+    var draft_writer = json.Writer.init(&buffer);
+    try encodePermissionRequest(.{
+        .draft = .{
+            .session_id = "s1",
+            .title = "Run",
+            .description = null,
+            .subject = null,
+            .options = &.{.{
+                .option_id = "a",
+                .name = "Allow",
+                .kind = .{ .other = "allow_later" },
+            }},
+        },
+    }, &draft_writer);
+    try testing.expectEqualStrings(
+        "{\"sessionId\":\"s1\",\"title\":\"Run\"," ++
+            "\"options\":[{\"optionId\":\"a\",\"name\":\"Allow\",\"kind\":\"allow_later\"}]}",
+        draft_writer.written(),
+    );
 }
 
 fn contains(set: []const []const u8, needle: []const u8) bool {
