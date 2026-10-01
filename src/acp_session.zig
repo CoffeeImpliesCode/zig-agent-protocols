@@ -2622,6 +2622,19 @@ const Endpoint = struct {
     /// The task that owns the endpoint hangs up itself, and the pump hangs up
     /// after it, so the two can both reach for the same stream.
     closed: bool = false,
+    /// Whether a task reads this endpoint, which [`open`] sets and [`adopt`]
+    /// does not.
+    ///
+    /// It decides who releases the descriptor: the pump when there is one,
+    /// because it is the only task that reads it, and the caller when there is
+    /// not. See [`hangUp`].
+    pumping: bool = false,
+    /// Whether the descriptor has been released.
+    ///
+    /// Read before every syscall on the stream, because a second `shutdown` on
+    /// a released descriptor is `EBADF`, and the standard library reports that
+    /// as a programmer bug by aborting the process.
+    released: bool = false,
 
     /// Take the stream and hand it to a connection over `Side`'s buffers.
     ///
@@ -2652,6 +2665,10 @@ const Endpoint = struct {
         if (orphan) |h| self.connection.setOrphanHandler(h);
         // Spawned on the group the test joins, because `Io.Group.async` does not
         // promise to run its task until the group is awaited or cancelled.
+        // Set before the spawn and not before the connection: an `init` that
+        // refused would leave no pump to release the descriptor, and the caller
+        // that hangs up on that path has to.
+        self.pumping = true;
         group.async(io, pump, .{self});
     }
 
@@ -2667,16 +2684,44 @@ const Endpoint = struct {
         self.writer = Io.net.Stream.Writer.init(stream, io, &self.writer_buffer);
     }
 
-    /// Hang up, and release the descriptor once.
+    /// Hang up: stop the reader, wake it, and let the descriptor go once.
     ///
     /// `shutdown` before `close`: closing a descriptor does not interrupt a read
     /// already blocked on it, so the peer's pump would sit on an open
-    /// description and the group would never finish. The flag is the guard: the
-    /// endpoint's own task hangs up and then waits for the group, so the pump
-    /// must not close a descriptor that task already released.
+    /// description and the group would never finish.
+    ///
+    /// Who closes the descriptor depends on whether anything reads it, and the
+    /// pump is the only task that may when there is one. `conn.pump` asks again
+    /// after a read of zero bytes, and a local `shutdown` makes the next read
+    /// return exactly that, so a caller that released the descriptor under a
+    /// live pump would have that pump read a freed descriptor: the standard
+    /// library aborts on `EBADF` inside `netReadPosix`, before the pump's own
+    /// `catch` can see an error, and the whole test binary dies instead of the
+    /// test failing. Telling the connection first is what makes the loop stop —
+    /// the pump leaves at its next turn and closes the stream on its way out,
+    /// after the last read that can touch it.
+    ///
+    /// An endpoint opened with [`adopt`] has no pump, so nothing else would
+    /// release the descriptor and this call does.
     fn hangUp(self: *Endpoint, io: Io) void {
         if (self.closed) return;
         self.closed = true;
+        // Every call below is a syscall on the descriptor, and a `shutdown` on
+        // a released one is `EBADF`, which aborts the process rather than
+        // returning. A pump that already let it go is the end of this.
+        if (self.released) return;
+        if (self.pumping) {
+            self.connection.close();
+            self.stream.shutdown(io, .both) catch {};
+            return;
+        }
+        self.release(io);
+    }
+
+    /// Release the descriptor once, and only on a stream that still has one.
+    fn release(self: *Endpoint, io: Io) void {
+        if (self.released) return;
+        self.released = true;
         self.stream.shutdown(io, .both) catch {};
         self.stream.close(io);
     }
@@ -2687,11 +2732,12 @@ const Endpoint = struct {
     /// to the process at exit is one the peer has nothing to shut down: in the
     /// permission exchange the serving side hangs up and then waits for the
     /// group, so a pump that only returned would leave the group waiting on a
-    /// descriptor nobody had released. `hangUp` is idempotent, so an endpoint
-    /// whose task already hung up is not closed twice.
+    /// descriptor nobody had released. `release` is idempotent, so a descriptor
+    /// a `hangUp` already let go of is not closed twice, and this is the only
+    /// caller that closes one after the last read that could touch it.
     fn pump(self: *Endpoint) void {
         self.connection.pump();
-        self.hangUp(self.connection.io);
+        self.release(self.connection.io);
     }
 };
 
@@ -2882,7 +2928,7 @@ test "a client negotiates and gates against an agent over a real socket" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var path_buffer: [128]u8 = undefined;
+    var path_buffer: [Io.net.UnixAddress.max_len]u8 = undefined;
     var address = try listenOn(io, &path_buffer, 0x5eed_0101);
     defer address.server.deinit(io);
     defer std.Io.Dir.cwd().deleteFile(io, address.path) catch {};
@@ -2939,7 +2985,7 @@ test "an agent reads a permission outcome a client returned over a real socket" 
     defer threaded.deinit();
     const io = threaded.io();
 
-    var path_buffer: [128]u8 = undefined;
+    var path_buffer: [Io.net.UnixAddress.max_len]u8 = undefined;
     var address = try listenOn(io, &path_buffer, 0x5eed_0102);
     defer address.server.deinit(io);
     defer std.Io.Dir.cwd().deleteFile(io, address.path) catch {};
@@ -2990,7 +3036,7 @@ test "a peer running this library is told of a refusal it sent with a null id" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var path_buffer: [128]u8 = undefined;
+    var path_buffer: [Io.net.UnixAddress.max_len]u8 = undefined;
     var address = try listenOn(io, &path_buffer, 0x5eed_0103);
     defer address.server.deinit(io);
     defer std.Io.Dir.cwd().deleteFile(io, address.path) catch {};
@@ -3041,11 +3087,29 @@ const Socket = struct {
     path: []const u8,
 };
 
+/// The pid is in the name so that two runs of this file never share a socket.
+/// A fixed name is a rendezvous point: whichever run reaches the unlink second
+/// deletes the other's bound path, the client then connects to nothing, and the
+/// loser of the race aborts in a pump with `BADF` on a socket file that is gone.
+/// It reads as a protocol fault and is not one. The examples already carry the
+/// pid for the same reason, and this is that mechanism rather than a second one.
+///
+/// The path is built once and handed back in [`Socket.path`], and
+/// [`Socket.address`] is the address the client connects to, so the two halves
+/// of a test cannot disagree about which socket they mean.
+///
+/// `path_buffer` is sized from `Io.net.UnixAddress.max_len` rather than a round
+/// number, because that is the one length that fails: `UnixAddress.init`
+/// refuses a longer name with `error.NameTooLong`, which a test reads as a peer
+/// that never connected. Sized this way a constant that grew past the limit
+/// fails at the format instead, and the widest name this renders — a pid at the
+/// full width of a `pid_t` and a full-width tag — is 57 bytes against the 108
+/// `sockaddr_un.sun_path` allows.
 fn listenOn(io: Io, path_buffer: []u8, tag: u64) !Socket {
     const path = try std.fmt.bufPrint(
         path_buffer,
-        "/tmp/zig-agent-proto-acp-session-{x}.sock",
-        .{tag},
+        "/tmp/zig-agent-proto-acp-session-{d}-{x}.sock",
+        .{ std.os.linux.getpid(), tag },
     );
     // A socket file left by a killed run would make `listen` fail.
     std.Io.Dir.cwd().deleteFile(io, path) catch {};

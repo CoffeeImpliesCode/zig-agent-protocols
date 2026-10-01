@@ -19,10 +19,14 @@
 //! - **The binding is MCP `2026-07-28` only.** It does not emulate earlier
 //!   revisions and performs no MCP handshake, so a caller pinned to another
 //!   revision is refused here rather than downstream. The same pin fixes the
-//!   method inventory: [`Client.call`] resolves its `method_name` through
-//!   [`mcp.lookupMethod`] before it hands the envelope to the connection,
-//!   which is the call `mcp_session.Client.request` makes, so a name
-//!   `2026-07-28` removed as a top-level request never reaches the wire.
+//!   method inventory: [`Client.call`] puts its `method_name` through
+//!   [`mcp_session.requestMethod`] — the name resolves on the bound revision
+//!   through [`mcp.lookupMethod`], it is a request rather than a
+//!   notification, and it travels from a client to a server — before it hands
+//!   the envelope to the connection. That gate is the MCP session layer's own
+//!   and is called rather than restated, so a name `2026-07-28` removed as a
+//!   top-level request never reaches the wire, and neither does one that is no
+//!   request this agent may send.
 //!
 //! ## Both directions
 //!
@@ -38,12 +42,13 @@ const conn = @import("conn.zig");
 const json = @import("json.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const mcp = @import("mcp.zig");
+const mcp_session = @import("mcp_session.zig");
 const root = @import("root.zig");
 const Io = std.Io;
 
 /// What a call, a served request or an outcome read can return here.
 ///
-/// The five members below are this binding's own. The rest belong to the
+/// The six members below are this binding's own. The rest belong to the
 /// codec and to the connection, which this file does not redefine, so an
 /// `error.InvalidField` off [`Client.call`] says the envelope the caller
 /// handed over is one this binding cannot carry: it is refused here, before
@@ -57,10 +62,13 @@ pub const Error = error{
     ///
     /// PROTOCOLS.md 4.4 removes `initialize`, `roots/list`,
     /// `sampling/createMessage` and `elicitation/create` as top-level
-    /// requests, and [`mcp.lookupMethod`] refuses every one of them. The same
-    /// call `mcp_session.Client.request` makes on the same revision, so the
-    /// binding and the MCP session layer cannot drift into two answers to one
-    /// question.
+    /// requests, and [`mcp.lookupMethod`] refuses every one of them. It is the
+    /// first of the three checks [`mcp_session.requestMethod`] makes on the same
+    /// revision, and this binding calls that function rather than writing the
+    /// check again, so the binding and the MCP session layer cannot drift into
+    /// two answers to one question; a name that resolves and is still no
+    /// request this agent may send is `NotARequest`, and the two are apart
+    /// because the caller's repair differs.
     ///
     /// Reported here rather than left to the peer's inner `-32601`, because
     /// the caller can fix it without a round trip and because the other end of
@@ -70,6 +78,36 @@ pub const Error = error{
     /// belongs to the resolver, and only the client side knows it before a
     /// byte is sent.
     MethodNotInRevision,
+    /// The inner MCP method is not a request this agent may send, so it was not
+    /// sent.
+    ///
+    /// PROTOCOLS.md 7 gives an agent-to-provider request one job: it invokes one
+    /// MCP operation. A notification invokes nothing, and a method the server
+    /// sends travels the other way, so neither is what an envelope of this
+    /// direction carries — and [`mcp.lookupMethod`] resolves both as readily
+    /// as it resolves `tools/call`, because it walks the request table and the
+    /// notification table alike, so the pin alone does not refuse either.
+    /// `notifications/cancelled` is the sharpest case: it is bidirectional, so
+    /// a reader of the inventory alone sees a method this side may send.
+    ///
+    /// A notification sent as a request leaves the caller waiting inside
+    /// `connection.call` for an answer no conforming provider sends, because
+    /// PROTOCOLS.md 7 makes the provider-to-agent direction carry
+    /// notifications and `bridge.decodeEnvelope` does not refuse one. The
+    /// second is refused wherever it appears: `notifications/progress` and the
+    /// six other server-to-client notifications are the provider's to send,
+    /// not this side's to call.
+    ///
+    /// Reported here rather than left to the peer because the caller can fix it
+    /// without a round trip, and apart from `MethodNotInRevision` because the
+    /// two repairs differ. A removed name is a method again at another
+    /// revision; a notification never is a request at any revision, so a caller
+    /// that read this error as "not here, try there" would be told to send a
+    /// name no revision turns into one. Both members are spelled the way
+    /// `mcp_session.GateError` spells them, and they arrive here unchanged,
+    /// because the gate that raises them is the MCP session layer's own and
+    /// both names are already in this set: widening, not renaming.
+    NotARequest,
     /// The peer refused this call with an outer error. Every outer refusal
     /// arrives this way whatever the code, because the connection is alive and
     /// carries the next call, and `refusal` says which refusal it was.
@@ -170,9 +208,18 @@ pub const Client = struct {
     /// entitled to; the round trip buys nothing, and the frame is one the
     /// other end of this same library refuses to answer.
     ///
-    /// The two refusals are ordered the way their faults are: an envelope the
+    /// A method the bound revision carries that is not a request this agent may
+    /// send is refused here as `error.NotARequest`, before the same line and on
+    /// the same terms: a notification, and a method the server sends rather
+    /// than the client. PROTOCOLS.md 7 gives this direction one job, invoking
+    /// one MCP operation, and neither of them invokes one. A notification sent
+    /// as a request has no answer coming back at all, so the caller would sit
+    /// in `connection.call` waiting for one no conforming provider sends.
+    ///
+    /// The three refusals are ordered the way their faults are: an envelope the
     /// binding cannot carry is condemned first, and an empty `method_name` is
-    /// that fault rather than a method this revision removed.
+    /// that fault rather than a method this revision removed or a method this
+    /// agent may not send.
     pub fn call(
         self: *Client,
         server_id: []const u8,
@@ -203,24 +250,22 @@ pub const Client = struct {
         }, &writer);
         const body = writer.written();
         // One rule for what a method may be, and it is the rule
-        // `mcp_session.Client.request` reaches for on the same revision, so the
+        // `mcp_session.Client.request` reaches for on the same revision —
+        // [`mcp_session.requestMethod`] itself, not a copy of it, so the
         // binding and the MCP session layer cannot drift into two answers to
-        // one question. `self.revision` is `.current` here: the check above
-        // refused every other value, which is what makes this
-        // `mcp.lookupMethod(.current, method_name)`.
+        // one question. The two refusals arrive unchanged: the gate raises
+        // `mcp_session.GateError`, and both names are already in this file's
+        // own `Error`, so widening absorbs the pair and renames nothing.
+        // `self.revision` is `.current` here: the check above refused every
+        // other value, which is what makes this the current revision's lookup.
         //
         // After the encoder rather than before it, because the encoder owns
         // the rule that a member is non-empty and an empty `method_name` is
-        // that fault rather than this one. Running it first would report a
-        // bad envelope as a method this revision does not carry, which is the
-        // second fault of a call the first already condemned.
-        //
-        // `lookupMethod` walks comptime tables and compares names, so it reads
-        // no caller buffer and no member of `DecodeError` but `UnknownMethod`
-        // can reach here. Collapsing the catch reports the refusal rather than
-        // unwrapping a path that cannot happen into a panic.
-        _ = mcp.lookupMethod(self.revision, method_name) catch
-            return error.MethodNotInRevision;
+        // that fault rather than either of the two this reports. Running it
+        // first would report a bad envelope as a method this revision does not
+        // carry, which is the second fault of a call the first already
+        // condemned.
+        _ = try mcp_session.requestMethod(self.revision, method_name);
 
         const answer = try self.connection.call(method, body, inner, out);
         if (answer.error_code) |code| {
@@ -886,6 +931,69 @@ test "a method removed at 2026-07-28 is refused before a byte is written" {
     ));
 }
 
+test "a notification is refused before a byte is written" {
+    // PROTOCOLS.md 7 gives an agent-to-provider request one job: it invokes one
+    // MCP operation. All eight names in `mcp.notifications` resolve at
+    // `2026-07-28`, because `mcp.lookupMethod` walks the request table and the
+    // notification table alike, so the pin alone does not refuse one.
+    // `notifications/cancelled` is the sharpest of the eight: it is
+    // bidirectional, so a reader of the inventory alone sees a method this side
+    // may send. The other seven are the provider's to send and never this
+    // client's to call.
+    //
+    // The transport is the one the removed-method test above uses, so a call
+    // that reached the connection would report `error.Transport` instead. What
+    // would come back is nothing at all: PROTOCOLS.md 7 makes the
+    // provider-to-agent direction carry notifications, so a conforming
+    // provider reads this frame as a message it must not answer and
+    // `bridge.decodeEnvelope` does not refuse it either, and the caller sits in
+    // `connection.call` waiting for an answer that never comes.
+    //
+    // `error.NotARequest` and not `error.MethodNotInRevision`: one gate raises
+    // both, and only one of the two names says the revision removed the name.
+    // Every name here is one `2026-07-28` carries, so a caller switching on the
+    // error to decide whether to retry at another revision would be told to
+    // send something that is still no request there.
+    var side: Side = .{};
+    var inner: [256]u8 = undefined;
+    var out: [512]u8 = undefined;
+    var envelope: [256]u8 = undefined;
+    var transport: DeadTransport = .{ .reader = Io.Reader.fixed("") };
+    var connection = try transport.connection(&side);
+    var client = Client.init(&connection);
+
+    for (mcp.notifications) |notification| {
+        try testing.expectError(error.NotARequest, client.call(
+            "project-tools:7a72",
+            "req-1",
+            notification.name,
+            "{\"requestId\":1,\"reason\":\"cancelled\"}",
+            &inner,
+            &out,
+            &envelope,
+        ));
+    }
+    // Nothing was framed across the eight and no id moved, so the connection
+    // was never asked: there is no frame a peer could answer and no slot held
+    // while the caller waits. And no refusal is recorded, because the peer
+    // refused nothing.
+    try testing.expectEqual(@as(usize, 0), connection.lastEncodedLen());
+    try testing.expectEqual(@as(i64, 1), connection.nextId());
+    try testing.expect(client.refusal == null);
+
+    // A request the revision does carry still goes out, so the gate is the
+    // arity and the direction and not a closed client.
+    try testing.expectError(error.Transport, client.call(
+        "project-tools:7a72",
+        "req-2",
+        "tools/list",
+        null,
+        &inner,
+        &out,
+        &envelope,
+    ));
+}
+
 test "a carried result is a success, not a failure" {
     var scratch: [256]u8 = undefined;
     const outcome = try classifyOutcome(
@@ -1056,7 +1164,7 @@ test "the binding carries both outcomes and two refusals over a real socket" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var path_buffer: [128]u8 = undefined;
+    var path_buffer: [Io.net.UnixAddress.max_len]u8 = undefined;
     var address = try listenOn(io, &path_buffer, 0x5eed_0201);
     // Unlinked after the listener closes, not before: a path removed while
     // the server is still bound can no longer be connected to.
@@ -1147,7 +1255,7 @@ test "a provider answers each carried request on the side its failure belongs to
     defer threaded.deinit();
     const io = threaded.io();
 
-    var path_buffer: [128]u8 = undefined;
+    var path_buffer: [Io.net.UnixAddress.max_len]u8 = undefined;
     var address = try listenOn(io, &path_buffer, 0x5eed_0202);
     defer std.Io.Dir.cwd().deleteFile(io, address.path) catch {};
     defer address.server.deinit(io);
@@ -1341,11 +1449,29 @@ const Socket = struct {
     path: []const u8,
 };
 
+/// The pid is in the name so that two runs of this file never share a socket.
+/// A fixed name is a rendezvous point: whichever run reaches the unlink second
+/// deletes the other's bound path, the client then connects to nothing, and the
+/// loser of the race aborts in a pump with `BADF` on a socket file that is gone.
+/// It reads as a protocol fault and is not one. The examples already carry the
+/// pid for the same reason, and this is that mechanism rather than a second one.
+///
+/// The path is built once and handed back in [`Socket.path`], and
+/// [`Socket.address`] is the address the client connects to, so the two halves
+/// of a test cannot disagree about which socket they mean.
+///
+/// `path_buffer` is sized from `Io.net.UnixAddress.max_len` rather than a round
+/// number, because that is the one length that fails: `UnixAddress.init`
+/// refuses a longer name with `error.NameTooLong`, which a test reads as a peer
+/// that never connected. Sized this way a constant that grew past the limit
+/// fails at the format instead, and the widest name this renders — a pid at the
+/// full width of a `pid_t` and a full-width tag — is 60 bytes against the 108
+/// `sockaddr_un.sun_path` allows.
 fn listenOn(io: Io, path_buffer: []u8, tag: u64) !Socket {
     const path = try std.fmt.bufPrint(
         path_buffer,
-        "/tmp/zig-agent-proto-bridge-session-{x}.sock",
-        .{tag},
+        "/tmp/zig-agent-proto-bridge-session-{d}-{x}.sock",
+        .{ std.os.linux.getpid(), tag },
     );
     // A socket file left by a killed run would make `listen` fail.
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
@@ -2114,9 +2240,17 @@ const Endpoint = struct {
     writer: Io.net.Stream.Writer = undefined,
     stream: Io.net.Stream = undefined,
     connection: conn.Conn = undefined,
-    /// Set once this side's descriptor is closed, by `hangUp` or by the pump,
-    /// so neither path closes it twice.
+    /// Set once this side's descriptor is closed, whichever path reaches
+    /// `release` first, so neither closes it twice.
     released: bool = false,
+    /// Whether this endpoint has been hung up already.
+    closed: bool = false,
+    /// Whether a task reads this endpoint, which `open` sets before it spawns
+    /// the pump.
+    ///
+    /// It decides who releases the descriptor: the pump when there is one,
+    /// because it is the only task that reads it. See `hangUp`.
+    pumping: bool = false,
 
     /// Open a side over `stream`, or report why there is no connection to
     /// open.
@@ -2148,13 +2282,50 @@ const Endpoint = struct {
         if (handler) |h| self.connection.setHandler(h);
         // Spawned on the group the test joins, because `Io.Group.async` does
         // not promise to run its task until the group is awaited or cancelled.
+        // Set before the spawn and not before the connection: an `init` that
+        // refused has already released the descriptor above, and no pump will
+        // run for it.
+        self.pumping = true;
         group.async(io, Endpoint.pump, .{self});
     }
 
-    /// Hang up. `shutdown` before `close`: closing a descriptor does not
-    /// interrupt a read already blocked on it, so the peer's pump would sit on
-    /// an open description and the group would never finish.
+    /// Hang up: stop the reader, wake it, and let the descriptor go once.
+    ///
+    /// `shutdown` before `close`: closing a descriptor does not interrupt a read
+    /// already blocked on it, so the peer's pump would sit on an open
+    /// description and the group would never finish.
+    ///
+    /// Who closes the descriptor depends on whether anything reads it, and the
+    /// pump is the only task that may when there is one. `conn.pump` asks again
+    /// after a read of zero bytes, and a local `shutdown` makes the next read
+    /// return exactly that, so a caller that released the descriptor under a
+    /// live pump would have that pump read a freed descriptor: the standard
+    /// library aborts on `EBADF` inside `netReadPosix`, before the pump's own
+    /// `catch` can see an error, and the whole test binary dies instead of the
+    /// test failing. Telling the connection first is what makes the loop stop —
+    /// the pump leaves at its next turn and closes the stream on its way out,
+    /// after the last read that can touch it.
+    ///
+    /// The guards are what make the several callers safe: a task hangs up, the
+    /// pump releases on its way out, and a failed `init` hangs up on a stream
+    /// that has no connection at all. Releasing the same descriptor twice would
+    /// close an unrelated one the process had opened in the meantime, and every
+    /// call below is a syscall on it.
     fn hangUp(self: *Endpoint, io: Io) void {
+        if (self.closed) return;
+        self.closed = true;
+        if (self.released) return;
+        if (self.pumping) {
+            self.connection.close();
+            self.stream.shutdown(io, .both) catch {};
+            return;
+        }
+        self.release(io);
+    }
+
+    /// Release the descriptor once, and only on a stream that still has one.
+    fn release(self: *Endpoint, io: Io) void {
+        if (self.released) return;
         self.released = true;
         self.stream.shutdown(io, .both) catch {};
         self.stream.close(io);
@@ -2163,14 +2334,12 @@ const Endpoint = struct {
     /// Pump until the peer hangs up, then release the descriptor.
     ///
     /// The accepted side has no caller to hang up on its behalf, so nothing
-    /// else closes it and the process would release it at exit instead. Close
-    /// alone is right here, because the read has already returned and no
-    /// reader is left blocked on it. A descriptor `hangUp` released is left
-    /// alone, because that path closed it already.
+    /// else closes it and the process would release it at exit instead. This
+    /// is the only caller that closes a descriptor after the last read that
+    /// could touch it; a descriptor `hangUp` released is left alone, because
+    /// that path let it go already.
     fn pump(self: *Endpoint) void {
         self.connection.pump();
-        if (self.released) return;
-        self.released = true;
-        self.stream.close(self.connection.io);
+        self.release(self.connection.io);
     }
 };

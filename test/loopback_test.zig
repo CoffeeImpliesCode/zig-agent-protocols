@@ -146,18 +146,22 @@ const Endpoint = struct {
     writer: Io.net.Stream.Writer = undefined,
     stream: Io.net.Stream = undefined,
     connection: conn.Conn = undefined,
-    /// Set on the accepted side, which has no caller left to close its stream.
-    /// Its reader closes the stream as it returns, so a test that waits for
-    /// end of file does not also need the process to exit to release the
-    /// descriptor.
-    close_on_end_of_stream: bool = false,
+    /// Whether this endpoint has been hung up already.
+    closed: bool = false,
+    /// Whether a task reads this endpoint, which `open` sets.
+    ///
+    /// It decides who releases the descriptor: the pump, because it is the only
+    /// task that reads it. See `hangUp`.
+    pumping: bool = false,
+    /// Whether the descriptor has been released.
+    released: bool = false,
 
     /// Start the connection and spawn its reader on `group`.
     ///
     /// A wiring fault is `init`'s to report and this function's to return: the
     /// refusal comes before the slot table is cleared, so a refused `open`
     /// leaves the caller's slots as they were handed over. The stream is
-    /// closed on the way out, because the reader that would have released it
+    /// released on the way out, because the reader that would have released it
     /// is never started and the peer would otherwise wait on a connection that
     /// was never made.
     fn open(
@@ -168,7 +172,7 @@ const Endpoint = struct {
         handler: ?conn.Handler,
     ) conn.Error!void {
         self.stream = stream;
-        errdefer stream.close(io);
+        errdefer self.release(io);
         self.reader = Io.net.Stream.Reader.init(stream, io, &self.reader_buffer);
         self.writer = Io.net.Stream.Writer.init(stream, io, &self.writer_buffer);
         self.connection = try conn.Conn.init(io, &self.reader.interface, &self.writer.interface, .{
@@ -178,19 +182,90 @@ const Endpoint = struct {
             .answer = &self.side.answer,
         });
         if (handler) |h| self.connection.setHandler(h);
+        // Set before the spawn and not before the connection: an `init` that
+        // refused has already released the descriptor above, and no pump will
+        // run for it.
+        self.pumping = true;
         group.async(io, Endpoint.pump, .{self});
     }
 
-    /// Read until the transport ends, then release the stream if this side is
-    /// the one that closes it.
+    /// Hang up: stop the reader, wake it, and let the descriptor go once.
+    ///
+    /// `shutdown` before `close`: closing a descriptor does not interrupt a read
+    /// already blocked on it, so the peer's pump would sit on an open
+    /// description and the group would never finish. That is a transport
+    /// contract, not a detail of this test.
+    ///
+    /// The pump releases the descriptor, not this call. `conn.pump` asks again
+    /// after a read of zero bytes, and a local `shutdown` makes the next read
+    /// return exactly that, so a caller that released the descriptor under a
+    /// live pump would have that pump read a freed descriptor: the standard
+    /// library aborts on `EBADF` inside `netReadPosix`, before the pump's own
+    /// `catch` can see an error, and the whole test binary dies instead of the
+    /// test failing. Telling the connection first is what makes the loop stop —
+    /// the pump leaves at its next turn and closes the stream on its way out,
+    /// after the last read that can touch it.
+    fn hangUp(self: *Endpoint, io: Io) void {
+        if (self.closed) return;
+        self.closed = true;
+        // Every call below is a syscall on the descriptor, and a `shutdown` on
+        // a released one is `EBADF`, which aborts the process rather than
+        // returning.
+        if (self.released) return;
+        if (self.pumping) {
+            self.connection.close();
+            self.stream.shutdown(io, .both) catch {};
+            return;
+        }
+        self.release(io);
+    }
+
+    /// Release the descriptor once, and only on a stream that still has one.
+    fn release(self: *Endpoint, io: Io) void {
+        if (self.released) return;
+        self.released = true;
+        self.stream.shutdown(io, .both) catch {};
+        self.stream.close(io);
+    }
+
+    /// Read until the transport ends, then release the stream.
+    ///
+    /// Every endpoint here is read by its own pump and no other task may
+    /// release the descriptor, so both sides close it here: the accepted side
+    /// has no caller left to do it, and the calling side hangs up first and
+    /// lets this close happen after the read that would touch the descriptor
+    /// has returned. A test that waits for end of file therefore does not also
+    /// need the process to exit to release the descriptor.
     fn pump(self: *Endpoint) void {
         self.connection.pump();
-        if (self.close_on_end_of_stream) self.stream.close(self.connection.io);
+        self.release(self.connection.io);
     }
 };
 
+/// The pid is in the name so that two runs of this file never share a socket.
+/// A fixed name is a rendezvous point: whichever run reaches the unlink second
+/// deletes the other's bound path, the client then connects to nothing, and the
+/// loser of the race aborts in a pump with `BADF` on a socket file that is gone.
+/// It reads as a transport fault and is not one. The examples already carry the
+/// pid for the same reason, and this is that mechanism rather than a second one.
+///
+/// Each test calls this once and hands the result to both halves — the listener
+/// is built from `path` and the client connects to the `Io.net.UnixAddress` made
+/// from the same `path` — so the server and the client cannot disagree about
+/// which socket they mean.
+///
+/// The buffer is sized from `Io.net.UnixAddress.max_len` rather than a round
+/// number, because that is the one length that fails: `UnixAddress.init`
+/// refuses a longer name with `error.NameTooLong`, which a test reads as a peer
+/// that never connected. Sized this way a constant that grew past the limit
+/// fails at the format instead, and the widest name this renders — a pid at the
+/// full width of a `pid_t` and a full-width tag — is 50 bytes against the 108
+/// `sockaddr_un.sun_path` allows.
 fn socketPath(buffer: []u8, id: u64) ![]const u8 {
-    return std.fmt.bufPrint(buffer, "/tmp/zig-agent-proto-test-{x}.sock", .{id});
+    return std.fmt.bufPrint(buffer, "/tmp/zig-agent-proto-test-{d}-{x}.sock", .{
+        std.os.linux.getpid(),
+        id,
+    });
 }
 
 /// What the client task leaves for the test, and how much of each encode
@@ -215,7 +290,7 @@ test "each answer is matched to its own call over a real socket" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var path_buffer: [128]u8 = undefined;
+    var path_buffer: [Io.net.UnixAddress.max_len]u8 = undefined;
     const path = try socketPath(&path_buffer, 0x5eed_0001);
     // A socket file left by a killed run would make listen fail.
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
@@ -247,11 +322,10 @@ test "each answer is matched to its own call over a real socket" {
                 self.failed.* = true;
                 return;
             };
-            // The accepted side has no caller left to close it, so its reader
-            // closes it when the client hangs up.
-            self.endpoint.close_on_end_of_stream = true;
+            // The accepted side has no caller left to close it, so its own
+            // reader releases the descriptor when the client hangs up.
             // A refused `open` leaves no connection, so the flag is the whole
-            // report; the stream has already been closed by `open` itself.
+            // report; the stream has already been released by `open` itself.
             self.endpoint.open(self.io, self.group, stream, self.handler) catch {
                 self.failed.* = true;
                 return;
@@ -341,9 +415,10 @@ test "each answer is matched to its own call over a real socket" {
             // descriptor does not interrupt a `read` already blocked on it:
             // the reader would sit on an open file description forever and
             // the group would never finish. A transport must unblock its
-            // peers this way, so it is part of the contract, not a detail.
-            self.endpoint.stream.shutdown(self.io, .both) catch {};
-            self.endpoint.stream.close(self.io);
+            // peers this way, so it is part of the contract, not a detail —
+            // and the descriptor itself is released by this endpoint's own
+            // pump, which is the only task reading it.
+            self.endpoint.hangUp(self.io);
         }
     };
 
@@ -434,7 +509,7 @@ test "a peer error answer is reported as an error, not as a result" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var path_buffer: [128]u8 = undefined;
+    var path_buffer: [Io.net.UnixAddress.max_len]u8 = undefined;
     const path = try socketPath(&path_buffer, 0x5eed_0002);
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
@@ -462,9 +537,8 @@ test "a peer error answer is reported as an error, not as a result" {
                 self.failed.* = true;
                 return;
             };
-            // The accepted side has no caller left to close it, so its reader
-            // closes it when the client hangs up.
-            self.endpoint.close_on_end_of_stream = true;
+            // The accepted side has no caller left to close it, so its own
+            // reader releases the descriptor when the client hangs up.
             self.endpoint.open(self.io, self.group, stream, .{ .call = errorReply }) catch {
                 self.failed.* = true;
                 return;
@@ -498,10 +572,11 @@ test "a peer error answer is reported as an error, not as a result" {
                 self.failed.* = true;
                 return;
             };
-            // Shutdown before close, for the reason given in the first test:
-            // closing does not interrupt a read already blocked on the fd.
-            self.endpoint.stream.shutdown(self.io, .both) catch {};
-            self.endpoint.stream.close(self.io);
+            // Hang up, for the reason given in the first test: closing does
+            // not interrupt a read already blocked on the fd, so the shutdown
+            // comes first and the pump releases the descriptor after its last
+            // read.
+            self.endpoint.hangUp(self.io);
         }
     };
 

@@ -518,13 +518,43 @@ fn writeDecimal(writer: *json.Writer, value: u64) root.EncodeError!void {
     try writer.slice(digits[at..]);
 }
 
+/// What [`requestMethod`] can refuse, and nothing else.
+///
+/// Declared apart from [`Error`] on purpose. `Error` is `mcp.ResultError` plus
+/// every fault a codec raises plus every fault `conn` can raise, and a layer
+/// that gates a method and nothing else would have to adopt all of it: it
+/// would owe its own callers `BufferTooSmall` and `NotANotification`, which
+/// are about a buffer and about a notification, and which no refusal of a
+/// request can be.
+///
+/// Both members are in this file's [`Error`] and in `bridge_session.Error`,
+/// which is what lets every layer absorb the pair by widening rather than by
+/// mapping: a caller gating a method carries these two names and keeps its own
+/// vocabulary around them, and neither file renames the other's fault.
+pub const GateError = error{
+    MethodNotInRevision,
+    NotARequest,
+};
+
 /// The pinned revision's entry for a request this side may send.
 ///
 /// A name the revision does not have is `MethodNotInRevision`; a name it has
 /// that is not a request is `NotARequest`. The two are apart because the
 /// caller's repair differs: a removed name is a method again at the other
 /// revision, and a notification never is one at any revision.
-fn requestMethod(revision: mcp.Revision, method: []const u8) Error!mcp.MethodInfo {
+///
+/// Published because the `mcp-over-acp` binding gates the inner method of every
+/// call it carries through this and not through a copy of it. The two answer
+/// one question — may this name go on the wire as a request this side sends —
+/// and a rule stated twice is answered twice: that shape is what four audit
+/// waves of this repository found and four repairs settled, and a gate whose
+/// two copies disagree lets a name through that neither side meant to send.
+/// This is the same move [`conn.overlaps`] made: one published function, called
+/// from every layer that needs the answer, with no second definition left
+/// anywhere to disagree with it. The refusals reach the binding unchanged
+/// because the set is [`GateError`], which every caller's own error set already
+/// contains.
+pub fn requestMethod(revision: mcp.Revision, method: []const u8) GateError!mcp.MethodInfo {
     const info = mcp.lookupMethod(revision, method) catch return error.MethodNotInRevision;
     // The arity, first. `mcp.lookupMethod` searches the request table and the
     // notification table alike, so a notification resolves as readily as a
@@ -1376,9 +1406,18 @@ test "an interim result is written only for a method PROTOCOLS.md 4.7 allows" {
             "\"requestState\":\"st\"}",
         body,
     );
+    // The store is measured from the document rather than guessed at, on the
+    // rule a caller has to apply: the shortest member this shape does not
+    // model is `"a":0`, five bytes, and every one but the last spends a comma
+    // on its separator, so a document of `n` bytes holds at most
+    // `(n + 1) / 6` of them. The wider of the two documents this test decodes
+    // is 111 bytes, so 19 slots is every vendor member a body that long could
+    // carry; neither body here has one, and a store with no room left is
+    // `error.BufferTooSmall` rather than a silent drop.
+    var verbatim: [19]mcp.VerbatimMember = undefined;
     // The body the server writes is the one the client half reads, so the two
     // halves agree on what an interim result is.
-    const decoded = try mcp.decodeInputRequiredResult(body, &scratch);
+    const decoded = try mcp.decodeInputRequiredResult(body, &verbatim, &scratch);
     try testing.expectEqualStrings(requests, decoded.input_requests.?);
     try testing.expectEqualStrings("st", decoded.request_state.?);
     try testing.expectEqual(mcp.KnownResultType.input_required, decoded.result_type.known().?);
@@ -1395,8 +1434,13 @@ test "an interim result is written only for a method PROTOCOLS.md 4.7 allows" {
     // the server meant to send.
     const awkward_state = "a\"b\\c";
     var escaped: [512]u8 = undefined;
+    // A fresh store for the second document rather than a reset of the first:
+    // regions are handed out in arrival order and never recycled, so reusing
+    // one would have the first document's members overwritten by the second's.
+    var verbatim_again: [19]mcp.VerbatimMember = undefined;
     const read_back = try mcp.decodeInputRequiredResult(
         try mcp.inputRequired("resources/read", requests, awkward_state, &escaped),
+        &verbatim_again,
         &scratch,
     );
     try testing.expectEqualStrings(awkward_state, read_back.request_state.?);
@@ -1525,6 +1569,15 @@ const Endpoint = struct {
     writer: Io.net.Stream.Writer = undefined,
     stream: Io.net.Stream = undefined,
     connection: conn.Conn = undefined,
+    /// Whether this endpoint has been hung up already.
+    closed: bool = false,
+    /// Whether a task reads this endpoint, which [`open`] sets.
+    ///
+    /// It decides who releases the descriptor: the pump, because it is the only
+    /// task that reads it, whenever there is one. See [`hangUp`].
+    pumping: bool = false,
+    /// Whether the descriptor has been released.
+    released: bool = false,
 
     /// Hand the endpoint its connection, or the reason it cannot have one.
     ///
@@ -1551,20 +1604,66 @@ const Endpoint = struct {
         if (handler) |h| self.connection.setHandler(h);
         // Spawned on the group the test joins, because `Io.Group.async` does not
         // promise to run its task until the group is awaited or cancelled.
-        group.async(io, pump, .{&self.connection});
+        // Set before the spawn and not before the connection: an `init` that
+        // refused would leave no pump to release the descriptor, and the caller
+        // that hangs up on that path has to.
+        self.pumping = true;
+        group.async(io, pump, .{self});
     }
 
-    /// Hang up. `shutdown` before `close`: closing a descriptor does not
-    /// interrupt a read already blocked on it, so the peer's pump would sit on
-    /// an open description and the group would never finish.
+    /// Hang up: stop the reader, wake it, and let the descriptor go once.
+    ///
+    /// `shutdown` before `close`: closing a descriptor does not interrupt a read
+    /// already blocked on it, so the peer's pump would sit on an open
+    /// description and the group would never finish.
+    ///
+    /// The pump releases the descriptor, not this call, and it is the only task
+    /// that may. `conn.pump` asks again after a read of zero bytes, and a local
+    /// `shutdown` makes the next read return exactly that, so a caller that
+    /// released the descriptor under a live pump would have that pump read a
+    /// freed descriptor: the standard library aborts on `EBADF` inside
+    /// `netReadPosix`, before the pump's own `catch` can see an error, and the
+    /// whole test binary dies instead of the test failing. Telling the
+    /// connection first is what makes the loop stop — the pump leaves at its
+    /// next turn and closes the stream on its way out, after the last read that
+    /// can touch it.
+    ///
+    /// The guards are what make the several callers safe: each of the seven
+    /// exits from an exchange can reach this on a path another one already
+    /// took, and the pump reaches it on the way out of every one of them.
+    /// Releasing the same descriptor twice would close an unrelated one that
+    /// the process had opened in the meantime, and every call below is a
+    /// syscall on it.
     fn hangUp(self: *Endpoint, io: Io) void {
+        if (self.closed) return;
+        self.closed = true;
+        if (self.released) return;
+        if (self.pumping) {
+            self.connection.close();
+            self.stream.shutdown(io, .both) catch {};
+            return;
+        }
+        self.release(io);
+    }
+
+    /// Release the descriptor once, and only on a stream that still has one.
+    fn release(self: *Endpoint, io: Io) void {
+        if (self.released) return;
+        self.released = true;
         self.stream.shutdown(io, .both) catch {};
         self.stream.close(io);
     }
 };
 
-fn pump(c: *conn.Conn) void {
-    c.pump();
+/// Drive the connection, then release the descriptor it drained.
+///
+/// The pump takes the endpoint rather than the connection because it is the one
+/// task that reads the descriptor and therefore the one that closes it: a
+/// caller that closed it first would have this loop read a freed descriptor and
+/// the process would abort inside the read.
+fn pump(self: *Endpoint) void {
+    self.connection.pump();
+    self.release(self.connection.io);
 }
 
 /// A listening Unix socket, with the address that reaches it.
@@ -1583,11 +1682,29 @@ const Socket = struct {
     path: []const u8,
 };
 
+/// The pid is in the name so that two runs of this file never share a socket.
+/// A fixed name is a rendezvous point: whichever run reaches the unlink second
+/// deletes the other's bound path, the client then connects to nothing, and the
+/// loser of the race aborts in a pump with `BADF` on a socket file that is gone.
+/// It reads as a protocol fault and is not one. The examples already carry the
+/// pid for the same reason, and this is that mechanism rather than a second one.
+///
+/// The path is built once and handed back in [`Socket.path`], and
+/// [`Socket.address`] is the address the client connects to, so the two halves
+/// of a test cannot disagree about which socket they mean.
+///
+/// `path_buffer` is sized from `Io.net.UnixAddress.max_len` rather than a round
+/// number, because that is the one length that fails: `UnixAddress.init`
+/// refuses a longer name with `error.NameTooLong`, which a test reads as a peer
+/// that never connected. Sized this way a constant that grew past the limit
+/// fails at the format instead, and the widest name this renders — a pid at the
+/// full width of a `pid_t` and a full-width tag — is 57 bytes against the 108
+/// `sockaddr_un.sun_path` allows.
 fn listenOn(io: Io, path_buffer: []u8, tag: u64) !Socket {
     const path = try std.fmt.bufPrint(
         path_buffer,
-        "/tmp/zig-agent-proto-mcp-session-{x}.sock",
-        .{tag},
+        "/tmp/zig-agent-proto-mcp-session-{d}-{x}.sock",
+        .{ std.os.linux.getpid(), tag },
     );
     // A socket file left by a killed run would make `listen` fail.
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
@@ -2037,7 +2154,7 @@ test "a peer error is a failure and an interim result is never the final one" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var path_buffer: [128]u8 = undefined;
+    var path_buffer: [Io.net.UnixAddress.max_len]u8 = undefined;
     var address = try listenOn(io, &path_buffer, 0x5eed_0301);
     defer address.server.deinit(io);
     defer std.Io.Dir.cwd().deleteFile(io, address.path) catch {};
