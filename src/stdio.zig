@@ -20,7 +20,11 @@
 //!
 //! Every region is vetted where the caller passes it: a region with no room is
 //! refused by [`Stdio.init`] or by [`conn.Conn.init`] rather than at the first
-//! message, so a wiring mistake is never reported as a dead transport.
+//! message, so a wiring mistake is never reported as a dead transport. Two
+//! regions that share a byte are refused on the same terms, and no call is
+//! handed all six of them, so the pairs that span [`Stdio.init`] and
+//! [`conn.Conn.init`] are refused by [`Stdio.connection`], which is the one
+//! call that sees both halves.
 
 const std = @import("std");
 const conn = @import("conn.zig");
@@ -56,21 +60,32 @@ pub const Stdio = struct {
     /// Open the process's own streams. Neither is closed by this type: they
     /// belong to the process rather than to a connection.
     ///
-    /// Falls with `error.UnusableBuffer`, and with nothing else, for a
-    /// `read_buffer` or a `write_buffer` with no room. The refusal is checked
+    /// Falls with `error.UnusableBuffer` for a `read_buffer` or a
+    /// `write_buffer` with no room, and with `error.OverlappingBuffers` for the
+    /// two of them sharing a byte, and with nothing else. Both are checked
     /// before anything is built, so a refused call leaves no half-wired reader
-    /// behind. It is the error `conn.Conn.init` raises for a configuration
-    /// region and the one name it raises it under, so the rule stays one rule
-    /// over all six regions a connection is handed. It lands here rather than
-    /// at [`Stdio.connection`] because this is the call that names the array:
-    /// one call later a region with no room is one nobody can see, and a write
-    /// buffer with no room comes back as `error.Transport` from the first
-    /// frame, a dead socket for a wiring mistake the caller can still make.
+    /// behind. `error.UnusableBuffer` is the error `conn.Conn.init` raises for
+    /// a configuration region and the one name it raises it under, so the rule
+    /// stays one rule over all six regions a connection is handed. It lands
+    /// here rather than at [`Stdio.connection`] because this is the call that
+    /// names the array: one call later a region with no room is one nobody can
+    /// see, and a write buffer with no room comes back as `error.Transport`
+    /// from the first frame, a dead socket for a wiring mistake the caller can
+    /// still make. The overlap lands here on the same reasoning, and it is the
+    /// one pair of the fifteen among a stdio connection's six regions that
+    /// this call is the earliest to see; [`Stdio.connection`] says which call
+    /// refuses the other fourteen.
     pub fn init(io: Io, read_buffer: []u8, write_buffer: []u8) conn.Error!Stdio {
         // One test per argument, in the order they are passed, rather than one
         // over both that cannot say which of them was short.
         if (read_buffer.len == 0) return error.UnusableBuffer;
         if (write_buffer.len == 0) return error.UnusableBuffer;
+        // The one pair of the fifteen this call can see, because these two are
+        // the only regions it is handed and it is the earliest call handed
+        // both. A reader filling into the writer's storage writes bytes an
+        // answer being composed there has not written yet, and nothing on the
+        // wire reports it.
+        if (conn.overlaps(read_buffer, write_buffer)) return error.OverlappingBuffers;
         // Streaming, not the positional default. A pipe is unseekable, so the
         // positional default finds that out by failing a syscall and then
         // falling back, and the streaming constructors skip the failed call
@@ -85,19 +100,51 @@ pub const Stdio = struct {
     /// Build a connection over these streams. The result borrows `self`, so
     /// `self` must outlive it; see the lifetime rule on [`Stdio`].
     ///
-    /// Falls when `conn.Conn.init` refuses the configuration, and it refuses
-    /// before it builds anything: `error.UnusableBuffer` for a region sized
-    /// with no room, and `error.OverlappingBuffers` for any two of the four
-    /// regions that share a byte. All six pairs are checked — the frame buffer
-    /// against each handler region, and the pending table against all three.
-    /// Both faults are the caller's to fix by resizing or separating its
-    /// buffers, and neither is visible once a peer is on the wire, which is
-    /// why they arrive here rather than at the first message.
+    /// Falls with `error.UnusableBuffer` for a configured region sized with no
+    /// room and `error.OverlappingBuffers` for two regions that share a byte,
+    /// and refuses both before it builds anything: a refused call leaves the
+    /// caller's pending table exactly as it was handed over. Every fault is the
+    /// caller's to fix by resizing or separating its buffers, and none of them
+    /// is visible once a peer is on the wire, which is why they arrive here
+    /// rather than at the first message.
     ///
-    /// The transport's own two regions were refused earlier and by the only
-    /// call the caller passed them to, [`Stdio.init`]. A caller that replaces
-    /// `reader` or `writer` after that owns the buffers it supplies.
+    /// A stdio connection is handed six regions and there are fifteen pairs
+    /// among them. No one call is handed all six, so the pairs are refused by
+    /// the three calls that see them:
+    ///
+    /// - The six among the four configured regions are `conn.Conn.init`'s own:
+    ///   the frame buffer against each handler region, and the pending table
+    ///   against all three.
+    /// - The one among the transport's own two regions is [`Stdio.init`]'s,
+    ///   which is handed both of them and neither of the other four.
+    /// - The eight that span the two calls are refused here, because this is
+    ///   the only call handed a transport region and a configured region
+    ///   together: `Stdio.init` never learns what the frame buffer is, and
+    ///   `conn.Conn.init` never learns what the read and write buffers are. Left
+    ///   unchecked they are silent rather than fatal: the reader's `fill`
+    ///   writes into the framer's own storage, and an answer composed into the
+    ///   write buffer lands inside a frame that has not been taken yet.
+    ///
+    /// The two compared here are the regions the reader and the writer hold
+    /// now. After [`Stdio.init`] those are the caller's own arrays; a caller
+    /// that replaced `reader` or `writer` after that has moved them, and what
+    /// this checks is whatever the replacement was handed.
     pub fn connection(self: *Stdio, config: conn.Conn.Config) conn.Error!conn.Conn {
+        // The eight pairs that neither [`Stdio.init`] nor the call below is
+        // handed, compared before anything is built. The pending table as its
+        // whole slice of bytes, because `conn.Conn.init` compares it the same
+        // way and a table that overlaps anything is a race on bytes rather
+        // than a wrong answer.
+        const table = std.mem.sliceAsBytes(config.pending);
+        for ([_][]const u8{
+            self.reader.interface.buffer,
+            self.writer.interface.buffer,
+        }) |transport| {
+            if (conn.overlaps(transport, config.frame_buffer)) return error.OverlappingBuffers;
+            if (conn.overlaps(transport, table)) return error.OverlappingBuffers;
+            if (conn.overlaps(transport, config.decode_scratch)) return error.OverlappingBuffers;
+            if (conn.overlaps(transport, config.answer)) return error.OverlappingBuffers;
+        }
         return conn.Conn.init(
             self.reader.io,
             &self.reader.interface,
@@ -120,9 +167,12 @@ pub const Stdio = struct {
 /// that matters is the frame buffer against the largest message the peer may
 /// send.
 ///
-/// [`Buffers.config`] hands the connection the four it owns. `read` and
-/// `write` are the pair [`Stdio.init`] takes, and `out`, `result` and `params`
-/// are the per-call buffers of [`conn.Conn.call`] and [`conn.Conn.notify`].
+/// [`Buffers.config`] hands the connection the four it owns, and
+/// [`Stdio.connection`] compares those four against `read` and `write`, so one
+/// array handed to two of these fields is refused there rather than corrupting
+/// the first frame that overlaps it. `read` and `write` are the pair
+/// [`Stdio.init`] takes, and `out`, `result` and `params` are the per-call
+/// buffers of [`conn.Conn.call`] and [`conn.Conn.notify`].
 pub const Buffers = struct {
     /// Read buffer. Bounds one read from the stream.
     read: [4096]u8 = undefined,
@@ -273,6 +323,86 @@ test "a write buffer with no room is refused at the call that passed it" {
     // the caller was told the socket was dead for a buffer it had not been
     // told to check.
     try testing.expectError(error.UnusableBuffer, Stdio.init(testing.io, &buffers.read, &.{}));
+}
+
+test "a read buffer and a write buffer that share a byte are refused" {
+    // One array carved two ways. Neither test above can catch this: each of
+    // them passes one empty region and one full array, so an `init` that
+    // compared nothing would pass both, and one that compared everything would
+    // refuse nothing here. `Stdio.init` is the only call handed both regions,
+    // so this pair is refused here or nowhere — `conn.Conn.init` is handed
+    // neither, and `Stdio.connection` would have to look at what the reader
+    // and the writer hold rather than at what the caller passed.
+    //
+    // The two halves are not the same array here on purpose: a reader filling
+    // into the writer's storage writes bytes an answer being composed there has
+    // not written yet, and nothing on the wire reports it.
+    var shared: [8192]u8 = undefined;
+    try testing.expectError(
+        error.OverlappingBuffers,
+        Stdio.init(testing.io, shared[0..4096], shared[0..4096]),
+    );
+}
+
+test "the transport's two regions are checked against the connection's four" {
+    // The eight pairs neither of the other two calls is handed: `Stdio.init`
+    // sees the two transport regions and `conn.Conn.init` the four configured
+    // ones, so a pair spanning the two is in neither. `Stdio.connection` is
+    // handed both halves, and it is where this is refused.
+    //
+    // One array carved three ways. The frame buffer takes the head, which is
+    // where the read buffer is, and the answer region takes the tail, which is
+    // where the write buffer is: the two pairs a real caller hits, one per
+    // direction. Both are silent rather than fatal without the refusal — the
+    // reader's `fill` writes into the framer's own storage, and an answer
+    // composed into the write buffer lands inside a frame that has not been
+    // taken yet, so the peer reads one good frame and then a mangled one.
+    // Aligned as a slot table as well as as bytes, because the third case
+    // below reads the head of it as one.
+    var shared: [65536 + 8192]u8 align(@alignOf(conn.Slot)) = undefined;
+    var buffers: Buffers = .{};
+    var slots: [4]conn.Slot = undefined;
+    var stdio = try Stdio.init(testing.io, shared[0..4096], shared[65536..]);
+
+    // The frame buffer against the read buffer.
+    try testing.expectError(error.OverlappingBuffers, stdio.connection(.{
+        .frame_buffer = shared[0..65536],
+        .pending = &slots,
+        .decode_scratch = &buffers.decode_scratch,
+        .answer = &buffers.answer,
+    }));
+    // The answer region against the write buffer, with the frame buffer moved
+    // clear so this fails on its own pair and not on the one above.
+    try testing.expectError(error.OverlappingBuffers, stdio.connection(.{
+        .frame_buffer = &buffers.frame,
+        .pending = &slots,
+        .decode_scratch = &buffers.decode_scratch,
+        .answer = shared[65536..],
+    }));
+    // And the pending table against the read buffer, which is a race on bytes
+    // rather than a wrong answer and is refused for the same reason. The
+    // alignment cast is over the array's own declared alignment, so it costs
+    // nothing to read.
+    const table_in_read: []conn.Slot = @ptrCast(@alignCast(
+        shared[0..@sizeOf(conn.Slot)],
+    ));
+    try testing.expectError(error.OverlappingBuffers, stdio.connection(.{
+        .frame_buffer = &buffers.frame,
+        .pending = table_in_read,
+        .decode_scratch = &buffers.decode_scratch,
+        .answer = &buffers.answer,
+    }));
+
+    // The same six regions, carved so that nothing shares a byte, build: the
+    // refusal is about the pair and not about this transport. `Buffers` is what
+    // a caller is meant to hand over, and it is disjoint by construction, so
+    // this is the arrangement the check has to leave alone.
+    _ = try stdio.connection(.{
+        .frame_buffer = shared[4096..65536],
+        .pending = &slots,
+        .decode_scratch = &buffers.decode_scratch,
+        .answer = &buffers.answer,
+    });
 }
 
 test "a request off the transport is answered on the transport" {
