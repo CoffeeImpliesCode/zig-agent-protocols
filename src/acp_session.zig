@@ -259,8 +259,11 @@ pub fn classifyFrame(frame: []const u8) FrameAction {
 /// whether anything will be matched against it, and a frame it cannot decode
 /// is dropped, because there is no id to answer on and nothing to send. The
 /// codec accepts a `null` id on a response carrying an `error` and nowhere
-/// else, and `conn.Conn.setRefusalHandler` is where such a frame is told rather
-/// than dropped.
+/// else, and `conn.Conn.setOrphanHandler` is where such a frame is told rather
+/// than dropped. That hook is the connection's only report for a response that
+/// matched no outstanding call, and this refusal is one of the three frames
+/// that reach it: a `null` id, an id this connection never allocated, and an id
+/// naming a call that has already returned.
 ///
 /// A builder cannot produce this one. Every other answer in the tree is an
 /// answer to a `jsonrpc.Request`, and a frame that is a batch, a value that is
@@ -2342,8 +2345,8 @@ const Endpoint = struct {
     /// test's own, so there is no caller to grow one and a task reports it as a
     /// failed test rather than as a fault the peer committed.
     ///
-    /// The refusal hook is installed here rather than by the caller afterwards,
-    /// because `open` spawns the reader task: a peer that refuses the instant
+    /// The orphan hook is installed here rather than by the caller afterwards,
+    /// because `open` spawns the reader task: a peer that answers the instant
     /// it is connected would be heard by nobody, which is the fault the hook
     /// exists to remove.
     fn open(
@@ -2352,7 +2355,7 @@ const Endpoint = struct {
         group: *Io.Group,
         stream: Io.net.Stream,
         handler: ?conn.Handler,
-        refusal: ?conn.RefusalHandler,
+        orphan: ?conn.OrphanHandler,
     ) conn.Error!void {
         self.adopt(io, stream);
         self.connection = try conn.Conn.init(io, &self.reader.interface, &self.writer.interface, .{
@@ -2362,7 +2365,7 @@ const Endpoint = struct {
             .answer = &self.side.answer,
         });
         if (handler) |h| self.connection.setHandler(h);
-        if (refusal) |h| self.connection.setRefusalHandler(h);
+        if (orphan) |h| self.connection.setOrphanHandler(h);
         // Spawned on the group the test joins, because `Io.Group.async` does not
         // promise to run its task until the group is awaited or cancelled.
         group.async(io, pump, .{self});
@@ -2708,7 +2711,7 @@ test "a peer running this library is told of a refusal it sent with a null id" {
     defer address.server.deinit(io);
     defer std.Io.Dir.cwd().deleteFile(io, address.path) catch {};
 
-    var seen: RefusalSeen = .{ .io = io };
+    var seen: OrphanSeen = .{ .io = io };
     var agent_endpoint: Endpoint = .{};
     var client_endpoint: Endpoint = .{};
 
@@ -2975,14 +2978,14 @@ const PermissionServer = struct {
     }
 };
 
-/// What the client saw of a refusal that matched no call.
+/// What the client saw of a response that matched no call.
 ///
-/// Its own type because the hook is handed the error object and nothing else:
-/// there is no `Io` to lock with, and the connection's is not reachable from
-/// here. The code and the message are copied out of the connection's decode
-/// region, which the next frame overwrites, so keeping a slice of it would
-/// name whatever was decoded after.
-const RefusalSeen = struct {
+/// Its own type because the hook is handed the decoded message and nothing
+/// else: there is no `Io` to lock with, and the connection's is not reachable
+/// from here. The code and the message are copied out of the connection's
+/// decode region, which the next frame overwrites, so keeping a slice of it
+/// would name whatever was decoded after.
+const OrphanSeen = struct {
     io: Io,
     mutex: Io.Mutex = .init,
     condition: Io.Condition = .init,
@@ -2991,28 +2994,34 @@ const RefusalSeen = struct {
     message: [64]u8 = undefined,
     message_len: usize = 0,
 
-    fn told(ctx: ?*anyopaque, object: jsonrpc.Error) void {
-        const self: *RefusalSeen = @ptrCast(@alignCast(ctx.?));
+    fn told(ctx: ?*anyopaque, message: jsonrpc.Message) void {
+        const self: *OrphanSeen = @ptrCast(@alignCast(ctx.?));
         self.mutex.lock(self.io) catch return;
         defer self.mutex.unlock(self.io);
-        const n = @min(object.message.len, self.message.len);
-        @memcpy(self.message[0..n], object.message[0..n]);
-        self.message_len = n;
-        self.code = object.code;
+        // Only a refusal carries an error. The hook is handed every response
+        // that matched no call, and an id naming a call that has already
+        // returned is the ordinary shape of a subscription's second response,
+        // so a frame carrying no `error` is counted and not unwrapped.
+        if (message.rpc_error) |object| {
+            const n = @min(object.message.len, self.message.len);
+            @memcpy(self.message[0..n], object.message[0..n]);
+            self.message_len = n;
+            self.code = object.code;
+        }
         self.calls += 1;
         self.condition.broadcast(self.io);
     }
 
-    /// Block until a refusal has been told. A barrier rather than a sleep: the
+    /// Block until a response has been told. A barrier rather than a sleep: the
     /// test passes when the frame arrived, not when it waited long enough to
     /// look as though it had.
-    fn wait(self: *RefusalSeen) void {
+    fn wait(self: *OrphanSeen) void {
         self.mutex.lock(self.io) catch return;
         while (self.calls == 0) self.condition.wait(self.io, &self.mutex) catch return;
         self.mutex.unlock(self.io);
     }
 
-    fn text(self: *const RefusalSeen) []const u8 {
+    fn text(self: *const OrphanSeen) []const u8 {
         return self.message[0..self.message_len];
     }
 };
@@ -3028,7 +3037,7 @@ const RefusingServer = struct {
     io: Io,
     server: *Io.net.Server,
     endpoint: *Endpoint,
-    seen: *RefusalSeen,
+    seen: *OrphanSeen,
 
     const batch = "[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/new\"}]";
 
@@ -3056,7 +3065,7 @@ const RefusingClient = struct {
     group: *Io.Group,
     address: *const Io.net.UnixAddress,
     endpoint: *Endpoint,
-    seen: *RefusalSeen,
+    seen: *OrphanSeen,
 
     fn run(self: *@This()) void {
         const stream = self.address.connect(self.io) catch return;
@@ -3064,7 +3073,7 @@ const RefusingClient = struct {
         // with no handler installed answers nobody, which is the point.
         self.endpoint.open(self.io, self.group, stream, null, .{
             .ctx = self.seen,
-            .call = RefusalSeen.told,
+            .call = OrphanSeen.told,
         }) catch {
             self.endpoint.hangUp(self.io);
             return;

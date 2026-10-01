@@ -24,18 +24,27 @@
 //! alternative — spawning handlers here — would need the frame copied out of
 //! the framer's buffer, which is the one buffer this layer refuses to allocate.
 //!
-//! ## The one response that belongs to nobody
+//! ## The response that belongs to nobody
 //!
-//! JSON-RPC 2.0 requires the id of an error response to be Null where the id
-//! could not be determined from the Request: a Parse error, or an Invalid
-//! Request for a batch or for a value that is not a request object. That frame
-//! is a response matching no call, so the pending table has nothing to do with
-//! it, and it is the one inbound message an application has to be told about
-//! rather than matched. [`setRefusalHandler`] is where it is told: it runs
-//! inline on the reader task, is handed the decoded error object, and returns
+//! A response can name no outstanding call, and it arrives here three ways: a
+//! `null` id, which JSON-RPC 2.0 requires where the id could not be
+//! determined from the Request — a Parse error, or an Invalid Request for a
+//! batch or for a value that is not a request object; a string id, which is
+//! legal on the wire while this connection allocates its own ids as integers;
+//! and an id naming a call that has already returned.
+//! [`setOrphanHandler`] is where all three are told: it runs inline on the
+//! reader task, is handed the decoded [`jsonrpc.Message`], and returns
 //! nothing, because there is no id to answer on and nothing this connection
-//! could usefully say back. [`RefusalHandler`] says why it is not a fourth
-//! case for [`setHandler`].
+//! could usefully say back. [`OrphanHandler`] says why it is one hook and not
+//! three, and what it is not.
+//!
+//! The third of the three is the one that is not a peer's mistake.
+//! PROTOCOLS.md 4.4 makes `subscriptions/listen` a single long-lived response
+//! stream, `call` returns on its first response, and so every response after
+//! that one has no call behind it: the scan in `deliver` finds no slot and the
+//! frame used to leave the connection having been seen by nobody at all. It is
+//! told now, and that is the whole of what is bought — [`OrphanHandler`] says
+//! the three things a caller still cannot do with what it is handed.
 //!
 //! ## Four regions, and why no two of them may share a byte
 //!
@@ -200,37 +209,75 @@ pub const Handler = struct {
     }
 };
 
-/// Told about an error response the peer sent with a `null` id.
+/// Told about a response that named no outstanding call.
 ///
-/// One frame, and it is the frame a peer writes when it refuses something and
-/// cannot say which request it belonged to. There is no id to match it
-/// against, so it belongs to no outstanding call, and before this hook it was
-/// dropped with every other response that matched no slot: the peer that wrote
-/// it, and the peer still waiting to hear what became of a frame it sent, both
-/// learned nothing.
+/// One event, three frames. A `null` id, which is what JSON-RPC 2.0 requires
+/// where the id could not be determined from the Request. A string id, which
+/// is legal on the wire while this connection allocates its own ids as
+/// integers. And an id naming a call that has already returned, which is the
+/// ordinary shape of the second and every later response on a
+/// `subscriptions/listen` stream: PROTOCOLS.md 4.4 makes that one long-lived
+/// response stream, `call` returns on its first, and each response after it
+/// has no call left behind it. Each of the three left this connection having
+/// been seen by nobody: the scan found no slot and fell through, and the
+/// `null` id returned before it. `route` is the only other place a decoded
+/// frame could go, so a frame that matched no call was the last place this
+/// layer could lose one.
+///
+/// It is one hook and not three because the three frames mean the same thing
+/// to whoever is reading them: the peer sent a response and nothing was
+/// waiting for it. One per case would make an application that wants all
+/// three install all three, and a caller reading one would not see the frames
+/// the other two were given. It is also the whole of the hook that covered
+/// only the `null` id, which this replaces rather than sits beside: that case
+/// is one of these three, and a second hook for it would tell one frame twice
+/// over to whoever installed both. The decoded message keeps the cases apart
+/// — it is handed whole, so `id_null` says which shape arrived, `id` says what
+/// the peer named, and `rpc_error` against `result` says whether it refused
+/// or answered — and a caller switches on one message rather than assembling
+/// a picture out of three callbacks.
 ///
 /// It is a hook of its own rather than a fourth case for [`Handler`]. A
-/// handler is handed a frame and returns the answer to it, and this frame has
-/// no answer: there is no id to answer on, so an answer written here would be a
-/// response sent in answer to a response. It is not a request or a
-/// notification either, so a handler typed against [`jsonrpc.Request`] would
-/// have to decline it on every path, which is the shape that made the frame
-/// invisible in the first place.
+/// handler is handed a frame and returns the answer to it, and none of these
+/// frames has an answer: there is no id to answer on, so an answer written
+/// here would be a response sent in answer to a response. They are not a
+/// request or a notification either, so a handler typed against
+/// [`jsonrpc.Request`] would have to decline all three on every path, which is
+/// the shape that made them invisible in the first place.
+///
+/// **It is not a stream reader, and the frames it is handed do not make it
+/// one.** There is no `Conn.stream`, and the three things one would have to
+/// answer are all unanswered here on purpose.
+///
+/// - **Where a value stays valid.** Every slice in the message borrows the
+///   reader's decode region, so it is live for this call and for nothing
+///   after it. The next frame is decoded over it, so a consumer that keeps
+///   the message keeps no bytes at all.
+/// - **What a slow consumer does.** Nothing is queued and no buffer is
+///   kept, so there is nothing to fall behind on: a consumer that is not
+///   running when a frame arrives misses that frame.
+/// - **When it stops.** Nothing marks an end. A consumer cannot tell a
+///   subscription the peer finished from a peer that hung up from a
+///   connection this one closed, because the next thing to arrive is either
+///   another message or silence, and silence is all three at once.
+///
+/// So the hook makes a lost response visible, which is the precondition for
+/// the rest of it, and no more than that. A caller that needs a stream copies
+/// the frames it wants into a buffer it owns, counts them, and says how it
+/// expects the stream to end — none of which this connection does for it.
 ///
 /// Runs inline on the reader task and takes the rule a handler takes: it must
 /// not make an outbound call on this connection, because the reader that would
-/// deliver that answer is the very task now waiting for it.
-///
-/// It is handed the decoded error object rather than the frame. Every slice in
-/// that object borrows the reader's decode region, so it is live for this call
-/// and for nothing after it.
-pub const RefusalHandler = struct {
+/// deliver that answer is the very task now waiting for it. The pending table
+/// is unlocked before it runs, so a consumer that blocks blocks the reader
+/// and the reader is the only thing that can deliver it anything further.
+pub const OrphanHandler = struct {
     ctx: ?*anyopaque = null,
-    call: ?*const fn (ctx: ?*anyopaque, object: jsonrpc.Error) void = null,
+    call: ?*const fn (ctx: ?*anyopaque, message: jsonrpc.Message) void = null,
 
-    fn invoke(self: RefusalHandler, object: jsonrpc.Error) void {
+    fn invoke(self: OrphanHandler, message: jsonrpc.Message) void {
         const func = self.call orelse return;
-        func(self.ctx, object);
+        func(self.ctx, message);
     }
 };
 
@@ -369,8 +416,9 @@ pub const Conn = struct {
     framer: framing.Framer,
     slots: []Slot,
     handler: Handler,
-    /// Told about an error response with a `null` id. See [`RefusalHandler`].
-    refusal: RefusalHandler = .{},
+    /// Told about a response that named no outstanding call. See
+    /// [`OrphanHandler`].
+    orphan: OrphanHandler = .{},
     /// The region an inbound frame is decoded into, and the region a handler
     /// is handed to decode one into.
     ///
@@ -539,25 +587,26 @@ pub const Conn = struct {
     ///
     /// A response never reaches the handler. `route` sends one to the
     /// pending table, where it is matched to a call by id, so this neither
-    /// intercepts nor answers an outstanding `call`. The one response that
-    /// belongs to no call goes to [`setRefusalHandler`] instead, because a
+    /// intercepts nor answers an outstanding `call`. The response that
+    /// belongs to no call goes to [`setOrphanHandler`] instead, because a
     /// handler is handed a frame to answer and that frame has no answer.
     pub fn setHandler(self: *Conn, handler: Handler) void {
         self.handler = handler;
     }
 
-    /// Install the hook that hears an error response with a `null` id.
+    /// Install the hook that hears a response no outstanding call is waiting
+    /// for.
     ///
     /// Legal only before the reader task starts, on the same terms and for the
-    /// same reason as [`setHandler`]: `route` reads the field once per inbound
-    /// response, on the reader task, and takes no lock for the read.
+    /// same reason as [`setHandler`]: `deliver` reads the field once per
+    /// inbound response, on the reader task, and takes no lock for the read.
     ///
     /// Nothing is installed by default, and a connection with no hook drops
-    /// the frame exactly as it did before one existed. The hook is the only
-    /// way to see it, so installing one after `pump` has begun has already
-    /// lost every refusal that arrived in between.
-    pub fn setRefusalHandler(self: *Conn, handler: RefusalHandler) void {
-        self.refusal = handler;
+    /// these frames exactly as it did before one existed. The hook is the only
+    /// way to see one, so installing it after `pump` has begun has already
+    /// lost every frame that arrived in between.
+    pub fn setOrphanHandler(self: *Conn, handler: OrphanHandler) void {
+        self.orphan = handler;
     }
 
     /// The length of the request or notification most recently written into
@@ -754,35 +803,50 @@ pub const Conn = struct {
     /// Hand a response to the call waiting for it, or to the application when
     /// no call can be waiting for it.
     ///
-    /// A `null` id is the specification's own id for a response whose id could
-    /// not be determined, so there is no slot to look it up in and nothing to
-    /// wake. It is told rather than dropped because it is the one response an
-    /// application has to see: the peer refused a frame and could not say
-    /// which request it belonged to, and nothing else on this connection can
-    /// act on that.
+    /// Three frames arrive here and they are one event: the peer sent a
+    /// response and no outstanding call can take it. A `null` id is the
+    /// specification's own id for a response whose request it could not
+    /// identify, and the peer refused something and could not say which — the
+    /// one frame JSON-RPC 2.0 says an application must be told about rather
+    /// than matched. A string id is not one this connection allocates. And an
+    /// id naming a call that has already returned is the ordinary shape of the
+    /// second and every later response on a `subscriptions/listen` stream.
+    ///
+    /// All three are told, and all three used to be dropped here with nothing
+    /// written anywhere. The hook runs after `deliver` has given the pending
+    /// table back, so it is called with no lock held.
     fn routeResponse(self: *Conn, message: jsonrpc.Message) void {
-        if (message.id_null) {
-            if (message.rpc_error) |object| self.refusal.invoke(object);
-            return;
-        }
-        self.deliver(message);
+        if (self.deliver(message)) return;
+        self.orphan.invoke(message);
     }
 
-    /// Hand a response to the call waiting for it.
-    fn deliver(self: *Conn, message: jsonrpc.Message) void {
+    /// Hand a response to the call waiting for it, and say whether one was.
+    ///
+    /// False is the whole of what this function knows about correlation: the
+    /// table had no slot for this frame, so nobody was waiting for it and
+    /// there is no buffer anywhere that a caller could read it out of. The
+    /// caller reports the frame itself; this one holds no lock to report it
+    /// under.
+    fn deliver(self: *Conn, message: jsonrpc.Message) bool {
         // A string id is legal on the wire, but this connection allocates its
         // own ids as integers, so a string id cannot be one of ours and there
-        // is nothing to match it against.
-        const id = switch (message.id orelse return) {
+        // is nothing to match it against. A `null` id is the specification's
+        // id for a response whose request it could not identify, which says
+        // the same thing. Neither names a slot, so neither is looked up and
+        // both leave here the way a frame with no owner leaves any other
+        // connection: reported rather than dropped.
+        const id: ?i64 = if (message.id) |named| switch (named) {
             .integer => |value| value,
-            .string => return,
-        };
+            .string => null,
+        } else null;
+        const wanted = id orelse return false;
 
         self.state_mutex.lockUncancelable(self.io);
         defer self.state_mutex.unlock(self.io);
 
+        var matched = false;
         for (self.slots) |*slot| {
-            if (!slot.used or slot.id != id or slot.answered) continue;
+            if (!slot.used or slot.id != wanted or slot.answered) continue;
             if (message.rpc_error) |rpc_error| {
                 slot.is_error = true;
                 slot.error_code = rpc_error.code;
@@ -810,9 +874,11 @@ pub const Conn = struct {
                 }
             }
             slot.answered = true;
+            matched = true;
             break;
         }
         self.wake.signal(self.io);
+        return matched;
     }
 
     /// Answer a request from the peer, or note a notification.
@@ -1191,30 +1257,62 @@ const Failing = struct {
     }
 };
 
-/// Records the error object of a refusal that matched no call, so a test can
-/// tell a told refusal from a dropped one.
+/// Records the responses that matched no outstanding call, so a test can tell
+/// a told one from a dropped one.
 ///
-/// The object borrows the reader's decode region, so the message is copied
-/// into a field rather than kept as a slice. A slice would be dead at the next
-/// frame, and a test asserting on it after the pump returned would be
-/// asserting on whatever the reader decoded after it.
-const Refused = struct {
+/// Every slice in a decoded message borrows the reader's decode region, so
+/// each one is copied into a field rather than kept as a slice. A slice would
+/// be dead at the next frame, and a test asserting on it after the pump
+/// returned would be asserting on whatever the reader decoded after it. A
+/// string id is not copied at all: it borrows the same region, and a test
+/// cannot tell one from a peer that named no id, so the arm is recorded as the
+/// fact it is.
+const Orphaned = struct {
     calls: usize = 0,
+    /// The peer wrote `"id":null`, the specification's own id for a response
+    /// whose request it could not identify.
+    id_null: bool = false,
+    /// The integer the peer named, or null when it named none this connection
+    /// can match against.
+    id: ?i64 = null,
+    /// The peer named an id as a string. It is legal on the wire and it cannot
+    /// be one of this connection's, so it is a response to nothing here.
+    named: bool = false,
     code: i32 = 0,
     message: [64]u8 = undefined,
     message_len: usize = 0,
+    result: [64]u8 = undefined,
+    result_len: usize = 0,
 
-    fn told(ctx: ?*anyopaque, object: jsonrpc.Error) void {
-        const self: *Refused = @ptrCast(@alignCast(ctx.?));
+    fn told(ctx: ?*anyopaque, message: jsonrpc.Message) void {
+        const self: *Orphaned = @ptrCast(@alignCast(ctx.?));
         self.calls += 1;
-        self.code = object.code;
-        const n = @min(object.message.len, self.message.len);
-        @memcpy(self.message[0..n], object.message[0..n]);
-        self.message_len = n;
+        self.id_null = message.id_null;
+        if (message.id) |named| switch (named) {
+            .integer => |value| self.id = value,
+            .string => self.named = true,
+        };
+        if (message.rpc_error) |object| {
+            self.code = object.code;
+            const n = @min(object.message.len, self.message.len);
+            @memcpy(self.message[0..n], object.message[0..n]);
+            self.message_len = n;
+        }
+        if (message.result) |text| {
+            const n = @min(text.len, self.result.len);
+            @memcpy(self.result[0..n], text[0..n]);
+            self.result_len = n;
+        }
     }
 
-    fn text(self: *const Refused) []const u8 {
+    /// The refusal's message, copied out of the frame that carried it.
+    fn said(self: *const Orphaned) []const u8 {
         return self.message[0..self.message_len];
+    }
+
+    /// The result body, copied out of the frame that carried it.
+    fn body(self: *const Orphaned) []const u8 {
+        return self.result[0..self.result_len];
     }
 };
 
@@ -1825,8 +1923,8 @@ test "a refusal whose id is null is told to the application, not dropped" {
         .decode_scratch = &decode_scratch,
         .answer = &answer,
     });
-    var state: Refused = .{};
-    connection.setRefusalHandler(.{ .ctx = &state, .call = Refused.told });
+    var state: Orphaned = .{};
+    connection.setOrphanHandler(.{ .ctx = &state, .call = Orphaned.told });
 
     var caller = Caller{ .connection = &connection, .result = &result, .out = &out };
     var group: Io.Group = .init;
@@ -1835,10 +1933,14 @@ test "a refusal whose id is null is told to the application, not dropped" {
     group.await(io) catch {};
 
     // Told once, with what the peer actually said rather than with a guess at
-    // which request it belonged to.
+    // which request it belonged to. `id_null` is what says which of the three
+    // frames arrived, and it is on the message rather than implied by the
+    // absence of an id.
     try testing.expectEqual(@as(usize, 1), state.calls);
+    try testing.expect(state.id_null);
+    try testing.expectEqual(@as(?i64, null), state.id);
     try testing.expectEqual(@as(i32, -32600), state.code);
-    try testing.expectEqualStrings("Invalid Request", state.text());
+    try testing.expectEqualStrings("Invalid Request", state.said());
 
     // Nothing was sent back. There is no id to answer on, so a frame this
     // connection did answer would be a response in answer to a response, and
@@ -1854,6 +1956,113 @@ test "a refusal whose id is null is told to the application, not dropped" {
     const replied = try caller.answer.?;
     try testing.expect(!replied.failed());
     try testing.expectEqualStrings("{\"ok\":true}", replied.body);
+}
+
+test "a response on a call that has already returned is told to the application" {
+    // PROTOCOLS.md 4.4 makes `subscriptions/listen` one long-lived response
+    // stream, and `call` returns on its first response, so every response
+    // after that one has no slot behind it. The scan in `deliver` found
+    // nothing and the frame left the connection having been seen by nobody:
+    // a consumer could not tell a finished subscription from a dropped one,
+    // and could not log the frame it was never handed. It is handed now.
+    //
+    // Both frames carry the id of one call. That is what the stream sends and
+    // what makes this the interesting case: the second is not a late answer
+    // to a live call, because a slot that is already answered is never matched
+    // twice.
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var frame_buffer: [512]u8 = undefined;
+    var pending: [2]Slot = undefined;
+    var decode_scratch: [256]u8 = undefined;
+    var answer: [256]u8 = undefined;
+    var out: [256]u8 = undefined;
+    var result: [256]u8 = undefined;
+    var sent: [256]u8 = undefined;
+    var gate: Io.Event = .unset;
+    var source = Scripted{
+        .io = io,
+        .bytes = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"uri\":\"first\"}}\n" ++
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"uri\":\"second\"}}\n",
+        .gate = &gate,
+    };
+    var recorder = Recorder{ .io = io, .sent = &sent, .gate = &gate };
+    var connection = try Conn.init(io, &source.reader, &recorder.writer, .{
+        .frame_buffer = &frame_buffer,
+        .pending = &pending,
+        .decode_scratch = &decode_scratch,
+        .answer = &answer,
+    });
+    var state: Orphaned = .{};
+    connection.setOrphanHandler(.{ .ctx = &state, .call = Orphaned.told });
+
+    var caller = Caller{ .connection = &connection, .result = &result, .out = &out };
+    var group: Io.Group = .init;
+    group.async(io, Caller.run, .{&caller});
+    group.async(io, pumpTask, .{&connection});
+    group.await(io) catch {};
+
+    // The caller got the first response, so the stream started and the call
+    // is over. The second is nobody's, and it says so by being told.
+    const replied = try caller.answer.?;
+    try testing.expect(!replied.failed());
+    try testing.expectEqualStrings("{\"uri\":\"first\"}", replied.body);
+
+    // Told once, with the whole message: the id the peer named, that it named
+    // an id rather than a null, and the body it carried. An application that
+    // logs the result can now say what it dropped and what it kept.
+    try testing.expectEqual(@as(usize, 1), state.calls);
+    try testing.expect(!state.id_null);
+    try testing.expectEqual(@as(?i64, 1), state.id);
+    try testing.expectEqual(@as(i32, 0), state.code);
+    try testing.expectEqualStrings("{\"uri\":\"second\"}", state.body());
+
+    // And the connection carried on: the frame took no slot and the table is
+    // as it was, so the caller's next request has room to be claimed.
+    for (connection.slots) |slot| try testing.expect(!slot.used);
+}
+
+test "a response with a string id is told to the application, not dropped" {
+    // A string id is legal on the wire and this connection allocates integer
+    // ids, so the frame cannot be one of ours and there is nothing in the
+    // pending table to match it against. It used to return out of the id
+    // switch, which is the same drop the null-id case took before it had a
+    // hook of its own, and the peer is told nothing either way.
+    var frame_buffer: [512]u8 = undefined;
+    var pending: [2]Slot = undefined;
+    var decode_scratch: [256]u8 = undefined;
+    var answer: [256]u8 = undefined;
+    var out_buffer: [512]u8 = undefined;
+    var source = Scripted{
+        .io = testing.io,
+        .bytes = "{\"jsonrpc\":\"2.0\",\"id\":\"sub-1\",\"result\":{\"uri\":\"a\"}}\n",
+    };
+    var writer = Io.Writer.fixed(&out_buffer);
+    var connection = try Conn.init(testing.io, &source.reader, &writer, .{
+        .frame_buffer = &frame_buffer,
+        .pending = &pending,
+        .decode_scratch = &decode_scratch,
+        .answer = &answer,
+    });
+    var state: Orphaned = .{};
+    connection.setOrphanHandler(.{ .ctx = &state, .call = Orphaned.told });
+
+    connection.pump();
+
+    // Told, and told as what it is: an id this connection never allocated, so
+    // the message carries it as a string rather than as a number that would
+    // read as one of ours.
+    try testing.expectEqual(@as(usize, 1), state.calls);
+    try testing.expect(state.named);
+    try testing.expect(!state.id_null);
+    try testing.expectEqual(@as(?i64, null), state.id);
+    try testing.expectEqualStrings("{\"uri\":\"a\"}", state.body());
+
+    // Nothing went back out. There is no id to answer on, so an answer here
+    // would be a response in answer to a response.
+    try testing.expectEqualStrings("", writer.buffered());
 }
 
 test "a request whose handler failed is answered with an error" {
