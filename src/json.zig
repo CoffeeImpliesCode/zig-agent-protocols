@@ -901,6 +901,18 @@ pub fn memberText(raw: []const u8, name: []const u8, scratch: []u8) ?[]const u8 
 /// `error.InvalidField`, never a trap. `error.BufferTooSmall` is the caller's
 /// own sizing mistake and is kept apart from it, because the two have
 /// different repairs.
+///
+/// Only the canonical spelling of a value decodes. RFC 4648 section 3.5
+/// requires the bits a pad covers to be zero, and enforcing that is what
+/// keeps `encode(decode(b)) == b`: an encoding of a value this emits has one
+/// spelling, so an accepted encoding is one that can be written back, and two
+/// spellings of the same bytes cannot both be accepted and then be told
+/// apart on the way out.
+///
+/// Encoding refuses before it writes. The bound is settled once from
+/// [`encodedLen`] rather than per quad, so `error.BufferTooSmall` leaves the
+/// caller's buffer as it was handed over and a caller may size, retry and
+/// grow without this having allocated anything.
 pub const base64 = struct {
     /// The RFC 4648 alphabet a value is written in.
     ///
@@ -968,6 +980,12 @@ pub const base64 = struct {
     /// is `error.BufferTooSmall` with nothing written, so a caller may size,
     /// retry and grow without this having allocated anything.
     pub fn encode(input: []const u8, output: []u8, alphabet: Alphabet) EncodeError![]const u8 {
+        // The whole result is sized before the first byte is written, so a
+        // refusal leaves the caller's buffer exactly as it was handed over
+        // and a caller may size, retry and grow without this having
+        // allocated anything. A check per quad cannot promise that: it has
+        // already written every earlier quad by the time it runs out.
+        if (output.len < encodedLen(input.len)) return error.BufferTooSmall;
         // Resolved once, so the alphabet costs a switch outside the loop rather
         // than a branch per character.
         const table = symbols(alphabet);
@@ -975,7 +993,6 @@ pub const base64 = struct {
         var index: usize = 0;
         while (index + 3 <= input.len) : (index += 3) {
             const chunk = std.mem.readInt(u24, input[index..][0..3], .big);
-            if (out + 4 > output.len) return error.BufferTooSmall;
             output[out] = table[(chunk >> 18) & 0x3f];
             output[out + 1] = table[(chunk >> 12) & 0x3f];
             output[out + 2] = table[(chunk >> 6) & 0x3f];
@@ -987,7 +1004,6 @@ pub const base64 = struct {
         const rest = input.len - index;
         if (rest == 1) {
             const chunk: u32 = @as(u32, input[index]) << 16;
-            if (out + 4 > output.len) return error.BufferTooSmall;
             output[out] = table[(chunk >> 18) & 0x3f];
             output[out + 1] = table[(chunk >> 12) & 0x3f];
             output[out + 2] = '=';
@@ -996,7 +1012,6 @@ pub const base64 = struct {
         } else if (rest == 2) {
             const chunk: u32 = @as(u32, input[index]) << 16 |
                 @as(u32, input[index + 1]) << 8;
-            if (out + 4 > output.len) return error.BufferTooSmall;
             output[out] = table[(chunk >> 18) & 0x3f];
             output[out + 1] = table[(chunk >> 12) & 0x3f];
             output[out + 2] = table[(chunk >> 6) & 0x3f];
@@ -1011,27 +1026,48 @@ pub const base64 = struct {
     /// `output` must hold [`decodedLen`] for `input`, which is never more than
     /// this writes, and a shorter one is `error.BufferTooSmall` rather than a
     /// truncated value. A character outside the alphabet, a group whose length
-    /// is not four, and a group carrying fewer than two digits are
-    /// `error.InvalidField`.
+    /// is not four, a group carrying fewer than two digits, a pad anywhere
+    /// but the tail of the final group, a character after a pad, and digits
+    /// that reach no byte without being zero are all `error.InvalidField`.
     pub fn decode(input: []const u8, output: []u8, alphabet: Alphabet) DecodeError![]const u8 {
         if (input.len % 4 != 0) return error.InvalidField;
         var out: usize = 0;
         var index: usize = 0;
         while (index < input.len) : (index += 4) {
             const quad = input[index..][0..4];
+            const final_group = index + 4 == input.len;
             var bits: u32 = 0;
             var count: usize = 0;
+            var last: u8 = 0;
+            var padded = false;
             for (quad, 0..) |byte, position| {
-                if (byte == '=') break;
+                // RFC 4648 sections 3.3 and 3.5: a pad appears only in the
+                // final group and only as a run to its end. A pad in an
+                // earlier group is a length the encoder never emits, and a
+                // character behind one is a digit this would have to drop.
+                if (byte == '=') {
+                    if (!final_group) return error.InvalidField;
+                    padded = true;
+                    continue;
+                }
+                if (padded) return error.InvalidField;
                 const digit = digitOf(byte, alphabet) orelse return error.InvalidField;
                 bits |= @as(u32, digit) << @intCast(18 - 6 * position);
+                last = digit;
                 count += 1;
             }
-            // A quad carries at least two digits. One digit is not a whole
-            // byte, and a quad that opens with `=` carries none at all, so
+            // A group carries at least two digits. One digit is not a whole
+            // byte, and a group that opens with `=` carries none at all, so
             // `count - 1` below would underflow a `usize`.
             if (count < 2) return error.InvalidField;
             const produced: usize = if (count == 4) 3 else count - 1;
+            // The digits that reach no byte must be zero. RFC 4648 section
+            // 3.5 requires it, and a group that sets them is a second
+            // spelling of bytes already decoded: two encodings reading back
+            // as one value, so a round trip can neither reproduce what the
+            // peer sent nor say which of the two it sent.
+            const discarded: u3 = @intCast(6 * count - 8 * produced);
+            if ((last & ((@as(u8, 1) << discarded) - 1)) != 0) return error.InvalidField;
             if (out + produced > output.len) return error.BufferTooSmall;
             for (0..produced) |offset| {
                 output[out + offset] = @truncate(bits >> @intCast(16 - 8 * offset));
@@ -1727,6 +1763,41 @@ test "a malformed base64 group is InvalidField, never a trap" {
     try testing.expectEqualStrings("", try base64.decode("", &out, .standard));
 }
 
+test "a base64 pad is legal only in the final group, and only as a run" {
+    var out: [8]u8 = undefined;
+    // A pad in a group that is not the last one. `aGk=aGk=` read as `hihi`
+    // before, and those four bytes encode as `aGloaQ==`, so the eight
+    // characters that arrived could not be reproduced: the value was accepted
+    // and then lost on the way back out.
+    try testing.expectError(error.InvalidField, base64.decode("aGk=aGk=", &out, .standard));
+    try testing.expectError(error.InvalidField, base64.decode("QQ==QQ==", &out, .standard));
+    // A digit behind a pad is the same fault inside one group: `aG=x`
+    // produced `h` and dropped the `x` without saying so.
+    try testing.expectError(error.InvalidField, base64.decode("aG=x", &out, .standard));
+    try testing.expectError(error.InvalidField, base64.decode("aA=a", &out, .standard));
+    // The legal forms beside them still decode, so the refusals above are not
+    // a decoder that refuses every pad.
+    try testing.expectEqualStrings("hi", try base64.decode("aGk=", &out, .standard));
+    try testing.expectEqualStrings("A", try base64.decode("QQ==", &out, .standard));
+    // A whole group carries every digit it reads, so there is nothing over
+    // the byte and the rule below has nothing to say about it.
+    try testing.expectEqualStrings("hia", try base64.decode("aGlh", &out, .standard));
+}
+
+test "a base64 group whose digits reach no byte must have them zero" {
+    var out: [8]u8 = undefined;
+    // RFC 4648 section 3.5. `aGl=` and `aGk=` are the same two bytes and only
+    // the second is a spelling this encoder emits, so a decoder reading both
+    // could not say which one the peer sent when asked to send it back.
+    try testing.expectError(error.InvalidField, base64.decode("aGl=", &out, .standard));
+    try testing.expectError(error.InvalidField, base64.decode("aGm=", &out, .standard));
+    try testing.expectEqualStrings("hi", try base64.decode("aGk=", &out, .standard));
+    // One byte over two digits leaves four digits over the byte rather than
+    // two, so the reach is longer here and `aB==` is the spelling refused.
+    try testing.expectError(error.InvalidField, base64.decode("aB==", &out, .standard));
+    try testing.expectEqualStrings("h", try base64.decode("aA==", &out, .standard));
+}
+
 test "a base64 buffer one byte short is the caller's error, not the peer's" {
     // `aGk=` decodes to two bytes, so a one-byte buffer is a caller-side
     // sizing mistake. Reporting it as InvalidField would tell the caller the
@@ -1741,6 +1812,37 @@ test "a base64 buffer one byte short is the caller's error, not the peer's" {
     @memset(&short, 0xff);
     try testing.expectError(error.BufferTooSmall, base64.encode("foobar", &short, .standard));
     try testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff }, &short);
+}
+
+test "a base64 encode refuses a short buffer without writing a byte" {
+    // Room for one whole group and not for the rest. The encode side used to
+    // bound itself per group, so it wrote `Zm9v` and only then reported the
+    // shortfall: a caller that sized, retried and grew would find the head
+    // of the failed attempt already in the buffer it passed again.
+    var one_group: [6]u8 = undefined;
+    @memset(&one_group, 0xff);
+    try testing.expectError(error.BufferTooSmall, base64.encode("foobar", &one_group, .standard));
+    try testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff }, &one_group);
+
+    // The padded tail is written after every whole group, so both of these
+    // reached their refusal with a buffer already holding the groups in
+    // front of the pad.
+    var one_tail: [5]u8 = undefined;
+    @memset(&one_tail, 0xff);
+    try testing.expectError(error.BufferTooSmall, base64.encode("foob", &one_tail, .standard));
+    try testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff, 0xff, 0xff }, &one_tail);
+
+    var two_tail: [6]u8 = undefined;
+    @memset(&two_tail, 0xff);
+    try testing.expectError(error.BufferTooSmall, base64.encode("fooba", &two_tail, .standard));
+    try testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff }, &two_tail);
+
+    // The bound the documentation tells a caller to size from is accepted, so
+    // the refusals above are not an encoder that refuses every length.
+    var exact: [8]u8 = undefined;
+    try testing.expectEqualStrings("Zm9vYmFy", try base64.encode("foobar", &exact, .standard));
+    try testing.expectEqualStrings("Zm9vYg==", try base64.encode("foob", &exact, .standard));
+    try testing.expectEqualStrings("Zm9vYmE=", try base64.encode("fooba", &exact, .standard));
 }
 
 test "the base64 length helpers state the bounds both directions need" {
