@@ -30,20 +30,25 @@
 //! `Mcp-Session-Id` and `Last-Event-ID` were removed at `2026-07-28`
 //! (PROTOCOLS.md 4.2). This transport therefore mints no identifier, echoes
 //! none, and keeps no state between requests on a connection.
-//! [`Headers.removed`] records which of the two a peer sent. A request that
-//! carried `Mcp-Session-Id` is refused, because PROTOCOLS.md 4.2 says a peer
-//! that sends it is not speaking this revision. The HTTP+SSE transport,
+//! [`Headers.removed`] records which of the two a peer sent, and both bits are
+//! set when a peer sent both, because the two decide independently. A request
+//! that carried `Mcp-Session-Id` is refused, whichever of the two arrived
+//! first, because PROTOCOLS.md 4.2 says a peer that sends it is not speaking
+//! this revision. The HTTP+SSE transport,
 //! deprecated in `2025-03-26`, is not implemented at all (section 9).
 //!
 //! ## What is decided here rather than in the caller
 //!
 //! The header rules are the substance of this layer, so they are enforced
 //! here instead of being left to whoever writes the server: the revision
-//! header, `Mcp-Method` and `Mcp-Name` checked against the body,
-//! `Content-Type`, `Accept`, a repeated MCP-defined header, and
-//! `Mcp-Session-Id`, which this revision removed and which therefore refuses
-//! the request. A gateway that routes on `Mcp-Method` without checking it
-//! against the body is the failure this file exists to prevent.
+//! header, `Mcp-Method` and `Mcp-Name` checked against the body, and the
+//! `params._meta` declaration of the revision that PROTOCOLS.md 4.3 records as
+//! carried on every request — so a client request that does not declare it is
+//! refused rather than served. `Content-Type`, `Accept`, a repeated
+//! MCP-defined header, and `Mcp-Session-Id`, which this revision removed and
+//! which therefore refuses the request. A gateway that routes on
+//! `Mcp-Method` without checking it against the body is the failure this file
+//! exists to prevent.
 //!
 //! The derived `Mcp-Param-{Name}` family is carried rather than enforced. Only
 //! the tool's own `inputSchema` says what a value in `arguments` must equal,
@@ -285,8 +290,18 @@ const Decision = struct {
 /// once per type rather than once per range. A parameter is not part of the
 /// rank: the two types this transport answers with carry none, so the cases a
 /// parameter would distinguish are not cases it can be asked about.
+///
+/// `*/*` is the only range whose `*` is the type. RFC 9110 §12.5.1 spells that
+/// one out literally as `"*/*"` rather than as `type "/" "*"`, and the text
+/// beside it names `*/*` and `type/*` as the two wildcards there are. A `*` as
+/// the type beside any other subtype is neither of them, so `*/json` names no
+/// range this transport can match and is skipped like any other entry that
+/// names none: reading it as covering both types is how a client that listed
+/// only `*/event-stream` was answered `Content-Type: application/json`.
 fn precedence(major: []const u8, minor: []const u8, kind: MediaType) ?u2 {
-    if (std.mem.eql(u8, major, "*")) return 0;
+    if (std.mem.eql(u8, major, "*")) {
+        return if (std.mem.eql(u8, minor, "*")) 0 else null;
+    }
     const name: []const u8 = switch (kind) {
         .json => mcp.uri_and_media.json_media_type,
         .event_stream => mcp.uri_and_media.event_stream_media_type,
@@ -332,6 +347,25 @@ pub const ParamHeader = struct {
     value: []const u8,
 };
 
+/// Which of the two headers `2026-07-28` removed a peer sent.
+///
+/// Two independent bits rather than one first-wins optional, because the two
+/// are independent verdicts: PROTOCOLS.md 4.2 refuses a request that carried
+/// `Mcp-Session-Id` and says nothing of one that carried `Last-Event-ID`, so
+/// whichever of the two arrived last must not be able to decide the verdict.
+pub const Removed = struct {
+    /// `Mcp-Session-Id` arrived, which PROTOCOLS.md 4.2 refuses.
+    session_id: bool = false,
+    /// `Last-Event-ID` arrived, which PROTOCOLS.md 4.2 removed without saying
+    /// a peer sending it is not speaking this revision.
+    last_event_id: bool = false,
+
+    /// Whether the peer sent neither, which is what `readHeaders` starts from.
+    pub fn none(self: Removed) bool {
+        return !self.session_id and !self.last_event_id;
+    }
+};
+
 /// The MCP headers on one request, as this transport reads them.
 ///
 /// Slices borrow the header block or `readHeaders`' scratch, so both must
@@ -347,15 +381,15 @@ pub const Headers = struct {
     /// dropped.
     origin: ?[]const u8 = null,
     authorization: ?[]const u8 = null,
-    /// A header removed at `2026-07-28` arrived, and which of the two it was.
+    /// A header removed at `2026-07-28` arrived, and which of the two.
     ///
     /// Recorded because a caller can then see that a peer sent a header this
     /// revision has no use for. It is never echoed, and this transport mints
-    /// no identifier. `checkPost` refuses a request that carried
-    /// `Mcp-Session-Id` and serves one that carried `Last-Event-ID`, because
-    /// PROTOCOLS.md 4.2 says only of the first that a peer sending it is not
-    /// speaking this revision.
-    removed: ?mcp.HeaderKind = null,
+    /// no identifier. [`checkPost`] refuses a request that carried
+    /// `Mcp-Session-Id` and serves one that carried only `Last-Event-ID`,
+    /// because PROTOCOLS.md 4.2 says only of the first that a peer sending it
+    /// is not speaking this revision.
+    removed: Removed = .{},
     /// The derived parameter headers, in the order they arrived.
     params: []const ParamHeader = &.{},
     /// The value of a header named `x-mcp-header`, which is the JSON Schema
@@ -444,12 +478,18 @@ pub fn readHeaders(head: []const u8, params: []ParamHeader, scratch: []u8) Error
                 if (headers.authorization != null) return error.DuplicateHeader;
                 headers.authorization = field.value;
             },
-            .session_id_removed, .last_event_id_removed => {
+            .session_id_removed => {
                 // Never read into a field and never echoed. Recorded so a
                 // caller can see that a peer sent a header this revision
                 // removed, and so `checkPost` can refuse the request.
-                if (headers.removed == null) headers.removed = mcp.headerKind(field.name);
+                //
+                // Its own bit and not a slot the two headers share, so a peer
+                // that wrote `Last-Event-ID` first cannot hide the
+                // `Mcp-Session-Id` that refuses the request. Neither is a
+                // first-wins record, so there is no order left to get wrong.
+                headers.removed.session_id = true;
             },
+            .last_event_id_removed => headers.removed.last_event_id = true,
             .schema_keyword => headers.schema_keyword_sent = field.value,
             // `www_authenticate` and every other header belong to whoever owns
             // the endpoint, and the body is where the MCP rules live.
@@ -610,10 +650,10 @@ pub fn checkPost(headers: Headers, body: []const u8, scratch: []u8) Error!Post {
     // ignore it" — and PROTOCOLS.md wins where the two disagree, so the
     // conflict is recorded here rather than resolved silently. A peer that
     // sent `Last-Event-ID` is served, because PROTOCOLS.md says no such thing
-    // of that header.
-    if (headers.removed) |removed| {
-        if (removed == .session_id_removed) return error.UnsupportedVersion;
-    }
+    // of that header. A request that sent both is refused either way: the bit
+    // is read on its own, so which of the two the peer wrote first cannot
+    // decide the verdict.
+    if (headers.removed.session_id) return error.UnsupportedVersion;
 
     if (mediaType(headers.content_type orelse return error.MissingHeader) != .json) {
         return error.UnsupportedMediaType;
@@ -642,21 +682,49 @@ pub fn checkPost(headers: Headers, body: []const u8, scratch: []u8) Error!Post {
     // `HeaderMismatch` (`-32020`) on `400 Bad Request`, and this is that
     // error.
     //
-    // PROTOCOLS.md 4.3 records the key as carried on every client request and
-    // does not restate the match rule, so PROTOCOLS.md is silent here rather
-    // than in conflict, and nothing is resolved silently. A body carrying no
-    // `_meta` at all has nothing to compare and is served: the rule this can
-    // state is the one about a value that is there and disagrees.
-    const body_revision = metaRevision(message.params, scratch) catch return error.MalformedRequest;
+    // The claim also has to be made at all. PROTOCOLS.md 4.3 records
+    // `io.modelcontextprotocol/protocolVersion` as carried "on every request",
+    // PROTOCOLS.md 2 says a field the specification marks required but the
+    // peer omits is a decode error, and
+    // `research/normative/mcp-2026-07-28.md` §2 grades the key
+    // `Required: Yes` on every client request `_meta` with "Missing ⇒ `-32602`
+    // on HTTP `400 Bad Request`", which §4 restates as a Server MUST. So a
+    // request whose `params` carries no `_meta` at all, an empty one, or one
+    // without the key is a request missing a required `_meta` field, and
+    // `MissingField` is the member that says exactly that — as distinct from
+    // `HeaderMismatch`, which is a value that is there and disagrees. The
+    // three null cases were served before, and none of them is a claim this
+    // library can check.
+    //
+    // A notification is not a request. The same table grades the key on
+    // "every client request `_meta`", and PROTOCOLS.md 4.3 says "on every
+    // request", so a POST carrying a notification is not required to declare
+    // the revision — and one that declares it is still checked against the
+    // header, because a disagreement is a disagreement whatever the message
+    // carries.
+    const body_revision = metaRevision(message.params, scratch) catch |err| switch (err) {
+        // The caller's `scratch`, not the peer's request. `jsonrpc.decode` two
+        // lines above propagates the same shortage as `BufferTooSmall`, and a
+        // `400` here would blame the peer for a fault only the caller can fix.
+        error.BufferTooSmall => return error.BufferTooSmall,
+        else => return error.MalformedRequest,
+    };
     if (body_revision) |value| {
         if (!std.mem.eql(u8, revision.string(), value)) return error.HeaderMismatch;
+    } else if (message.kind != .notification) {
+        return error.MissingField;
     }
 
     var name: ?[]const u8 = null;
     if (requiresName(method)) {
         if (headers.name == null) return error.MissingHeader;
-        const from_body = nameFromParams(method, message.params, scratch) catch
-            return error.MalformedRequest;
+        const from_body = nameFromParams(method, message.params, scratch) catch |err| switch (err) {
+            // The same caller's buffer as above, and the same reason: this
+            // shortage is not the peer's request and must not be reported as
+            // one.
+            error.BufferTooSmall => return error.BufferTooSmall,
+            else => return error.MalformedRequest,
+        };
         const claimed = from_body orelse return error.HeaderMismatch;
         if (!std.mem.eql(u8, headers.name.?, claimed)) return error.HeaderMismatch;
         name = claimed;
@@ -1384,10 +1452,9 @@ pub const Server = struct {
         if (headers.schema_keyword_sent != null) return error.NotAHeader;
         _ = try revisionOf(headers);
         // A peer that sent `Mcp-Session-Id` is refused before its body is
-        // taken off the socket, for the reason `checkPost` gives.
-        if (headers.removed) |removed| {
-            if (removed == .session_id_removed) return error.UnsupportedVersion;
-        }
+        // taken off the socket, for the reason `checkPost` gives, and off the
+        // same bit rather than a slot two headers share.
+        if (headers.removed.session_id) return error.UnsupportedVersion;
         if (mediaType(headers.content_type orelse return error.MissingHeader) != .json) {
             return error.UnsupportedMediaType;
         }
@@ -1557,7 +1624,7 @@ test "the version header is all-caps and the rest are title-case, and both are r
     try testing.expectEqualStrings("tools/list", headers.method.?);
     try testing.expectEqualStrings("unrelated", headers.name.?);
     try testing.expectEqual(mcp.Revision.current, try revisionOf(headers));
-    try testing.expect(headers.removed == null);
+    try testing.expect(headers.removed.none());
 }
 
 test "a header block that is not one is refused, not walked" {
@@ -1583,13 +1650,51 @@ test "a peer that sends the session id this revision removed is refused" {
         "Content-Type: application/json\r\n" ++
         "\r\n";
     const headers = try readHeaders(head, &params, &scratch);
-    try testing.expectEqual(mcp.HeaderKind.session_id_removed, headers.removed.?);
+    try testing.expect(headers.removed.session_id);
     // PROTOCOLS.md 4.2 says a peer that sends `Mcp-Session-Id` is not speaking
     // this revision, so the request is refused. The compatibility matrix in
     // the normative source asks for the opposite, and the two disagree, so
     // this is the refusal PROTOCOLS.md requires.
     const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}";
     try testing.expectError(error.UnsupportedVersion, checkPost(headers, body, &scratch));
+}
+
+test "the removed session id refuses the request whichever of the two headers came first" {
+    var params: [2]ParamHeader = undefined;
+    var scratch: [256]u8 = undefined;
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"," ++
+        "\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":" ++
+        "\"2026-07-28\"}}}";
+
+    // One slot shared by the two removed headers made the verdict depend on
+    // which line the peer wrote first, so a request carrying `Mcp-Session-Id`
+    // was served whenever a `Last-Event-ID` reached the slot before it. The
+    // two are separate bits for that reason, and both orders below are refused
+    // for the same reason and with the same error.
+    const last_event_first = "POST /mcp HTTP/1.1\r\n" ++
+        "MCP-Protocol-Version: 2026-07-28\r\n" ++
+        "Mcp-Method: tools/list\r\n" ++
+        "Last-Event-ID: 11\r\n" ++
+        "Mcp-Session-Id: 5eed\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "\r\n";
+    const headers = try readHeaders(last_event_first, &params, &scratch);
+    // Both are recorded, so a caller can still see that the peer sent both.
+    try testing.expect(headers.removed.session_id);
+    try testing.expect(headers.removed.last_event_id);
+    try testing.expectError(error.UnsupportedVersion, checkPost(headers, body, &scratch));
+
+    const session_first = "POST /mcp HTTP/1.1\r\n" ++
+        "MCP-Protocol-Version: 2026-07-28\r\n" ++
+        "Mcp-Method: tools/list\r\n" ++
+        "Mcp-Session-Id: 5eed\r\n" ++
+        "Last-Event-ID: 11\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "\r\n";
+    const reversed = try readHeaders(session_first, &params, &scratch);
+    try testing.expect(reversed.removed.session_id);
+    try testing.expect(reversed.removed.last_event_id);
+    try testing.expectError(error.UnsupportedVersion, checkPost(reversed, body, &scratch));
 }
 
 test "Last-Event-ID alone is recorded, and the request it arrived on is served" {
@@ -1602,12 +1707,14 @@ test "Last-Event-ID alone is recorded, and the request it arrived on is served" 
         "Content-Type: application/json\r\n" ++
         "\r\n";
     const headers = try readHeaders(head, &params, &scratch);
-    try testing.expectEqual(mcp.HeaderKind.last_event_id_removed, headers.removed.?);
+    try testing.expect(headers.removed.last_event_id);
     // PROTOCOLS.md 4.2 says of `Mcp-Session-Id` that a peer sending it is not
     // speaking this revision, and says no such thing of this header, so a
     // request that carried only this one is served. Nothing echoes it back and
     // there is no resumption to resume.
-    const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}";
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"," ++
+        "\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":" ++
+        "\"2026-07-28\"}}}";
     try testing.expectEqualStrings("tools/list", (try checkPost(headers, body, &scratch)).method);
 }
 
@@ -1752,7 +1859,8 @@ test "Mcp-Name is required for the three methods that name an entity, and only t
         "\r\n";
     const headers = try readHeaders(head, &params, &scratch);
     const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
-        "\"params\":{\"name\":\"echo\"}}";
+        "\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":" ++
+        "\"2026-07-28\"},\"name\":\"echo\"}}";
     try testing.expectError(error.MissingHeader, checkPost(headers, body, &scratch));
 
     // A method that names nothing does not get a header requirement invented
@@ -1763,7 +1871,9 @@ test "Mcp-Name is required for the three methods that name an entity, and only t
         "Content-Type: application/json\r\n" ++
         "\r\n";
     const list_headers = try readHeaders(list_head, &params, &scratch);
-    const list_body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}";
+    const list_body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"," ++
+        "\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":" ++
+        "\"2026-07-28\"}}}";
     const post = try checkPost(list_headers, list_body, &scratch);
     try testing.expectEqualStrings("tools/list", post.method);
     try testing.expect(post.name == null);
@@ -1781,7 +1891,8 @@ test "Mcp-Name must equal the name the body carries" {
         "\r\n";
     const headers = try readHeaders(head, &params, &scratch);
     const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
-        "\"params\":{\"name\":\"echo\"}}";
+        "\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":" ++
+        "\"2026-07-28\"},\"name\":\"echo\"}}";
     try testing.expectError(error.HeaderMismatch, checkPost(headers, body, &scratch));
 }
 
@@ -1804,7 +1915,8 @@ test "Mcp-Name is compared with the member the method's schema binds" {
     try testing.expectError(error.HeaderMismatch, checkPost(
         headers,
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
-            "\"params\":{\"uri\":\"echo\"}}",
+            "\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":" ++
+            "\"2026-07-28\"},\"uri\":\"echo\"}}",
         &scratch,
     ));
 
@@ -1818,7 +1930,8 @@ test "Mcp-Name is compared with the member the method's schema binds" {
     try testing.expectError(error.HeaderMismatch, checkPost(
         read_headers,
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/read\"," ++
-            "\"params\":{\"name\":\"file:///notes.txt\"}}",
+            "\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":" ++
+            "\"2026-07-28\"},\"name\":\"file:///notes.txt\"}}",
         &scratch,
     ));
 
@@ -1827,14 +1940,16 @@ test "Mcp-Name is compared with the member the method's schema binds" {
     const tool = try checkPost(
         headers,
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
-            "\"params\":{\"name\":\"echo\"}}",
+            "\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":" ++
+            "\"2026-07-28\"},\"name\":\"echo\"}}",
         &scratch,
     );
     try testing.expectEqualStrings("echo", tool.name.?);
     const resource = try checkPost(
         read_headers,
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/read\"," ++
-            "\"params\":{\"uri\":\"file:///notes.txt\"}}",
+            "\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":" ++
+            "\"2026-07-28\"},\"uri\":\"file:///notes.txt\"}}",
         &scratch,
     );
     try testing.expectEqualStrings("file:///notes.txt", resource.name.?);
@@ -1869,7 +1984,8 @@ test "a sentinel-encoded Mcp-Name is decoded before it is compared" {
     try testing.expectEqualStrings("städte", headers.name.?);
 
     const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
-        "\"params\":{\"name\":\"städte\"}}";
+        "\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":" ++
+        "\"2026-07-28\"},\"name\":\"städte\"}}";
     const post = try checkPost(headers, body, &body_scratch);
     try testing.expectEqualStrings("städte", post.name.?);
 }
@@ -1897,7 +2013,8 @@ test "a revision the header and the body disagree on is a mismatch" {
     ));
 
     // The same body declaring the revision the header named is served, and so
-    // is one whose `_meta` is about something else entirely.
+    // is one whose `_meta` carries members this transport does not read
+    // alongside the one it does.
     const agreed = try checkPost(
         headers,
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"," ++
@@ -1910,10 +2027,157 @@ test "a revision the header and the body disagree on is a mismatch" {
     const unrelated = try checkPost(
         headers,
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"," ++
-            "\"params\":{\"_meta\":{\"progressToken\":7}}}",
+            "\"params\":{\"_meta\":{\"progressToken\":7," ++
+            "\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}}}",
         &scratch,
     );
     try testing.expectEqualStrings("tools/list", unrelated.method);
+}
+
+test "a request that does not declare the revision in _meta is refused" {
+    var params: [2]ParamHeader = undefined;
+    var scratch: [512]u8 = undefined;
+    const head = "POST /mcp HTTP/1.1\r\n" ++
+        "MCP-Protocol-Version: 2026-07-28\r\n" ++
+        "Mcp-Method: tools/list\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "\r\n";
+    const headers = try readHeaders(head, &params, &scratch);
+
+    // PROTOCOLS.md 4.3 records `io.modelcontextprotocol/protocolVersion` as
+    // carried "on every request" and PROTOCOLS.md 2 makes a required field the
+    // peer omits a decode error, and
+    // `research/normative/mcp-2026-07-28.md` §2 grades the key `Required: Yes`
+    // with "Missing ⇒ `-32602` on HTTP `400 Bad Request`". Four ways of not
+    // declaring it, one error: a body with no `params`, one with `params` but
+    // no `_meta`, an empty `_meta`, and a `_meta` carrying only other keys.
+    // Every one of them was served, on the reasoning that a value that is not
+    // there has nothing to compare — which is true of the comparison and false
+    // of the requirement.
+    try testing.expectError(error.MissingField, checkPost(
+        headers,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}",
+        &scratch,
+    ));
+    try testing.expectError(error.MissingField, checkPost(
+        headers,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}",
+        &scratch,
+    ));
+    try testing.expectError(error.MissingField, checkPost(
+        headers,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"," ++
+            "\"params\":{\"_meta\":{}}}",
+        &scratch,
+    ));
+    try testing.expectError(error.MissingField, checkPost(
+        headers,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"," ++
+            "\"params\":{\"_meta\":{\"progressToken\":7}}}",
+        &scratch,
+    ));
+
+    // The key arriving is what changes the verdict and nothing else, so the
+    // four refusals above are not a blanket refusal of bodies that do not
+    // carry a `_meta` at all.
+    try testing.expectEqualStrings("tools/list", (try checkPost(
+        headers,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"," ++
+            "\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":" ++
+            "\"2026-07-28\"}}}",
+        &scratch,
+    )).method);
+
+    // A notification is not a request, and the normative table grades the key
+    // on "every client request `_meta`", so a POST carrying one is not refused
+    // for a `_meta` it never owed. A notification that declares a revision the
+    // header disagrees with is still a disagreement, so both halves run
+    // against a header naming the method the body declares.
+    const progress_head = "POST /mcp HTTP/1.1\r\n" ++
+        "MCP-Protocol-Version: 2026-07-28\r\n" ++
+        "Mcp-Method: notifications/progress\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "\r\n";
+    const progress_headers = try readHeaders(progress_head, &params, &scratch);
+    const progress = try checkPost(
+        progress_headers,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"," ++
+            "\"params\":{\"progress\":1}}",
+        &scratch,
+    );
+    try testing.expect(progress.notification);
+    try testing.expectError(error.HeaderMismatch, checkPost(
+        progress_headers,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"," ++
+            "\"params\":{\"_meta\":{\"io.modelcontextprotocol/" ++
+            "protocolVersion\":\"2025-11-25\"}}}",
+        &scratch,
+    ));
+}
+
+test "a body scratch too small is the caller's shortage, not the peer's request" {
+    var params: [2]ParamHeader = undefined;
+    var scratch: [512]u8 = undefined;
+    const head = "POST /mcp HTTP/1.1\r\n" ++
+        "MCP-Protocol-Version: 2026-07-28\r\n" ++
+        "Mcp-Method: tools/list\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "\r\n";
+    const headers = try readHeaders(head, &params, &scratch);
+
+    // A body whose `params` carries a key that needs the caller's scratch to
+    // decode. `jsonrpc.decode` steps over `params` as a raw value and never
+    // writes, so this body decodes in a buffer of nothing and the shortage
+    // belongs to the walk `checkPost` runs next.
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"," ++
+        "\"params\":{\"a\\u0020b\":1,\"_meta\":{\"io.modelcontextprotocol/" ++
+        "protocolVersion\":\"2026-07-28\"}}}";
+    // The same body with room to decode is served, so the assertion below is
+    // about the buffer and not about the body.
+    try testing.expectEqualStrings("tools/list", (try checkPost(headers, body, &scratch)).method);
+
+    // The escape is in a key `metaRevision` reads, and a scratch of zero bytes
+    // cannot decode it. Reported as `400 MalformedRequest` before this, which
+    // blames the peer for a fault only the caller can fix: the shortage is the
+    // caller's `Server.Buffers.body_scratch` being too small, and
+    // `jsonrpc.decode` propagates the very same fault as `BufferTooSmall`.
+    try testing.expectError(
+        error.BufferTooSmall,
+        checkPost(headers, body, scratch[0..0]),
+    );
+
+    // The same shortage in the `Mcp-Name` walk. `nameFromParams` reads every
+    // key from the top of `params`, so the escaped key has to come after the
+    // `_meta` that lets `metaRevision` return first — otherwise the walk above
+    // would be the one that ran out.
+    const named = "POST /mcp HTTP/1.1\r\n" ++
+        "MCP-Protocol-Version: 2026-07-28\r\n" ++
+        "Mcp-Method: tools/call\r\n" ++
+        "Mcp-Name: echo\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "\r\n";
+    const name_headers = try readHeaders(named, &params, &scratch);
+    try testing.expectError(
+        error.BufferTooSmall,
+        checkPost(
+            name_headers,
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+                "\"params\":{\"_meta\":{\"io.modelcontextprotocol/" ++
+                "protocolVersion\":\"2026-07-28\"},\"a\\u0020b\":1," ++
+                "\"name\":\"echo\"}}",
+            scratch[0..0],
+        ),
+    );
+    // The same body with room to decode is served, so the walk above is what
+    // ran out rather than the request.
+    try testing.expectEqualStrings("echo", (try checkPost(
+        name_headers,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+            "\"params\":{\"_meta\":{\"io.modelcontextprotocol/" ++
+            "protocolVersion\":\"2026-07-28\"},\"a\\u0020b\":1," ++
+            "\"name\":\"echo\"}}",
+        &scratch,
+    )).name.?);
 }
 
 test "a derived parameter header is checked against the value arguments carries" {
@@ -1951,7 +2215,8 @@ test "a derived parameter header is checked against the value arguments carries"
     try testing.expectEqual(@as(usize, 1), headers.params.len);
 
     const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
-        "\"params\":{\"name\":\"echo\",\"arguments\":{\"city\":\"Zürich\"}}}";
+        "\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":" ++
+        "\"2026-07-28\"},\"name\":\"echo\",\"arguments\":{\"city\":\"Zürich\"}}}";
     const post = try checkPost(headers, body, &scratch);
     try testing.expectEqualStrings("Zürich", post.param("city").?);
 
@@ -2059,6 +2324,38 @@ test "the most specific Accept entry decides a type, and a wildcard cannot re-ad
     // the more specific entry only decides, and it decides the same answer.
     const admitted = parseAccept("*/*, application/json");
     try testing.expect(admitted.allows(.json) and admitted.allows(.event_stream));
+}
+
+test "a * as the type is only a wildcard beside another *" {
+    // RFC 9110 §12.5.1 spells the range that covers every media type `"*/*"`
+    // literally rather than as `type "/" "*"`, and the text beside it names
+    // `*/*` and `type/*` as the two wildcards there are. Reading any `*` in the
+    // type position as `*/*` made `*/event-stream` answer a JSON body and
+    // `*/json` answer a stream, each of which is the one media type the client
+    // did not list.
+    const stream_only = parseAccept("*/event-stream");
+    try testing.expect(!stream_only.allows(.json));
+    try testing.expect(!stream_only.isAcceptable());
+
+    const json_only = parseAccept("*/json");
+    try testing.expect(!json_only.allows(.event_stream));
+    try testing.expect(!json_only.isAcceptable());
+
+    // An entry that names no range decides nothing, so it cannot admit the one
+    // media type a real entry beside it refused either. Before this, the `*` in
+    // `*/json` decided `text/event-stream` at rank `*/*` and the request was
+    // accepted for a stream it had not asked for.
+    const beside = parseAccept("*/json, application/json;q=0");
+    try testing.expect(!beside.allows(.json));
+    try testing.expect(!beside.allows(.event_stream));
+    try testing.expect(!beside.isAcceptable());
+
+    // `*/*` and `type/*` are the two that are ranges, and neither changed.
+    const everything = parseAccept("*/*");
+    try testing.expect(everything.allows(.json) and everything.allows(.event_stream));
+    const by_type = parseAccept("text/*");
+    try testing.expect(!by_type.allows(.json));
+    try testing.expect(by_type.allows(.event_stream));
 }
 
 test "a POST that accepts no reply this transport can send is refused" {
@@ -2738,7 +3035,13 @@ const Chunked = struct {
             return;
         };
 
-        self.answer = client.call(2, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}", spec, &self.side.head, .{
+        // A request after the refused one carries the `_meta` PROTOCOLS.md 4.3
+        // requires, so what this test measures is the connection surviving the
+        // refusal above and nothing else.
+        const body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"," ++
+            "\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":" ++
+            "\"2026-07-28\"}}}";
+        self.answer = client.call(2, body, spec, &self.side.head, .{
             .transfer = &self.side.transfer,
             .out = &self.side.out,
             .decode = &self.side.decode,
@@ -2907,7 +3210,8 @@ test "one POST over a real socket is answered with a single JSON body" {
         .endpoint = &endpoint,
         .side = &client_side,
         .body = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\"," ++
-            "\"params\":{\"name\":\"echo\"}}",
+            "\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":" ++
+            "\"2026-07-28\"},\"name\":\"echo\"}}",
         .spec = .{ .method = "tools/call", .name = "echo" },
         .id = 7,
         .reply = &reply,
@@ -3124,7 +3428,9 @@ test "the same request is answered as a stream when the client accepts one" {
         .http = &http_client,
         .endpoint = &endpoint,
         .side = &client_side,
-        .body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"subscriptions/listen\"}",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"subscriptions/listen\"," ++
+            "\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":" ++
+            "\"2026-07-28\"}}}",
         .spec = .{ .method = "subscriptions/listen" },
         .status = .ok,
         .got = &got,
@@ -3395,7 +3701,8 @@ test "a stream keeps delivering after the result, which is what a subscription i
         .endpoint = &endpoint,
         .side = &client_side,
         .body = "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"subscriptions/listen\"," ++
-            "\"params\":{\"resourceSubscriptions\":[\"file:///a\"]}}",
+            "\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":" ++
+            "\"2026-07-28\"},\"resourceSubscriptions\":[\"file:///a\"]}}",
         .spec = .{ .method = "subscriptions/listen" },
         .status = .ok,
         .got = &got,
@@ -3633,7 +3940,9 @@ test "a reply this transport cannot read keeps its status instead of reading as 
         .http = &http_client,
         .endpoint = &endpoint,
         .side = &client_side,
-        .body = "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/list\"}",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/list\"," ++
+            "\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":" ++
+            "\"2026-07-28\"}}}",
         .spec = .{ .method = "tools/list" },
         .id = 4,
         .reply = &reply,
