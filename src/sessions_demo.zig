@@ -102,9 +102,25 @@ const Agent = struct {
 
         var writer = json.Writer.init(answer);
         writer.slice("{\"jsonrpc\":\"2.0\",\"id\":") catch return null;
-        var digits: [24]u8 = undefined;
-        const id_text = std.fmt.bufPrint(&digits, "{d}", .{id.integer}) catch return null;
-        writer.slice(id_text) catch return null;
+        // The id is echoed in the arm it arrived in. A response is matched by
+        // id and by nothing else, so a string id answered as an integer is an
+        // answer to nothing, and a string id is legal JSON-RPC that this
+        // handler has no way to promise it will not be sent: reading the
+        // integer arm off a `.string` is a safety trap rather than a wrong
+        // answer, and nothing about a `conn.Handler` on a socket makes the
+        // peer's frame the example's own writing.
+        switch (id) {
+            .integer => |value| {
+                var digits: [24]u8 = undefined;
+                const id_text = std.fmt.bufPrint(&digits, "{d}", .{value}) catch return null;
+                writer.slice(id_text) catch return null;
+            },
+            // `json.Writer.string` escapes, so an id the peer wrote with an
+            // escape comes back as a JSON string rather than as its lexeme.
+            // The text it borrows is the decode region and the writer is the
+            // answer region, and those are two arrays.
+            .string => |text| writer.string(text) catch return null,
+        }
 
         if (std.mem.eql(u8, method.text, "initialize")) {
             // v1, and two advertised features. `loadSession` is the gate on
@@ -235,13 +251,16 @@ const Endpoint = struct {
     stream: Io.net.Stream = undefined,
     connection: conn.Conn = undefined,
 
-    /// Whether the pump releases this endpoint's stream when the connection
-    /// ends. The server endpoint sets it before `open` spawns the pump, because
-    /// `ServerTask.run` hands the accepted stream over and returns, so the pump
-    /// is the last task left holding the descriptor. The client endpoint leaves
-    /// it false, because `ClientTask.run` hangs up its own end and a second
-    /// close would release whatever descriptor the first one returned.
-    close_in_pump: bool = false,
+    /// Whether this endpoint has been hung up already.
+    closed: bool = false,
+    /// Whether a task reads this endpoint's stream, which [`open`] sets before
+    /// it spawns the pump.
+    ///
+    /// It decides who releases the descriptor: the pump, because it is the only
+    /// task that reads it, whenever there is one. See [`hangUp`].
+    pumping: bool = false,
+    /// Whether the descriptor has been released.
+    released: bool = false,
 
     /// Open an endpoint over `stream`, or report why there is no connection to
     /// open. `conn.Conn.init` refuses a region with no room and a pair that
@@ -269,13 +288,58 @@ const Endpoint = struct {
         if (handler) |h| self.connection.setHandler(h);
         // Spawned on the group the example joins, because `Io.Group.async` does
         // not promise to run its task until the group is awaited or cancelled.
+        // `pumping` is set here and not before the connection: an `init` that
+        // refused leaves no pump to release the descriptor, and the caller that
+        // hangs up on that path has to.
+        self.pumping = true;
         group.async(io, pump, .{ self, io });
     }
 
-    /// Hang up. `shutdown` before `close`: closing a descriptor does not
-    /// interrupt a read already blocked on it, so the peer's pump would sit on
-    /// an open description and the group would never finish.
+    /// Hang up: stop the reader, wake it, and let the descriptor go once.
+    ///
+    /// `shutdown` before `close`: closing a descriptor does not interrupt a read
+    /// already blocked on it, so the peer's pump would sit on an open
+    /// description and the group would never finish.
+    ///
+    /// The pump releases the descriptor, not this call, and it is the only task
+    /// that may. `conn.pump` asks again after a read of zero bytes, and a local
+    /// `shutdown` makes the next read return exactly that, so a caller that
+    /// released the descriptor under a live pump would have that pump read a
+    /// freed descriptor: the standard library aborts on `EBADF` inside
+    /// `netReadPosix`, before the pump's own `catch` can see an error, and the
+    /// whole binary dies instead of the exchange failing. Telling the
+    /// connection first is what makes the loop stop — the pump leaves at its
+    /// next turn and closes the stream on its way out, after the last read that
+    /// can touch it.
+    ///
+    /// The client's own pump is the one this is for. It runs on the same group
+    /// and `ClientTask.run` is a different task from it, so `shutdown` followed
+    /// by `close` here closes a descriptor another task is reading: that read
+    /// wakes with zero bytes, `conn.pump` reads zero as "ask again", and the
+    /// next read lands on the number `close` returned.
+    ///
+    /// The guards are what make the callers safe: `abandon` reaches this from
+    /// every arm that gave the exchange up, the last line of the exchange
+    /// reaches it too, and the pump reaches `release` on the way out of all of
+    /// them. Releasing the same descriptor twice would close an unrelated one
+    /// the process had opened in the meantime, and every call below is a
+    /// syscall on it.
     fn hangUp(self: *Endpoint, io: Io) void {
+        if (self.closed) return;
+        self.closed = true;
+        if (self.released) return;
+        if (self.pumping) {
+            self.connection.close();
+            self.stream.shutdown(io, .both) catch {};
+            return;
+        }
+        self.release(io);
+    }
+
+    /// Release the descriptor once, and only on a stream that still has one.
+    fn release(self: *Endpoint, io: Io) void {
+        if (self.released) return;
+        self.released = true;
         self.stream.shutdown(io, .both) catch {};
         self.stream.close(io);
     }
@@ -283,13 +347,15 @@ const Endpoint = struct {
 
 /// The connection pump, and the descriptor release that goes with it.
 ///
-/// `pump` returns when the peer hangs up, which on the server side is the only
-/// event that hands the accepted stream back, so that endpoint's pump closes
-/// it. The client's pump does not: `ClientTask.run` already hung up that end,
-/// and closing a descriptor twice releases an unrelated one the second time.
+/// The pump takes the endpoint rather than the connection because it is the one
+/// task that reads the descriptor and therefore the one that closes it: a
+/// caller that closed it first would have this loop read a freed descriptor
+/// and the process would abort inside the read. It releases on the way out of
+/// every exchange, which is why no endpoint needs a flag saying which side
+/// closes.
 fn pump(endpoint: *Endpoint, io: Io) void {
     endpoint.connection.pump();
-    if (endpoint.close_in_pump) endpoint.hangUp(io);
+    endpoint.release(io);
 }
 
 /// One carried call's inner outcome.
@@ -373,11 +439,10 @@ const ServerTask = struct {
             self.report.failed = true;
             return;
         };
-        // Set before `open` spawns the pump, because this task returns below
-        // and the pump is then the only one left holding the accepted stream.
-        self.endpoint.close_in_pump = true;
         // A refused `open` spawned no pump, so nothing else releases the
-        // accepted stream and this task hangs its end up itself.
+        // accepted stream and this task hangs its end up itself. The pump that
+        // did start needs no flag to say it releases the stream: it releases
+        // every stream it reads, and `hangUp` is the one that waits for it.
         self.endpoint.open(self.io, self.group, stream, .{
             .ctx = self.agent,
             .call = Agent.handle,
@@ -400,6 +465,9 @@ const ClientTask = struct {
     /// Give up on the exchange. Every arm that reaches here has an endpoint
     /// holding this side's stream — `open` stores it before it can refuse —
     /// so there is a descriptor to hang up, and the peer's pump ends on it.
+    /// What hangs up is this side's own reader: it closes this endpoint's
+    /// descriptor on its way out rather than here, where a task other than the
+    /// reader would be closing a descriptor that reader may still be using.
     fn abandon(self: *@This()) void {
         self.report.failed = true;
         self.endpoint.hangUp(self.io);
@@ -409,11 +477,18 @@ const ClientTask = struct {
         const stream = self.address.connect(self.io) catch {
             // Not `abandon`, because `Endpoint.stream` is undefined until
             // `open` assigns it and a hang up here would close whatever
-            // descriptor the stack held. Nothing is hung up on this arm: the
-            // agent's task stays parked in `accept` on a listener this example
-            // never closes, and no member of the group can wake it from here.
-            // `main` listens before it spawns either task, so the listener is
-            // already there and this arm does not run.
+            // descriptor the stack held. There is nothing of this side's to
+            // hang up: `connect` failed, so no descriptor was ever assigned.
+            //
+            // What this arm cannot reach is the agent's task, which is still
+            // parked in `accept`. `main` listens before it spawns either task,
+            // so the listener is already there and a connection to it is
+            // queued rather than refused; this arm runs when the kernel has no
+            // room for one, and then the join in `main` waits on a task that
+            // will not return, because a listening socket has no way to be
+            // told that no connection is coming. `http_demo` answers the same
+            // wait with a handoff its client signals, and that is the
+            // mechanism that would end this arm as well.
             self.report.failed = true;
             return;
         };
@@ -537,7 +612,9 @@ const ClientTask = struct {
         record(&report.second, second);
 
         // The client hangs up. The agent's reader sees end of file and returns,
-        // and this side's own pump returns with it.
+        // and this side's own pump returns with it — releasing this endpoint's
+        // descriptor on its way out, which is the last read's own task and so
+        // the only one that may close it.
         self.endpoint.hangUp(self.io);
     }
 };
@@ -625,9 +702,16 @@ pub fn main(init: std.process.Init) !void {
     // both pumps return on their own.
     group.await(io) catch {};
 
+    // The step fails rather than returning quietly. `http_demo` answers the
+    // same condition with `error.ExchangeFailed`, and this run step is the
+    // proof that the two protocol layers compose on transport bytes, so an
+    // exit status of 0 on a run whose own output says the exchange failed is
+    // a green build line over a broken binding. The line stays on stdout
+    // beside the status, so the run says in its own output what the status is
+    // about.
     if (report.failed) {
         try out.print("the exchange failed\n", .{});
-        return;
+        return error.ExchangeFailed;
     }
 
     try out.print("ACP handshake\n", .{});
@@ -752,4 +836,34 @@ test "an escaped carried envelope is decoded into the agent's own region" {
     try testing.expectEqualStrings(
         \\{"jsonrpc":"2.0","id":8,"result":{"result":{"resultType":"complete","content":[{"type":"text","text":"echo"}]}}}
     , reply);
+}
+
+test "a string id is answered in the arm it arrived in" {
+    // A string id is legal JSON-RPC and legal here: `conn.Conn.route` hands
+    // every request to this handler whatever arm its id arrived in, and every
+    // byte off that socket is a peer's. Reading the integer arm instead is a
+    // safety panic in Debug and ReleaseSafe rather than a wrong answer, so the
+    // handler has to branch on the arm to be able to answer at all.
+    var agent: Agent = .{};
+    var decode_scratch: [1024]u8 = undefined;
+    var answer: [4096]u8 = undefined;
+    const frame =
+        \\{"jsonrpc":"2.0","id":"x","method":"session/load"}
+    ;
+    const reply = (try Agent.handle(&agent, frame, &decode_scratch, &answer)).?;
+
+    // The whole answer is pinned rather than a member of it: an answer that
+    // does not parse is one `conn.Conn.route` drops, and a dropped answer is a
+    // caller waiting on a reply that is never coming.
+    try testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":"x","result":{"sessionId":"s1"}}
+    , reply);
+    try testing.expectEqual(@as(usize, 1), agent.calls);
+    // An answer is matched by id and by nothing else, so the id has to come
+    // back as the string it arrived as.
+    var check: [256]u8 = undefined;
+    const message = try jsonrpc.decode(reply, &check);
+    try testing.expectEqual(jsonrpc.Kind.response, message.kind);
+    const id = message.id orelse return error.ExpectedAnId;
+    try testing.expectEqualStrings("x", id.string);
 }

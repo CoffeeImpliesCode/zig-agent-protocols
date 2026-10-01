@@ -138,12 +138,16 @@ const Side = struct {
     /// returned.
     reader: Io.net.Stream.Reader = undefined,
     writer: Io.net.Stream.Writer = undefined,
-    /// Whether this side's pump releases the stream when it ends. The peer sets
-    /// it, because `Peer.run` hands the accepted stream over and returns, so
-    /// the pump is the last task holding that descriptor. The client leaves it
-    /// false, because `Client.run` hangs up its own end, and a second close
-    /// releases whatever descriptor the second one is given.
-    release_in_pump: bool = false,
+    /// Whether this side has been hung up already.
+    closed: bool = false,
+    /// Whether a task reads this side's stream, which [`open`] sets before it
+    /// spawns the pump.
+    ///
+    /// It decides who releases the descriptor: the pump, because it is the only
+    /// task that reads it, whenever there is one. See [`hangUp`].
+    pumping: bool = false,
+    /// Whether the descriptor has been released.
+    released: bool = false,
 
     /// Open a side over `stream`, or report why there is no connection to
     /// open. `init` refuses a region with no room and a pair that shares a
@@ -168,24 +172,82 @@ const Side = struct {
         );
         if (handler) |h| self.connection.setHandler(h);
         // On the group the example joins, because `Io.Group.async` does not run
-        // its task until the group is awaited or cancelled.
+        // its task until the group is awaited or cancelled. `pumping` is set
+        // here and not before the connection: an `init` that refused leaves no
+        // pump to release the descriptor, and the caller that hangs up on that
+        // path has to.
+        self.pumping = true;
         group.async(io, Side.pump, .{self});
     }
 
-    /// The reader task, which ends when the peer hangs up.
+    /// Read until the peer hangs up, then release the stream.
+    ///
+    /// The pump takes the side rather than the connection because it is the one
+    /// task that reads the descriptor and therefore the one that closes it: a
+    /// caller that closed it first would have this loop read a freed
+    /// descriptor, and the process would abort inside the read.
     fn pump(self: *Side) void {
         self.connection.pump();
-        if (self.release_in_pump) self.hangUp();
+        self.release();
     }
 
-    /// Hang up. `shutdown` before `close`: closing a descriptor does not
-    /// interrupt a read already blocked on it, so the peer's pump would sit on
-    /// an open description and the group would never finish.
+    /// Hang up: stop the reader, wake it, and let the descriptor go once.
+    ///
+    /// `shutdown` before `close`: closing a descriptor does not interrupt a read
+    /// already blocked on it, so the peer's pump would sit on an open
+    /// description and the group would never finish.
+    ///
+    /// The pump releases the descriptor, not this call, and it is the only task
+    /// that may. `conn.pump` asks again after a read of zero bytes, and a local
+    /// `shutdown` makes the next read return exactly that, so a caller that
+    /// released the descriptor under a live pump would have that pump read a
+    /// freed descriptor: the standard library aborts on `EBADF` inside
+    /// `netReadPosix`, before the pump's own `catch` can see an error, and the
+    /// whole binary dies instead of the exchange failing. Telling the
+    /// connection first is what makes the loop stop — the pump leaves at its
+    /// next turn and closes the stream on its way out, after the last read that
+    /// can touch it.
+    ///
+    /// The client's own pump is the one this is for. It runs on the same group
+    /// and the client task is a different task from it, so `shutdown` followed
+    /// by `close` here closes a descriptor another task is reading: that read
+    /// wakes with zero bytes, `conn.pump` reads zero as "ask again", and the
+    /// next read lands on the number `close` returned.
+    ///
+    /// The guards are what make the callers safe: a refused `open` left no pump
+    /// and nobody else holding the descriptor, the client reaches this on every
+    /// path out of its task, and the pump leaves through `release` on the way
+    /// out of every one of them. Releasing the same descriptor twice would
+    /// close an unrelated one the process had opened in the meantime, and
+    /// every call below is a syscall on it.
     fn hangUp(self: *Side) void {
+        if (self.closed) return;
+        self.closed = true;
+        if (self.released) return;
+        if (self.pumping) {
+            self.connection.close();
+            self.stream.shutdown(self.io, .both) catch {};
+            return;
+        }
+        self.release();
+    }
+
+    /// Release the descriptor once, and only on a stream that still has one.
+    fn release(self: *Side) void {
+        if (self.released) return;
+        self.released = true;
         self.stream.shutdown(self.io, .both) catch {};
         self.stream.close(self.io);
     }
 };
+
+/// The size of the buffer `conn.Conn.call` fills and of every `Answer` body
+/// beside it, as one constant because the two have to agree. `call` refuses
+/// an answer longer than its result buffer with `error.ResponseTooLarge`, so an
+/// `Answer` smaller than that buffer is cut without a marker and printed under
+/// a heading claiming it is the whole result. Anything longer than this is a
+/// failure the client reports rather than a body the example prints.
+const answer_capacity = 4096;
 
 /// What one call came back with: the body, and the code that says whether the
 /// body is a result or a refusal.
@@ -196,7 +258,7 @@ const Side = struct {
 /// so the next call, which reuses the connection's result buffer, cannot
 /// overwrite what this one returned.
 const Answer = struct {
-    body: [2048]u8 = undefined,
+    body: [answer_capacity]u8 = undefined,
     len: usize = 0,
     /// The peer's JSON-RPC error code, or 0 when the call succeeded.
     code: i32 = 0,
@@ -212,9 +274,13 @@ const Answer = struct {
     /// Copy out what `conn.Conn.call` read into the caller's result buffer.
     fn take(self: *Answer, response: conn.Response) void {
         self.code = response.error_code orelse 0;
-        // Truncated rather than dropped, so a buffer too small still shows the
-        // start of a body. `call` already refuses an answer that does not fit
-        // with `error.ResponseTooLarge`, so the two agree about the length.
+        // `response.body` is a prefix of the result buffer `call` was given,
+        // and that buffer is `answer_capacity`, so this copy cannot cut. The
+        // truncation is kept as the bound a defensive copy needs rather than
+        // removed: a caller that hands `take` a bigger buffer gets the start of
+        // a body rather than a panic, and this example's client cannot reach
+        // that arm because `call` refuses such an answer with
+        // `error.ResponseTooLarge` first, which the client reports.
         self.len = @min(response.body.len, self.body.len);
         @memcpy(self.body[0..self.len], response.body[0..self.len]);
     }
@@ -230,14 +296,13 @@ const Peer = struct {
 
     fn run(self: *@This()) void {
         const stream = self.server.accept(self.io) catch return;
-        // The reader runs on the shared group and ends by itself when the
-        // client hangs up, so this task has nothing left to do and the pump is
-        // the last task holding the accepted descriptor.
-        self.side.release_in_pump = true;
         // A side that could not be opened hangs its end up rather than
         // returning quietly: the pump never started, so nothing else would
         // close the accepted descriptor and the client would sit in `call`
-        // waiting for a server that is no longer there.
+        // waiting for a server that is no longer there. The reader that did
+        // start needs no flag to say it releases the stream, because it
+        // releases every stream it reads and `hangUp` is the one that waits
+        // for it.
         self.side.open(self.io, self.group, stream, .{
             .ctx = self.handler,
             .call = ToolServer.handle,
@@ -282,6 +347,10 @@ const Client = struct {
         // a read on a descriptor nobody closed, and the join never returned.
         // Ahead of the open for the same reason: a side with no connection is
         // a path out of this task too, and it already holds a descriptor.
+        //
+        // What it stops is this side's pump; it does not close this side's
+        // descriptor. See `Side.hangUp` for why that is the one thing a task
+        // other than the reader may not do.
         defer self.side.hangUp();
         self.side.open(self.io, self.group, stream, null) catch |err| {
             self.failure = @errorName(err);
@@ -293,7 +362,11 @@ const Client = struct {
         var session = mcp_session.Client.init(&self.side.connection, .current);
         session.capabilities = "{\"tools\":{}}";
 
-        var result_buffer: [4096]u8 = undefined;
+        // `answer_capacity` and not a literal, because `call` measures the
+        // answer against this buffer and every `Answer` measures it against
+        // its own. The two disagreeing is what used to let a reply between
+        // their sizes come back whole and then be printed cut.
+        var result_buffer: [answer_capacity]u8 = undefined;
         var out_buffer: [4096]u8 = undefined;
         var params_buffer: [4096]u8 = undefined;
 
@@ -429,9 +502,16 @@ pub fn main(init: std.process.Init) !void {
     // Reached, not hung on. A client that returned without releasing its end
     // left the join above waiting on a pump that could not end, and the name
     // of the error was the one thing the reader never got.
+    //
+    // The step fails rather than returning quietly, as `http_demo` does with
+    // `error.ExchangeFailed`. This run step is the proof that the codec
+    // composes on transport bytes, so an exit status of 0 on a run whose own
+    // output says the exchange failed is a green build line over a broken
+    // binding. The line stays on stdout beside the status, so the run says in
+    // its own output what the status is about.
     if (client.failure) |name| {
         try out.print("the exchange failed: {s}\n", .{name});
-        return;
+        return error.ExchangeFailed;
     }
 
     try printAnswer(out, "tools/list", &client.listed);
@@ -445,7 +525,13 @@ pub fn main(init: std.process.Init) !void {
 const testing = std.testing;
 
 test "the three frames this example's client sends are all answered" {
-    // The exact bytes the session puts on the wire, `_meta` wrapper and all.
+    // The three frames `mcp_session.Client.request` writes for these three
+    // calls at this revision, `_meta` wrapper and all, written out by hand
+    // rather than derived from it. This test pins the handler, and a test that
+    // built its frames with the session would be checking the session against
+    // itself; the spelling of the wrapper is `injectMeta`'s, which
+    // `mcp_session`'s own tests pin, and the exchange below drives the real
+    // session over a real socket.
     //
     // A handler that declines answers nothing, and a caller blocked in `call`
     // then waits for an answer that is never coming: a decline is not a
@@ -612,4 +698,23 @@ test "a method written with an escape is answered as the method it decodes to" {
     const message = try jsonrpc.decode(reply, &check);
     try testing.expect(message.rpc_error == null);
     try testing.expect(std.mem.indexOf(u8, message.result.?, "\"cacheScope\"") != null);
+}
+
+test "an answer as long as the buffer call fills is not cut" {
+    // The result buffer `conn.Conn.call` fills and the `Answer` body it is
+    // copied into are both `answer_capacity`, and `Response.body` is a prefix
+    // of that buffer, so an answer of this length is the longest one this
+    // client's `take` can be handed.
+    //
+    // It is also the case the two sizes used to disagree about. A `tools/list`
+    // answer of a few more tools lands between 2048 and 4096 bytes: `call`
+    // accepted it whole, `take` cut it to the length of its own body with no
+    // marker, and `main` printed the prefix under a `tools/list ->` heading
+    // that claims it is the whole result.
+    var answer: Answer = .{};
+    var body: [answer_capacity - 1]u8 = undefined;
+    @memset(&body, 'x');
+    answer.take(.{ .body = &body });
+
+    try testing.expectEqual(body.len, answer.len);
 }
