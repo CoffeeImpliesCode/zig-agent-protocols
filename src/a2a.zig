@@ -60,13 +60,17 @@
 //! null for the other reason, that a `oneof` has no member name of its own.
 //!
 //! **What this file encodes, and what it does not.** The tables below say
-//! which name and which number a field has, and the last section turns the flat
-//! half of them into a codec: every message with no `Part`, no `Message`, no
-//! `Task` and no `OAuthFlows` in it has a decoder and an encoder today. The
-//! content half has neither, and one field is the reason.
+//! which name and which number a field has, and the last two sections turn them
+//! into codecs. Every message in the flat half and every message in the content
+//! half has a decoder and an encoder: `PartContent`, `Part`, `Message`,
+//! `Artifact`, `TaskStatus`, `Task`, `TaskStatusUpdateEvent`,
+//! `TaskArtifactUpdateEvent`, `SendMessageRequest`, `SendMessageResponse` and
+//! `StreamResponse` joined the twenty the flat half already had. What is left
+//! without a codec is `AgentCard`, `SecurityScheme`, `OAuthFlows` and the five
+//! `AgentExtension` and skill fields that reach a map.
 //!
-//! Two of the three encodings an earlier revision of this note named as
-//! missing are not encodings. `TaskStatus.timestamp` and
+//! Three encodings an earlier revision of this note named as missing are not
+//! encodings. `TaskStatus.timestamp` and
 //! `ListTasksRequest.status_timestamp_after` are already the ISO-8601 text a
 //! peer sent, so there is no `Timestamp` to convert and re-formatting one would
 //! break the round trip the contract requires: re-encoding has to put back the
@@ -76,11 +80,21 @@
 //! with `reader.rawValue`, which is what `bridge.Envelope.meta` does and why
 //! that is both the cheaper and the more faithful representation.
 //!
-//! So one blocker remains. `Part.raw` is the only `bytes` field in the module
-//! and ProtoJSON renders `bytes` as base64, which `json.zig` does not have yet.
-//! A `Part` carrying `text`, `url` or `data` could be decoded without it, but a
-//! codec that refuses an arm its own `oneof` declares is not a codec, so the
-//! content half waits for `json.base64`.
+//! The one real blocker was `Part.raw`, the only `bytes` field in the module,
+//! and `json.base64` is what it waited for. ProtoJSON renders `bytes` as
+//! RFC 4648 section 4 base64, so `Part.raw` is `json.base64.Alphabet.standard`.
+//! `AgentCardSignature.protected` and `.signature` are the other base64 pair
+//! here and needed no codec at all: the normative table types both as `string`,
+//! so the base64url they carry is text the message already holds and encoding
+//! one is a splice.
+//!
+//! **A member the wire may omit is a presence here, never a default.** A
+//! REQUIRED field carries no default at all, and an optional one is `?T` rather
+//! than a scalar carrying its default. `{"contextId":""}` and no `contextId`
+//! are two documents, `[]` and no member are two documents, and a struct that
+//! holds one empty string or one empty slice for both cannot write either of
+//! them back. Nine of the content-half fields were a default before this half
+//! had a codec, and each of them would have made its message lossy.
 //!
 //! `TaskState` and `Role` are declared `enum(u8)` because PROTOCOLS.md says so.
 //! The proto states no explicit backing type, and proto3's default is `int32`,
@@ -539,16 +553,28 @@ pub const Task = struct {
     /// 1. Required, server-generated for a new task.
     id: []const u8,
     /// 2.
-    context_id: []const u8 = "",
+    ///
+    /// Optional, and carried as presence rather than as a `[]const u8 = ""`
+    /// default: a peer that wrote `"contextId":""` and a peer that wrote no
+    /// `contextId` sent two documents, and one empty string cannot write either
+    /// of them back.
+    context_id: ?[]const u8 = null,
     /// 3. Required, and it carries no default: section 2.2 of
     /// `research/normative/a2a-1.0.0.md` marks it REQUIRED, and PROTOCOLS.md
     /// section 5.4 leaves its note empty, so the normative artifact is the only
     /// thing that says so. A defaulted `status` is a task the proto forbids.
     status: TaskStatus,
     /// 4.
-    artifacts: []const Artifact = &.{},
+    ///
+    /// A `[]const Artifact = &.{}` default would make `"artifacts":[]` and no
+    /// `artifacts` the same value, and an encoder could then not put back the
+    /// bytes of the one the peer did not write. Null is the absent list and a
+    /// zero-length slice is the empty one, and the two are told apart.
+    artifacts: ?[]const Artifact = null,
     /// 5. Soft-deprecated in favour of a timeline, retained through 1.x.
-    history: []const Message = &.{},
+    ///
+    /// Optional, and for the reason `artifacts` above is.
+    history: ?[]const Message = null,
     /// 6.
     metadata: ?[]const u8 = null,
 
@@ -593,19 +619,36 @@ pub const Message = struct {
     /// 1. Required.
     message_id: []const u8,
     /// 2.
-    context_id: []const u8 = "",
+    ///
+    /// A presence, not a `[]const u8 = ""` default: `"contextId":""` and no
+    /// `contextId` are two documents and a single empty string is not either of
+    /// them.
+    context_id: ?[]const u8 = null,
     /// 3.
-    task_id: []const u8 = "",
+    ///
+    /// A presence, for the reason `context_id` above is one.
+    task_id: ?[]const u8 = null,
     /// 4. Required.
     role: Role,
     /// 5. Required.
+    ///
+    /// A REQUIRED `repeated` field is satisfied by an empty array, so this one
+    /// carries no default and no emptiness rule: `[]` is a message with no
+    /// parts, and only the absence of the member is `error.MissingField`. The
+    /// elements live in the caller's storage; see `ContentArena`.
     parts: []const Part,
     /// 6.
     metadata: ?[]const u8 = null,
     /// 7. Extension URIs.
-    extensions: []const []const u8 = &.{},
+    ///
+    /// Optional, and so a presence: `[]` is an empty activation list and no
+    /// `extensions` member is no activation list, and the two are different
+    /// requests. The elements live in `ContentArena.strings`.
+    extensions: ?[]const []const u8 = null,
     /// 8.
-    reference_task_ids: []const []const u8 = &.{},
+    ///
+    /// Optional, and a presence, for the reason `extensions` above is one.
+    reference_task_ids: ?[]const []const u8 = null,
 
     /// The ProtoJSON name of every field, in field order.
     pub const fields = [_]Field{
@@ -690,11 +733,20 @@ pub const Artifact = struct {
     /// 3.
     description: ?[]const u8 = null,
     /// 4. Required.
+    ///
+    /// A REQUIRED `repeated` field is satisfied by an empty array, for the
+    /// reason `Message.parts` is: `[]` is an artifact with no parts and only
+    /// the absence of the member is `error.MissingField`. The elements live in
+    /// `ContentArena.parts`.
     parts: []const Part,
     /// 5.
     metadata: ?[]const u8 = null,
     /// 6.
-    extensions: []const []const u8 = &.{},
+    ///
+    /// Optional, and so a presence rather than an empty-slice default: `[]` is
+    /// an empty activation list and no member is none at all. The elements live
+    /// in `ContentArena.strings`.
+    extensions: ?[]const []const u8 = null,
 
     /// The ProtoJSON name of every field, in field order.
     pub const fields = [_]Field{
@@ -921,7 +973,12 @@ comptime {
 /// The send RPC's request. `message` is required by the proto.
 pub const SendMessageRequest = struct {
     /// 1.
-    tenant: []const u8 = "",
+    ///
+    /// A presence, and the same shape every other request in this file gives its
+    /// tenant. A peer that wrote `"tenant":""` asked for the empty tenant, which
+    /// is not the same request as asking for none, and a `[]const u8 = ""` would
+    /// answer the first with the second.
+    tenant: ?[]const u8 = null,
     /// 2. Required.
     message: Message,
     /// 3.
@@ -2296,11 +2353,11 @@ pub const extension_missing_error = A2aError.extension_support_required;
 
 // What this section carries
 //
-// Every message below is one with no `Part`, no `Message`, no `Task` and no
-// `OAuthFlows` in it, and every one of them has a decoder and an encoder. The
-// content half has neither, and the reason is one field: `Part.raw` is the
-// only `bytes` field in the module, ProtoJSON renders `bytes` as base64, and
-// `json.zig` has no base64 yet.
+// Every message below is one with no `Part`, no `Message` and no `Task` in it,
+// and every one of them has a decoder and an encoder. The content half is the
+// next section, and it is the reason this one stopped where it did: `Part.raw`
+// is the only `bytes` field in the module and `json.base64` is what a codec for
+// it needs.
 //
 // Presence, because the round trip is byte-exact
 //
@@ -2314,9 +2371,9 @@ pub const extension_missing_error = A2aError.extension_support_required;
 // tables above used to declare: a peer that wrote `"tenant":""` is not a peer
 // this library may answer with no `tenant` at all.
 //
-// The messages further up, which have no codec yet, still hold plain defaults.
-// Changing one of those would be a type change with no decoder to justify it,
-// so it waits for the unit that writes that decoder.
+// The rule is not local to this section. Every message in the content half
+// follows it too, and nine fields had to change shape before their encoder
+// could exist; the next section's note names what it fixed.
 //
 // A repeated member resolves first-wins
 //
@@ -3137,12 +3194,11 @@ fn readTaskPushNotificationConfig(
             if (config.authentication != null) {
                 try reader.skipValue(scratch);
             } else {
-                // `null` and an absent member agree here: the normative row
-                // types this member as an object, and a configuration with no
-                // authentication sends none rather than an empty one.
-                reader.skipWhitespace();
-                if (reader.peek() == 'n') {
-                    try reader.nullLiteral();
+                if (try isNullMember(reader)) {
+                    // `null` and an absent member agree here: the normative
+                    // row types this member as a message, and a configuration
+                    // with no authentication sends none rather than an empty
+                    // one.
                 } else {
                     config.authentication = try readAuthenticationInfo(reader, scratch);
                 }
@@ -3217,6 +3273,26 @@ pub fn decodeSendMessageConfiguration(
     scratch: []u8,
 ) DecodeError!SendMessageConfiguration {
     var reader = json.Reader.init(raw);
+    var used: usize = 0;
+    const configuration = try readSendMessageConfiguration(&reader, out_modes, &used, scratch);
+
+    if (!reader.atEnd()) return error.MalformedJson;
+    return configuration;
+}
+
+/// The walk `decodeSendMessageConfiguration` opens, so `readSendMessageRequest`
+/// can read one nested beside its own members on the same reader.
+///
+/// `used` is how much of `out` is already spoken for, which is what lets the
+/// same walk fill a caller's own array and a `ContentArena.strings` it shares
+/// with every other `repeated string` in a document. One walk, two callers, and
+/// no second copy of the rule that `[]` and no member are told apart.
+fn readSendMessageConfiguration(
+    reader: *json.Reader,
+    out: [][]const u8,
+    used: *usize,
+    scratch: []u8,
+) DecodeError!SendMessageConfiguration {
     var configuration: SendMessageConfiguration = .{};
 
     const is_empty = try reader.beginObject();
@@ -3226,29 +3302,27 @@ pub fn decodeSendMessageConfiguration(
                 if (configuration.accepted_output_modes != null) {
                     try reader.skipValue(scratch);
                 } else {
-                    const count = try readStringList(&reader, out_modes, scratch);
-                    configuration.accepted_output_modes = out_modes[0..count];
+                    const count = try readStringList(reader, out[used.*..], scratch);
+                    configuration.accepted_output_modes = out[used.*..][0..count];
+                    used.* += count;
                 }
             } else if (std.mem.eql(u8, key, "taskPushNotificationConfig")) {
                 if (configuration.task_push_notification_config != null) {
                     try reader.skipValue(scratch);
                 } else {
-                    // `null` and an absent member agree here. The normative
-                    // row types this member as an object, and a configuration
-                    // with no push config sends none rather than an empty one.
-                    reader.skipWhitespace();
-                    if (reader.peek() == 'n') {
-                        try reader.nullLiteral();
+                    if (try isNullMember(reader)) {
+                        // `null` and an absent member agree here, for the same
+                        // reason `authentication` above does.
                     } else {
                         configuration.task_push_notification_config =
-                            try readTaskPushNotificationConfig(&reader, scratch);
+                            try readTaskPushNotificationConfig(reader, scratch);
                     }
                 }
             } else if (std.mem.eql(u8, key, "historyLength")) {
                 if (configuration.history_length != null) {
                     try reader.skipValue(scratch);
                 } else {
-                    configuration.history_length = try readInt32(&reader);
+                    configuration.history_length = try readInt32(reader);
                 }
             } else if (std.mem.eql(u8, key, "returnImmediately")) {
                 if (configuration.return_immediately != null) {
@@ -3262,7 +3336,6 @@ pub fn decodeSendMessageConfiguration(
         }
     }
 
-    if (!reader.atEnd()) return error.MalformedJson;
     return configuration;
 }
 
@@ -3271,29 +3344,38 @@ pub fn encodeSendMessageConfiguration(
     configuration: SendMessageConfiguration,
     writer: *json.Writer,
 ) EncodeError!void {
+    try writeSendMessageConfiguration(configuration, writer);
+}
+
+/// The write half, so `writeSendMessageRequest` can place a configuration
+/// beside its own members without a second walk of it.
+fn writeSendMessageConfiguration(
+    configuration: SendMessageConfiguration,
+    writer: *json.Writer,
+) EncodeError!void {
     try writer.byte('{');
     var separator: []const u8 = "";
     if (configuration.accepted_output_modes) |modes| {
         try writer.slice(separator);
-        try writer.slice("\"acceptedOutputModes\":");
+        try writeMemberName(SendMessageConfiguration, 0, writer);
         try writeStringList(modes, writer);
         separator = ",";
     }
     if (configuration.task_push_notification_config) |config| {
         try writer.slice(separator);
-        try writer.slice("\"taskPushNotificationConfig\":");
+        try writeMemberName(SendMessageConfiguration, 1, writer);
         try encodeTaskPushNotificationConfig(config, writer);
         separator = ",";
     }
     if (configuration.history_length) |history_length| {
         try writer.slice(separator);
-        try writer.slice("\"historyLength\":");
+        try writeMemberName(SendMessageConfiguration, 2, writer);
         try writeInt32(writer, history_length);
         separator = ",";
     }
     if (configuration.return_immediately) |return_immediately| {
         try writer.slice(separator);
-        try writer.slice("\"returnImmediately\":");
+        try writeMemberName(SendMessageConfiguration, 3, writer);
         try writer.slice(if (return_immediately) "true" else "false");
     }
     try writer.byte('}');
@@ -3812,6 +3894,1754 @@ pub fn encodeMutualTlsSecurityScheme(
         return;
     }
     try writer.slice("{}");
+}
+
+// --- Codec: the content half ----------------------------------------------------
+
+// What this section carries
+//
+// Eleven messages: `PartContent`, `Part`, `Message`, `Artifact`, `TaskStatus`,
+// `Task`, `TaskStatusUpdateEvent`, `TaskArtifactUpdateEvent`,
+// `SendMessageRequest`, `SendMessageResponse` and `StreamResponse`. Each has a
+// decoder and an encoder, and the two are exact inverses.
+//
+// One caller-owned arena, not nine out arrays
+//
+// A `Task` reaches a `Part` along four paths — its `status.message`, the `parts`
+// of each of its `artifacts`, and the `parts` of each message in its `history` —
+// and a `StreamResponse` reaches one along all four of its arms. The shape this
+// walk would otherwise take is nine positional out arrays, which no call site
+// can read and no second call site can keep consistent. So `ContentArena` is one
+// struct of five caller-owned arrays with a fill level for each, and every
+// decode in this section takes it.
+//
+// The five arrays are filled in document order and each owner takes the run that
+// belongs to it, so the first message holds `arena.parts[0..2]` and the second
+// holds `arena.parts[2..4]`. That is a property of the walk rather than a
+// promise the caller has to keep: the reader is a cursor, it visits elements in
+// the order the document spells them, and a list is consumed before the next
+// list of the same kind begins. Nothing here reads ahead.
+//
+// Exhaustion is an error and never a truncation
+//
+// A member with more elements than the caller reserved is
+// `error.BufferTooSmall`, for the reason `acp.decodePermissionRequest` gives: a
+// task whose tenth artifact silently disappears is a task that says something
+// the caller did not mean. The same holds for a `Part.raw` whose bytes outgrow
+// `bytes` and for every `repeated string` in the half, because those elements
+// share `strings` with each other and with `acceptedOutputModes`.
+//
+// The oneof is named by `PartContent`, not by `Part`
+//
+// `Part.fields[0]` carries `json = null`, because a `oneof` has no member name
+// of its own. `findField(Part, "text")` is therefore null for every arm, and a
+// decoder that dispatched on `Part` would skip all four, find no content, and
+// refuse the part for it. The arm is named by `PartContent`'s own table, and the
+// number a protobuf encoder writes for that arm is the number
+// `PartContent.fields` gives it rather than the tag ordinal. `oneofMemberName`
+// is that lookup, and it is a compile error if a tag ordinal and its row ever
+// stop agreeing.
+//
+// `Part.raw` and which base64
+//
+// `Part.raw` is the only `bytes` field in the module. `research/normative/
+// a2a-1.0.0.md` section 2.5 gives the proto type as `bytes` and states that the
+// field "serializes as a base64 string in JSON", and ProtoJSON renders `bytes`
+// as RFC 4648 section 4 base64 with `=` padding, so this is
+// `json.base64.Alphabet.standard` and not the URL-safe alphabet. The
+// `AgentCardSignature` pair is the different case and needed no decision: the
+// same document's section 2.16 gives their proto type as `string`, and the
+// base64url they carry is text the message already holds, so encoding one is a
+// splice and there is nothing to convert.
+//
+// An empty REQUIRED string is refused; an empty REQUIRED list is not
+//
+// A REQUIRED string that arrives as `""` is `error.InvalidField`, for the
+// reason `GetTaskRequest.id` gives: an empty task id is not a task. A REQUIRED
+// `repeated` field is satisfied by `[]`, so `Message.parts` and `Artifact.parts`
+// carry no emptiness rule and only the absence of the member is
+// `error.MissingField`. A decoder that refused an empty part list would refuse
+// a legal document.
+//
+// The nine presence defects this half found and fixed
+//
+// Every one of these is a field the wire may omit that the tables held as a
+// plain value carrying a default, so an absent member and a present one
+// holding that default were the same value and the encoder could not tell which
+// bytes to write back. Each is named by the normative table that settles it.
+//
+//   `Task.context_id`                    `""`     section 2.2  no
+//   `Task.artifacts`                     `&.{}`   section 2.2  no
+//   `Task.history`                       `&.{}`   section 2.2  no
+//   `Message.context_id`                 `""`     section 2.6  no
+//   `Message.task_id`                    `""`     section 2.6  no
+//   `Message.extensions`                 `&.{}`   section 2.6  no
+//   `Message.reference_task_ids`         `&.{}`   section 2.6  no
+//   `Artifact.extensions`                `&.{}`   section 2.7  no
+//   `SendMessageRequest.tenant`          `""`     section 2.24 no
+//
+// The last column is the `Req` column of that table, and every row is `no`:
+// each field is optional in the proto, so each may be absent, so each must be
+// able to represent its absence. `SendMessageRequest.tenant` is the one that
+// reads as a mistake — the eleven other requests in this file already gave
+// their tenant a `?[]const u8`, and this one was left behind when the flat half
+// was written.
+//
+// Two fields were the other way round and were not defects.
+// `Task.statusUpdateEvent.context_id` and `TaskArtifactUpdateEvent.context_id`
+// are REQUIRED and already carry no default, and the test above records that.
+// `Message.parts` and `Artifact.parts` are REQUIRED too, and a default would
+// have been wrong in a second way: a `[]const Part = &.{}` could not tell an
+// absent `parts` from an empty one, and absence is the only case a decoder
+// refuses there. They carry no default and no emptiness rule for that reason
+// and not because an empty list is a valid part.
+
+/// The caller-owned storage a content-half decode writes into.
+///
+/// Every array here is sized by the caller, and a decode that finds more
+/// elements than an array holds is `error.BufferTooSmall` rather than a
+/// truncated message. The `*_used` fields are the fill levels: they start at
+/// zero, and every public decoder in this section resets them before it reads,
+/// so one arena serves one document at a time. Reusing an arena for a second
+/// document overwrites the first one's values, which is the same contract
+/// `acp.decodePermissionRequest` offers its option array.
+///
+/// Nothing in here is retained past the call that filled it. The borrowed
+/// strings and lexemes still point into the document and the caller's scratch,
+/// and the decoded `Part.raw` bytes into `bytes`, so all of it dies with the
+/// buffers the caller named.
+pub const ContentArena = struct {
+    /// Every `Part` in the document, in the order the document spells them.
+    parts: []Part,
+    /// The elements of `Task.artifacts`.
+    artifacts: []Artifact,
+    /// The elements of `Task.history`.
+    messages: []Message,
+    /// Every `repeated string` element in the document: the extension URIs, the
+    /// reference task ids and the accepted output modes alike. They share one
+    /// array because they are the same type, they are all bounded by the same
+    /// caller, and sharing it is what keeps the fill level to one number.
+    strings: [][]const u8,
+    /// The decoded bytes of every `Part.raw`.
+    bytes: []u8,
+
+    parts_used: usize = 0,
+    artifacts_used: usize = 0,
+    messages_used: usize = 0,
+    strings_used: usize = 0,
+    bytes_used: usize = 0,
+
+    /// An arena over storage the caller already has.
+    pub fn init(
+        parts: []Part,
+        artifacts: []Artifact,
+        messages: []Message,
+        strings: [][]const u8,
+        bytes: []u8,
+    ) ContentArena {
+        return .{
+            .parts = parts,
+            .artifacts = artifacts,
+            .messages = messages,
+            .strings = strings,
+            .bytes = bytes,
+        };
+    }
+
+    /// Forget what a previous decode wrote, keeping the storage.
+    pub fn reset(self: *ContentArena) void {
+        self.parts_used = 0;
+        self.artifacts_used = 0;
+        self.messages_used = 0;
+        self.strings_used = 0;
+        self.bytes_used = 0;
+    }
+};
+
+/// The ProtoJSON member name of `oneof` member `index`, read from the table.
+///
+/// The number a protobuf encoder writes for that member is
+/// `U.fields[index].number`; the tag ordinal is `@intFromEnum` of the member's
+/// tag, which is 0-based. The two coincide only because every `oneof` in this
+/// file numbers its members from 1 with no gaps, and that is a fact about the
+/// table rather than about the union, so it is checked here and a disagreement
+/// is a compile error rather than a part that arrives as a different arm. The
+/// name comes out of the same row, so a rename in the table moves the encoder
+/// with it rather than leaving a literal behind.
+fn oneofMemberName(comptime U: type, comptime index: usize) []const u8 {
+    const info = @typeInfo(U).@"union";
+    // An `if` and not an `orelse`, for the reason `assertTable` records: a
+    // `@compileError` is only legal in a comptime branch, and an `orelse`
+    // operand is a runtime position.
+    if (comptime info.tag_type == null) {
+        @compileError(std.fmt.comptimePrint(
+            "{s} is not a tagged union, so it has no oneof member names",
+            .{@typeName(U)},
+        ));
+    }
+    const tag_type = info.tag_type.?;
+    const ordinal = @intFromEnum(@field(tag_type, info.fields[index].name));
+    if (comptime ordinal != index) {
+        @compileError(std.fmt.comptimePrint(
+            "{s} member {d} has tag ordinal {d}, so a codec taking the ordinal" ++
+                " for the field number writes it one below where the proto puts it",
+            .{ @typeName(U), index, ordinal },
+        ));
+    }
+    if (comptime index + 1 != U.fields[index].number) {
+        @compileError(std.fmt.comptimePrint(
+            "{s} member {d} is field {d}, and its tag ordinal {d} does not give it",
+            .{ @typeName(U), index, U.fields[index].number, ordinal },
+        ));
+    }
+    // An `if` and not an `orelse`, for the reason `assertTable` records: a
+    // `@compileError` is only legal in a comptime branch, and an `orelse`
+    // operand is a runtime position.
+    if (comptime U.fields[index].json == null) {
+        @compileError(std.fmt.comptimePrint(
+            "{s} member {d} has no ProtoJSON name, and a oneof member always has one",
+            .{ @typeName(U), index },
+        ));
+    }
+    return U.fields[index].json.?;
+}
+
+/// Write `"name":` for member `index` of message `T`.
+///
+/// The name comes from the table rather than from a literal in the body, so the
+/// one place a member name is transcribed stays the one place an encoder reads
+/// it. A row with `json = null` is a compile error here rather than a `null`
+/// that would slice, and the rows that carry one are the two kinds a member
+/// name cannot describe: a synthetic map entry, whose name is its key, and a
+/// `oneof` a struct holds as one field, which goes through `oneofMemberName`
+/// instead because the name that goes on the wire belongs to the union's arm.
+fn writeMemberName(comptime T: type, comptime index: usize, writer: *json.Writer) EncodeError!void {
+    // An `if` and not an `orelse`, for the reason `assertTable` records.
+    if (comptime jsonName(T, index) == null) {
+        @compileError(std.fmt.comptimePrint(
+            "{s} field {d} has no ProtoJSON name, so an encoder cannot spell it",
+            .{ @typeName(T), index },
+        ));
+    }
+    try writer.byte('"');
+    try writer.slice(jsonName(T, index).?);
+    try writer.slice("\":");
+}
+
+/// Write `bytes` as a JSON string holding its base64 text.
+///
+/// RFC 4648 section 4 gives `A-Za-z0-9+/` and the pad `=`, and JSON escapes none
+/// of those, so the quoted form is written straight out of the encoded buffer
+/// with no second escaping pass. `base64` is the caller's, sized from
+/// `json.base64.encodedLen` of the largest `Part.raw` the caller will encode, and
+/// `validatePart` refuses a value that does not fit it before the first byte of
+/// the message is written.
+fn writeBase64String(bytes: []const u8, base64: []u8, writer: *json.Writer) EncodeError!void {
+    const encoded = try json.base64.encode(bytes, base64, .standard);
+    try writer.byte('"');
+    try writer.slice(encoded);
+    try writer.byte('"');
+}
+
+/// Read the base64 text of a `Part.raw` and decode it into `arena.bytes`.
+///
+/// `Part.raw` is a `bytes` field, so the value on the wire is base64 and the
+/// value a caller wants is the bytes. The buffer is bounded from the encoded
+/// length with `decodedLen`, which overstates the result because it ignores the
+/// padding, so a buffer sized from it is never short and the peer's bytes are
+/// never reported as the caller's mistake. An encoded length that is not a
+/// whole number of groups is `error.InvalidField`, which is what
+/// `json.base64.decode` would say about it and is said here so the bound can be
+/// computed.
+fn readRawPart(
+    reader: *json.Reader,
+    arena: *ContentArena,
+    scratch: []u8,
+) DecodeError![]const u8 {
+    const encoded = try reader.string(scratch);
+    const bound = json.base64.decodedLen(encoded.len) orelse return error.InvalidField;
+    const start = arena.bytes_used;
+    if (start + bound > arena.bytes.len) return error.BufferTooSmall;
+    const decoded = try json.base64.decode(encoded, arena.bytes[start..][0..bound], .standard);
+    arena.bytes_used = start + decoded.len;
+    return arena.bytes[start..][0..decoded.len];
+}
+
+/// Consume a `null` and report it, when the next value is one.
+///
+/// A message member sent as `null` is the member missing and wearing a key.
+/// The document is well formed and it names a member whose value is no
+/// message, so this leaves the field null for the caller's own
+/// `error.MissingField` check to report rather than handing `null` to
+/// `beginObject`, which would call it a syntax error and blame the peer's
+/// grammar for a field the peer did send. Every message member in this half
+/// asks first, so one member has three answers and not four: absent and `null`
+/// are both `MissingField`, and a value that is neither is whatever the
+/// member's own walk says.
+fn isNullMember(reader: *json.Reader) DecodeError!bool {
+    reader.skipWhitespace();
+    if (reader.peek() != 'n') return false;
+    try reader.nullLiteral();
+    return true;
+}
+
+/// Read a `repeated string` member into the arena's element storage.
+///
+/// The fill starts where the arena already stands, so two lists in one document
+/// take two runs of one array and neither overwrites the other. An array
+/// carrying no element is well formed and takes a zero-length run.
+fn readStrings(
+    reader: *json.Reader,
+    arena: *ContentArena,
+    scratch: []u8,
+) DecodeError![]const []const u8 {
+    const start = arena.strings_used;
+    const count = try readStringList(reader, arena.strings[start..], scratch);
+    arena.strings_used = start + count;
+    return arena.strings[start..][0..count];
+}
+
+/// Read a `repeated Part` member into the arena.
+///
+/// Exhaustion is `error.BufferTooSmall` for the reason `readStrings` gives it
+/// for a list of strings, and for the stronger reason that a `Part` is content
+/// rather than a hint: dropping the last part of a message is dropping what the
+/// message says.
+fn readParts(
+    reader: *json.Reader,
+    arena: *ContentArena,
+    scratch: []u8,
+) DecodeError![]const Part {
+    const start = arena.parts_used;
+    if (try reader.beginArray()) return arena.parts[start..start];
+    var count: usize = 0;
+    while (try reader.nextArrayElement()) {
+        if (start + count == arena.parts.len) return error.BufferTooSmall;
+        arena.parts[start + count] = try readPart(reader, arena, scratch);
+        count += 1;
+    }
+    arena.parts_used = start + count;
+    return arena.parts[start..][0..count];
+}
+
+/// Read the `PartContent` member `key` names.
+///
+/// The arm is chosen by the name that arrived and the name is the table's, so
+/// this is the walk that makes the oneof a `union(enum)` at all. The four arms
+/// below are the four members of the union and `findField` only ever returns an
+/// index below `fields.len`, so the `else` is not reachable from the wire; it is
+/// `error.InvalidField` rather than `unreachable` because decoding is total and
+/// this library does not have a branch a peer can reach that traps.
+fn readPartContentMember(
+    key: []const u8,
+    reader: *json.Reader,
+    arena: *ContentArena,
+    scratch: []u8,
+) DecodeError!PartContent {
+    const arm = findField(PartContent, key) orelse return error.InvalidField;
+    return switch (arm) {
+        0 => PartContent{ .text = try reader.string(scratch) },
+        1 => PartContent{ .raw = try readRawPart(reader, arena, scratch) },
+        2 => PartContent{ .url = try reader.string(scratch) },
+        3 => PartContent{ .data = try reader.rawValue(scratch) },
+        else => error.InvalidField,
+    };
+}
+
+/// The walk `decodePartContent` opens, so `readPart` can read one beside its own
+/// members on the same reader.
+fn readPartContentObject(
+    reader: *json.Reader,
+    arena: *ContentArena,
+    scratch: []u8,
+) DecodeError!?PartContent {
+    var found: ?PartContent = null;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            // First-wins, and the discarded arm is still read as a value rather
+            // than stepped over blindly, for the reason the section above gives
+            // for a repeated member: a peer must not be able to hide a syntax
+            // error in the slot a name already used.
+            if (found != null or findField(PartContent, key) == null) {
+                try reader.skipValue(scratch);
+            } else {
+                found = try readPartContentMember(key, reader, arena, scratch);
+            }
+        }
+    }
+
+    return found;
+}
+
+/// The walk `decodePart` opens, so `readParts` can read one per element.
+fn readPart(reader: *json.Reader, arena: *ContentArena, scratch: []u8) DecodeError!Part {
+    var content: ?PartContent = null;
+    var metadata: ?[]const u8 = null;
+    var filename: ?[]const u8 = null;
+    var media_type: ?[]const u8 = null;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            // The oneof is asked first. `Part.fields[0]` has no member name, so
+            // every arm name is a `PartContent` row, and putting that question
+            // first is what stops a future row on either table from making the
+            // arm unreachable.
+            if (findField(PartContent, key) != null) {
+                if (content != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    content = try readPartContentMember(key, reader, arena, scratch);
+                }
+            } else if (std.mem.eql(u8, key, "metadata")) {
+                if (metadata != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    metadata = try reader.rawValue(scratch);
+                }
+            } else if (std.mem.eql(u8, key, "filename")) {
+                if (filename != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    filename = try reader.string(scratch);
+                }
+            } else if (std.mem.eql(u8, key, "mediaType")) {
+                if (media_type != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    media_type = try reader.string(scratch);
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    return .{
+        // A `Part` MUST carry exactly one arm, section 4.1.6 of the rendered
+        // specification as `research/normative/a2a-1.0.0.md` quotes it, so a
+        // part with no content member is a missing field and not an empty part.
+        .content = content orelse return error.MissingField,
+        .metadata = metadata,
+        .filename = filename,
+        .media_type = media_type,
+    };
+}
+
+/// The walk `decodeMessage` opens, so `readTaskStatus` and `readTask` can read
+/// one nested beside their own members on the same reader.
+fn readMessage(reader: *json.Reader, arena: *ContentArena, scratch: []u8) DecodeError!Message {
+    var message_id: []const u8 = "";
+    var saw_message_id = false;
+    var context_id: ?[]const u8 = null;
+    var task_id: ?[]const u8 = null;
+    var role: Role = .unspecified;
+    var saw_role = false;
+    var parts: ?[]const Part = null;
+    var metadata: ?[]const u8 = null;
+    var extensions: ?[]const []const u8 = null;
+    var reference_task_ids: ?[]const []const u8 = null;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, "messageId")) {
+                if (saw_message_id) {
+                    try reader.skipValue(scratch);
+                } else {
+                    message_id = try reader.string(scratch);
+                    saw_message_id = true;
+                }
+            } else if (std.mem.eql(u8, key, "contextId")) {
+                if (context_id != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    context_id = try reader.string(scratch);
+                }
+            } else if (std.mem.eql(u8, key, "taskId")) {
+                if (task_id != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    task_id = try reader.string(scratch);
+                }
+            } else if (std.mem.eql(u8, key, "role")) {
+                if (saw_role) {
+                    try reader.skipValue(scratch);
+                } else {
+                    role = try Role.parse(try reader.string(scratch));
+                    saw_role = true;
+                }
+            } else if (std.mem.eql(u8, key, "parts")) {
+                if (parts != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    parts = try readParts(reader, arena, scratch);
+                }
+            } else if (std.mem.eql(u8, key, "metadata")) {
+                if (metadata != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    metadata = try reader.rawValue(scratch);
+                }
+            } else if (std.mem.eql(u8, key, "extensions")) {
+                if (extensions != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    extensions = try readStrings(reader, arena, scratch);
+                }
+            } else if (std.mem.eql(u8, key, "referenceTaskIds")) {
+                if (reference_task_ids != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    reference_task_ids = try readStrings(reader, arena, scratch);
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    if (!saw_message_id) return error.MissingField;
+    if (message_id.len == 0) return error.InvalidField;
+    if (!saw_role) return error.MissingField;
+    return .{
+        .message_id = message_id,
+        .context_id = context_id,
+        .task_id = task_id,
+        .role = role,
+        // `parts` is REQUIRED and an empty array satisfies it, so the absence
+        // of the member is what is missing and not the absence of elements.
+        .parts = parts orelse return error.MissingField,
+        .metadata = metadata,
+        .extensions = extensions,
+        .reference_task_ids = reference_task_ids,
+    };
+}
+
+/// The walk `decodeArtifact` opens, so `readTask` and
+/// `readTaskArtifactUpdateEvent` can read one nested beside their own members.
+fn readArtifact(reader: *json.Reader, arena: *ContentArena, scratch: []u8) DecodeError!Artifact {
+    var artifact_id: []const u8 = "";
+    var saw_artifact_id = false;
+    var name: ?[]const u8 = null;
+    var description: ?[]const u8 = null;
+    var parts: ?[]const Part = null;
+    var metadata: ?[]const u8 = null;
+    var extensions: ?[]const []const u8 = null;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, "artifactId")) {
+                if (saw_artifact_id) {
+                    try reader.skipValue(scratch);
+                } else {
+                    artifact_id = try reader.string(scratch);
+                    saw_artifact_id = true;
+                }
+            } else if (std.mem.eql(u8, key, "name")) {
+                if (name != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    name = try reader.string(scratch);
+                }
+            } else if (std.mem.eql(u8, key, "description")) {
+                if (description != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    description = try reader.string(scratch);
+                }
+            } else if (std.mem.eql(u8, key, "parts")) {
+                if (parts != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    parts = try readParts(reader, arena, scratch);
+                }
+            } else if (std.mem.eql(u8, key, "metadata")) {
+                if (metadata != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    metadata = try reader.rawValue(scratch);
+                }
+            } else if (std.mem.eql(u8, key, "extensions")) {
+                if (extensions != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    extensions = try readStrings(reader, arena, scratch);
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    if (!saw_artifact_id) return error.MissingField;
+    if (artifact_id.len == 0) return error.InvalidField;
+    return .{
+        .artifact_id = artifact_id,
+        .name = name,
+        .description = description,
+        .parts = parts orelse return error.MissingField,
+        .metadata = metadata,
+        .extensions = extensions,
+    };
+}
+
+/// The walk `decodeTaskStatus` opens, so `readTask` and
+/// `readTaskStatusUpdateEvent` can read one nested beside their own members.
+fn readTaskStatus(reader: *json.Reader, arena: *ContentArena, scratch: []u8) DecodeError!TaskStatus {
+    var state: TaskState = .unspecified;
+    var saw_state = false;
+    var message: ?Message = null;
+    var timestamp: ?[]const u8 = null;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, "state")) {
+                if (saw_state) {
+                    try reader.skipValue(scratch);
+                } else {
+                    state = try TaskState.parse(try reader.string(scratch));
+                    saw_state = true;
+                }
+            } else if (std.mem.eql(u8, key, "message")) {
+                if (message != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    if (try isNullMember(reader)) {
+                        // `null` and an absent member agree, and the check
+                        // after the loop is what reports the difference.
+                    } else {
+                        message = try readMessage(reader, arena, scratch);
+                    }
+                }
+            } else if (std.mem.eql(u8, key, "timestamp")) {
+                if (timestamp != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    // The ISO-8601 text the peer wrote, and not a `Timestamp`
+                    // converted here. Re-encoding has to put back the bytes that
+                    // arrived, and a normalised spelling of the same instant is
+                    // not those bytes.
+                    timestamp = try reader.string(scratch);
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    if (!saw_state) return error.MissingField;
+    return .{ .state = state, .message = message, .timestamp = timestamp };
+}
+
+/// The walk `decodeTask` opens, so `readSendMessageResponse` and
+/// `readStreamResponse` can read one nested beside their own members.
+fn readTask(reader: *json.Reader, arena: *ContentArena, scratch: []u8) DecodeError!Task {
+    var id: []const u8 = "";
+    var saw_id = false;
+    var context_id: ?[]const u8 = null;
+    var status: ?TaskStatus = null;
+    var artifacts: ?[]const Artifact = null;
+    var history: ?[]const Message = null;
+    var metadata: ?[]const u8 = null;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, "id")) {
+                if (saw_id) {
+                    try reader.skipValue(scratch);
+                } else {
+                    id = try reader.string(scratch);
+                    saw_id = true;
+                }
+            } else if (std.mem.eql(u8, key, "contextId")) {
+                if (context_id != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    context_id = try reader.string(scratch);
+                }
+            } else if (std.mem.eql(u8, key, "status")) {
+                if (status != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    if (try isNullMember(reader)) {
+                        // `null` and an absent member agree here too.
+                    } else {
+                        status = try readTaskStatus(reader, arena, scratch);
+                    }
+                }
+            } else if (std.mem.eql(u8, key, "artifacts")) {
+                if (artifacts != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    artifacts = try readArtifacts(reader, arena, scratch);
+                }
+            } else if (std.mem.eql(u8, key, "history")) {
+                if (history != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    history = try readMessages(reader, arena, scratch);
+                }
+            } else if (std.mem.eql(u8, key, "metadata")) {
+                if (metadata != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    metadata = try reader.rawValue(scratch);
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    if (!saw_id) return error.MissingField;
+    if (id.len == 0) return error.InvalidField;
+    return .{
+        .id = id,
+        .context_id = context_id,
+        .status = status orelse return error.MissingField,
+        .artifacts = artifacts,
+        .history = history,
+        .metadata = metadata,
+    };
+}
+
+/// Read a `repeated Artifact` member into the arena.
+fn readArtifacts(
+    reader: *json.Reader,
+    arena: *ContentArena,
+    scratch: []u8,
+) DecodeError![]const Artifact {
+    const start = arena.artifacts_used;
+    if (try reader.beginArray()) return arena.artifacts[start..start];
+    var count: usize = 0;
+    while (try reader.nextArrayElement()) {
+        if (start + count == arena.artifacts.len) return error.BufferTooSmall;
+        arena.artifacts[start + count] = try readArtifact(reader, arena, scratch);
+        count += 1;
+    }
+    arena.artifacts_used = start + count;
+    return arena.artifacts[start..][0..count];
+}
+
+/// Read a `repeated Message` member into the arena.
+fn readMessages(
+    reader: *json.Reader,
+    arena: *ContentArena,
+    scratch: []u8,
+) DecodeError![]const Message {
+    const start = arena.messages_used;
+    if (try reader.beginArray()) return arena.messages[start..start];
+    var count: usize = 0;
+    while (try reader.nextArrayElement()) {
+        if (start + count == arena.messages.len) return error.BufferTooSmall;
+        arena.messages[start + count] = try readMessage(reader, arena, scratch);
+        count += 1;
+    }
+    arena.messages_used = start + count;
+    return arena.messages[start..][0..count];
+}
+
+/// The walk `decodeTaskStatusUpdateEvent` opens, so `readStreamResponse` can
+/// read one beside its own members.
+fn readTaskStatusUpdateEvent(
+    reader: *json.Reader,
+    arena: *ContentArena,
+    scratch: []u8,
+) DecodeError!TaskStatusUpdateEvent {
+    var task_id: []const u8 = "";
+    var saw_task_id = false;
+    var context_id: []const u8 = "";
+    var saw_context_id = false;
+    var status: ?TaskStatus = null;
+    var metadata: ?[]const u8 = null;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, "taskId")) {
+                if (saw_task_id) {
+                    try reader.skipValue(scratch);
+                } else {
+                    task_id = try reader.string(scratch);
+                    saw_task_id = true;
+                }
+            } else if (std.mem.eql(u8, key, "contextId")) {
+                if (saw_context_id) {
+                    try reader.skipValue(scratch);
+                } else {
+                    context_id = try reader.string(scratch);
+                    saw_context_id = true;
+                }
+            } else if (std.mem.eql(u8, key, "status")) {
+                if (status != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    if (try isNullMember(reader)) {
+                        // `null` and an absent member agree here too.
+                    } else {
+                        status = try readTaskStatus(reader, arena, scratch);
+                    }
+                }
+            } else if (std.mem.eql(u8, key, "metadata")) {
+                if (metadata != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    metadata = try reader.rawValue(scratch);
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    if (!saw_task_id or !saw_context_id) return error.MissingField;
+    if (task_id.len == 0 or context_id.len == 0) return error.InvalidField;
+    return .{
+        .task_id = task_id,
+        .context_id = context_id,
+        .status = status orelse return error.MissingField,
+        .metadata = metadata,
+    };
+}
+
+/// The walk `decodeTaskArtifactUpdateEvent` opens, so `readStreamResponse` can
+/// read one beside its own members.
+fn readTaskArtifactUpdateEvent(
+    reader: *json.Reader,
+    arena: *ContentArena,
+    scratch: []u8,
+) DecodeError!TaskArtifactUpdateEvent {
+    var task_id: []const u8 = "";
+    var saw_task_id = false;
+    var context_id: []const u8 = "";
+    var saw_context_id = false;
+    var artifact: ?Artifact = null;
+    var append: ?bool = null;
+    var last_chunk: ?bool = null;
+    var metadata: ?[]const u8 = null;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, "taskId")) {
+                if (saw_task_id) {
+                    try reader.skipValue(scratch);
+                } else {
+                    task_id = try reader.string(scratch);
+                    saw_task_id = true;
+                }
+            } else if (std.mem.eql(u8, key, "contextId")) {
+                if (saw_context_id) {
+                    try reader.skipValue(scratch);
+                } else {
+                    context_id = try reader.string(scratch);
+                    saw_context_id = true;
+                }
+            } else if (std.mem.eql(u8, key, "artifact")) {
+                if (artifact != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    if (try isNullMember(reader)) {
+                        // `null` and an absent member agree here too.
+                    } else {
+                        artifact = try readArtifact(reader, arena, scratch);
+                    }
+                }
+            } else if (std.mem.eql(u8, key, "append")) {
+                if (append != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    append = try reader.boolean();
+                }
+            } else if (std.mem.eql(u8, key, "lastChunk")) {
+                if (last_chunk != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    last_chunk = try reader.boolean();
+                }
+            } else if (std.mem.eql(u8, key, "metadata")) {
+                if (metadata != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    metadata = try reader.rawValue(scratch);
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    if (!saw_task_id or !saw_context_id) return error.MissingField;
+    if (task_id.len == 0 or context_id.len == 0) return error.InvalidField;
+    return .{
+        .task_id = task_id,
+        .context_id = context_id,
+        .artifact = artifact orelse return error.MissingField,
+        .append = append,
+        .last_chunk = last_chunk,
+        .metadata = metadata,
+    };
+}
+
+/// The walk `decodeSendMessageRequest` opens, so nothing nested has to be read
+/// twice.
+fn readSendMessageRequest(
+    reader: *json.Reader,
+    arena: *ContentArena,
+    scratch: []u8,
+) DecodeError!SendMessageRequest {
+    var tenant: ?[]const u8 = null;
+    var message: ?Message = null;
+    var configuration: ?SendMessageConfiguration = null;
+    var metadata: ?[]const u8 = null;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, "tenant")) {
+                if (tenant != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    tenant = try reader.string(scratch);
+                }
+            } else if (std.mem.eql(u8, key, "message")) {
+                if (message != null) {
+                    try reader.skipValue(scratch);
+                } else if (try isNullMember(reader)) {
+                    // `null` and an absent member agree, and the check after
+                    // the loop is what reports the difference.
+                } else {
+                    message = try readMessage(reader, arena, scratch);
+                }
+            } else if (std.mem.eql(u8, key, "configuration")) {
+                if (configuration != null) {
+                    try reader.skipValue(scratch);
+                } else if (try isNullMember(reader)) {
+                    // `null` and an absent member agree here too.
+                } else {
+                    // The accepted modes are `repeated string` like every other
+                    // list in the half, so they come from the arena's element
+                    // storage rather than from a second array the caller would
+                    // have to size.
+                    configuration = try readSendMessageConfiguration(
+                        reader,
+                        arena.strings,
+                        &arena.strings_used,
+                        scratch,
+                    );
+                }
+            } else if (std.mem.eql(u8, key, "metadata")) {
+                if (metadata != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    metadata = try reader.rawValue(scratch);
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    return .{
+        .tenant = tenant,
+        .message = message orelse return error.MissingField,
+        .configuration = configuration,
+        .metadata = metadata,
+    };
+}
+
+/// The walk `decodeSendMessageResponse` opens.
+///
+/// The union is the whole message, so the object carries one member out of the
+/// two its table names and every other member is a name no row carries. The
+/// first arm named wins, for the reason every repeated member in this file does,
+/// and the discarded arm is still read as a value so a peer cannot hide a
+/// syntax error behind it.
+fn readSendMessageResponse(
+    reader: *json.Reader,
+    arena: *ContentArena,
+    scratch: []u8,
+) DecodeError!?SendMessageResponse {
+    var found: ?SendMessageResponse = null;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (found != null) {
+                try reader.skipValue(scratch);
+            } else if (try isNullMember(reader)) {
+                // An arm with no value is an arm that is not there, so a later
+                // arm that does carry one still decides the union — the same
+                // rule a repeated member takes its first occurrence under.
+                //
+                // This is asked before the arm name on purpose. Asking after
+                // would hand `null` to `beginObject` and call a well-formed
+                // document a syntax error, and it is what the order has to be
+                // for `{"task":null}` to answer "no arm" rather than "broken
+                // JSON".
+            } else if (std.mem.eql(u8, key, oneofMemberName(SendMessageResponse, 0))) {
+                found = SendMessageResponse{ .task = try readTask(reader, arena, scratch) };
+            } else if (std.mem.eql(u8, key, oneofMemberName(SendMessageResponse, 1))) {
+                found = SendMessageResponse{ .message = try readMessage(reader, arena, scratch) };
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    return found;
+}
+
+/// The walk `decodeStreamResponse` opens.
+///
+/// The same rule as `readSendMessageResponse`, over four arms instead of two.
+fn readStreamResponse(
+    reader: *json.Reader,
+    arena: *ContentArena,
+    scratch: []u8,
+) DecodeError!?StreamResponse {
+    var found: ?StreamResponse = null;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (found != null) {
+                try reader.skipValue(scratch);
+            } else if (try isNullMember(reader)) {
+                // The same rule, and the same order, as
+                // `readSendMessageResponse` above.
+            } else if (std.mem.eql(u8, key, oneofMemberName(StreamResponse, 0))) {
+                found = StreamResponse{ .task = try readTask(reader, arena, scratch) };
+            } else if (std.mem.eql(u8, key, oneofMemberName(StreamResponse, 1))) {
+                found = StreamResponse{ .message = try readMessage(reader, arena, scratch) };
+            } else if (std.mem.eql(u8, key, oneofMemberName(StreamResponse, 2))) {
+                found = StreamResponse{ .status_update = try readTaskStatusUpdateEvent(
+                    reader,
+                    arena,
+                    scratch,
+                ) };
+            } else if (std.mem.eql(u8, key, oneofMemberName(StreamResponse, 3))) {
+                found = StreamResponse{ .artifact_update = try readTaskArtifactUpdateEvent(
+                    reader,
+                    arena,
+                    scratch,
+                ) };
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    return found;
+}
+
+/// Decode a `PartContent` on its own.
+///
+/// The object is the `content` `oneof` written out, which is what a caller that
+/// received a part from somewhere other than this library's own `Part` has.
+/// A `oneof` carries exactly one member, so an object with none is
+/// `error.MissingField` and an object with two is first-wins.
+pub fn decodePartContent(
+    raw: []const u8,
+    arena: *ContentArena,
+    scratch: []u8,
+) DecodeError!PartContent {
+    arena.reset();
+    var reader = json.Reader.init(raw);
+    const content = try readPartContentObject(&reader, arena, scratch);
+
+    // The body is one JSON value, and the `data` lexeme above is a sub-slice of
+    // it, so a tail behind the closing brace is a second document this function
+    // would answer as though it had not arrived. The check is here rather than
+    // in the loop for that reason.
+    if (!reader.atEnd()) return error.MalformedJson;
+    return content orelse return error.MissingField;
+}
+
+/// Decode a `Part`.
+///
+/// `raw` is the only `bytes` field the half has, so the base64 text under it is
+/// decoded into `arena.bytes` and the `Part` holds a slice of the caller's own
+/// storage. A part with no content member is `error.MissingField`, for the
+/// reason the section above gives.
+pub fn decodePart(raw: []const u8, arena: *ContentArena, scratch: []u8) DecodeError!Part {
+    arena.reset();
+    var reader = json.Reader.init(raw);
+    const part = try readPart(&reader, arena, scratch);
+
+    if (!reader.atEnd()) return error.MalformedJson;
+    return part;
+}
+
+/// Decode a `Message`.
+///
+/// `messageId` and `role` are the only members the proto marks REQUIRED, and
+/// neither may be empty. `parts` is REQUIRED too, and an empty array satisfies
+/// it, so `[]` is a message with no parts and only the absence of the member is
+/// refused.
+pub fn decodeMessage(raw: []const u8, arena: *ContentArena, scratch: []u8) DecodeError!Message {
+    arena.reset();
+    var reader = json.Reader.init(raw);
+    const message = try readMessage(&reader, arena, scratch);
+
+    if (!reader.atEnd()) return error.MalformedJson;
+    return message;
+}
+
+/// Decode an `Artifact`.
+pub fn decodeArtifact(raw: []const u8, arena: *ContentArena, scratch: []u8) DecodeError!Artifact {
+    arena.reset();
+    var reader = json.Reader.init(raw);
+    const artifact = try readArtifact(&reader, arena, scratch);
+
+    if (!reader.atEnd()) return error.MalformedJson;
+    return artifact;
+}
+
+/// Decode a `TaskStatus`.
+pub fn decodeTaskStatus(
+    raw: []const u8,
+    arena: *ContentArena,
+    scratch: []u8,
+) DecodeError!TaskStatus {
+    arena.reset();
+    var reader = json.Reader.init(raw);
+    const status = try readTaskStatus(&reader, arena, scratch);
+
+    if (!reader.atEnd()) return error.MalformedJson;
+    return status;
+}
+
+/// Decode a `Task`.
+///
+/// This is the walk the arena was designed for: a task holds its status, and
+/// that status may hold a message, and the task holds artifacts and history,
+/// and every message and artifact holds parts, and every part may hold bytes.
+/// Nine positional out arrays is the other shape and it is not one a call site
+/// can read.
+pub fn decodeTask(raw: []const u8, arena: *ContentArena, scratch: []u8) DecodeError!Task {
+    arena.reset();
+    var reader = json.Reader.init(raw);
+    const task = try readTask(&reader, arena, scratch);
+
+    if (!reader.atEnd()) return error.MalformedJson;
+    return task;
+}
+
+/// Decode a `TaskStatusUpdateEvent`.
+pub fn decodeTaskStatusUpdateEvent(
+    raw: []const u8,
+    arena: *ContentArena,
+    scratch: []u8,
+) DecodeError!TaskStatusUpdateEvent {
+    arena.reset();
+    var reader = json.Reader.init(raw);
+    const event = try readTaskStatusUpdateEvent(&reader, arena, scratch);
+
+    if (!reader.atEnd()) return error.MalformedJson;
+    return event;
+}
+
+/// Decode a `TaskArtifactUpdateEvent`.
+pub fn decodeTaskArtifactUpdateEvent(
+    raw: []const u8,
+    arena: *ContentArena,
+    scratch: []u8,
+) DecodeError!TaskArtifactUpdateEvent {
+    arena.reset();
+    var reader = json.Reader.init(raw);
+    const event = try readTaskArtifactUpdateEvent(&reader, arena, scratch);
+
+    if (!reader.atEnd()) return error.MalformedJson;
+    return event;
+}
+
+/// Decode a `SendMessageRequest`.
+///
+/// The accepted output modes come from `arena.strings` like every other list in
+/// the half, so this is three parameters rather than four and the caller sizes
+/// one element array instead of two.
+pub fn decodeSendMessageRequest(
+    raw: []const u8,
+    arena: *ContentArena,
+    scratch: []u8,
+) DecodeError!SendMessageRequest {
+    arena.reset();
+    var reader = json.Reader.init(raw);
+    const request = try readSendMessageRequest(&reader, arena, scratch);
+
+    if (!reader.atEnd()) return error.MalformedJson;
+    return request;
+}
+
+/// Decode a `SendMessageResponse`.
+pub fn decodeSendMessageResponse(
+    raw: []const u8,
+    arena: *ContentArena,
+    scratch: []u8,
+) DecodeError!SendMessageResponse {
+    arena.reset();
+    var reader = json.Reader.init(raw);
+    const response = try readSendMessageResponse(&reader, arena, scratch);
+
+    if (!reader.atEnd()) return error.MalformedJson;
+    return response orelse return error.MissingField;
+}
+
+/// Decode a `StreamResponse`.
+pub fn decodeStreamResponse(
+    raw: []const u8,
+    arena: *ContentArena,
+    scratch: []u8,
+) DecodeError!StreamResponse {
+    arena.reset();
+    var reader = json.Reader.init(raw);
+    const response = try readStreamResponse(&reader, arena, scratch);
+
+    if (!reader.atEnd()) return error.MalformedJson;
+    return response orelse return error.MissingField;
+}
+
+/// Encode a `PartContent`.
+pub fn encodePartContent(
+    content: PartContent,
+    writer: *json.Writer,
+    base64: []u8,
+) EncodeError!void {
+    try validatePartContent(content, base64);
+    try writePartContent(content, writer, base64);
+}
+
+/// Encode a `Part`.
+pub fn encodePart(part: Part, writer: *json.Writer, base64: []u8) EncodeError!void {
+    try validatePart(part, base64);
+    try writePart(part, writer, base64);
+}
+
+/// Encode a `Message`.
+pub fn encodeMessage(message: Message, writer: *json.Writer, base64: []u8) EncodeError!void {
+    try validateMessage(message, base64);
+    try writeMessage(message, writer, base64);
+}
+
+/// Encode an `Artifact`.
+pub fn encodeArtifact(artifact: Artifact, writer: *json.Writer, base64: []u8) EncodeError!void {
+    try validateArtifact(artifact, base64);
+    try writeArtifact(artifact, writer, base64);
+}
+
+/// Encode a `TaskStatus`.
+pub fn encodeTaskStatus(status: TaskStatus, writer: *json.Writer, base64: []u8) EncodeError!void {
+    try validateTaskStatus(status, base64);
+    try writeTaskStatus(status, writer, base64);
+}
+
+/// Encode a `Task`.
+pub fn encodeTask(task: Task, writer: *json.Writer, base64: []u8) EncodeError!void {
+    try validateTask(task, base64);
+    try writeTask(task, writer, base64);
+}
+
+/// Encode a `TaskStatusUpdateEvent`.
+pub fn encodeTaskStatusUpdateEvent(
+    event: TaskStatusUpdateEvent,
+    writer: *json.Writer,
+    base64: []u8,
+) EncodeError!void {
+    try validateTaskStatusUpdateEvent(event, base64);
+    try writeTaskStatusUpdateEvent(event, writer, base64);
+}
+
+/// Encode a `TaskArtifactUpdateEvent`.
+pub fn encodeTaskArtifactUpdateEvent(
+    event: TaskArtifactUpdateEvent,
+    writer: *json.Writer,
+    base64: []u8,
+) EncodeError!void {
+    try validateTaskArtifactUpdateEvent(event, base64);
+    try writeTaskArtifactUpdateEvent(event, writer, base64);
+}
+
+/// Encode a `SendMessageRequest`.
+pub fn encodeSendMessageRequest(
+    request: SendMessageRequest,
+    writer: *json.Writer,
+    base64: []u8,
+) EncodeError!void {
+    try validateSendMessageRequest(request, base64);
+    try writeSendMessageRequest(request, writer, base64);
+}
+
+/// Encode a `SendMessageResponse`.
+pub fn encodeSendMessageResponse(
+    response: SendMessageResponse,
+    writer: *json.Writer,
+    base64: []u8,
+) EncodeError!void {
+    try validateSendMessageResponse(response, base64);
+    try writeSendMessageResponse(response, writer, base64);
+}
+
+/// Encode a `StreamResponse`.
+pub fn encodeStreamResponse(
+    response: StreamResponse,
+    writer: *json.Writer,
+    base64: []u8,
+) EncodeError!void {
+    try validateStreamResponse(response, base64);
+    try writeStreamResponse(response, writer, base64);
+}
+
+// The validation half
+//
+// Every encoder above checks its whole value before it writes its first byte,
+// for the reason `acp.encodePermissionRequest` checks its whole request: a
+// refusal halfway through leaves `{"id":"t","status":{"sta` in the caller's
+// buffer, which is neither a message nor nothing. What is refused is a value
+// the decoder could not have returned — an empty REQUIRED string, or a
+// `Part.raw` that does not fit the caller's base64 buffer — and both are
+// `error.InvalidField` and `error.BufferTooSmall` rather than a truncated
+// document.
+
+fn validatePartContent(content: PartContent, base64: []u8) EncodeError!void {
+    switch (content) {
+        .text, .url, .data => {},
+        .raw => |raw| {
+            if (json.base64.encodedLen(raw.len) > base64.len) return error.BufferTooSmall;
+        },
+    }
+}
+
+fn validatePart(part: Part, base64: []u8) EncodeError!void {
+    try validatePartContent(part.content, base64);
+}
+
+fn validateParts(parts: []const Part, base64: []u8) EncodeError!void {
+    for (parts) |part| try validatePart(part, base64);
+}
+
+fn validateMessage(message: Message, base64: []u8) EncodeError!void {
+    if (message.message_id.len == 0) return error.InvalidField;
+    try validateParts(message.parts, base64);
+}
+
+fn validateMessages(messages: []const Message, base64: []u8) EncodeError!void {
+    for (messages) |message| try validateMessage(message, base64);
+}
+
+fn validateArtifact(artifact: Artifact, base64: []u8) EncodeError!void {
+    if (artifact.artifact_id.len == 0) return error.InvalidField;
+    try validateParts(artifact.parts, base64);
+}
+
+fn validateArtifacts(artifacts: []const Artifact, base64: []u8) EncodeError!void {
+    for (artifacts) |artifact| try validateArtifact(artifact, base64);
+}
+
+fn validateTaskStatus(status: TaskStatus, base64: []u8) EncodeError!void {
+    if (status.message) |message| try validateMessage(message, base64);
+}
+
+fn validateTask(task: Task, base64: []u8) EncodeError!void {
+    if (task.id.len == 0) return error.InvalidField;
+    try validateTaskStatus(task.status, base64);
+    if (task.artifacts) |artifacts| try validateArtifacts(artifacts, base64);
+    if (task.history) |history| try validateMessages(history, base64);
+}
+
+fn validateTaskStatusUpdateEvent(
+    event: TaskStatusUpdateEvent,
+    base64: []u8,
+) EncodeError!void {
+    if (event.task_id.len == 0 or event.context_id.len == 0) return error.InvalidField;
+    try validateTaskStatus(event.status, base64);
+}
+
+fn validateTaskArtifactUpdateEvent(
+    event: TaskArtifactUpdateEvent,
+    base64: []u8,
+) EncodeError!void {
+    if (event.task_id.len == 0 or event.context_id.len == 0) return error.InvalidField;
+    try validateArtifact(event.artifact, base64);
+}
+
+fn validateSendMessageRequest(request: SendMessageRequest, base64: []u8) EncodeError!void {
+    try validateMessage(request.message, base64);
+}
+
+fn validateSendMessageResponse(
+    response: SendMessageResponse,
+    base64: []u8,
+) EncodeError!void {
+    switch (response) {
+        .task => |task| try validateTask(task, base64),
+        .message => |message| try validateMessage(message, base64),
+    }
+}
+
+fn validateStreamResponse(response: StreamResponse, base64: []u8) EncodeError!void {
+    switch (response) {
+        .task => |task| try validateTask(task, base64),
+        .message => |message| try validateMessage(message, base64),
+        .status_update => |event| try validateTaskStatusUpdateEvent(event, base64),
+        .artifact_update => |event| try validateTaskArtifactUpdateEvent(event, base64),
+    }
+}
+
+// The write half
+//
+// Private, so a nested value is written without a second validation pass: the
+// public encoder above already walked the whole tree, and a message with a
+// hundred parts must not be walked a hundred times to find that out.
+
+fn writePartContent(content: PartContent, writer: *json.Writer, base64: []u8) EncodeError!void {
+    try writer.byte('{');
+    switch (content) {
+        .text => |text| {
+            try writeMemberName(PartContent, 0, writer);
+            try writer.string(text);
+        },
+        .raw => |raw| {
+            try writeMemberName(PartContent, 1, writer);
+            try writeBase64String(raw, base64, writer);
+        },
+        .url => |url| {
+            try writeMemberName(PartContent, 2, writer);
+            try writer.string(url);
+        },
+        .data => |data| {
+            try writeMemberName(PartContent, 3, writer);
+            // The lexeme the peer wrote, spliced. `Part.data` is a
+            // `google.protobuf.Value` and may be any JSON value at all, so a
+            // shape this library could decode would still not be able to write
+            // a key a peer may send.
+            try writer.slice(data);
+        },
+    }
+    try writer.byte('}');
+}
+
+fn writePart(part: Part, writer: *json.Writer, base64: []u8) EncodeError!void {
+    try writer.byte('{');
+    // The `oneof` is fields 1 to 4 and `Part.fields[0]` carries no member
+    // name, so the arm's name comes from the union's own row. It is always
+    // written and it is always first, so the separator starts non-empty.
+    switch (part.content) {
+        .text => {
+            try writeMemberName(PartContent, 0, writer);
+            try writer.string(part.content.text);
+        },
+        .raw => {
+            try writeMemberName(PartContent, 1, writer);
+            try writeBase64String(part.content.raw, base64, writer);
+        },
+        .url => {
+            try writeMemberName(PartContent, 2, writer);
+            try writer.string(part.content.url);
+        },
+        .data => {
+            try writeMemberName(PartContent, 3, writer);
+            try writer.slice(part.content.data);
+        },
+    }
+    const separator: []const u8 = ",";
+    if (part.metadata) |metadata| {
+        try writer.slice(separator);
+        try writeMemberName(Part, 1, writer);
+        try writer.slice(metadata);
+    }
+    if (part.filename) |filename| {
+        try writer.slice(separator);
+        try writeMemberName(Part, 2, writer);
+        try writer.string(filename);
+    }
+    if (part.media_type) |media_type| {
+        try writer.slice(separator);
+        try writeMemberName(Part, 3, writer);
+        try writer.string(media_type);
+    }
+    try writer.byte('}');
+}
+
+fn writeParts(parts: []const Part, writer: *json.Writer, base64: []u8) EncodeError!void {
+    try writer.byte('[');
+    for (parts, 0..) |part, index| {
+        if (index != 0) try writer.byte(',');
+        try writePart(part, writer, base64);
+    }
+    try writer.byte(']');
+}
+
+fn writeMessage(message: Message, writer: *json.Writer, base64: []u8) EncodeError!void {
+    try writer.byte('{');
+    try writeMemberName(Message, 0, writer);
+    try writer.string(message.message_id);
+    const separator: []const u8 = ",";
+    if (message.context_id) |context_id| {
+        try writer.slice(separator);
+        try writeMemberName(Message, 1, writer);
+        try writer.string(context_id);
+    }
+    if (message.task_id) |task_id| {
+        try writer.slice(separator);
+        try writeMemberName(Message, 2, writer);
+        try writer.string(task_id);
+    }
+    try writer.slice(separator);
+    try writeMemberName(Message, 3, writer);
+    try writer.string(message.role.wireName());
+    // `parts` is REQUIRED, so it is always written even when it is empty. An
+    // encoder that omitted the empty array would answer a peer that sent `"parts":[]`
+    // with a document that has no `parts` member at all.
+    try writer.slice(separator);
+    try writeMemberName(Message, 4, writer);
+    try writeParts(message.parts, writer, base64);
+    if (message.metadata) |metadata| {
+        try writer.slice(separator);
+        try writeMemberName(Message, 5, writer);
+        try writer.slice(metadata);
+    }
+    if (message.extensions) |extensions| {
+        try writer.slice(separator);
+        try writeMemberName(Message, 6, writer);
+        try writeStringList(extensions, writer);
+    }
+    if (message.reference_task_ids) |reference_task_ids| {
+        try writer.slice(separator);
+        try writeMemberName(Message, 7, writer);
+        try writeStringList(reference_task_ids, writer);
+    }
+    try writer.byte('}');
+}
+
+fn writeArtifact(artifact: Artifact, writer: *json.Writer, base64: []u8) EncodeError!void {
+    try writer.byte('{');
+    try writeMemberName(Artifact, 0, writer);
+    try writer.string(artifact.artifact_id);
+    const separator: []const u8 = ",";
+    if (artifact.name) |name| {
+        try writer.slice(separator);
+        try writeMemberName(Artifact, 1, writer);
+        try writer.string(name);
+    }
+    if (artifact.description) |description| {
+        try writer.slice(separator);
+        try writeMemberName(Artifact, 2, writer);
+        try writer.string(description);
+    }
+    try writer.slice(separator);
+    try writeMemberName(Artifact, 3, writer);
+    try writeParts(artifact.parts, writer, base64);
+    if (artifact.metadata) |metadata| {
+        try writer.slice(separator);
+        try writeMemberName(Artifact, 4, writer);
+        try writer.slice(metadata);
+    }
+    if (artifact.extensions) |extensions| {
+        try writer.slice(separator);
+        try writeMemberName(Artifact, 5, writer);
+        try writeStringList(extensions, writer);
+    }
+    try writer.byte('}');
+}
+
+fn writeTaskStatus(status: TaskStatus, writer: *json.Writer, base64: []u8) EncodeError!void {
+    try writer.byte('{');
+    try writeMemberName(TaskStatus, 0, writer);
+    try writer.string(status.state.wireName());
+    const separator: []const u8 = ",";
+    if (status.message) |message| {
+        try writer.slice(separator);
+        try writeMemberName(TaskStatus, 1, writer);
+        try writeMessage(message, writer, base64);
+    }
+    if (status.timestamp) |timestamp| {
+        try writer.slice(separator);
+        try writeMemberName(TaskStatus, 2, writer);
+        // The text the peer wrote, not a reformatted instant. The field is a
+        // `google.protobuf.Timestamp` in the proto and ISO-8601 in JSON, and
+        // normalising it here would replace the bytes that came in with bytes
+        // this library chose.
+        try writer.string(timestamp);
+    }
+    try writer.byte('}');
+}
+
+fn writeTask(task: Task, writer: *json.Writer, base64: []u8) EncodeError!void {
+    try writer.byte('{');
+    try writeMemberName(Task, 0, writer);
+    try writer.string(task.id);
+    const separator: []const u8 = ",";
+    if (task.context_id) |context_id| {
+        try writer.slice(separator);
+        try writeMemberName(Task, 1, writer);
+        try writer.string(context_id);
+    }
+    try writer.slice(separator);
+    try writeMemberName(Task, 2, writer);
+    try writeTaskStatus(task.status, writer, base64);
+    if (task.artifacts) |artifacts| {
+        try writer.slice(separator);
+        try writeMemberName(Task, 3, writer);
+        try writer.byte('[');
+        for (artifacts, 0..) |artifact, index| {
+            if (index != 0) try writer.byte(',');
+            try writeArtifact(artifact, writer, base64);
+        }
+        try writer.byte(']');
+    }
+    if (task.history) |history| {
+        try writer.slice(separator);
+        try writeMemberName(Task, 4, writer);
+        try writer.byte('[');
+        for (history, 0..) |message, index| {
+            if (index != 0) try writer.byte(',');
+            try writeMessage(message, writer, base64);
+        }
+        try writer.byte(']');
+    }
+    if (task.metadata) |metadata| {
+        try writer.slice(separator);
+        try writeMemberName(Task, 5, writer);
+        try writer.slice(metadata);
+    }
+    try writer.byte('}');
+}
+
+fn writeTaskStatusUpdateEvent(
+    event: TaskStatusUpdateEvent,
+    writer: *json.Writer,
+    base64: []u8,
+) EncodeError!void {
+    try writer.byte('{');
+    try writeMemberName(TaskStatusUpdateEvent, 0, writer);
+    try writer.string(event.task_id);
+    try writer.slice(",");
+    try writeMemberName(TaskStatusUpdateEvent, 1, writer);
+    try writer.string(event.context_id);
+    try writer.slice(",");
+    try writeMemberName(TaskStatusUpdateEvent, 2, writer);
+    try writeTaskStatus(event.status, writer, base64);
+    if (event.metadata) |metadata| {
+        try writer.slice(",");
+        try writeMemberName(TaskStatusUpdateEvent, 3, writer);
+        try writer.slice(metadata);
+    }
+    try writer.byte('}');
+}
+
+fn writeTaskArtifactUpdateEvent(
+    event: TaskArtifactUpdateEvent,
+    writer: *json.Writer,
+    base64: []u8,
+) EncodeError!void {
+    try writer.byte('{');
+    try writeMemberName(TaskArtifactUpdateEvent, 0, writer);
+    try writer.string(event.task_id);
+    try writer.slice(",");
+    try writeMemberName(TaskArtifactUpdateEvent, 1, writer);
+    try writer.string(event.context_id);
+    try writer.slice(",");
+    try writeMemberName(TaskArtifactUpdateEvent, 2, writer);
+    try writeArtifact(event.artifact, writer, base64);
+    const separator: []const u8 = ",";
+    if (event.append) |append| {
+        try writer.slice(separator);
+        try writeMemberName(TaskArtifactUpdateEvent, 3, writer);
+        try writer.slice(if (append) "true" else "false");
+    }
+    if (event.last_chunk) |last_chunk| {
+        try writer.slice(separator);
+        try writeMemberName(TaskArtifactUpdateEvent, 4, writer);
+        try writer.slice(if (last_chunk) "true" else "false");
+    }
+    if (event.metadata) |metadata| {
+        try writer.slice(separator);
+        try writeMemberName(TaskArtifactUpdateEvent, 5, writer);
+        try writer.slice(metadata);
+    }
+    try writer.byte('}');
+}
+
+fn writeSendMessageRequest(
+    request: SendMessageRequest,
+    writer: *json.Writer,
+    base64: []u8,
+) EncodeError!void {
+    try writer.byte('{');
+    var separator: []const u8 = "";
+    if (request.tenant) |tenant| {
+        try writer.slice(separator);
+        try writeMemberName(SendMessageRequest, 0, writer);
+        try writer.string(tenant);
+        separator = ",";
+    }
+    try writer.slice(separator);
+    try writeMemberName(SendMessageRequest, 1, writer);
+    try writeMessage(request.message, writer, base64);
+    if (request.configuration) |configuration| {
+        try writer.slice(",");
+        try writeMemberName(SendMessageRequest, 2, writer);
+        try writeSendMessageConfiguration(configuration, writer);
+    }
+    if (request.metadata) |metadata| {
+        try writer.slice(",");
+        try writeMemberName(SendMessageRequest, 3, writer);
+        try writer.slice(metadata);
+    }
+    try writer.byte('}');
+}
+
+fn writeSendMessageResponse(
+    response: SendMessageResponse,
+    writer: *json.Writer,
+    base64: []u8,
+) EncodeError!void {
+    try writer.byte('{');
+    switch (response) {
+        .task => |task| {
+            try writeMemberName(SendMessageResponse, 0, writer);
+            try writeTask(task, writer, base64);
+        },
+        .message => |message| {
+            try writeMemberName(SendMessageResponse, 1, writer);
+            try writeMessage(message, writer, base64);
+        },
+    }
+    try writer.byte('}');
+}
+
+fn writeStreamResponse(
+    response: StreamResponse,
+    writer: *json.Writer,
+    base64: []u8,
+) EncodeError!void {
+    try writer.byte('{');
+    switch (response) {
+        .task => |task| {
+            try writeMemberName(StreamResponse, 0, writer);
+            try writeTask(task, writer, base64);
+        },
+        .message => |message| {
+            try writeMemberName(StreamResponse, 1, writer);
+            try writeMessage(message, writer, base64);
+        },
+        .status_update => |event| {
+            try writeMemberName(StreamResponse, 2, writer);
+            try writeTaskStatusUpdateEvent(event, writer, base64);
+        },
+        .artifact_update => |event| {
+            try writeMemberName(StreamResponse, 3, writer);
+            try writeTaskArtifactUpdateEvent(event, writer, base64);
+        },
+    }
+    try writer.byte('}');
 }
 
 const testing = std.testing;
@@ -4571,7 +6401,7 @@ fn hasDefault(comptime T: type, comptime field: []const u8) bool {
     };
 }
 
-test "a REQUIRED field carries no default and an optional one still does" {
+test "a REQUIRED field carries no default and an optional one is a presence" {
     // The proto marks `Task.status`, `TaskStatusUpdateEvent.context_id` and
     // `TaskArtifactUpdateEvent.context_id` REQUIRED, so a default on any of them
     // is a message the specification does not describe: a caller who omits one
@@ -4581,11 +6411,52 @@ test "a REQUIRED field carries no default and an optional one still does" {
     try testing.expect(!hasDefault(TaskStatusUpdateEvent, "context_id"));
     try testing.expect(!hasDefault(TaskArtifactUpdateEvent, "context_id"));
 
-    // The over-correction is to strip the two `context_id` fields that the same
-    // tables mark optional, which would make an absent context an error on a
-    // message the proto says may omit it.
-    try testing.expect(hasDefault(Task, "context_id"));
-    try testing.expect(hasDefault(Message, "context_id"));
+    // The over-correction is to make the fields the same tables mark optional
+    // REQUIRED, which would refuse a message the proto says may omit one.
+    //
+    // `hasDefault` is the wrong instrument for that half and is not used here.
+    // It reads `default_value_ptr`, and `?[]const u8 = null` has one, so it
+    // answers true for the optional `context_id` and for the `[]const u8 = ""`
+    // that was the presence defect: a check that passes on both the fix and the
+    // bug pins nothing. What separates them is the type, so the type is what
+    // this asserts, and the behaviour it protects is checked where it is
+    // observable — an absent context decodes, in the `Message` and `Task`
+    // tests below.
+    try testing.expectEqual(?[]const u8, fieldType(Task, "context_id"));
+    try testing.expectEqual(?[]const u8, fieldType(Message, "context_id"));
+    try testing.expectEqual(?[]const u8, fieldType(Message, "task_id"));
+
+    // The same six fields, and the ones with a default that no member name can
+    // reach: an empty list and an absent list are different requests.
+    try testing.expectEqual(?[]const Artifact, fieldType(Task, "artifacts"));
+    try testing.expectEqual(?[]const Message, fieldType(Task, "history"));
+    try testing.expectEqual(?[]const []const u8, fieldType(Message, "extensions"));
+    try testing.expectEqual(?[]const []const u8, fieldType(Message, "reference_task_ids"));
+    try testing.expectEqual(?[]const []const u8, fieldType(Artifact, "extensions"));
+    try testing.expectEqual(?[]const u8, fieldType(SendMessageRequest, "tenant"));
+
+    // The two REQUIRED `repeated` fields are the other side of the rule. An
+    // empty array satisfies a REQUIRED `repeated` field, so these carry no
+    // default and no emptiness check: only the absence of the member is a
+    // missing field, and `[]` is a message with no parts.
+    try testing.expectEqual([]const Part, fieldType(Message, "parts"));
+    try testing.expectEqual([]const Part, fieldType(Artifact, "parts"));
+}
+
+/// The declared type of message `T`'s field `field`.
+///
+/// A name `T` does not carry is a compile error rather than a false, for the
+/// reason `hasDefault` gives: a renamed field cannot pass as an absent one.
+fn fieldType(comptime T: type, comptime field: []const u8) type {
+    return comptime blk: {
+        for (@typeInfo(T).@"struct".fields) |candidate| {
+            if (std.mem.eql(u8, candidate.name, field)) break :blk candidate.type;
+        }
+        @compileError(std.fmt.comptimePrint(
+            "{s} has no field named '{s}'",
+            .{ @typeName(T), field },
+        ));
+    };
 }
 
 test "the device code flow is variant 5 and carries its own authorization URL" {
@@ -5452,4 +7323,1242 @@ test "a MutualTlsSecurityScheme is an empty object" {
         error.MalformedJson,
         decodeMutualTlsSecurityScheme("{\"description\":\"mTLS\"} x", &scratch),
     );
+}
+
+// --- Tests: the content half ----------------------------------------------------
+
+/// The storage one content-half test runs against.
+///
+/// The arena is a set of slices into these arrays and nothing outlives the test
+/// that declared it, which is the same contract `ContentArena` offers a real
+/// caller. A test that has to prove exhaustion builds its own smaller arrays,
+/// because that is the whole point of it.
+const TestStorage = struct {
+    parts: [16]Part = undefined,
+    artifacts: [4]Artifact = undefined,
+    messages: [4]Message = undefined,
+    strings: [8][]const u8 = undefined,
+    bytes: [256]u8 = undefined,
+    out: [4096]u8 = undefined,
+    base64: [512]u8 = undefined,
+    scratch: [512]u8 = undefined,
+    arena: ContentArena = undefined,
+
+    /// Point the arena at the arrays above. A method and not a field default,
+    /// because a slice of a field cannot be named until the struct exists.
+    fn init(self: *TestStorage) void {
+        self.arena = ContentArena.init(
+            &self.parts,
+            &self.artifacts,
+            &self.messages,
+            &self.strings,
+            &self.bytes,
+        );
+    }
+};
+
+test "a oneof is named by its own table, not by the struct that holds it" {
+    // This is the trap the content half is built around. `Part.fields[0]`
+    // carries `json = null` because a `oneof` has no member name of its own, so
+    // `findField(Part, ...)` cannot name an arm. A decoder that dispatched on
+    // `Part` would skip all four members, find no content, and answer
+    // `error.MissingField` for a part that names one perfectly well.
+    try testing.expectEqual(@as(?[]const u8, null), jsonName(Part, 0));
+    try testing.expectEqual(@as(?usize, null), findField(Part, "text"));
+    try testing.expectEqual(@as(?usize, null), findField(Part, "raw"));
+    try testing.expectEqual(@as(?usize, null), findField(Part, "url"));
+    try testing.expectEqual(@as(?usize, null), findField(Part, "data"));
+    // The three members that are not the oneof are named by `Part` itself.
+    try testing.expectEqual(@as(?usize, 1), findField(Part, "metadata"));
+    try testing.expectEqual(@as(?usize, 3), findField(Part, "mediaType"));
+
+    // The arms live in the union's table, and the union is a tagged one.
+    try testing.expectEqual(@as(usize, 0), findField(PartContent, "text").?);
+    try testing.expectEqual(@as(usize, 1), findField(PartContent, "raw").?);
+    try testing.expectEqual(@as(usize, 2), findField(PartContent, "url").?);
+    try testing.expectEqual(@as(usize, 3), findField(PartContent, "data").?);
+
+    // And the name an encoder writes is that same row, checked against the tag
+    // ordinal at comptime: a codec that took `@intFromEnum` for the number
+    // writes every oneof field one below where the proto puts it.
+    try testing.expectEqualStrings("text", oneofMemberName(PartContent, 0));
+    try testing.expectEqualStrings("raw", oneofMemberName(PartContent, 1));
+    try testing.expectEqualStrings("url", oneofMemberName(PartContent, 2));
+    try testing.expectEqualStrings("data", oneofMemberName(PartContent, 3));
+    try testing.expectEqualStrings("statusUpdate", oneofMemberName(StreamResponse, 2));
+    try testing.expectEqualStrings("artifactUpdate", oneofMemberName(StreamResponse, 3));
+    try testing.expectEqualStrings("message", oneofMemberName(SendMessageResponse, 1));
+}
+
+test "a PartContent round-trips each of its four arms" {
+    var storage: TestStorage = .{};
+    storage.init();
+
+    const text = try decodePartContent("{\"text\":\"hello\"}", &storage.arena, &storage.scratch);
+    try testing.expect(text == .text);
+    try testing.expectEqualStrings("hello", text.text);
+    var writer = json.Writer.init(&storage.out);
+    try encodePartContent(text, &writer, &storage.base64);
+    try testing.expectEqualStrings("{\"text\":\"hello\"}", writer.written());
+
+    // `data` is a `google.protobuf.Value` and may be any JSON value at all, so
+    // the lexeme is spliced and a key this library does not model survives.
+    const data = try decodePartContent(
+        "{\"data\":{\"nested\":[1,true,null]}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expect(data == .data);
+    try testing.expectEqualStrings("{\"nested\":[1,true,null]}", data.data);
+    writer = json.Writer.init(&storage.out);
+    try encodePartContent(data, &writer, &storage.base64);
+    try testing.expectEqualStrings("{\"data\":{\"nested\":[1,true,null]}}", writer.written());
+
+    // A `Value` may also be the four bytes `null`, and that is a value rather
+    // than an absent member, so it comes back as those four bytes.
+    const nulled = try decodePartContent("{\"data\":null}", &storage.arena, &storage.scratch);
+    try testing.expectEqualStrings("null", nulled.data);
+    writer = json.Writer.init(&storage.out);
+    try encodePartContent(nulled, &writer, &storage.base64);
+    try testing.expectEqualStrings("{\"data\":null}", writer.written());
+
+    // A oneof carries exactly one member, so an object with none is a missing
+    // field and not an empty content.
+    try testing.expectError(
+        error.MissingField,
+        decodePartContent("{}", &storage.arena, &storage.scratch),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodePartContent("{\"filename\":\"a.txt\"}", &storage.arena, &storage.scratch),
+    );
+    // Two arms is first-wins, the rule every repeated member in this file
+    // follows, and the discarded arm is still read as a value.
+    const two = try decodePartContent(
+        "{\"url\":\"https://x\",\"text\":\"later\"}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expect(two == .url);
+    try testing.expectError(
+        error.MalformedJson,
+        decodePartContent("{\"text\":} {\"text\":\"b\"}", &storage.arena, &storage.scratch),
+    );
+    // A tail is refused, and the check is after the member loop.
+    try testing.expectError(
+        error.MalformedJson,
+        decodePartContent("{\"text\":\"a\"} trailing", &storage.arena, &storage.scratch),
+    );
+}
+
+test "Part.raw is the base64 of the bytes, in the standard alphabet" {
+    var storage: TestStorage = .{};
+    storage.init();
+
+    // `aGVsbG8=` is `hello` under RFC 4648 section 4.
+    const part = try decodePart("{\"raw\":\"aGVsbG8=\"}", &storage.arena, &storage.scratch);
+    try testing.expect(part.content == .raw);
+    try testing.expectEqualStrings("hello", part.content.raw);
+    // The bytes are the caller's own storage and not a sub-slice of the
+    // document, which is what makes `raw` a `bytes` field rather than a string.
+    try testing.expectEqual(
+        @intFromPtr(storage.bytes[0..].ptr),
+        @intFromPtr(part.content.raw.ptr),
+    );
+    var writer = json.Writer.init(&storage.out);
+    try encodePart(part, &writer, &storage.base64);
+    try testing.expectEqualStrings("{\"raw\":\"aGVsbG8=\"}", writer.written());
+
+    // The alphabet is the one the choice turns on. Three `0xFF` bytes are
+    // `////` under section 4 and `____` under section 5, so a codec that had
+    // taken the URL-safe alphabet would have written four underscores here and
+    // the round trip would have changed the document.
+    const high = try decodePart("{\"raw\":\"////\"}", &storage.arena, &storage.scratch);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xff, 0xff, 0xff }, high.content.raw);
+    writer = json.Writer.init(&storage.out);
+    try encodePart(high, &writer, &storage.base64);
+    try testing.expectEqualStrings("{\"raw\":\"////\"}", writer.written());
+
+    // A one-byte and a two-byte group are the two partial tails, and both are
+    // padded to a group boundary rather than left short.
+    const one = try decodePart("{\"raw\":\"AA==\"}", &storage.arena, &storage.scratch);
+    try testing.expectEqualSlices(u8, &[_]u8{0}, one.content.raw);
+    writer = json.Writer.init(&storage.out);
+    try encodePart(one, &writer, &storage.base64);
+    try testing.expectEqualStrings("{\"raw\":\"AA==\"}", writer.written());
+    const two = try decodePart("{\"raw\":\"AAA=\"}", &storage.arena, &storage.scratch);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0, 0 }, two.content.raw);
+    writer = json.Writer.init(&storage.out);
+    try encodePart(two, &writer, &storage.base64);
+    try testing.expectEqualStrings("{\"raw\":\"AAA=\"}", writer.written());
+
+    // An empty `bytes` is a `bytes` of no bytes and not an absent part: the arm
+    // is present, so the part is present.
+    const empty = try decodePart("{\"raw\":\"\"}", &storage.arena, &storage.scratch);
+    try testing.expectEqual(@as(usize, 0), empty.content.raw.len);
+    writer = json.Writer.init(&storage.out);
+    try encodePart(empty, &writer, &storage.base64);
+    try testing.expectEqualStrings("{\"raw\":\"\"}", writer.written());
+
+    // The URL-safe spelling is what `AgentCardSignature` carries and not what
+    // this field does, so a peer that sent it here is refused rather than
+    // quietly accepted and written back in the other alphabet: the contract is
+    // `encode(decode(b)) == b`, and accepting both alphabets would break it for
+    // every document that used the second one.
+    try testing.expectError(
+        error.InvalidField,
+        decodePart("{\"raw\":\"____\"}", &storage.arena, &storage.scratch),
+    );
+    // A length that is not a whole number of groups, a character outside the
+    // alphabet and a quad that opens with the pad are all the peer's bytes and
+    // never a trap.
+    try testing.expectError(
+        error.InvalidField,
+        decodePart("{\"raw\":\"AAA\"}", &storage.arena, &storage.scratch),
+    );
+    try testing.expectError(
+        error.InvalidField,
+        decodePart("{\"raw\":\"AA*A\"}", &storage.arena, &storage.scratch),
+    );
+    try testing.expectError(
+        error.InvalidField,
+        decodePart("{\"raw\":\"=AAA\"}", &storage.arena, &storage.scratch),
+    );
+    // And the two `AgentCardSignature` members are the base64url text already,
+    // so a splice is all an encoder does with them and there is no codec to
+    // disagree with.
+    const signature = try decodeAgentCardSignature(
+        "{\"protected\":\"eyJhbGciOiJFUzI1NiJ9\",\"signature\":\"QFdkNLNszlGj3z3u\"}",
+        &storage.scratch,
+    );
+    try testing.expectEqualStrings("eyJhbGciOiJFUzI1NiJ9", signature.protected);
+    writer = json.Writer.init(&storage.out);
+    try encodeAgentCardSignature(signature, &writer);
+    try testing.expectEqualStrings(
+        "{\"protected\":\"eyJhbGciOiJFUzI1NiJ9\",\"signature\":\"QFdkNLNszlGj3z3u\"}",
+        writer.written(),
+    );
+}
+
+test "a Part round-trips a field-order document and refuses a part with no arm" {
+    var storage: TestStorage = .{};
+    storage.init();
+
+    // The members arrive in the reverse of the table's order, and they come
+    // back in the table's order, so this is a round trip of the value and not of
+    // the bytes: the bytes are what the field-order document above and this
+    // pair check.
+    const body = "{\"mediaType\":\"image/png\",\"filename\":\"a.png\"," ++
+        "\"raw\":\"aGVsbG8=\",\"metadata\":{\"w\":2}}";
+    const part = try decodePart(body, &storage.arena, &storage.scratch);
+    try testing.expect(part.content == .raw);
+    try testing.expectEqualStrings("a.png", part.filename.?);
+    try testing.expectEqualStrings("image/png", part.media_type.?);
+    try testing.expectEqualStrings("{\"w\":2}", part.metadata.?);
+    var writer = json.Writer.init(&storage.out);
+    try encodePart(part, &writer, &storage.base64);
+    try testing.expectEqualStrings(
+        "{\"raw\":\"aGVsbG8=\",\"metadata\":{\"w\":2},\"filename\":\"a.png\"," ++
+            "\"mediaType\":\"image/png\"}",
+        writer.written(),
+    );
+
+    // The `oneof` is always written and always first, and the three members
+    // beside it are written only when they were present.
+    const bare = try decodePart("{\"text\":\"a\"}", &storage.arena, &storage.scratch);
+    writer = json.Writer.init(&storage.out);
+    try encodePart(bare, &writer, &storage.base64);
+    try testing.expectEqualStrings("{\"text\":\"a\"}", writer.written());
+    // A `null` metadata is the four bytes `null` and not an absent member.
+    const nulled = try decodePart("{\"url\":\"u\",\"metadata\":null}", &storage.arena, &storage.scratch);
+    writer = json.Writer.init(&storage.out);
+    try encodePart(nulled, &writer, &storage.base64);
+    try testing.expectEqualStrings("{\"url\":\"u\",\"metadata\":null}", writer.written());
+
+    // A part MUST contain exactly one of the four, so a part with no arm is a
+    // missing field.
+    try testing.expectError(error.MissingField, decodePart("{}", &storage.arena, &storage.scratch));
+    try testing.expectError(
+        error.MissingField,
+        decodePart("{\"filename\":\"a\"}", &storage.arena, &storage.scratch),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodePart("{\"text\":\"a\"} trailing", &storage.arena, &storage.scratch),
+    );
+    // The refusal comes before the first byte, so a writer handed a value whose
+    // base64 does not fit the caller's buffer is left untouched.
+    var refusal = json.Writer.init(&storage.out);
+    try testing.expectError(
+        error.BufferTooSmall,
+        encodePart(
+            .{ .content = .{ .raw = storage.base64[0..300] } },
+            &refusal,
+            storage.base64[0..4],
+        ),
+    );
+    try testing.expectEqual(@as(usize, 0), refusal.written().len);
+}
+
+test "a Message round-trips and tells an absent list from an empty one" {
+    var storage: TestStorage = .{};
+    storage.init();
+
+    const body = "{\"referenceTaskIds\":[\"t-1\"],\"extensions\":[]," ++
+        "\"parts\":[{\"text\":\"hi\"},{\"url\":\"https://x\"}]," ++
+        "\"role\":\"ROLE_AGENT\",\"taskId\":\"t-1\",\"contextId\":\"c-1\"," ++
+        "\"messageId\":\"m-1\"}";
+    const message = try decodeMessage(body, &storage.arena, &storage.scratch);
+    try testing.expectEqualStrings("m-1", message.message_id);
+    try testing.expectEqualStrings("c-1", message.context_id.?);
+    try testing.expectEqualStrings("t-1", message.task_id.?);
+    try testing.expect(message.role == .agent);
+    try testing.expectEqual(@as(usize, 2), message.parts.len);
+    try testing.expectEqualStrings("hi", message.parts[0].content.text);
+    // An empty list and an absent list are two documents. `"extensions":[]`
+    // gives a zero-length slice and the encoder writes `[]` back; no member at
+    // all gives null and the encoder writes nothing.
+    try testing.expectEqual(@as(usize, 0), message.extensions.?.len);
+    try testing.expectEqual(@as(usize, 1), message.reference_task_ids.?.len);
+    var writer = json.Writer.init(&storage.out);
+    try encodeMessage(message, &writer, &storage.base64);
+    try testing.expectEqualStrings(
+        "{\"messageId\":\"m-1\",\"contextId\":\"c-1\",\"taskId\":\"t-1\"," ++
+            "\"role\":\"ROLE_AGENT\",\"parts\":[{\"text\":\"hi\"}," ++
+            "{\"url\":\"https://x\"}],\"extensions\":[]," ++
+            "\"referenceTaskIds\":[\"t-1\"]}",
+        writer.written(),
+    );
+
+    // The bare message: two REQUIRED members and an empty part list. This is
+    // where an optional `contextId` is proved optional rather than REQUIRED,
+    // which is the assertion the type check above stands in for.
+    const bare = try decodeMessage(
+        "{\"messageId\":\"m\",\"role\":\"ROLE_USER\",\"parts\":[]}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(?[]const u8, null), bare.context_id);
+    try testing.expectEqual(@as(?[]const u8, null), bare.task_id);
+    try testing.expectEqual(@as(?[]const []const u8, null), bare.extensions);
+    try testing.expectEqual(@as(?[]const []const u8, null), bare.reference_task_ids);
+    try testing.expectEqual(@as(usize, 0), bare.parts.len);
+    writer = json.Writer.init(&storage.out);
+    try encodeMessage(bare, &writer, &storage.base64);
+    try testing.expectEqualStrings(
+        "{\"messageId\":\"m\",\"role\":\"ROLE_USER\",\"parts\":[]}",
+        writer.written(),
+    );
+    // And the presence defect this unit fixed: `"contextId":""` is a document
+    // and so is no `contextId`, and a `[]const u8 = ""` would answer the first
+    // with the second.
+    const blank = try decodeMessage(
+        "{\"messageId\":\"m\",\"contextId\":\"\",\"taskId\":\"\"," ++
+            "\"role\":\"ROLE_USER\",\"parts\":[]}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqualStrings("", blank.context_id.?);
+    try testing.expectEqualStrings("", blank.task_id.?);
+    writer = json.Writer.init(&storage.out);
+    try encodeMessage(blank, &writer, &storage.base64);
+    try testing.expectEqualStrings(
+        "{\"messageId\":\"m\",\"contextId\":\"\",\"taskId\":\"\"," ++
+            "\"role\":\"ROLE_USER\",\"parts\":[]}",
+        writer.written(),
+    );
+
+    // `messageId` and `role` are the two REQUIRED members, and `parts` is a
+    // third: a REQUIRED `repeated` field is satisfied by `[]` and refused only
+    // when the member is absent.
+    try testing.expectError(
+        error.MissingField,
+        decodeMessage("{\"role\":\"ROLE_USER\",\"parts\":[]}", &storage.arena, &storage.scratch),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeMessage("{\"messageId\":\"m\",\"parts\":[]}", &storage.arena, &storage.scratch),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeMessage("{\"messageId\":\"m\",\"role\":\"ROLE_USER\"}", &storage.arena, &storage.scratch),
+    );
+    // An empty REQUIRED string is a value the proto does not allow.
+    try testing.expectError(
+        error.InvalidField,
+        decodeMessage(
+            "{\"messageId\":\"\",\"role\":\"ROLE_USER\",\"parts\":[]}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    // A role outside the declared range is an unknown tag and never a
+    // fallback to `unspecified`.
+    try testing.expectError(
+        error.UnknownTag,
+        decodeMessage(
+            "{\"messageId\":\"m\",\"role\":\"ROLE_OPERATOR\",\"parts\":[]}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeMessage(
+            "{\"messageId\":\"m\",\"role\":\"ROLE_USER\",\"parts\":[]} x",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    // An encoder handed a value the decoder could not have returned refuses it
+    // before the first byte.
+    var refusal = json.Writer.init(&storage.out);
+    try testing.expectError(
+        error.InvalidField,
+        encodeMessage(
+            .{ .message_id = "", .role = .user, .parts = &.{} },
+            &refusal,
+            &storage.base64,
+        ),
+    );
+    try testing.expectEqual(@as(usize, 0), refusal.written().len);
+}
+
+test "an Artifact round-trips and keeps its own parts in the arena" {
+    var storage: TestStorage = .{};
+    storage.init();
+
+    const body = "{\"parts\":[{\"raw\":\"AAEC\"},{\"text\":\"note\"}]," ++
+        "\"extensions\":[\"https://x/ext/v1\"],\"metadata\":null," ++
+        "\"description\":\"d\",\"name\":\"n\",\"artifactId\":\"a-1\"}";
+    const artifact = try decodeArtifact(body, &storage.arena, &storage.scratch);
+    try testing.expectEqualStrings("a-1", artifact.artifact_id);
+    try testing.expectEqualStrings("n", artifact.name.?);
+    try testing.expectEqualStrings("d", artifact.description.?);
+    try testing.expectEqualStrings("null", artifact.metadata.?);
+    try testing.expectEqual(@as(usize, 1), artifact.extensions.?.len);
+    try testing.expectEqual(@as(usize, 2), artifact.parts.len);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 2 }, artifact.parts[0].content.raw);
+    var writer = json.Writer.init(&storage.out);
+    try encodeArtifact(artifact, &writer, &storage.base64);
+    try testing.expectEqualStrings(
+        "{\"artifactId\":\"a-1\",\"name\":\"n\",\"description\":\"d\"," ++
+            "\"parts\":[{\"raw\":\"AAEC\"},{\"text\":\"note\"}]," ++
+            "\"metadata\":null,\"extensions\":[\"https://x/ext/v1\"]}",
+        writer.written(),
+    );
+
+    // `artifactId` and `parts` are the two REQUIRED members.
+    try testing.expectError(
+        error.MissingField,
+        decodeArtifact("{\"parts\":[]}", &storage.arena, &storage.scratch),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeArtifact("{\"artifactId\":\"a\"}", &storage.arena, &storage.scratch),
+    );
+    try testing.expectError(
+        error.InvalidField,
+        decodeArtifact("{\"artifactId\":\"\",\"parts\":[]}", &storage.arena, &storage.scratch),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeArtifact("{\"artifactId\":\"a\",\"parts\":[]} x", &storage.arena, &storage.scratch),
+    );
+    // An empty part list is a legal artifact, and the encoder writes it back
+    // rather than dropping the member.
+    const empty = try decodeArtifact(
+        "{\"artifactId\":\"a\",\"parts\":[]}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    writer = json.Writer.init(&storage.out);
+    try encodeArtifact(empty, &writer, &storage.base64);
+    try testing.expectEqualStrings("{\"artifactId\":\"a\",\"parts\":[]}", writer.written());
+}
+
+test "a TaskStatus round-trips its state, its message and its timestamp text" {
+    var storage: TestStorage = .{};
+    storage.init();
+
+    // The members arrive in the reverse of the table's order.
+    const body = "{\"timestamp\":\"2026-01-02T03:04:05Z\",\"message\":" ++
+        "{\"messageId\":\"m\",\"role\":\"ROLE_AGENT\",\"parts\":[{\"text\":\"working\"}]}," ++
+        "\"state\":\"TASK_STATE_WORKING\"}";
+    const status = try decodeTaskStatus(body, &storage.arena, &storage.scratch);
+    try testing.expect(status.state == .working);
+    try testing.expectEqualStrings("m", status.message.?.message_id);
+    // The timestamp is the ISO-8601 text the peer wrote and not a `Timestamp`
+    // converted here: normalising it would replace the bytes that came in with
+    // bytes this library chose.
+    try testing.expectEqualStrings("2026-01-02T03:04:05Z", status.timestamp.?);
+    var writer = json.Writer.init(&storage.out);
+    try encodeTaskStatus(status, &writer, &storage.base64);
+    try testing.expectEqualStrings(
+        "{\"state\":\"TASK_STATE_WORKING\",\"message\":" ++
+            "{\"messageId\":\"m\",\"role\":\"ROLE_AGENT\",\"parts\":[{\"text\":\"working\"}]}," ++
+            "\"timestamp\":\"2026-01-02T03:04:05Z\"}",
+        writer.written(),
+    );
+
+    // `state` is the only REQUIRED member, and the two optional ones are a
+    // presence each.
+    const bare = try decodeTaskStatus(
+        "{\"state\":\"TASK_STATE_SUBMITTED\"}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(?Message, null), bare.message);
+    try testing.expectEqual(@as(?[]const u8, null), bare.timestamp);
+    writer = json.Writer.init(&storage.out);
+    try encodeTaskStatus(bare, &writer, &storage.base64);
+    try testing.expectEqualStrings("{\"state\":\"TASK_STATE_SUBMITTED\"}", writer.written());
+
+    try testing.expectError(
+        error.MissingField,
+        decodeTaskStatus("{}", &storage.arena, &storage.scratch),
+    );
+    try testing.expectError(
+        error.UnknownTag,
+        decodeTaskStatus("{\"state\":\"TASK_STATE_PENDING\"}", &storage.arena, &storage.scratch),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeTaskStatus("{\"state\":\"TASK_STATE_WORKING\"} x", &storage.arena, &storage.scratch),
+    );
+    // A `null` message agrees with an absent one: the normative row types the
+    // member as a message, and a status with no message sends none.
+    const nulled = try decodeTaskStatus(
+        "{\"state\":\"TASK_STATE_WORKING\",\"message\":null}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(?Message, null), nulled.message);
+}
+
+test "a Task round-trips four lists out of one arena without any of them sharing a run" {
+    var storage: TestStorage = .{};
+    storage.init();
+
+    // One artifact and two history messages, each with its own parts, plus a
+    // status that carries a message of its own: four parts in all, and the four
+    // runs must not overlap or the second owner would read the first one's
+    // content.
+    const body = "{\"history\":[" ++
+        "{\"messageId\":\"m-1\",\"role\":\"ROLE_USER\",\"parts\":[{\"text\":\"one\"}]}," ++
+        "{\"messageId\":\"m-2\",\"role\":\"ROLE_AGENT\",\"parts\":[{\"text\":\"two\"}]}]," ++
+        "\"artifacts\":[{\"artifactId\":\"a-1\",\"parts\":[{\"text\":\"three\"}]}]," ++
+        "\"status\":{\"state\":\"TASK_STATE_WORKING\"," ++
+        "\"message\":{\"messageId\":\"m-0\",\"role\":\"ROLE_AGENT\"," ++
+        "\"parts\":[{\"text\":\"four\"}]}}," ++
+        "\"contextId\":\"c-1\",\"id\":\"t-1\"}";
+    const task = try decodeTask(body, &storage.arena, &storage.scratch);
+    try testing.expectEqualStrings("t-1", task.id);
+    try testing.expectEqualStrings("c-1", task.context_id.?);
+    try testing.expectEqual(@as(usize, 4), storage.arena.parts_used);
+    try testing.expectEqualStrings("four", task.status.message.?.parts[0].content.text);
+    try testing.expectEqualStrings("three", task.artifacts.?[0].parts[0].content.text);
+    try testing.expectEqualStrings("one", task.history.?[0].parts[0].content.text);
+    try testing.expectEqualStrings("two", task.history.?[1].parts[0].content.text);
+    // Four distinct runs, in document order, and none of them aliasing another.
+    const first = task.status.message.?.parts[0].content.text.ptr;
+    try testing.expect(first != task.artifacts.?[0].parts[0].content.text.ptr);
+    try testing.expect(first != task.history.?[0].parts[0].content.text.ptr);
+    try testing.expect(first != task.history.?[1].parts[0].content.text.ptr);
+    try testing.expect(
+        task.artifacts.?[0].parts[0].content.text.ptr != task.history.?[0].parts[0].content.text.ptr,
+    );
+    try testing.expect(
+        task.history.?[0].parts[0].content.text.ptr != task.history.?[1].parts[0].content.text.ptr,
+    );
+
+    var writer = json.Writer.init(&storage.out);
+    try encodeTask(task, &writer, &storage.base64);
+    try testing.expectEqualStrings(
+        "{\"id\":\"t-1\",\"contextId\":\"c-1\",\"status\":{\"state\":\"TASK_STATE_WORKING\"," ++
+            "\"message\":{\"messageId\":\"m-0\",\"role\":\"ROLE_AGENT\"," ++
+            "\"parts\":[{\"text\":\"four\"}]}}," ++
+            "\"artifacts\":[{\"artifactId\":\"a-1\",\"parts\":[{\"text\":\"three\"}]}]," ++
+            "\"history\":[{\"messageId\":\"m-1\",\"role\":\"ROLE_USER\"," ++
+            "\"parts\":[{\"text\":\"one\"}]}," ++
+            "{\"messageId\":\"m-2\",\"role\":\"ROLE_AGENT\",\"parts\":[{\"text\":\"two\"}]}]}",
+        writer.written(),
+    );
+
+    // `"artifacts":[]` and no `artifacts` are two documents, and so are
+    // `"history":[]` and no `history`. This is the presence defect the
+    // `[]const Artifact = &.{}` default made invisible.
+    const empty_lists = try decodeTask(
+        "{\"id\":\"t-1\",\"status\":{\"state\":\"TASK_STATE_SUBMITTED\"}," ++
+            "\"artifacts\":[],\"history\":[]}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(usize, 0), empty_lists.artifacts.?.len);
+    try testing.expectEqual(@as(usize, 0), empty_lists.history.?.len);
+    writer = json.Writer.init(&storage.out);
+    try encodeTask(empty_lists, &writer, &storage.base64);
+    try testing.expectEqualStrings(
+        "{\"id\":\"t-1\",\"status\":{\"state\":\"TASK_STATE_SUBMITTED\"}," ++
+            "\"artifacts\":[],\"history\":[]}",
+        writer.written(),
+    );
+    const no_lists = try decodeTask(
+        "{\"id\":\"t-1\",\"status\":{\"state\":\"TASK_STATE_SUBMITTED\"}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(?[]const Artifact, null), no_lists.artifacts);
+    try testing.expectEqual(@as(?[]const Message, null), no_lists.history);
+    writer = json.Writer.init(&storage.out);
+    try encodeTask(no_lists, &writer, &storage.base64);
+    try testing.expectEqualStrings(
+        "{\"id\":\"t-1\",\"status\":{\"state\":\"TASK_STATE_SUBMITTED\"}}",
+        writer.written(),
+    );
+
+    // `id` and `status` are the two REQUIRED members, and an empty id is a
+    // value the proto does not allow.
+    try testing.expectError(
+        error.MissingField,
+        decodeTask("{\"status\":{\"state\":\"TASK_STATE_WORKING\"}}", &storage.arena, &storage.scratch),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeTask("{\"id\":\"t-1\"}", &storage.arena, &storage.scratch),
+    );
+    try testing.expectError(
+        error.InvalidField,
+        decodeTask(
+            "{\"id\":\"\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeTask("{\"id\":\"t-1\",\"status\":{}}", &storage.arena, &storage.scratch),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeTask(
+            "{\"id\":\"t-1\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}} x",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    var refusal = json.Writer.init(&storage.out);
+    try testing.expectError(
+        error.InvalidField,
+        encodeTask(
+            .{ .id = "", .status = .{ .state = .working } },
+            &refusal,
+            &storage.base64,
+        ),
+    );
+    try testing.expectEqual(@as(usize, 0), refusal.written().len);
+}
+
+test "a TaskStatusUpdateEvent round-trips its three REQUIRED members" {
+    var storage: TestStorage = .{};
+    storage.init();
+
+    const body = "{\"metadata\":{\"seq\":7},\"status\":" ++
+        "{\"state\":\"TASK_STATE_COMPLETED\",\"timestamp\":\"2026-01-02T03:04:05Z\"}," ++
+        "\"contextId\":\"c-1\",\"taskId\":\"t-1\"}";
+    const event = try decodeTaskStatusUpdateEvent(body, &storage.arena, &storage.scratch);
+    try testing.expectEqualStrings("t-1", event.task_id);
+    try testing.expectEqualStrings("c-1", event.context_id);
+    try testing.expect(event.status.state == .completed);
+    try testing.expectEqualStrings("{\"seq\":7}", event.metadata.?);
+    var writer = json.Writer.init(&storage.out);
+    try encodeTaskStatusUpdateEvent(event, &writer, &storage.base64);
+    try testing.expectEqualStrings(
+        "{\"taskId\":\"t-1\",\"contextId\":\"c-1\",\"status\":" ++
+            "{\"state\":\"TASK_STATE_COMPLETED\",\"timestamp\":\"2026-01-02T03:04:05Z\"}," ++
+            "\"metadata\":{\"seq\":7}}",
+        writer.written(),
+    );
+
+    // All three are REQUIRED, and none of them may be empty.
+    try testing.expectError(
+        error.MissingField,
+        decodeTaskStatusUpdateEvent(
+            "{\"contextId\":\"c\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeTaskStatusUpdateEvent(
+            "{\"taskId\":\"t\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeTaskStatusUpdateEvent(
+            "{\"taskId\":\"t\",\"contextId\":\"c\"}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.InvalidField,
+        decodeTaskStatusUpdateEvent(
+            "{\"taskId\":\"\",\"contextId\":\"c\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeTaskStatusUpdateEvent(
+            "{\"taskId\":\"t\",\"contextId\":\"c\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}} x",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+}
+
+test "a TaskArtifactUpdateEvent round-trips the booleans it recorded as presence" {
+    var storage: TestStorage = .{};
+    storage.init();
+
+    // `append:false` and `lastChunk:false` are two members a peer wrote and not
+    // two absences, which is why both are `?bool` here.
+    const body = "{\"metadata\":null,\"lastChunk\":false,\"append\":false," ++
+        "\"artifact\":{\"artifactId\":\"a-1\",\"parts\":[{\"raw\":\"AA==\"}]}," ++
+        "\"contextId\":\"c-1\",\"taskId\":\"t-1\"}";
+    const event = try decodeTaskArtifactUpdateEvent(body, &storage.arena, &storage.scratch);
+    try testing.expectEqual(@as(?bool, false), event.append);
+    try testing.expectEqual(@as(?bool, false), event.last_chunk);
+    try testing.expectEqualStrings("a-1", event.artifact.artifact_id);
+    try testing.expectEqualStrings("null", event.metadata.?);
+    var writer = json.Writer.init(&storage.out);
+    try encodeTaskArtifactUpdateEvent(event, &writer, &storage.base64);
+    try testing.expectEqualStrings(
+        "{\"taskId\":\"t-1\",\"contextId\":\"c-1\",\"artifact\":" ++
+            "{\"artifactId\":\"a-1\",\"parts\":[{\"raw\":\"AA==\"}]}," ++
+            "\"append\":false,\"lastChunk\":false,\"metadata\":null}",
+        writer.written(),
+    );
+
+    // The three REQUIRED members, and the two booleans as an absence.
+    const bare = try decodeTaskArtifactUpdateEvent(
+        "{\"taskId\":\"t-1\",\"contextId\":\"c-1\",\"artifact\":" ++
+            "{\"artifactId\":\"a-1\",\"parts\":[]}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(?bool, null), bare.append);
+    try testing.expectEqual(@as(?bool, null), bare.last_chunk);
+    try testing.expectEqual(@as(?[]const u8, null), bare.metadata);
+    writer = json.Writer.init(&storage.out);
+    try encodeTaskArtifactUpdateEvent(bare, &writer, &storage.base64);
+    try testing.expectEqualStrings(
+        "{\"taskId\":\"t-1\",\"contextId\":\"c-1\",\"artifact\":" ++
+            "{\"artifactId\":\"a-1\",\"parts\":[]}}",
+        writer.written(),
+    );
+
+    try testing.expectError(
+        error.MissingField,
+        decodeTaskArtifactUpdateEvent(
+            "{\"contextId\":\"c\",\"artifact\":{\"artifactId\":\"a\",\"parts\":[]}}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeTaskArtifactUpdateEvent(
+            "{\"taskId\":\"t\",\"contextId\":\"c\"}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.InvalidField,
+        decodeTaskArtifactUpdateEvent(
+            "{\"taskId\":\"t\",\"contextId\":\"\",\"artifact\":" ++
+                "{\"artifactId\":\"a\",\"parts\":[]}}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeTaskArtifactUpdateEvent(
+            "{\"taskId\":\"t\",\"contextId\":\"c\",\"artifact\":" ++
+                "{\"artifactId\":\"a\",\"parts\":[]}} x",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+}
+
+test "a SendMessageRequest round-trips its configuration out of the shared string array" {
+    var storage: TestStorage = .{};
+    storage.init();
+
+    // The accepted modes are `repeated string` like every other list in the
+    // half, so they take a run of the same array the message's own extension
+    // URIs take. The order here puts the modes first, so the two runs are
+    // disjoint and neither is the other's first element.
+    const body = "{\"metadata\":{\"priority\":1}," ++
+        "\"configuration\":{\"acceptedOutputModes\":[\"text/plain\"," ++
+        "\"application/json\"],\"historyLength\":2,\"returnImmediately\":true}," ++
+        "\"message\":{\"extensions\":[\"https://x/e/v1\"]," ++
+        "\"parts\":[{\"text\":\"q\"}],\"role\":\"ROLE_USER\"," ++
+        "\"messageId\":\"m-1\"}," ++
+        "\"tenant\":\"acme\"}";
+    const request = try decodeSendMessageRequest(body, &storage.arena, &storage.scratch);
+    try testing.expectEqualStrings("acme", request.tenant.?);
+    try testing.expectEqualStrings("m-1", request.message.message_id);
+    try testing.expectEqualStrings("https://x/e/v1", request.message.extensions.?[0]);
+    try testing.expectEqualStrings("text/plain", request.configuration.?.accepted_output_modes.?[0]);
+    try testing.expectEqualStrings("application/json", request.configuration.?.accepted_output_modes.?[1]);
+    try testing.expectEqual(@as(?i32, 2), request.configuration.?.history_length);
+    try testing.expectEqual(@as(?bool, true), request.configuration.?.return_immediately);
+    // Three runs of one array: the modes, then the message's own extension.
+    try testing.expectEqual(@as(usize, 3), storage.arena.strings_used);
+    try testing.expectEqualStrings("{\"priority\":1}", request.metadata.?);
+
+    var writer = json.Writer.init(&storage.out);
+    try encodeSendMessageRequest(request, &writer, &storage.base64);
+    try testing.expectEqualStrings(
+        "{\"tenant\":\"acme\",\"message\":{\"messageId\":\"m-1\"," ++
+            "\"role\":\"ROLE_USER\",\"parts\":[{\"text\":\"q\"}]," ++
+            "\"extensions\":[\"https://x/e/v1\"]}," ++
+            "\"configuration\":{\"acceptedOutputModes\":[\"text/plain\"," ++
+            "\"application/json\"],\"historyLength\":2,\"returnImmediately\":true}," ++
+            "\"metadata\":{\"priority\":1}}",
+        writer.written(),
+    );
+
+    // `message` is the only REQUIRED member, and `tenant` is a presence: the
+    // empty tenant is a request and no tenant is another one.
+    const bare = try decodeSendMessageRequest(
+        "{\"message\":{\"messageId\":\"m\",\"role\":\"ROLE_USER\",\"parts\":[]}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(?[]const u8, null), bare.tenant);
+    try testing.expectEqual(@as(?SendMessageConfiguration, null), bare.configuration);
+    writer = json.Writer.init(&storage.out);
+    try encodeSendMessageRequest(bare, &writer, &storage.base64);
+    try testing.expectEqualStrings(
+        "{\"message\":{\"messageId\":\"m\",\"role\":\"ROLE_USER\",\"parts\":[]}}",
+        writer.written(),
+    );
+    const blank = try decodeSendMessageRequest(
+        "{\"tenant\":\"\",\"message\":{\"messageId\":\"m\",\"role\":\"ROLE_USER\"," ++
+            "\"parts\":[]}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqualStrings("", blank.tenant.?);
+    writer = json.Writer.init(&storage.out);
+    try encodeSendMessageRequest(blank, &writer, &storage.base64);
+    try testing.expectEqualStrings(
+        "{\"tenant\":\"\",\"message\":{\"messageId\":\"m\",\"role\":\"ROLE_USER\"," ++
+            "\"parts\":[]}}",
+        writer.written(),
+    );
+
+    try testing.expectError(
+        error.MissingField,
+        decodeSendMessageRequest("{\"tenant\":\"acme\"}", &storage.arena, &storage.scratch),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeSendMessageRequest(
+            "{\"message\":{\"role\":\"ROLE_USER\",\"parts\":[]}}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeSendMessageRequest(
+            "{\"message\":{\"messageId\":\"m\",\"role\":\"ROLE_USER\",\"parts\":[]}} x",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    // A nested REQUIRED member is still a missing field, and the walk reaches
+    // it rather than accepting a message with no id.
+    try testing.expectError(
+        error.MissingField,
+        decodeSendMessageRequest(
+            "{\"message\":{\"role\":\"ROLE_USER\",\"parts\":[]}}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+}
+
+test "a SendMessageResponse round-trips both arms of its oneof" {
+    var storage: TestStorage = .{};
+    storage.init();
+
+    const with_task = "{\"task\":{\"id\":\"t-1\"," ++
+        "\"status\":{\"state\":\"TASK_STATE_SUBMITTED\"}}}";
+    const task_response = try decodeSendMessageResponse(
+        with_task,
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expect(task_response == .task);
+    try testing.expectEqualStrings("t-1", task_response.task.id);
+    var writer = json.Writer.init(&storage.out);
+    try encodeSendMessageResponse(task_response, &writer, &storage.base64);
+    try testing.expectEqualStrings(with_task, writer.written());
+
+    const with_message = "{\"message\":{\"messageId\":\"m-1\"," ++
+        "\"role\":\"ROLE_AGENT\",\"parts\":[{\"text\":\"answer\"}]}}";
+    const message_response = try decodeSendMessageResponse(
+        with_message,
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expect(message_response == .message);
+    writer = json.Writer.init(&storage.out);
+    try encodeSendMessageResponse(message_response, &writer, &storage.base64);
+    try testing.expectEqualStrings(with_message, writer.written());
+
+    // The oneof is the whole message, so an object with no arm is a missing
+    // field and a name no row carries is stepped over.
+    try testing.expectError(
+        error.MissingField,
+        decodeSendMessageResponse("{}", &storage.arena, &storage.scratch),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeSendMessageResponse(
+            "{\"statusUpdate\":{\"taskId\":\"t\",\"contextId\":\"c\"," ++
+                "\"status\":{\"state\":\"TASK_STATE_WORKING\"}}}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeSendMessageResponse(
+            "{\"message\":{\"messageId\":\"m\",\"role\":\"ROLE_USER\"," ++
+                "\"parts\":[]}} x",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+}
+
+test "a StreamResponse round-trips all four arms under their own names" {
+    var storage: TestStorage = .{};
+    storage.init();
+
+    // The four arms are four members of the object, and the number a protobuf
+    // encoder writes for each is the one `StreamResponse.fields` gives it. A
+    // codec that took the tag ordinal would have put `artifactUpdate` where
+    // `task` belongs, and this document is what that mistake changes.
+    const bodies = [_][]const u8{
+        "{\"task\":{\"id\":\"t-1\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}}",
+        "{\"message\":{\"messageId\":\"m-1\",\"role\":\"ROLE_USER\"," ++
+            "\"parts\":[{\"text\":\"q\"}]}}",
+        "{\"statusUpdate\":{\"taskId\":\"t-1\",\"contextId\":\"c-1\"," ++
+            "\"status\":{\"state\":\"TASK_STATE_COMPLETED\"}}}",
+        "{\"artifactUpdate\":{\"taskId\":\"t-1\",\"contextId\":\"c-1\"," ++
+            "\"artifact\":{\"artifactId\":\"a-1\",\"parts\":[{\"text\":\"chunk\"}]}," ++
+            "\"append\":true}}",
+    };
+    for (bodies, 0..) |body, index| {
+        const response = try decodeStreamResponse(body, &storage.arena, &storage.scratch);
+        switch (index) {
+            0 => try testing.expect(response == .task),
+            1 => try testing.expect(response == .message),
+            2 => try testing.expect(response == .status_update),
+            3 => try testing.expect(response == .artifact_update),
+            // Not a branch a document can reach: the loop runs over four
+            // bodies and the switch covers four arms. It is a decode error
+            // rather than `unreachable` because this library does not have a
+            // branch that traps, here or in a codec.
+            else => return error.TestUnexpectedResult,
+        }
+        var writer = json.Writer.init(&storage.out);
+        try encodeStreamResponse(response, &writer, &storage.base64);
+        try testing.expectEqualStrings(body, writer.written());
+    }
+
+    // The oneof is the whole message, so an object with no arm is a missing
+    // field, and a second arm is first-wins for the reason every repeated
+    // member in this file is.
+    try testing.expectError(
+        error.MissingField,
+        decodeStreamResponse("{}", &storage.arena, &storage.scratch),
+    );
+    const two = try decodeStreamResponse(
+        "{\"message\":{\"messageId\":\"m\",\"role\":\"ROLE_USER\",\"parts\":[]}," ++
+            "\"task\":{\"id\":\"t\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expect(two == .message);
+    try testing.expectError(
+        error.MalformedJson,
+        decodeStreamResponse(
+            "{\"task\":{\"id\":\"t\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}} x",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    // An arm whose own REQUIRED member is missing is still a missing field, and
+    // the walk reaches inside the oneof to find it.
+    try testing.expectError(
+        error.MissingField,
+        decodeStreamResponse(
+            "{\"artifactUpdate\":{\"taskId\":\"t\",\"contextId\":\"c\"," ++
+                "\"artifact\":{\"artifactId\":\"a\"}}}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+}
+
+test "a null message member is a missing field, and the first arm with a value wins" {
+    var storage: TestStorage = .{};
+    storage.init();
+
+    // A oneof member sent as `null` is an arm that is not there. The object is
+    // well formed and it names a member, so this is a missing field and not a
+    // syntax error — the caller is told the arm is absent, not that the peer
+    // sent malformed JSON.
+    try testing.expectError(
+        error.MissingField,
+        decodeStreamResponse("{\"task\":null}", &storage.arena, &storage.scratch),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeSendMessageResponse("{\"message\":null}", &storage.arena, &storage.scratch),
+    );
+    // A later arm that does carry a value still decides the union, for the
+    // same reason a repeated member takes its first occurrence.
+    const later = try decodeStreamResponse(
+        "{\"task\":null,\"message\":{\"messageId\":\"m\",\"role\":\"ROLE_USER\"," ++
+            "\"parts\":[]}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expect(later == .message);
+
+    // The same rule for a REQUIRED message member that is not in a oneof.
+    try testing.expectError(
+        error.MissingField,
+        decodeSendMessageRequest("{\"message\":null}", &storage.arena, &storage.scratch),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeTask(
+            "{\"id\":\"t\",\"status\":null}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeTaskStatusUpdateEvent(
+            "{\"taskId\":\"t\",\"contextId\":\"c\",\"status\":null}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeTaskArtifactUpdateEvent(
+            "{\"taskId\":\"t\",\"contextId\":\"c\",\"artifact\":null}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    // And for the optional message members the flat half already had, so the
+    // rule is one rule in the file and not eleven. These are optional, so a
+    // `null` is the absent value rather than a missing field, and the encoder
+    // writes nothing for it.
+    const config = try decodeTaskPushNotificationConfig(
+        "{\"url\":\"https://hooks.example.com/t\",\"authentication\":null}",
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(?AuthenticationInfo, null), config.authentication);
+    var modes: [4][]const u8 = undefined;
+    const configuration = try decodeSendMessageConfiguration(
+        "{\"taskPushNotificationConfig\":null,\"historyLength\":1}",
+        &modes,
+        &storage.scratch,
+    );
+    try testing.expectEqual(
+        @as(?TaskPushNotificationConfig, null),
+        configuration.task_push_notification_config,
+    );
+    const status = try decodeTaskStatus(
+        "{\"state\":\"TASK_STATE_WORKING\",\"message\":null}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(?Message, null), status.message);
+    var out: [256]u8 = undefined;
+    var writer = json.Writer.init(&out);
+    try encodeTaskStatus(status, &writer, &storage.base64);
+    try testing.expectEqualStrings("{\"state\":\"TASK_STATE_WORKING\"}", writer.written());
+}
+
+test "an out array that fills is an error and never a truncation" {
+    var scratch: [256]u8 = undefined;
+    var base64: [64]u8 = undefined;
+    var out: [1024]u8 = undefined;
+
+    // One part slot and a document with two parts. A message whose second part
+    // silently disappeared would be a message that says something the caller
+    // did not mean, so the decode is refused instead.
+    var one_part: [1]Part = undefined;
+    var one_artifact_slot: [1]Artifact = undefined;
+    var one_message_slot: [1]Message = undefined;
+    var one_string_slot: [1][]const u8 = undefined;
+    var byte_slots: [64]u8 = undefined;
+    var part_arena = ContentArena.init(
+        &one_part,
+        &one_artifact_slot,
+        &one_message_slot,
+        &one_string_slot,
+        &byte_slots,
+    );
+    try testing.expectError(
+        error.BufferTooSmall,
+        decodeMessage(
+            "{\"messageId\":\"m\",\"role\":\"ROLE_USER\"," ++
+                "\"parts\":[{\"text\":\"a\"},{\"text\":\"b\"}]}",
+            &part_arena,
+            &scratch,
+        ),
+    );
+    // One part is enough for the same document with one part, so the refusal is
+    // the second part and not the shape.
+    _ = try decodeMessage(
+        "{\"messageId\":\"m\",\"role\":\"ROLE_USER\",\"parts\":[{\"text\":\"a\"}]}",
+        &part_arena,
+        &scratch,
+    );
+
+    // The same rule for the artifact array, which is a different array reached
+    // through a different document. Every arena below is the full-size one with
+    // exactly one array shrunk, so each refusal names the array it came from.
+    var parts: [8]Part = undefined;
+    var artifacts: [2]Artifact = undefined;
+    var messages: [2]Message = undefined;
+    var strings: [4][]const u8 = undefined;
+    var bytes: [64]u8 = undefined;
+
+    var one_artifact: [1]Artifact = undefined;
+    var one_artifact_arena = ContentArena.init(
+        &parts,
+        &one_artifact,
+        &messages,
+        &strings,
+        &bytes,
+    );
+    try testing.expectError(
+        error.BufferTooSmall,
+        decodeTask(
+            "{\"id\":\"t\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}," ++
+                "\"artifacts\":[{\"artifactId\":\"a\",\"parts\":[]}," ++
+                "{\"artifactId\":\"b\",\"parts\":[]}]}",
+            &one_artifact_arena,
+            &scratch,
+        ),
+    );
+
+    // And for the history array, which is the fifth slot and not the fourth.
+    var one_message: [1]Message = undefined;
+    var one_message_arena = ContentArena.init(
+        &parts,
+        &artifacts,
+        &one_message,
+        &strings,
+        &bytes,
+    );
+    try testing.expectError(
+        error.BufferTooSmall,
+        decodeTask(
+            "{\"id\":\"t\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}," ++
+                "\"history\":[{\"messageId\":\"m-1\",\"role\":\"ROLE_USER\"," ++
+                "\"parts\":[]},{\"messageId\":\"m-2\",\"role\":\"ROLE_USER\"," ++
+                "\"parts\":[]},{\"messageId\":\"m-3\",\"role\":\"ROLE_USER\"," ++
+                "\"parts\":[]}]}",
+            &one_message_arena,
+            &scratch,
+        ),
+    );
+
+    // And for the shared string array, which is where a `repeated string` that
+    // outgrows the caller's element storage lands.
+    var one_string: [1][]const u8 = undefined;
+    var one_string_arena = ContentArena.init(
+        &parts,
+        &artifacts,
+        &messages,
+        &one_string,
+        &bytes,
+    );
+    try testing.expectError(
+        error.BufferTooSmall,
+        decodeMessage(
+            "{\"messageId\":\"m\",\"role\":\"ROLE_USER\",\"parts\":[]," ++
+                "\"extensions\":[\"a\",\"b\"]}",
+            &one_string_arena,
+            &scratch,
+        ),
+    );
+
+    // And for the decoded bytes of a `Part.raw`, the fifth array and the only
+    // one holding something the codec computed rather than copied.
+    //
+    // The bound is `decodedLen` of the encoded text, which ignores the padding
+    // and so overstates: `AAECAw==` is four bytes and the bound is six. A
+    // four-byte buffer is refused and a six-byte one is not, and that is the
+    // direction that matters — a buffer sized from the bound is never short,
+    // whereas one sized from the result would report the peer's bytes as the
+    // caller's mistake.
+    var four_bytes: [4]u8 = undefined;
+    var short_arena = ContentArena.init(
+        &parts,
+        &artifacts,
+        &messages,
+        &strings,
+        &four_bytes,
+    );
+    try testing.expectError(
+        error.BufferTooSmall,
+        decodePart("{\"raw\":\"AAECAw==\"}", &short_arena, &scratch),
+    );
+    var six_bytes: [6]u8 = undefined;
+    short_arena.bytes = &six_bytes;
+    const decoded = try decodePart("{\"raw\":\"AAECAw==\"}", &short_arena, &scratch);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 2, 3 }, decoded.content.raw);
+
+    // The encoder refuses the same value the same way, and it refuses before
+    // the first byte rather than after.
+    var refusal = json.Writer.init(&out);
+    try testing.expectError(
+        error.BufferTooSmall,
+        encodePart(.{ .content = .{ .raw = &[_]u8{ 0, 1, 2, 3, 4 } } }, &refusal, base64[0..4]),
+    );
+    try testing.expectEqual(@as(usize, 0), refusal.written().len);
+    // A base64 buffer that does fit takes the same value, so the refusal is the
+    // buffer and not the bytes.
+    var fits = json.Writer.init(&out);
+    try encodePart(.{ .content = .{ .raw = &[_]u8{ 0, 1, 2, 3, 4 } } }, &fits, &base64);
+    // `00 01 02 03 04` is `AAEC` then `AwQ=`: five bytes, so the tail carries
+    // one pad and not two.
+    try testing.expectEqualStrings("{\"raw\":\"AAECAwQ=\"}", fits.written());
 }
