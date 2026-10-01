@@ -1528,18 +1528,49 @@ pub const InputRequiredResult = struct {
     /// influences authorization, so a client that parses its contents is already
     /// outside the contract. The library carries it and never interprets it.
     request_state: ?[]const u8 = null,
+    /// The members this shape does not model, as the peer sent them.
+    ///
+    /// `Result` declares `[key: string]: unknown` and a `_meta` of its own, so
+    /// the member set of a result object is **open** and a member here is one
+    /// a peer may legally send: a vendor key, or the carrier itself. None is
+    /// ever dropped — the first occurrence and every repeat are carried, for
+    /// the reason [`VerbatimMember`] states, and [`encodeInputRequiredResult`]
+    /// writes them back last, in the order they arrived.
+    verbatim: []const VerbatimMember = &.{},
 };
 
 /// Decode the members of an `InputRequiredResult`.
 ///
 /// `raw` is the `result` object as borrowed JSON text. The caller has already
 /// established from the JSON-RPC layer that this is a response, so this reads
-/// the members the MRTR rules constrain and skips the rest.
+/// the members the MRTR rules constrain and carries the rest.
+///
+/// `verbatim` is the caller's store for the members this shape does not model,
+/// and it is the same third-party live region every other result decoder in
+/// this module takes: a caller-owned array the caller sizes, so nothing here
+/// allocates. It exists because `Result` declares `[key: string]: unknown` and
+/// a `_meta` of its own, which makes both a vendor member and the carrier
+/// members a peer may legally send, and this is the result a client answers
+/// with the body it re-encoded. Skipping them would drop them on that answer
+/// with no error anywhere.
+///
+/// A caller that does not care what the result carried beyond its three
+/// members still passes one — the array it has, sized for what it expects.
+/// Exhaustion is `error.BufferTooSmall`, which is a refusal and never a
+/// truncation, so a store that is too small is a loud mistake rather than a
+/// result that has quietly lost a member the peer sent.
+///
+/// The order is the ten section 4.10.3 decoders use — `raw`, the caller's
+/// regions, `scratch` — and the position is the same one in all of them, so a
+/// caller who has learned one has learned the other eleven.
 pub fn decodeInputRequiredResult(
     raw: []const u8,
+    verbatim: []VerbatimMember,
     scratch: []u8,
 ) DecodeError!InputRequiredResult {
     var reader = json.Reader.init(raw);
+    var store = VerbatimStore.init(verbatim);
+    const at = store.mark();
     var result: InputRequiredResult = .{};
 
     if (try reader.beginObject()) return error.MissingField;
@@ -1552,7 +1583,7 @@ pub fn decodeInputRequiredResult(
         } else if (std.mem.eql(u8, key, "requestState")) {
             try claimFirst(&result.request_state, &reader, scratch, takeString);
         } else {
-            try reader.skipValue(scratch);
+            try takeVerbatim(key, &reader, &store, scratch);
         }
     }
 
@@ -1560,12 +1591,13 @@ pub fn decodeInputRequiredResult(
     // `decodeResultType`. This is the decoder a caller re-encodes most often —
     // the client answers the interim result with a retry — so the tail is
     // dropped on the retry the same way, and nothing downstream reports it.
-    if (!reader.atEnd()) return error.MalformedJson;
+    const open_members = try closeResult(&reader, &store, at);
 
     // "At least one of inputRequests or requestState MUST be present."
     if (result.input_requests == null and result.request_state == null) {
         return error.MissingField;
     }
+    result.verbatim = open_members;
     return result;
 }
 
@@ -1578,12 +1610,19 @@ pub fn decodeInputRequiredResult(
 /// gives a second result type to, so it is a body a server both reads and
 /// writes.
 ///
-/// Not the byte-for-byte inverse of a general `InputRequiredResult` document:
-/// like [`encodeResultType`] it writes the members the type carries, and a
-/// member the decoder skips is gone. The value it *does* write back is exact —
-/// `inputRequests` is spliced as the lexeme it arrived as, and `requestState`
-/// is written as a JSON string literal so the escapes do not end the member
-/// early.
+/// The exact inverse of [`decodeInputRequiredResult`], for the reason
+/// [`encodeDiscoverResult`] states for the same pair over the same document: a
+/// member the shape does not model is a member a peer may legally send, because
+/// `Result` declares `[key: string]: unknown` and a `_meta` of its own, and it
+/// comes back in [`InputRequiredResult.verbatim`] as the lexeme it arrived as
+/// rather than being skipped. The three modelled members come first, in the
+/// order [`inputRequired`] writes them, and the carried members follow in the
+/// order the peer sent them.
+///
+/// The value it writes back is exact: `inputRequests` is spliced as the lexeme
+/// it arrived as, `requestState` is written as a JSON string literal so the
+/// escapes do not end the member early, and a carried member is spliced whole
+/// after [`checkVerbatim`] has held it to one JSON value.
 pub fn encodeInputRequiredResult(
     result: InputRequiredResult,
     writer: *json.Writer,
@@ -1593,34 +1632,20 @@ pub fn encodeInputRequiredResult(
     // the caller's buffer, which is neither a result nor nothing, so a caller
     // that sized the buffer for the refusal would have to discard what it
     // holds rather than read it.
-    if (result.input_requests) |requests| {
-        if (!isOneJsonValue(requests)) return error.InvalidField;
-    }
+    try checkRaw(&.{result.input_requests});
+    try checkVerbatim(result.verbatim);
 
-    try writer.byte('{');
-    // The separator goes in front of every member after the first rather than
-    // baked into each one, because `resultType` is optional: a comma where
-    // that member stood is a document no reader is right to accept, and the
-    // member was the caller's to omit.
-    var separator: []const u8 = "";
-    if (result.result_type.value) |value| {
-        try writer.slice(separator);
-        try writer.slice("\"resultType\":");
-        try writer.string(value);
-        separator = ",";
-    }
-    if (result.input_requests) |requests| {
-        try writer.slice(separator);
-        try writer.slice("\"inputRequests\":");
-        try writer.slice(requests);
-        separator = ",";
-    }
-    if (result.request_state) |state| {
-        try writer.slice(separator);
-        try writer.slice("\"requestState\":");
-        try writer.string(state);
-    }
-    try writer.byte('}');
+    // The separator belongs to the object writer rather than to each member
+    // here, for the reason `ObjectWriter` states: `resultType` is optional, and
+    // a comma where that member stood is a document no reader is right to
+    // accept.
+    var object: ObjectWriter = .{ .writer = writer };
+    try object.open();
+    try writeResultType(&object, result.result_type);
+    try object.optRaw("inputRequests", result.input_requests);
+    try object.optText("requestState", result.request_state);
+    try object.verbatim(result.verbatim);
+    try object.close();
 }
 
 /// The methods that may return an `InputRequiredResult`.
@@ -3795,7 +3820,9 @@ pub fn decodeDiscoverResult(
 /// The member order is the one `mcp_session.Server.discoverBody` already
 /// writes, so a body a session built re-encodes to the same bytes rather than
 /// to an equivalent document in another order. `nextCursor` is not a member
-/// of this result and `DiscoverResult` is not one of the five paginated rows.
+/// of this result, and `DiscoverResult` is not one of the four paginated rows:
+/// the artifact has it extend `CacheableResult` and not `PaginatedResult`, so
+/// it is the sixth cacheable row and none of the four that page.
 pub fn encodeDiscoverResult(result: DiscoverResult, writer: *json.Writer) EncodeError!void {
     try checkRaw(&.{ result.capabilities, result.meta });
     try checkVerbatim(result.verbatim);
@@ -5029,45 +5056,120 @@ test "the reserved and legacy ranges are disjoint" {
 
 test "an InputRequiredResult needs at least one of its two optional members" {
     var scratch: [128]u8 = undefined;
+    var verbatim: [16]VerbatimMember = undefined;
 
     const both = try decodeInputRequiredResult(
         \\{"resultType":"input_required","inputRequests":{"a":{"method":"elicitation/create"}},"requestState":"opaque"}
-    , &scratch);
+    , verbatim[0..], &scratch);
     try testing.expect(both.input_requests != null);
     try testing.expectEqualStrings("opaque", both.request_state.?);
 
     const state_only = try decodeInputRequiredResult(
         \\{"resultType":"input_required","requestState":"opaque"}
-    , &scratch);
+    , verbatim[0..], &scratch);
     try testing.expectEqual(@as(?[]const u8, null), state_only.input_requests);
 
     try testing.expectError(error.MissingField, decodeInputRequiredResult(
         \\{"resultType":"input_required"}
-    , &scratch));
+    , verbatim[0..], &scratch));
 
     // A complete result is not an InputRequiredResult.
     try testing.expectError(error.InvalidField, decodeInputRequiredResult(
         \\{"resultType":"complete","requestState":"x"}
-    , &scratch));
+    , verbatim[0..], &scratch));
+}
+
+test "an unmodelled member of an interim result round-trips byte for byte" {
+    var scratch: [512]u8 = undefined;
+    var out: [512]u8 = undefined;
+    var verbatim: [16]VerbatimMember = undefined;
+
+    // The result object is open in its keys: `Result` declares
+    // `[key: string]: unknown`, so a member this shape does not model is one a
+    // peer may legally send. It used to be skipped here and the encoder wrote
+    // only the three members the type models, so a client that answered the
+    // interim result with the body it re-encoded dropped what the server had
+    // sent — on the one result a client always re-encodes, and with no error
+    // anywhere.
+    const wire =
+        \\{"resultType":"input_required","requestState":"x","vendor.example.com/trace":{"a":[1,2]}}
+    ;
+    const decoded = try decodeInputRequiredResult(wire, verbatim[0..], &scratch);
+    try testing.expectEqual(@as(usize, 1), decoded.verbatim.len);
+    try testing.expectEqualStrings("vendor.example.com/trace", decoded.verbatim[0].key);
+    try testing.expectEqualStrings("{\"a\":[1,2]}", decoded.verbatim[0].value);
+    var writer = json.Writer.init(&out);
+    try encodeInputRequiredResult(decoded, &writer);
+    try testing.expectEqualStrings(wire, writer.written());
+
+    // The carrier `_meta` is declared on `Result` itself, so it is the member a
+    // peer is likeliest to send, and no fixture in the tree carries one: the
+    // same rule, one member nearer the specification's own, and it comes back
+    // beside the others rather than in place of them.
+    const carrier =
+        \\{"resultType":"input_required","inputRequests":{"e1":{"method":"elicitation/create"}},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"s"}}}
+    ;
+    const carried = try decodeInputRequiredResult(carrier, verbatim[0..], &scratch);
+    try testing.expectEqual(@as(usize, 1), carried.verbatim.len);
+    try testing.expectEqualStrings("_meta", carried.verbatim[0].key);
+    writer = json.Writer.init(&out);
+    try encodeInputRequiredResult(carried, &writer);
+    try testing.expectEqualStrings(carrier, writer.written());
+
+    // A document carrying only the three members the type models is the
+    // ordinary path, and the store leaves it alone: no carried member, and the
+    // same bytes it has always re-encoded to.
+    const plain = "{\"resultType\":\"input_required\",\"requestState\":\"x\"}";
+    const bare = try decodeInputRequiredResult(plain, verbatim[0..], &scratch);
+    try testing.expectEqual(@as(usize, 0), bare.verbatim.len);
+    writer = json.Writer.init(&out);
+    try encodeInputRequiredResult(bare, &writer);
+    try testing.expectEqualStrings(plain, writer.written());
+
+    // A member this shape does not name is never interpreted, so there is no
+    // value for the first-wins rule to resolve and every occurrence is carried.
+    const twice = try decodeInputRequiredResult(
+        \\{"requestState":"x","hint":1,"hint":2}
+    , verbatim[0..], &scratch);
+    try testing.expectEqual(@as(usize, 2), twice.verbatim.len);
+    writer = json.Writer.init(&out);
+    try encodeInputRequiredResult(twice, &writer);
+    try testing.expectEqualStrings(
+        \\{"requestState":"x","hint":1,"hint":2}
+    , writer.written());
+
+    // A store with no room left is a refusal and never a truncation, which is
+    // what a caller who sizes it wrong is told: this pair would otherwise hand
+    // back a result whose open members quietly stopped being written back, and
+    // that is the defect the store was added to close.
+    var one_member: [1]VerbatimMember = undefined;
+    try testing.expectError(
+        error.BufferTooSmall,
+        decodeInputRequiredResult(
+            \\{"requestState":"x","first":1,"second":2}
+        , one_member[0..], &scratch),
+    );
 }
 
 test "requestState is carried and never interpreted" {
     var scratch: [128]u8 = undefined;
+    var verbatim: [16]VerbatimMember = undefined;
     // A value that would be dangerous if parsed as anything else. The library
     // hands it back byte for byte.
     const hostile = "{\"admin\":true,\"role\":\"owner\"}";
     const decoded = try decodeInputRequiredResult(
         \\{"resultType":"input_required","requestState":"{\"admin\":true,\"role\":\"owner\"}"}
-    , &scratch);
+    , verbatim[0..], &scratch);
     try testing.expectEqualStrings(hostile, decoded.request_state.?);
 }
 
 test "an InputRequiredResult records an absent resultType instead of inventing one" {
     var scratch: [128]u8 = undefined;
+    var verbatim: [16]VerbatimMember = undefined;
 
     const present = try decodeInputRequiredResult(
         \\{"resultType":"input_required","requestState":"x"}
-    , &scratch);
+    , verbatim[0..], &scratch);
     try testing.expectEqualStrings(result_type_value.input_required, present.result_type.value.?);
     try testing.expectEqual(KnownResultType.input_required, present.result_type.known().?);
 
@@ -5076,7 +5178,7 @@ test "an InputRequiredResult records an absent resultType instead of inventing o
     // and would be re-encoded as one.
     const absent = try decodeInputRequiredResult(
         \\{"requestState":"x"}
-    , &scratch);
+    , verbatim[0..], &scratch);
     try testing.expectEqual(@as(?[]const u8, null), absent.result_type.value);
     // ... and the client MUST treat an absent member as complete.
     try testing.expectEqual(KnownResultType.complete, absent.result_type.known().?);
@@ -5184,6 +5286,7 @@ test "a result object with a trailing byte is refused, not truncated" {
 test "an InputRequiredResult with a trailing byte is refused" {
     var scratch: [128]u8 = undefined;
     var out: [128]u8 = undefined;
+    var verbatim: [16]VerbatimMember = undefined;
 
     // The tail is dropped whichever arm took the last member, so the case is
     // stated against the `requestState` arm, which takes a lexeme and is the
@@ -5194,6 +5297,7 @@ test "an InputRequiredResult with a trailing byte is refused" {
         error.MalformedJson,
         decodeInputRequiredResult(
             "{\"resultType\":\"input_required\",\"requestState\":\"x\"} trailing",
+            verbatim[0..],
             &scratch,
         ),
     );
@@ -5203,6 +5307,7 @@ test "an InputRequiredResult with a trailing byte is refused" {
         error.MalformedJson,
         decodeInputRequiredResult(
             "{\"resultType\":\"input_required\",\"inputRequests\":{\"a\":{\"method\":\"tools/call\"}}} trailing",
+            verbatim[0..],
             &scratch,
         ),
     );
@@ -5211,17 +5316,21 @@ test "an InputRequiredResult with a trailing byte is refused" {
     // that sits below the check.
     try testing.expectError(
         error.MalformedJson,
-        decodeInputRequiredResult("{\"resultType\":\"input_required\"} trailing", &scratch),
+        decodeInputRequiredResult(
+            "{\"resultType\":\"input_required\"} trailing",
+            verbatim[0..],
+            &scratch,
+        ),
     );
 
     // The round trip the tail would have broken, on the documents that are
     // accepted. A client answers the interim result with a retry, so this pair
     // is one a caller really writes.
-    const state_decoded = try decodeInputRequiredResult(interim, &scratch);
+    const state_decoded = try decodeInputRequiredResult(interim, verbatim[0..], &scratch);
     var writer = json.Writer.init(&out);
     try encodeInputRequiredResult(state_decoded, &writer);
     try testing.expectEqualStrings(interim, writer.written());
-    const request_decoded = try decodeInputRequiredResult(requests, &scratch);
+    const request_decoded = try decodeInputRequiredResult(requests, verbatim[0..], &scratch);
     writer = json.Writer.init(&out);
     try encodeInputRequiredResult(request_decoded, &writer);
     try testing.expectEqualStrings(requests, writer.written());
@@ -5229,6 +5338,7 @@ test "an InputRequiredResult with a trailing byte is refused" {
     // Whitespace after the value is not a second document.
     const spaced = try decodeInputRequiredResult(
         "{\"resultType\":\"input_required\",\"requestState\":\"x\"} \n",
+        verbatim[0..],
         &scratch,
     );
     try testing.expectEqualStrings("x", spaced.request_state.?);
@@ -5837,6 +5947,7 @@ test "a repeated member is first-wins, and a repeated unmodelled one is kept twi
 test "the interim result writers are the library's, not a harness's" {
     var scratch: [128]u8 = undefined;
     var out: [128]u8 = undefined;
+    var verbatim: [16]VerbatimMember = undefined;
 
     // `encodeResultType` and `encodeInputRequiredResult` are the encoders for
     // the two public decoders beside them. A result type a server writes is
@@ -5849,7 +5960,7 @@ test "the interim result writers are the library's, not a harness's" {
 
     const interim = try decodeInputRequiredResult(
         \\{"resultType":"input_required","inputRequests":{"a":{"method":"tools/call"}}}
-    , &scratch);
+    , verbatim[0..], &scratch);
     writer = json.Writer.init(&out);
     try encodeInputRequiredResult(interim, &writer);
     try testing.expectEqualStrings(
@@ -6227,10 +6338,11 @@ test "a repeated member resolves first-wins in every decoder that names one" {
 
     // The interim result has to be exactly `input_required`, and the check is
     // part of reading the member rather than a verdict on the body: a peer
-    // naming it twice is not a peer that contradicted itself.
+    // that names it twice is answered by the first name. The store is the
+    // caller's here as in every other result decoder.
     const interim = try decodeInputRequiredResult(
         \\{"resultType":"input_required","resultType":"complete","requestState":"s"}
-    , &scratch);
+    , verbatim[0..], &scratch);
     try testing.expectEqualStrings(result_type_value.input_required, interim.result_type.value.?);
     try testing.expectEqualStrings("s", interim.request_state.?);
 
