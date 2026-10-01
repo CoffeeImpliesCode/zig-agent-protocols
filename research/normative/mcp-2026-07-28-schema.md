@@ -1,14 +1,17 @@
-# Model Context Protocol `2026-07-28` — result-payload declarations from `schema.ts`
+# Model Context Protocol `2026-07-28` — capability and notification declarations from `schema.ts`
 
 This document transcribes the `schema/2026-07-28/schema.ts` declarations that
-`PROTOCOLS.md` §4.10 is built from: the ten `*ResultResponse` interfaces, the ten
-result interfaces they name, the two result base interfaces, the `ServerResult`
-union, `ContentBlock` and its five members, `ResourceContents` and its two arms, and
-the element types those reference. §4.10 is the newest and largest section of the
-contract and the only one the MCP result codec in `src/mcp.zig` implements against;
-before this file existed, none of it could be re-verified offline, because §4.10 was
-transcribed from the upstream artifact directly rather than from a document in this
-directory.
+`PROTOCOLS.md` §4.8, §4.10 and §4.11 are built from: the ten `*ResultResponse`
+interfaces, the ten result interfaces they name, the two result base interfaces,
+the `ServerResult` union, `ContentBlock` and its five members,
+`ResourceContents` and its two arms, the element types those reference, both
+capability interfaces, and all eight notification shapes with the types they
+depend on. §4.10 is the newest and largest section of the contract and the only
+one the MCP result codec in `src/mcp.zig` implements against; before this file
+existed, none of it could be re-verified offline, because §4.10 was transcribed
+from the upstream artifact directly rather than from a document in this
+directory. §4.8 and §4.11 were added for the same reason: each named a shape the
+artifact declares and no document here declared.
 
 Every declaration below is reproduced exactly as it appears in the artifact,
 including its JSDoc comment, and each is labelled with the artifact's line range.
@@ -16,8 +19,9 @@ Nothing here is restated or paraphrased: where a declaration carries normative
 requirement language, that language is inside the quoted block.
 
 - Retrieval date: 2026-10-01
-- Contract: [`../../PROTOCOLS.md`](../../PROTOCOLS.md) §4.10 — the result payloads
-- Evidence: this file, transcribed from the single artifact named under
+- Contract: [`../../PROTOCOLS.md`](../../PROTOCOLS.md) §4.8 — capabilities; §4.10
+  — the result payloads; §4.11 — the notification payloads
+- Evidence: this file, transcribed from the artifacts named under
   *Artifact provenance*
 
 ## Artifact provenance
@@ -28,6 +32,14 @@ requirement language, that language is inside the quoted block.
   `| InputRequiredResult;` and a terminating newline.
 - sha256, recomputed from `main` on **2026-10-01**:
   `742750af0bb8c716e7030c4977c992b55d1adc4407e9e66997db5846baedc2cd`
+- `https://raw.githubusercontent.com/modelcontextprotocol/specification/3098fe94caa1b9e0afaaa6d30e040b61d5802471/schema/2026-07-28/schema.json`
+  — the **generated** JSON Schema, draft 2020-12, 181,474 bytes, 3,963 lines, no
+  `$id`, sha256
+  `ef70b61f99b6d2e5e3b46863822eab08dff6a45bedc7a08914e0e5b133f40203`, fetched
+  2026-10-01 at the same commit. It is a **cross-check, not a second source of
+  truth**: no declaration is quoted from it, and where it is read below the reading
+  is of a keyword the TypeScript source cannot express. It is listed because two
+  claims that this file previously made are decidable only here — see §9.
 
 The digest equals the one recorded for the transcription of `PROTOCOLS.md` §4.10, so
 §4.10 was taken from bytes this URL still serves and the section's provenance is
@@ -35,6 +47,39 @@ reproducible: fetching the URL and hashing the result is sufficient to establish
 the artifact before this file was written is the artifact §4.10 was written from.
 `main` is a moving branch and a later fetch may not match; re-hash before relying on
 any line range below.
+
+### Immutable pin
+
+`main` is a branch, so the line ranges below are only pinned by a digest and a
+later fetch may not reproduce them. As of **2026-10-01** the same bytes are
+reachable at an immutable ref, and both URLs were fetched and hashed
+separately:
+
+| | URL | Bytes | Lines | sha256 |
+| --- | --- | --- | --- | --- |
+| Moving ref | `https://raw.githubusercontent.com/modelcontextprotocol/specification/main/schema/2026-07-28/schema.ts` | 98,426 | 3,197 | `742750af0bb8c716e7030c4977c992b55d1adc4407e9e66997db5846baedc2cd` |
+| Immutable ref | `https://raw.githubusercontent.com/modelcontextprotocol/specification/3098fe94caa1b9e0afaaa6d30e040b61d5802471/schema/2026-07-28/schema.ts` | 98,426 | 3,197 | `742750af0bb8c716e7030c4977c992b55d1adc4407e9e66997db5846baedc2cd` |
+
+The two responses are byte-identical (`cmp` reports no difference), so the
+commit-pinned URL is a second address for the *same* artifact, not a different
+revision of it. Commit `3098fe94caa1b9e0afaaa6d30e040b61d5802471` is the `main`
+head at 2026-10-01T12:55:32Z, subject *"Merge pull request #3408 from
+modelcontextprotocol/claude/maintainers-tnorimat-nbarbettini — Add Conformance
+maintainers"*, resolved through
+`https://api.github.com/repositories/862570523/commits?sha=main&per_page=1`.
+
+The digest above is unchanged from the one this file already recorded, and that
+is the point: the historical provenance of `PROTOCOLS.md` §4.10 is **not**
+rewritten. §4.10 was transcribed from bytes whose digest is `742750af…2cd`, the
+digest recomputed on 2026-10-01 is the same value, and the commit-pinned fetch
+of the same date is byte-identical to it. The pin adds a durable address for
+the line ranges; it introduces no new claim about when §4.10 was written and
+does not license moving any `artifact L…` cite.
+
+Every hash in this section is over the **original HTTP response body** as
+written to disk by `curl -o`, never over reader output, a wrapper, or a
+normalised copy. A reader that reformats, line-numbers, or wraps the source
+cannot be hashed and must not be.
 
 **Provenance conflict, now resolved in the sibling.**
 [`mcp-2026-07-28.md`](mcp-2026-07-28.md) lines 6 and 21–22 described this same URL as
@@ -48,24 +93,32 @@ provenance of the correction and not as a live disagreement. No value either doc
 transcribes was ever affected: every declaration quoted here sits at or before line
 3197, and the `sha256` above is the digest of the 3,197-line artifact.
 
-## Scope: what §4.10 takes from this artifact
+## Scope: what §4.8, §4.10 and §4.11 take from this artifact
 
-| §4.10 subsection | Declarations quoted below |
-| --- | --- |
-| 4.10 preamble | `JSONRPCResultResponse`, `ResultType`, `Result`, `ResultMetaObject`, `MetaObject`, `Cursor`, `RequestId` |
-| 4.10.1 method to result | the ten `*ResultResponse` interfaces, `EmptyResult`, `ServerResult` |
-| 4.10.2 cacheable and paginated | `CacheableResult`, `PaginatedResult`, `PaginatedRequest`, `PaginatedRequestParams` |
-| 4.10.3 payloads | the ten result interfaces, `PromptMessage`, `Role`, `SubscriptionsListenResultMetaObject`, `ToolAnnotations` |
-| 4.10.4 `ContentBlock` | `ContentBlock` and `TextContent`, `ImageContent`, `AudioContent`, `ResourceLink`, `EmbeddedResource`; `Resource`, `BaseMetadata`, `Icons`, `Icon`, `Annotations` |
-| 4.10.5 caller-owned sequences | `Prompt`, `PromptArgument`, `ResourceTemplate`, `ResourceContents`, `TextResourceContents`, `BlobResourceContents` |
-| 4.10.6 open and closed sets | `Result`'s index signature, `ContentBlock`'s declaration, the capability doc sentences, `Role`, `Icon.theme`, `cacheScope` |
-| 4.10.7 where the source is silent | `ResourceContents` arms, `Annotations.priority`, `completion.values` |
+| Contract subsection | Declarations quoted below | Here |
+| --- | --- | --- |
+| 4.10 preamble | `JSONRPCResultResponse`, `ResultType`, `Result`, `ResultMetaObject`, `MetaObject`, `Cursor`, `RequestId` | §1 |
+| 4.10.1 method to result | the ten `*ResultResponse` interfaces, `EmptyResult`, `ServerResult` | §1, §3, §5 |
+| 4.10.2 cacheable and paginated | `CacheableResult`, `PaginatedResult`, `PaginatedRequest`, `PaginatedRequestParams` | §2 |
+| 4.10.3 payloads | the ten result interfaces, `PromptMessage`, `Role`, `SubscriptionsListenResultMetaObject`, `ToolAnnotations` | §4, §8 |
+| 4.10.4 `ContentBlock` | `ContentBlock` and `TextContent`, `ImageContent`, `AudioContent`, `ResourceLink`, `EmbeddedResource`; `Resource`, `BaseMetadata`, `Icons`, `Icon`, `Annotations` | §6, §8 |
+| 4.10.5 caller-owned sequences | `Prompt`, `PromptArgument`, `ResourceTemplate`, `ResourceContents`, `TextResourceContents`, `BlobResourceContents` | §7, §8 |
+| 4.10.6 open and closed sets | `Result`'s index signature, `ContentBlock`'s declaration, the capability doc sentences, `Role`, `Icon.theme`, `cacheScope`, and the `additionalProperties` census over the generated `schema.json` | §1, §2, §6, §8, §9 |
+| 4.10.7 where the source is silent | `ResourceContents` arms, `Annotations.priority`, `completion.values` | §4, §7, §8 |
+| 4.8 capabilities | `ClientCapabilities`, `ServerCapabilities` | §9 |
+| 4.11 notifications | `NotificationParams`, `Notification`, `JSONRPCNotification`, `NotificationMetaObject`, `RequestMetaObject` (the `progressToken` member), `ProgressToken`, `SubscriptionFilter`, `LoggingLevel`, all eight notification interfaces and the five params interfaces they name, `ClientNotification`, `ServerNotification` | §10 |
 
 Also quoted, though §4.10 names them only by type: `Implementation`, which
 `ResultMetaObject` points at, and `ServerCapabilities`, the type of
-`DiscoverResult.capabilities`. `ClientCapabilities` is quoted by doc comment only; its
-body is transcribed in [`mcp-2026-07-28.md`](mcp-2026-07-28.md) §6 and §4.10 cites
-only its doc sentence.
+`DiscoverResult.capabilities`.
+
+`ClientCapabilities` was previously quoted by doc comment only, with its body
+left to [`mcp-2026-07-28.md`](mcp-2026-07-28.md) §6. It is now quoted in full at
+§9, because §4.8 states a member table for it and a table whose declaration is
+in a different document than its own citations is not auditable from one place.
+§6 of the sibling remains a true and useful second source: every value in its
+`ClientCapabilities` JSON shape and field table agrees with the L711–L786
+declaration now quoted here.
 
 ## 1. Envelope and base types
 
@@ -1594,7 +1647,106 @@ export interface BaseMetadata {
 `Icon.theme` is `"light" | "dark"` — a closed inline union, like `cacheScope` and with
 no named alias in the artifact.
 
-## 9. Capability and implementation declarations §4.10 leans on
+## 9. Capability and implementation declarations §4.8 and §4.10 lean on
+
+Both capability interfaces are quoted in full below. `ServerCapabilities` was
+already here for `DiscoverResult.capabilities`; `ClientCapabilities` is added
+because §4.8 now carries a member table for each, and a member table with no
+declaration behind it is exactly the gap this file exists to close. The section
+closes with the one measurement the TypeScript source cannot make on its own —
+whether any of these member sets is closed on the wire — and finding 11 records
+why that measurement changed a claim this file had already made.
+
+### `ClientCapabilities` — artifact L711–L786
+
+```ts
+/**
+ * Capabilities a client may support. Known capabilities are defined here, in this schema, but this is not a closed set: any client can define its own, additional capabilities.
+ *
+ * @category `server/discover`
+ */
+export interface ClientCapabilities {
+  /**
+   * Experimental, non-standard capabilities that the client supports.
+   */
+  experimental?: { [key: string]: JSONObject };
+  /**
+   * Present if the client supports listing roots.
+   *
+   * @deprecated Deprecated as of protocol version 2026-07-28 (SEP-2577).
+   * Remains in the specification for at least twelve months; see the
+   * deprecated features registry.
+   *
+   * @example Roots — minimum baseline support
+   * {@includeCode ./examples/ClientCapabilities/roots-minimum-baseline-support.json}
+   */
+  // eslint-disable-next-line @typescript-eslint/no-empty-object-type
+  roots?: {};
+  /**
+   * Present if the client supports sampling from an LLM.
+   *
+   * @deprecated Deprecated as of protocol version 2026-07-28 (SEP-2577).
+   * Remains in the specification for at least twelve months; see the
+   * deprecated features registry.
+   *
+   * @example Sampling — minimum baseline support
+   * {@includeCode ./examples/ClientCapabilities/sampling-minimum-baseline-support.json}
+   *
+   * @example Sampling — tool use support
+   * {@includeCode ./examples/ClientCapabilities/sampling-tool-use-support.json}
+   *
+   * @example Sampling — context inclusion support (deprecated)
+   * {@includeCode ./examples/ClientCapabilities/sampling-context-inclusion-support-deprecated.json}
+   */
+  sampling?: {
+    /**
+     * Whether the client supports context inclusion via `includeContext` parameter.
+     * If not declared, servers SHOULD only use `includeContext: "none"` (or omit it).
+     */
+    context?: JSONObject;
+    /**
+     * Whether the client supports tool use via `tools` and `toolChoice` parameters.
+     */
+    tools?: JSONObject;
+  };
+  /**
+   * Present if the client supports elicitation from the server.
+   *
+   * @example Elicitation — form and URL mode support
+   * {@includeCode ./examples/ClientCapabilities/elicitation-form-and-url-mode-support.json}
+   *
+   * @example Elicitation — form mode only (implicit)
+   * {@includeCode ./examples/ClientCapabilities/elicitation-form-only-implicit.json}
+   */
+  elicitation?: {
+    form?: JSONObject;
+    url?: JSONObject;
+  };
+
+  /**
+   * Optional MCP extensions that the client supports. Keys are extension identifiers
+   * (e.g., "io.modelcontextprotocol/oauth-client-credentials"), and values are
+   * per-extension settings objects. An empty object indicates support with no settings.
+   *
+   * Keys MUST follow the {@link MetaObject | `_meta` key naming rules}, with a
+   * mandatory prefix.
+   *
+   * @example Extensions — MCP Apps (UI) extension with MIME type support
+   * {@includeCode ./examples/ClientCapabilities/extensions-ui-mime-types.json}
+   */
+  extensions?: { [key: string]: JSONObject };
+}
+```
+
+Two shapes in it are not plain objects and are easy to mistranscribe. `roots?: {}`
+is the **empty** object type — any JSON object satisfies it, which is why the
+artifact carries an `eslint-disable-next-line
+@typescript-eslint/no-empty-object-type` comment on that line (L731) and
+declares no member for it. And `elicitation.form` and `elicitation.url` carry
+**no JSDoc at all** (L769–L772), unlike `sampling.context` and `sampling.tools`;
+the only prose about them is in `client/elicitation.md`, which
+[`mcp-2026-07-28.md`](mcp-2026-07-28.md) §6 quotes. `ClientCapabilities`
+declares no required member: all five of its members are optional.
 
 ### `ServerCapabilities` — artifact L788–L883
 
@@ -1741,10 +1893,614 @@ doc comments on capability objects:
   capabilities are defined here, in this schema, but this is not a closed set: any
   server can define its own, additional capabilities."*
 
-That is the whole of the artifact's guidance about open discriminators, and it is what
-`PROTOCOLS.md` §4.10.6 cites when it says the phrase appears only on those two.
+That is the whole of the artifact's guidance about **open** sets, and it is about
+member sets, not about values. It is also the only place the artifact says anything
+about openness at all — no interface is ever marked open by an index signature alone,
+and the one place a **value** set is meant to be open, `ResultType`, says so with a
+`\| string` arm instead. The census below turns that idiom into a measurement.
 
-## 10. What the artifact fixes, as counts and sets
+### The generated JSON Schema, and the `additionalProperties` census
+
+`schema.ts` is the normative source, but it is TypeScript, and a TypeScript index
+signature is a compile-time construct: it constrains what a *writer* may put in an
+object literal, not what a peer may put on the wire. The construct that closes a
+member set on the wire is `additionalProperties: false`, and this protocol never uses
+it. Both artifacts, fetched 2026-10-01 at the commit pinned above:
+
+| Artifact | sha256 | `additionalProperties` | `unevaluatedProperties` | `…: false` |
+| --- | --- | --- | --- | --- |
+| `schema/2026-07-28/schema.ts` — 3,197 lines, 98,426 bytes | `742750af…2cd` | **0** | **0** | **0** |
+| `schema/2026-07-28/schema.json` — 3,963 lines, 181,474 bytes | `ef70b61f…0203` | **20** | **0** | **0** |
+
+The `main` ref serves the same bytes for the JSON Schema as for the TypeScript:
+fetched separately from the commit-pinned URL and compared, `cmp` reports no
+difference — 181,474 bytes, 3,963 lines, `ef70b61f…0203` from both. Both digests
+are over the raw HTTP response body, never over reader output.
+
+Not one of the twenty is `false`. Fifteen are typed maps —
+`JSONObject` → `{"$ref": "#/$defs/JSONValue"}`, `ClientCapabilities` and
+`ServerCapabilities` `.experimental` and `.extensions`, `InputRequests`,
+`InputResponses`, `CallToolRequestParams.arguments`,
+`CompleteRequestParams.context…arguments`, `GetPromptRequestParams.arguments`,
+`ElicitRequestFormParams.requestedSchema…properties`, `ElicitResult.content`,
+`Tool.inputSchema`, `Tool.outputSchema`, `ToolUseContent.input` — and five are the
+bare `{}` that admits any value, on `Result` and on the `params` of `Request`,
+`Notification`, `JSONRPCRequest` and `JSONRPCNotification`.
+
+Two things follow, and together they are why the word *closed* is withdrawn wherever
+this file applied it to a **member set**:
+
+- **No object type in the schema is closed.** Every nested object read — `elicitation`,
+  `sampling`, `prompts`, `resources`, `tools`, the six notification params
+  interfaces, `SubscriptionFilter`, `TextContent`, `Tool`, `Prompt`, `Resource`,
+  `ResourceContents` — carries **no** `additionalProperties` keyword at all, and under
+  draft 2020-12 an absent keyword permits undeclared properties. The generated schema
+  therefore positively **allows** a key the type does not name. The limiting case is
+  `ClientCapabilities.roots`: `"properties": {}` with no `additionalProperties`, so
+  any JSON object satisfies it, exactly as `roots?: {}` does in the TypeScript.
+- **A value set is a different question, and it is closed where the artifact says so.**
+  `ContentBlock`'s five arms emit `"type": {"const": "text"}` … `{"const": "resource"}`,
+  and `LoggingLevel` emits an `enum` of eight literals, so those are closed at the
+  wire level. The requiredness of §10's `progressToken` pair is visible here too:
+  `RequestMetaObject.required` is
+  `["io.modelcontextprotocol/clientCapabilities","io.modelcontextprotocol/protocolVersion"]`
+  — `progressToken` is **not** in it — while `ProgressNotificationParams.required` is
+  `["progress","progressToken"]`. That is the wire-level form of the opt-in argument
+  quoted at §10.
+
+## 10. Notification declarations
+
+`PROTOCOLS.md` §4.11 needs these. Before this section the eight notification
+shapes were reachable only through [`mcp-2026-07-28.md`](mcp-2026-07-28.md) §1b,
+which tabulates them in one line each, so the requiredness of every member, the
+inherited `_meta`, and the two dependent types they share were all unverified
+against a declaration anywhere in this directory.
+
+### The notification base chain — artifact L191–L206, L273–L280
+
+```ts
+/**
+ * Common params for any notification.
+ *
+ * @category Common Types
+ */
+export interface NotificationParams {
+  _meta?: NotificationMetaObject;
+}
+
+/** @internal */
+export interface Notification {
+  method: string;
+  // Allow unofficial extensions of `Notification.params` without impacting `NotificationParams`.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  params?: { [key: string]: any };
+}
+```
+
+```ts
+/**
+ * A notification which does not expect a response.
+ *
+ * @category JSON-RPC
+ */
+export interface JSONRPCNotification extends Notification {
+  jsonrpc: typeof JSONRPC_VERSION;
+}
+```
+
+`NotificationParams` has exactly **one** member and it is **optional**
+ (`_meta?: NotificationMetaObject`, L197), which is the inherited `_meta` every
+one of the eight shapes below gets for free. `Notification` is the open layer:
+its `params?: { [key: string]: any }` (L205) exists so unofficial extensions do
+not have to touch `NotificationParams`, and each of the eight narrows `params`
+again in its own declaration — five to a named params interface, three to
+`NotificationParams` directly.
+
+`JSONRPCNotification` contributes `jsonrpc: typeof JSONRPC_VERSION` and
+**no `id`**, which is the whole of the difference from `JSONRPCRequest` and the
+reason a notification never correlates with a response.
+
+### `NotificationMetaObject` — artifact L113–L134
+
+```ts
+/**
+ * Extends {@link MetaObject} with additional notification-specific fields. All key naming rules from `MetaObject` apply.
+ *
+ * @see {@link MetaObject} for key naming rules and reserved prefixes.
+ * @see [General fields: `_meta`](/specification/2026-07-28/basic/index#meta) for more details.
+ * @category Common Types
+ */
+export interface NotificationMetaObject extends MetaObject {
+  /**
+   * Identifies the subscription stream a notification was delivered on. The
+   * server MUST include this key on every notification delivered via a
+   * {@link SubscriptionsListenRequest | subscriptions/listen} stream, so the
+   * client can correlate the notification with the originating subscription.
+   * The key is absent on notifications not delivered via a subscription
+   * stream (e.g. progress notifications for an in-flight request), which is
+   * why it is optional here.
+   *
+   * The value is the JSON-RPC ID of the `subscriptions/listen` request that
+   * opened the stream.
+   */
+  "io.modelcontextprotocol/subscriptionId"?: RequestId;
+}
+```
+
+`MetaObject = Record<string, unknown>` (L54, quoted in §1), so a notification's
+`_meta` is **open**. The one named key is optional in the type and required by
+the doc comment **conditionally**: *"The server MUST include this key on every
+notification delivered via a `subscriptions/listen` stream"* and *"The key is
+absent on notifications not delivered via a subscription stream (e.g. progress
+notifications for an in-flight request), which is why it is optional here."*
+The requirement is therefore established and scoped, not a silence.
+
+### `ProgressToken`, and the two places it appears — artifact L160–L165, L63–L67, L1009–L1013
+
+```ts
+/**
+ * A progress token, used to associate progress notifications with the original request.
+ *
+ * @category Common Types
+ */
+export type ProgressToken = string | number;
+```
+
+```ts
+export interface RequestMetaObject extends MetaObject {
+  /**
+   * If specified, the caller is requesting out-of-band progress notifications for this request (as represented by {@link ProgressNotification | notifications/progress}). The value of this parameter is an opaque token that will be attached to any subsequent notifications. The receiver is not obligated to provide these notifications.
+   */
+  progressToken?: ProgressToken;
+```
+
+```ts
+export interface ProgressNotificationParams extends NotificationParams {
+  /**
+   * The progress token which was given in the initial request, used to associate this notification with the request that is proceeding.
+   */
+  progressToken: ProgressToken;
+```
+
+**These two are not in tension, and the difference is the whole point.**
+`RequestMetaObject.progressToken` (L67) is `progressToken?:` — **optional**, an
+opt-in: *"If specified, the caller is requesting out-of-band progress
+notifications… The receiver is not obligated to provide these notifications."*
+`ProgressNotificationParams.progressToken` (L1013) is `progressToken:` —
+**required**, and it is a payload member of the notification, not a `_meta` key
+at all. A sender that opted in must echo the token it was given; a receiver that
+sends the notification at all must have received the opt-in, which is what makes
+the required member well formed. The first is a `RequestMetaObject` key, the
+second is a `ProgressNotificationParams` member; §4.11 states both.
+
+### `CancelledNotification` — artifact L612–L651
+
+```ts
+/**
+ * Parameters for a `notifications/cancelled` notification.
+ *
+ * @example User-requested cancellation
+ * {@includeCode ./examples/CancelledNotificationParams/user-requested-cancellation.json}
+ *
+ * @category `notifications/cancelled`
+ */
+export interface CancelledNotificationParams extends NotificationParams {
+  /**
+   * The ID of the request to cancel.
+   *
+   * This MUST correspond to the ID of a request the client previously issued.
+   */
+  requestId: RequestId;
+
+  /**
+   * An optional string describing the reason for the cancellation. This MAY be logged or presented to the user.
+   */
+  reason?: string;
+}
+
+/**
+ * This notification is sent by the client to indicate that it is cancelling a request it previously issued.
+ *
+ * On stdio, the server also sends this notification, solely to terminate a {@link SubscriptionsListenRequest | subscriptions/listen} stream: it references the ID of the `subscriptions/listen` request that opened the stream. Servers MUST NOT use this notification to cancel any other request.
+ *
+ * The request SHOULD still be in-flight, but due to communication latency, it is always possible that this notification MAY arrive after the request has already finished.
+ *
+ * This notification indicates that the result will be unused, so any associated processing SHOULD cease.
+ *
+ * @example User-requested cancellation
+ * {@includeCode ./examples/CancelledNotification/user-requested-cancellation.json}
+ *
+ * @category `notifications/cancelled`
+ */
+export interface CancelledNotification extends JSONRPCNotification {
+  method: "notifications/cancelled";
+  params: CancelledNotificationParams;
+}
+```
+
+The only one of the eight with a **requiredness requirement in prose**: `requestId`
+is required by the type and *"This MUST correspond to the ID of a request the
+client previously issued"* (L624). `params` itself is required here — one of
+five.
+
+### `ProgressNotification` — artifact L1001–L1043
+
+```ts
+/**
+ * Parameters for a {@link ProgressNotification | notifications/progress} notification.
+ *
+ * @example Progress message
+ * {@includeCode ./examples/ProgressNotificationParams/progress-message.json}
+ *
+ * @category `notifications/progress`
+ */
+export interface ProgressNotificationParams extends NotificationParams {
+  /**
+   * The progress token which was given in the initial request, used to associate this notification with the request that is proceeding.
+   */
+  progressToken: ProgressToken;
+  /**
+   * The progress thus far. This should increase every time progress is made, even if the total is unknown.
+   *
+   * @TJS-type number
+   */
+  progress: number;
+  /**
+   * Total number of items to process (or total progress required), if known.
+   *
+   * @TJS-type number
+   */
+  total?: number;
+  /**
+   * An optional message describing the current progress.
+   */
+  message?: string;
+}
+
+/**
+ * An out-of-band notification used to inform the receiver of a progress update for a long-running request.
+ *
+ * @example Progress message
+ * {@includeCode ./examples/ProgressNotification/progress-message.json}
+ *
+ * @category `notifications/progress`
+ */
+export interface ProgressNotification extends JSONRPCNotification {
+  method: "notifications/progress";
+  params: ProgressNotificationParams;
+}
+```
+
+`progress: number` is required and unbounded — *"This should increase every time
+progress is made, even if the total is unknown"* — while `total?` is optional, so
+`progress` alone is a well-formed params object. Both carry `@TJS-type number`,
+which is a typebox generation hint and not a constraint: neither is narrowed to
+an integer and neither carries `@minimum`.
+
+### `SubscriptionFilter` — artifact L1261–L1288
+
+```ts
+/**
+ * The set of notification types a client may opt in to on a
+ * {@link SubscriptionsListenRequest | subscriptions/listen} request.
+ *
+ * Each notification type is **opt-in**; the server **MUST NOT** send
+ * notification types the client has not explicitly requested here.
+ *
+ * @category `subscriptions/listen`
+ */
+export interface SubscriptionFilter {
+  /**
+   * If true, receive {@link ToolListChangedNotification | notifications/tools/list_changed}.
+   */
+  toolsListChanged?: boolean;
+  /**
+   * If true, receive {@link PromptListChangedNotification | notifications/prompts/list_changed}.
+   */
+  promptsListChanged?: boolean;
+  /**
+   * If true, receive {@link ResourceListChangedNotification | notifications/resources/list_changed}.
+   */
+  resourcesListChanged?: boolean;
+  /**
+   * Subscribe to {@link ResourceUpdatedNotification | notifications/resources/updated} for these resource URIs.
+   * Replaces the former `resources/subscribe` RPC.
+   */
+  resourceSubscriptions?: string[];
+}
+```
+
+Four members, all optional. It is the type of
+`SubscriptionsListenRequestParams.notifications`, which is **required** (L1301),
+and of `SubscriptionsAcknowledgedNotificationParams.notifications`, also
+**required** (L1378) — so an empty filter `{}` is well formed and means "nothing
+opted in", while a request without the member is not.
+
+### The three `list_changed` notifications — artifact L1248–L1259, L1745–L1756, L1887–L1898
+
+```ts
+/**
+ * An optional notification from the server to the client, informing it that the list of resources it can read from has changed. This is only delivered on a {@link SubscriptionsListenRequest | subscriptions/listen} stream when the client requested it via the `resourcesListChanged` filter field.
+ *
+ * @example Resources list changed
+ * {@includeCode ./examples/ResourceListChangedNotification/resources-list-changed.json}
+ *
+ * @category `notifications/resources/list_changed`
+ */
+export interface ResourceListChangedNotification extends JSONRPCNotification {
+  method: "notifications/resources/list_changed";
+  params?: NotificationParams;
+}
+```
+
+```ts
+/**
+ * An optional notification from the server to the client, informing it that the list of prompts it offers has changed. This is only delivered on a {@link SubscriptionsListenRequest | subscriptions/listen} stream when the client requested it via the `promptsListChanged` filter field.
+ *
+ * @example Prompts list changed
+ * {@includeCode ./examples/PromptListChangedNotification/prompts-list-changed.json}
+ *
+ * @category `notifications/prompts/list_changed`
+ */
+export interface PromptListChangedNotification extends JSONRPCNotification {
+  method: "notifications/prompts/list_changed";
+  params?: NotificationParams;
+}
+```
+
+```ts
+/**
+ * An optional notification from the server to the client, informing it that the list of tools it offers has changed. This is only delivered on a {@link SubscriptionsListenRequest | subscriptions/listen} stream when the client requested it via the `toolsListChanged` filter field.
+ *
+ * @example Tools list changed
+ * {@includeCode ./examples/ToolListChangedNotification/tools-list-changed.json}
+ *
+ * @category `notifications/tools/list_changed`
+ */
+export interface ToolListChangedNotification extends JSONRPCNotification {
+  method: "notifications/tools/list_changed";
+  params?: NotificationParams;
+}
+```
+
+These three are the **only** ones whose `params` is optional
+ (`params?: NotificationParams`, L1258, L1755, L1897), and the only ones that
+declare no params interface of their own. Each carries nothing but the inherited
+optional `_meta`, so the notification's whole payload is its method string. All
+three name their `SubscriptionFilter` member in the doc comment, which is the
+one place a filter is linked to the notification it gates.
+
+### `SubscriptionsAcknowledgedNotification` — artifact L1366–L1401
+
+```ts
+/**
+ * Parameters for a {@link SubscriptionsAcknowledgedNotification | notifications/subscriptions/acknowledged} notification.
+ *
+ * @category `notifications/subscriptions/acknowledged`
+ */
+export interface SubscriptionsAcknowledgedNotificationParams extends NotificationParams {
+  /**
+   * The subset of requested notification types the server agreed to honor.
+   * Only includes notification types the server actually supports; if the
+   * client requested an unsupported type (e.g., `promptsListChanged` when
+   * the server has no prompts), it is omitted from this set.
+   */
+  notifications: SubscriptionFilter;
+}
+
+/**
+ * Sent by the server to acknowledge that a
+ * {@link SubscriptionsListenRequest | subscriptions/listen} subscription has been
+ * established and to report which notification types it agreed to honor.
+ *
+ * This notification MUST be the first message the server sends carrying the
+ * subscription's ID in `io.modelcontextprotocol/subscriptionId`. The server MUST
+ * NOT send any notification on the subscription before acknowledging it. On
+ * stdio, where every subscription shares one channel, this ordering is defined
+ * per subscription ID and not per channel: messages belonging to other
+ * subscriptions MAY be interleaved before it.
+ *
+ * @example Listen acknowledged
+ * {@includeCode ./examples/SubscriptionsAcknowledgedNotification/listen-acknowledged.json}
+ *
+ * @category `notifications/subscriptions/acknowledged`
+ */
+export interface SubscriptionsAcknowledgedNotification extends JSONRPCNotification {
+  method: "notifications/subscriptions/acknowledged";
+  params: SubscriptionsAcknowledgedNotificationParams;
+}
+```
+
+The only notification whose doc comment carries an **ordering MUST**: it MUST be
+the first message carrying that subscription's
+`io.modelcontextprotocol/subscriptionId`, and no notification on the
+subscription may precede it — scoped per subscription ID, not per channel, so
+interleaving from other subscriptions is allowed.
+
+### `ResourceUpdatedNotification` — artifact L1403–L1431
+
+```ts
+/**
+ * Parameters for a `notifications/resources/updated` notification.
+ *
+ * @example File resource updated
+ * {@includeCode ./examples/ResourceUpdatedNotificationParams/file-resource-updated.json}
+ *
+ * @category `notifications/resources/updated`
+ */
+export interface ResourceUpdatedNotificationParams extends NotificationParams {
+  /**
+   * The URI of the resource that has been updated. This might be a sub-resource of the one that the client actually subscribed to.
+   *
+   * @format uri
+   */
+  uri: string;
+}
+
+/**
+ * A notification from the server to the client, informing it that a resource has changed and may need to be read again. This is only sent for resources the client opted in to via the `resourceSubscriptions` field of a {@link SubscriptionsListenRequest | subscriptions/listen} request.
+ *
+ * @example File resource updated notification
+ * {@includeCode ./examples/ResourceUpdatedNotification/file-resource-updated-notification.json}
+ *
+ * @category `notifications/resources/updated`
+ */
+export interface ResourceUpdatedNotification extends JSONRPCNotification {
+  method: "notifications/resources/updated";
+  params: ResourceUpdatedNotificationParams;
+}
+```
+
+`uri` is required and carries `@format uri`. That is a JSDoc format hint and the
+artifact declares no pattern or format constraint on it in the type system, so a
+decoder validates nothing beyond "a string is present" — the same limit 4.10
+records for other `@format`-hinted strings.
+
+### `LoggingMessageNotification` and `LoggingLevel` — artifact L2019–L2083
+
+```ts
+/**
+ * Parameters for a `notifications/message` notification.
+ *
+ * @deprecated Deprecated as of protocol version 2026-07-28 (SEP-2577).
+ * Remains in the specification for at least twelve months; see the
+ * deprecated features registry.
+ *
+ * @example Log database connection failed
+ * {@includeCode ./examples/LoggingMessageNotificationParams/log-database-connection-failed.json}
+ *
+ * @category `notifications/message`
+ */
+export interface LoggingMessageNotificationParams extends NotificationParams {
+  /**
+   * The severity of this log message.
+   */
+  level: LoggingLevel;
+  /**
+   * An optional name of the logger issuing this message.
+   */
+  logger?: string;
+  /**
+   * The data to be logged, such as a string message or an object. Any JSON serializable type is allowed here.
+   */
+  data: unknown;
+}
+
+/**
+ * JSONRPCNotification of a log message passed from server to client. The client opts in by setting `"io.modelcontextprotocol/logLevel"` in a request's `_meta`.
+ *
+ * @deprecated Deprecated as of protocol version 2026-07-28 (SEP-2577).
+ * Remains in the specification for at least twelve months; see the
+ * deprecated features registry.
+ *
+ * @example Log database connection failed
+ * {@includeCode ./examples/LoggingMessageNotification/log-database-connection-failed.json}
+ *
+ * @category `notifications/message`
+ */
+export interface LoggingMessageNotification extends JSONRPCNotification {
+  method: "notifications/message";
+  params: LoggingMessageNotificationParams;
+}
+
+/**
+ * The severity of a log message.
+ *
+ * These map to syslog message severities, as specified in RFC-5424:
+ * https://datatracker.ietf.org/doc/html/rfc5424#section-6.2.1
+ *
+ * @deprecated Deprecated as of protocol version 2026-07-28 (SEP-2577).
+ * Remains in the specification for at least twelve months; see the
+ * deprecated features registry.
+ *
+ * @category Common Types
+ */
+export type LoggingLevel =
+  | "debug"
+  | "info"
+  | "notice"
+  | "warning"
+  | "error"
+  | "critical"
+  | "alert"
+  | "emergency";
+```
+
+`data: unknown` is required and unconstrained — *"Any JSON serializable type is
+allowed here"* — so it is **not** a string and not an object; a decoder that
+narrowed it to either would refuse a legal notification. `level` is required and
+is the same eight-member closed union the artifact types for
+`RequestMetaObject["io.modelcontextprotocol/logLevel"]` (L110). Three
+declarations in this block carry `@deprecated` — both interfaces and the union —
+all SEP-2577.
+
+### The two notification unions — artifact L3165–L3166, L3173–L3182
+
+```ts
+/** @internal */
+export type ClientNotification = CancelledNotification;
+```
+
+```ts
+/** @internal */
+export type ServerNotification =
+  | CancelledNotification
+  | ProgressNotification
+  | LoggingMessageNotification
+  | ResourceUpdatedNotification
+  | ResourceListChangedNotification
+  | ToolListChangedNotification
+  | PromptListChangedNotification
+  | SubscriptionsAcknowledgedNotification;
+```
+
+`ServerNotification` has exactly **eight** arms and `ClientNotification`
+exactly **one**. `CancelledNotification` is in **both**, which is why 4.11 gives
+it a direction of its own and §4.4 lists it under "both".
+
+### Counts, mechanically
+
+Counted over the 3,197-line artifact, not read off the prose above:
+
+| Set | Count | How counted |
+| --- | --- | --- |
+| Interfaces extending `JSONRPCNotification` | **8** | `^export interface \w+Notification extends JSONRPCNotification \{` |
+| Notifications declaring their own params interface | **5** — `Cancelled`, `Progress`, `ResourceUpdated`, `SubscriptionsAcknowledged`, `LoggingMessage` | `params: <Name>NotificationParams;` |
+| Notifications with required `params` | **5** — the same five | `^  params: \w+NotificationParams;$` |
+| Notifications with optional `params` | **3** — the three `list_changed` | `^  params\?: NotificationParams;$` |
+| Distinct notification method strings | **8** | one `method: "notifications/…"` literal per interface |
+| `SubscriptionFilter` members | **4**, all optional | L1274, L1278, L1282, L1287 |
+| `LoggingLevel` literals | **8**, closed | L2076–L2083 |
+| `ProgressToken` arms | **2** — `string \| number` | L165 |
+| `NotificationParams` members | **1** — `_meta?` | L197 |
+
+The eight method strings, each declared exactly once: `notifications/cancelled`
+(L649), `notifications/progress` (L1041), `notifications/resources/list_changed`
+(L1257), `notifications/subscriptions/acknowledged` (L1399),
+`notifications/resources/updated` (L1429),
+`notifications/prompts/list_changed` (L1754),
+`notifications/tools/list_changed` (L1896) and `notifications/message` (L2059).
+
+### Open and closed, for the notification side
+
+| Set | Status | Evidence |
+| --- | --- | --- |
+| Members of any notification params interface | **Declared members only** — closing is **NOT ESTABLISHED** | The six interfaces — `NotificationParams` plus the five named ones — declare exactly the members quoted above and no index signature. That fixes the *declared* set. It does not close the set: `schema.ts` contains no `additionalProperties` and no `unevaluatedProperties`, and in the generated `schema.json` none of the six carries `additionalProperties` at all, so undeclared keys are permitted. `_meta`, which each inherits, is separately open by type |
+| A notification's `_meta` | **Open** | `NotificationMetaObject extends MetaObject`, and `MetaObject = Record<string, unknown>` (L54) |
+| `params` on the `Notification` base interface | **Open** — `{ [key: string]: any }` | L205. Narrowed by each of the eight; the base form is what an unofficial extension uses |
+| `LoggingLevel` | **Closed** — 8 literals | L2075–L2083. No `\| string` arm |
+| `data` on `LoggingMessageNotificationParams` | **Open** — `unknown` | L2043, *"Any JSON serializable type is allowed here"* |
+| `ProgressToken` | **Closed** — `string \| number` | L165 |
+
+Unlike `Result`, no notification params object carries an index signature, so none of
+them *invites* an undeclared key the way `Result` does — but the census above shows
+that none of them is closed either, and the two facts are not the same fact. What the
+source fixes for a notification params object is its declared member set and the
+requiredness of each member; what a peer may send beyond that is not addressed by any
+primary source, so it is recorded as a silence at `PROTOCOLS.md` §4.11.5 rather than
+asserted here.
+
+## 11. What the artifact fixes, as counts and sets
 
 These are read off the `extends` clauses and the declarations above, not inferred.
 
@@ -1764,16 +2520,30 @@ These are read off the `extends` clauses and the declarations above, not inferre
 | `ResourceContents` arms | **2**, undiscriminated | artifact L1535, L1548 |
 | `ServerResult` arms that have a method | **11** of 12; `EmptyResult` has none | §3, artifact L534 |
 | Result arrays carrying a numeric bound | **1** — `CompleteResult.completion.values`, `@maxItems 100` | artifact L2649 |
+| `ServerNotification` arms | **8** | artifact L3173–L3182, §10 |
+| `ClientNotification` arms | **1** — `CancelledNotification` | artifact L3165–L3166, §10 |
+| Notifications in both unions | **1** — `CancelledNotification` | artifact L3166, L3175 |
+| Notifications with required `params` | **5** | §10 |
+| Notifications with optional `params` | **3** — the three `list_changed` | §10 |
+| Notifications declaring their own params interface | **5** | §10 |
+| `SubscriptionFilter` members | **4**, all optional | artifact L1270–L1288 |
+| `LoggingLevel` literals | **8**, closed | artifact L2075–L2083 |
+| Capability members that name a notification method or carry its payload | **0** | §9, §10. `ServerCapabilities.prompts.listChanged`, `.resources.subscribe`, `.resources.listChanged` and `.tools.listChanged` are `boolean` members that state whether a notification is emitted; they are not the payload, and the `notifications/*` string occurs in no capability interface |
 
 `nextCursor` appears in exactly one declaration in the whole artifact,
 `PaginatedResult` at L1073. Any result that is not one of the four above inherits no
 `nextCursor` member.
 
-## Findings for `PROTOCOLS.md` §4.10
+## Findings for `PROTOCOLS.md` §4.8, §4.10 and §4.11
 
 Read off the artifact. Each carries a status. `PROTOCOLS.md` and `src/mcp.zig` are
 being revised against this list, so the statuses are the record of what was checked
-and what happened to it; nothing here is deleted when it is fixed.
+and what happened to it; nothing here is deleted when it is fixed. Items 1–8 concern
+§4.10; items 9 and 10 are the two contract **gaps** found while building §4.8 and
+§4.11 — a shape §4.8 promised but did not carry, and payloads §4.4 named but
+`PROTOCOLS.md` never stated. Those two are gaps rather than disagreements: nothing
+in the artifact or the sibling was wrong, so there was no conflict to resolve and
+no prior value to overturn.
 
 **Two classes of reference in this section, with different durability.** Every
 `artifact L…` cite is pinned by the sha256 above and is immutable as long as that
@@ -1892,9 +2662,115 @@ relying on any of these statuses.
    `Tool.outputSchema` is `{ $schema?: string; [key: string]: unknown }` (L2005). Both
    are open. The claim is true only of the *interfaces*; it was contradicted by §4.10.4,
    which calls both "open JSON Schema objects", and by §4.10.5, which excludes them
-   from library-typed sequences. §4.10.6 now separates interface-level closedness from
-   the two open members inside `Tool`, which is the distinction §4.10.4 was already
-   making.
+   from library-typed sequences. §4.10.6 now separates the two open members inside
+   `Tool` from the declared member set of the interface, which is the distinction
+   §4.10.4 was already making. The half of that fix which called the interface-level
+   member set "closed" was itself wrong, and item 11 withdraws it.
+
+9. **APPLIED — a contract gap, not a disagreement. §4.8 named a shape it did not
+   carry, and §4.10 pointed at it.** §4.10.3's `DiscoverResult` row read
+   `| capabilities | ServerCapabilities | **Yes** | The 4.8 shape |`, and §4.8
+   carried no member table for anything. The note was a pointer to a shape that
+   did not exist in the document it pointed into, so `ServerCapabilities` — whose
+   full declaration has been in this file at §9 since it was written — was
+   reachable only by reading the evidence document before the contract, which
+   inverts the authority relationship `PROTOCOLS.md` states for itself.
+
+   §4.8 now carries **4.8.1 `ClientCapabilities`** and **4.8.2
+   `ServerCapabilities`** member tables with nested types, per-member
+   optionality and deprecation status, plus **4.8.3** on open sets, and the
+   §4.10.3 cell now points at 4.8.2. `ClientCapabilities` is quoted here in full
+   at §9 for the first time — it was previously doc-comment only, with its body
+   left to the sibling's §6 — so both tables have a declaration behind them in
+   the same document the contract cites.
+
+   Counts, read off the declarations rather than the tables:
+   `ClientCapabilities` has **5** members and `ServerCapabilities` **7**, and
+   **neither declares a single required member**. The two interfaces are the only
+   place the artifact says a member set is open, and it says so in prose: *"this is
+   not a closed set"*. Neither declares an index signature, so unlike `Result` they
+   do not advertise openness by type either — which is a difference in how the
+   source *expresses* openness, not a difference in whether undeclared keys are
+   permitted. Item 11 measures that.
+
+10. **APPLIED — a second contract gap of the same kind. The eight notification
+    shapes were listed as method names and nowhere as payloads.** §4.4 named all
+    eight and gave three of them a one-clause note; no section of
+    `PROTOCOLS.md` stated a notification's members, their requiredness, or the
+    `_meta` every one of them inherits. The only transcription was the sibling's
+    §1b, one line each, which lists payload **members** and states **no
+    requiredness** — so the five-required/three-optional `params` split, the
+    optional `_meta` on all eight, and the two dependent types
+    `SubscriptionFilter` and `LoggingLevel` were established nowhere.
+
+    §10 of this file now carries every notification declaration with its line
+    range, and `PROTOCOLS.md` §4.11 carries the extracted shapes: **4.11.1** the
+    base and the inherited `_meta`, **4.11.2** the `progressToken` distinction,
+    **4.11.3** the eight shapes with requiredness, **4.11.4** `SubscriptionFilter`,
+    and **4.11.5** the silences.
+
+    The `progressToken` item is the one that could have been mishandled, so it is
+    recorded as what it is: `RequestMetaObject.progressToken?` (L67) is a request
+    `_meta` key and an opt-in, while `ProgressNotificationParams.progressToken`
+    (L1013) is a **required payload member of the notification** and not a
+    `_meta` key at all. Opposite markers on two different members of two
+    different types, both correct; nothing was moved and no fixture was
+    relocated. See decision 8 in [`SPEC-DECISIONS.md`](../../SPEC-DECISIONS.md).
+
+    One thing the extraction had to get right rather than assume: unlike
+    `Result`, **none** of the six notification params interfaces declares an
+    index signature — `NotificationParams` and the five named ones. That was
+    recorded at the time as making a notification's top level closed and only
+    `_meta` open. **Item 11 withdraws that reading**; what survives is that none
+    of the six *invites* an undeclared key, and that no source forbids one either.
+
+11. **CLAIM WITHDRAWN, and corrected in place above. "Nested objects are closed
+    because the interface declares no index signature" was an inference, not a
+    transcription.** *Closed* was asserted of three member sets — the capability
+    nested objects `sampling`, `elicitation`, `prompts`, `resources`, `tools`; the
+    members of the thirteen result element interfaces; and the six notification
+    params interfaces — and in every case the evidence offered was the absence of a
+    `[key: string]` index signature. A fourth place made the same move in the other
+    direction, reading the two capability interfaces' *openness* out of their
+    likewise-missing signature rather than out of the prose that states it.
+    Such an absence is a fact about a TypeScript declaration. It is not a JSON Schema
+    `additionalProperties: false`, it is not a wire rule, and nothing in this
+    repository had checked whether the protocol writes one.
+
+    **It does not.** The census in §9 measures it over both artifacts: the string
+    `additionalProperties` occurs **zero** times in the 3,197-line `schema.ts`, and
+    **twenty** times in the generated `schema.json`, **none of them `false`** — five
+    bare `{}`, fifteen typed maps. `unevaluatedProperties` occurs zero times in
+    either. Every nested object the claim covered — `elicitation`, `sampling`,
+    `prompts`, `resources`, `tools`, the six notification params interfaces,
+    `SubscriptionFilter`, `TextContent`, `Tool`, `Prompt`, `Resource`,
+    `ResourceContents` — carries **no** `additionalProperties` keyword at all, and
+    under draft 2020-12 an absent keyword permits undeclared properties. So the
+    generated schema does not merely fail to close those sets; it **permits** a key
+    the type does not name.
+
+    What the artifact does fix, and what survives untouched, is the **declared**
+    member set and each member's requiredness — 5 members and 7, all optional;
+    4 `SubscriptionFilter` members, all optional; 1 optional `_meta` on each
+    notification params interface. And the **value** sets stay closed exactly where
+    a literal union says so, because `schema.json` emits `"type": {"const": "text"}`
+    through `{"const": "resource"}` for the five `ContentBlock` arms and an `enum` of
+    eight literals for `LoggingLevel`. Closed *value* sets and declared *member*
+    sets are two different questions, and the error was answering the second with the
+    evidence for neither.
+
+    **Applied where.** `PROTOCOLS.md` §4.8.3 and §4.10.6 now say *declared* member
+    set and mark closing `NOT ESTABLISHED`, with a new bullet in §4.10.7 and a new
+    §4.11.5 bullet for what a receiver does with an undeclared key. Decision 9 in
+    [`SPEC-DECISIONS.md`](../../SPEC-DECISIONS.md) records it, including the one code
+    comment that repeats the inference.
+
+    **No code consequence today, and that is checked rather than assumed.**
+    `src/mcp.zig` has no typed capability decoder: `DiscoverResult.capabilities` is
+    `[]const u8`, the whole object carried as the lexeme it arrived as
+    (`src/mcp.zig` L3752–L3763), so there is no nested member set to reject. The
+    correction therefore changes no behaviour; what it changes is a claim the
+    contract was making about a protocol it does not fully specify.
 
 ### A note on how items 5 and 4 happened
 
@@ -1904,7 +2780,7 @@ absence — "appears nowhere in that document" — from a grep over the wrong pa
 class, having searched for *declarations* and reported it as *mentions*. A digest
 cannot catch either: it certifies that the bytes were fetched, not that they were read.
 The check that does catch them is quoting the thing and asserting the count
-mechanically, which is what §10 is for.
+mechanically, which is what §10 and §11 are for.
 
 ## Cross-source conflicts and gaps
 
@@ -1918,6 +2794,38 @@ mechanically, which is what §10 is for.
   [`mcp-2026-07-28.md`](mcp-2026-07-28.md) §5 and §10. Every declaration agrees. The
   duplication is deliberate: §4.10 needs the envelope, the bases and the MRTR arm in one
   place, and this file is the one §4.10's citation resolves to.
+- **Capabilities and notifications, now overlapping in three places — and they
+  agree.** `ClientCapabilities`, `ServerCapabilities` and all eight notification
+  shapes are described in this file (§9, §10), in
+  [`mcp-2026-07-28.md`](mcp-2026-07-28.md) §6 and §1b, and in
+  [`../../PROTOCOLS.md`](../../PROTOCOLS.md) §4.8 and §4.11. Every value checked
+  across all three agrees; the sibling's member lists match the declarations here,
+  and it states no requiredness where §10 does. The three-way overlap is
+  deliberate — the sibling is the at-a-glance shape, this file is the pinned
+  declaration, and the contract is the authority for `src/`.
+- **Immutable pin added, provenance not rewritten.** The `main` ref is a moving
+  branch and the historical digest recorded for §4.10's transcription is
+  `742750af…2cd`. A commit-pinned URL for the same file is now cited alongside
+  it, and a 2026-10-01 fetch of that commit returned bytes **identical** to the
+  `main` fetch — same length, same line count, same digest. The historical record
+  is therefore unchanged and the pin is additive: it gives the `artifact L…`
+  ranges a durable address without asserting anything new about when §4.10 was
+  transcribed. See *Artifact provenance* → *Immutable pin*. Both digests are over
+  the raw HTTP response body, not over reader output.
+- **A second artifact, admitted for one question and only that one.** The generated
+  `schema/2026-07-28/schema.json` is cited here for the `additionalProperties` census
+  at §9 and for nothing else — no declaration in this file is quoted from it, and it
+  is not a second source of truth. It is admissible on that one point precisely
+  because the TypeScript source is silent there: an index signature is a compile-time
+  construct, and the wire-level construct that closes a member set appears nowhere in
+  the source. Finding 11 is what the census produced, and it withdrew a claim this
+  file had made in three places.
+- **Not re-derived here, notifications included.** The `subscriptions/listen`
+  opt-in MUSTs and the elicitation rules §4.8.3 and §4.11.4 restate are prose in
+  other specification pages. §10 quotes what `schema.ts` itself states — including
+  the JSDoc MUSTs on `CancelledNotificationParams.requestId`, on
+  `NotificationMetaObject.subscriptionId` and on
+  `SubscriptionsAcknowledgedNotification` — and leaves the rest to the sibling.
 - **Not re-derived here.** The requirement language §4.10 attributes to
   `basic/index.md`, `server/tools.md`, `server/resources.md`, `server/prompts.md` and
   `server/utilities/caching.md` is prose and lives in those documents, not in

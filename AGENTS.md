@@ -7,8 +7,13 @@ Git.
 
 ## Layout
 
-- `src/root.zig` is the root module. It re-exports every module and declares the
-  shared `DecodeError` and `EncodeError` sets.
+- `src/root.zig` is the root module. It re-exports the library modules and
+  declares the shared `DecodeError` and `EncodeError` sets. Four modules are
+  reached as named imports rather than through it: `testkit.zig`, which the
+  `fuzz` step compiles as its own root; `testio.zig`, the shared test executor
+  the build adds to the library module as `testio`; and `bench_codec.zig` and
+  `bench_runtime.zig`, which the `run-bench` driver reaches the same way. The
+  eight executable roots under `src/` are programs rather than library surface.
 - `src/json.zig` is the substrate: a borrowing pull parser and a fixed-buffer
   writer. It exists because `std.json` owns heap memory, which the encoding
   contract forbids, so a decoder that touched it would allocate on every call.
@@ -66,6 +71,16 @@ Git.
   of the two. It is built on `std.http` and adds no dependency. It mints no
   session identifier and keeps no state between requests, because
   `Mcp-Session-Id` and `Last-Event-ID` were removed at that revision.
+- `src/a2a_http.zig` is the A2A `1.0` unary JSON-RPC binding, the newest layer
+  above the codec and the only one written straight onto `std.http` rather than
+  through `http.zig`, whose gates are MCP's. PROTOCOLS.md section 5 is its
+  authority and its own module comment records why each rule is there, so this
+  entry is a pointer rather than a second statement of the contract. It borrows
+  a `*std.http.Client` instead of constructing one, so the allocator, the
+  executor and the connection pool are the consumer's, and every buffer on the
+  path is a caller buffer. No REST, no gRPC, no server-sent events, no push, no
+  task store, no authentication, no signature and no retry is implemented, and
+  a redirect is not replayed.
 - `src/runtime_demo.zig` is the `run-runtime` step: a real MCP client and a
   real server talking to each other over a socket, with the same `conn.Conn` a
   server binary would use.
@@ -76,9 +91,35 @@ Git.
 - `src/http_demo.zig` is the `run-http` step: the Streamable HTTP transport over
   a real loopback socket, answering one POST with a single JSON body and one
   with an event stream.
-- `build.zig` exposes the `zig-agent-proto` module, installs a static library
-  and the four examples, and defines `run`, `run-runtime`, `run-sessions`,
-  `run-http`, `test`, `fuzz`, and `docs` steps.
+- `src/a2a_demo.zig` is the `run-a2a` step: discovery through
+  `a2a.discovery_path`, a card whose advertised endpoint is neither a default
+  nor `/rpc`, and three unary `SendMessage` calls answered with a `Task`, a
+  `Message` and a JSON-RPC error, so the three answers are read as three
+  different things.
+- `src/bench_codec.zig` and `src/bench_runtime.zig` are the two benchmark
+  modules, each with the frozen entry point `run(io, out, iterations,
+  samples)`. The first measures a fixed literal corpus in caller buffers; the
+  second measures a `Conn` round trip and an HTTP first valid event between
+  real peers over real sockets. Neither allocates per iteration and neither
+  grows with the counts a caller asks for. `src/bench.zig` is the driver: it
+  owns the command line and the work budget, and it reaches both modules as
+  named imports, so the driver and the test binary share one module instance
+  each instead of compiling a second copy of a benchmark.
+- `src/mcp_interop.zig` and `src/a2a_interop.zig` are the two interoperability
+  participants, not library modules: a supervisor in `test/interop/` starts one
+  and an independent upstream SDK serves the other end of the wire. Nothing in
+  the library imports them, which is how the zero-dependency guarantee survives
+  their existence — a peer is a process, not a caller. `test/interop/` holds
+  the supervisors, and `test/interop/sdk-pins.json` the versions, digests and
+  API facts that both of them read and refuse to run without.
+- `build.zig` exposes the `zig-agent-proto` module, installs a static library,
+  the five examples, the benchmark driver and the two interoperability
+  participants, and defines `run`, `run-runtime`, `run-sessions`, `run-http`,
+  `run-a2a`, `run-bench`, `interop-mcp`, `interop-a2a`, `test`,
+  `test-artifacts`, `fuzz` and `docs`. The two `interop-*` steps build a
+  participant and stop; the exchange
+  is driven by the `devenv` scripts of the same names. `run-bench` forwards
+  `-- …` to the driver, which owns its own flags and bounds.
 - The library has no dependencies beyond the Zig toolchain and no system library
   dependencies.
 
@@ -117,11 +158,19 @@ style; each one has a failure that is hard to see from the code alone.
   and both already carry the interface. The exception is stated here rather
   than only in the source, because a rule with an unrecorded exception is a
   rule a reader has to discover by finding the thing that breaks it.
-- **`Io.Group.async` does not run its task until `await` or `cancel`.** A
-  reader parked on a group nobody joins simply never starts, and the call
-  waiting for its answer waits forever. Join the group.
-- **Both ends of a test share one group.** Awaiting the client's group alone
-  deadlocks: the client blocks on an answer only the peer's task can produce.
+  Three `a2a_http` entry points cross-check their executor rather than making an
+  exception to the rule: `discover`, `Client.init` and `Client.sendMessage` take
+  the `io` *and* a borrowed `*std.http.Client`, and debug-assert that the two
+  name the same one — userdata and vtable. Two executors in one call is a call
+  whose socket wait has no thread to run on, and the assertion is where that is
+  caught rather than on a socket that hangs.
+- **Blocking peers and readers use `Io.Group.concurrent`, not `async`.**
+  `async` may execute inline when the executor reaches its async limit, so a
+  reader can prevent its caller from sending the request it waits for.
+  `concurrent` assigns independent execution or returns
+  `error.ConcurrencyUnavailable`; propagate that refusal and unwind the group.
+- **Both ends of a test share one group.** The caller owns all tasks and joins
+  or cancels them before releasing their buffers and transport state.
 - **A transport must `shutdown` before `close`.** Closing a file descriptor
   does not interrupt a `read` already blocked on it, so the reader sits on an
   open file description and the group never finishes.
@@ -219,6 +268,29 @@ style; each one has a failure that is hard to see from the code alone.
 - `a2a.aliasToCurrent` maps a `0.3` slash-form method name to its `1.0` RPC
   name; `a2a.TaskState.fromTag` / `a2a.Role.fromTag` range-check a numeric tag
   and return `error.UnknownTag` above the declared range.
+- **The two A2A list responses decode into storage the caller names.**
+  `decodeListTasksResponse` takes a caller `[]Task` and a `ContentArena`, and
+  reads every nested task through one `json.Reader`, so two tasks in one page
+  cannot be handed the same escape region; the arena is reset once at the
+  public boundary, because one decode serves one document. All four members are
+  REQUIRED, so `""` and `0` are values a page may carry and neither can stand
+  for "not seen", and a page larger than the caller's array is `BufferTooSmall`
+  rather than a page that lost its last task.
+  `decodeListTaskPushNotificationConfigsResponse` takes a caller
+  `[]TaskPushNotificationConfig` and no arena — nothing under a configuration
+  is a `Part` — and marks both members optional, so `null` and `[]` are two
+  documents for `configs` and `null` and `""` are two for `nextPageToken`. A
+  `""` default would read as "no further pages" for a response that never said
+  so.
+- **An A2A interface is chosen in the card's order, and the advertised URL is
+  used as written.** `a2a_http.select` takes the first JSON-RPC `1.0` interface
+  and skips a `2.0` entry, a `0.3` entry or a gRPC one; an entry that claims
+  `1.0` and is not an absolute HTTP(S) URL is an error rather than a skip.
+  `Binding.uri` borrows the card body, so `DiscoveryBuffers.body` and the
+  `CardArena` have to outlive the binding and the client, and `serve`'s seven
+  buffers are proven pairwise disjoint with `conn.overlaps` because
+  `payload_out` and `envelope_out` are both live when the frame splices the
+  answer into itself.
 - Container nesting is bounded by `json.max_depth`. `zbc` reports the recursion
   in `json.Reader.skipValue` as advisory; that finding is wrong, the bound is
   enforced by `enterContainer` and covered by a test, so do not add a second
@@ -269,10 +341,26 @@ nor its file, so the next reader pays for it twice unless it is written down.
 
 Run at the repository root:
 
-- `zig build` installs the static library and the four examples, and makes the
+- `zig build` installs the static library, the five examples, the benchmark
+  driver and the two interoperability participants, and makes the
   `zig-agent-proto` module available to consumers.
-  `zig build test` runs the unit tests, the golden vectors and the loopback
-  tests. `zig build docs` generates documentation. `zig build run`
+  `zig build test` runs thirteen roots: the library unit tests, the golden
+  vectors, the loopback tests, the test blocks the four socket-driven examples
+  carry, the benchmark driver, each benchmark module as a root of its own,
+  `testio`, and both interoperability participants. Each is a separate module
+  instance, so a benchmark or a participant is never compiled twice for the
+  test that covers it. `zig build docs` generates documentation.
+  `zig build test-artifacts` installs those same thirteen binaries and their
+  generated manifest without running them. `cross-test.bsd.profile.sh` drives
+  that export inside full-system guests for the eighteen BSD rows it registers
+  — three FreeBSD, nine NetBSD, six OpenBSD — through
+  `devenv --profile bsd-cross shell`. The manifest is the same registry
+  `test` uses, so a guest runs the same thirteen roots and reports the same
+  executed test count. Binaries stay on a read-only payload CD, fixtures use
+  writable guest scratch, disks are opened as snapshots so a cached image is
+  never written, and the receipt reader refuses a missing, repeated or
+  zero-test root, a failed exit, skipped tests and an incomplete transcript.
+  `zig build run`
   executes the codec demonstration, which prints what each decoder produced
   from real wire bytes; it writes to stdout through one buffered writer, so
   `zig build run > demo.txt` captures the whole report. `zig build run-runtime`
@@ -283,8 +371,50 @@ Run at the repository root:
   carries two MCP requests over that same connection and prints the carried
   result and the carried error. `zig build run-http` runs a Streamable HTTP
   client and server over a loopback port and prints one single-JSON reply and
-  one event stream. Both are examples rather than tests: they are the proof
-  that the newest layers work on real transport bytes, and CI runs both.
+  one event stream. `zig build run-a2a` discovers an agent through
+  `a2a.discovery_path`, reads its card, and sends three unary `SendMessage`
+  calls to the endpoint that card advertised, printing the selected endpoint and
+  version, the typed task, the typed message and the JSON-RPC error. All three
+  are examples rather than tests: they are the proof that the newest layers work
+  on real transport bytes, and CI runs all three.
+- `zig build run-bench` runs the benchmark driver, and every flag belongs to the
+  driver, so `zig build run-bench -- --mode all --iterations 20 --samples 5`
+  reaches it verbatim: `--mode codec|runtime|all`, `--iterations N` in
+  `1..1000000` and `--samples N` in `1..64`, defaulting to `100` and `5`. The
+  product `iterations * samples` is capped at `1000000` for `codec` and `10000`
+  for `runtime` and `all`, and the runtime workload carries a 120 second wall
+  budget over the measured run. Every refusal happens before a benchmark
+  starts, with exit status 2, and `--help` does not swallow a typo standing
+  beside it.
+- The counts mean different things in the two modules, and a report is read
+  against the unit lines it prints. One codec iteration is one pass over the
+  whole corpus, so one operation is one accepted row decoded and encoded; one
+  runtime iteration is one round trip per peer, each of which opens a socket and
+  exchanges frames over it. The unqualified `*_ns_per_op` is a mean over every
+  operation measured, and is what `*_ops_per_second` inverts.
+  `*_median_ns_per_op`, `*_p90_ns_per_op` and `*_p99_ns_per_op` are quantiles
+  of the **window averages**, so with `--samples 5` a `p99` is the largest of
+  five window averages and can sit below `*_max_op_ns`, which is the slowest
+  single operation anywhere in the run; the codec's `sample_ns_*` figures are
+  whole window totals instead. The HTTP boundary is time to the first event
+  whose bytes decode, with the TCP connect outside it and reported separately
+  as `http_connect_*`, which makes the connect mean the number to subtract
+  rather than to add. The storage figures a codec report prints —
+  `codec_storage_bytes`, `scratch_used_bytes`, `window_array_bytes`,
+  `harness_fixed_bytes` — are the sizes of fixed arrays the process holds and
+  are not a peak: nothing is allocated in order to have one. A number from here
+  is a baseline for a later candidate measured the same way, not a claim about
+  another host or about peer behaviour.
+- `zig build interop-mcp` and `zig build interop-a2a` build the participants and
+  stop; neither starts an SDK, and neither is a run. The exchange is driven
+  from `devenv shell` by `interop-mcp`, which runs `mcp_peer.py --role
+  supervise`, and `interop-a2a`, which runs `a2a_peer.py --role zig-interop` —
+  the two roles that between them drive the Zig client against the SDK server
+  and the SDK client against the Zig server. Both accept `--work-dir` for the
+  capture and reports and bound the whole run with `--deadline`, and
+  `ZIG_AGENT_PROTO_MCP_INTEROP` / `ZIG_AGENT_PROTO_A2A_INTEROP` override the
+  participant path they start. `interop-python` is the same interpreter with the
+  pinned SDKs for anything the two scripts do not cover.
 - `zig build fuzz` runs the property and differential harness on its own. It
   takes `-Dfuzz-seed=<u64>` and `-Dfuzz-iterations=<usize>`, both in decimal, and
   prints them on every run, so a failure is reproducible from the log. It
@@ -299,6 +429,24 @@ Run at the repository root:
   `zig build fuzz --cache-dir <directory on a local filesystem>`. No other step
   writes one, so the rest of the gate is unaffected.
 - `zig fmt --check .` checks formatting. `gate` runs the house gate.
+- `cross-test` runs a profile outside the house gate. Three exist, and each
+  states its own bounds rather than inheriting one:
+  `cross-test --profile cross-test.profile.sh` requires execution on the
+  twenty Linux targets (`CROSS_REQUIRE_RUNNERS=1`, `CROSS_BUILD_STEP=test`, so
+  an unavailable runner or a reduced root set is a failure);
+  `cross-test --profile cross-test.full.profile.sh` unsets the matrix and
+  audits all 53 Tier 1/2 targets of the pinned Zig 0.16.0 support table with
+  `CROSS_REQUIRE_RUNNERS=0`, recording compilation, execution and executed
+  test counts separately so a `build_only` row cannot be read as a pass;
+  `cross-test --profile cross-test.bsd.profile.sh --output "$TMPDIR/bsd-cross"`
+  runs the same thirteen roots in full-system guests and needs
+  `devenv --profile bsd-cross shell` first. `--targets` selects rows already in
+  a profile and never adds one, so an unregistered port is not runnable by
+  naming it. Known runtime failures stay failures: on this host the full audit
+  compiles all 53 targets and still reports both Windows rows failed and 31
+  rows `build_only`, and under Wasmtime the `wasm32-wasi` row fails on socket
+  and concurrency operations. Those are recorded facts, not defects to be
+  hidden by skipping tests. `README.md` carries the per-platform results.
 - `jj st` shows working-copy status. Use `jj`, not raw Git commands.
 
 Continuous integration runs the toolchain half of that gate on Linux and on
@@ -306,16 +454,40 @@ macOS, in `.github/workflows/ci.yml`. It installs the toolchain named by
 `.minimum_zig_version` from `ziglang.org`, checks the tarball against the
 sha256 the download index publishes, cross-checks `zig version` against the
 pin the way `gate` does, and then runs `zig fmt --check .`, `zig build`,
-`zig build test` in Debug and again in ReleaseSafe, `zig build fuzz`,
-`zig ast-check` over the file set the manifest publishes in `.paths`,
-`zig build run`, `zig build run-runtime`, `zig build run-sessions`,
-`zig build run-http`, and `zig build docs`. `zlint` and `zbc` are deliberately not in it: both are
-builds of personal checkouts under `~/tools`, outside this repository, so CI
-would have to vendor an unpinned third-party build to run them.
+`zig build test` in Debug and again in ReleaseSafe, `zig ast-check` over every
+Zig file under `build.zig`, `src` and `test`, `zig build fuzz`, all five
+demonstrations (`run`, `run-runtime`, `run-sessions`, `run-http`, `run-a2a`),
+one bounded benchmark smoke — `zig build run-bench -- --mode all --iterations 4
+--samples 3`, which proves the driver runs and asserts no threshold — and
+`zig build docs`. The two interoperability participants are installed by
+`zig build` and nothing in CI drives them: their SDK peers are declarative
+devenv development state that CI does not evaluate, so what CI proves about
+them is that they compile and that their own test blocks pass.
+`zlint` and `zbc` are deliberately not in it: both are builds
+of personal checkouts under `~/tools`, outside this repository, so CI would
+have to vendor an unpinned third-party build to run them.
 
 This NixOS project declares development dependencies and tools in `devenv.nix`.
-Do not install system or development libraries imperatively. Use direnv or
-`devenv shell`; run `direnv allow` after changing the environment.
+Do not install system or development libraries imperatively. Use `devenv shell`,
+or let direnv read `.envrc`. That environment also provides `gate`,
+`interop-python`, `interop-mcp` and `interop-a2a`, and it pins both SDKs against
+`test/interop/sdk-pins.json` so a peer refuses an environment that does not
+match. Nothing in this repository repairs, extends or depends on host-wide
+state around it.
+
+Two optional profiles add more, still as declared Nix development state and
+still never as a library dependency: `cross-audit` adds Wasmtime so the
+`wasm32-wasi` row executes, and `bsd-cross` adds full-system QEMU with its
+firmware, the ISO and archive tools, `anita` 2.18 with `pexpect` for the guest
+console, U-Boot for `armv7l` and `riscv64`, the Loongson PMON
+`20210112` firmware, `e2fsprogs`, and every guest image pinned by the
+checksum its publisher publishes. Its `makefs` is Debian's `20190105-3`
+repackaged with `autoPatchelfHook` and glibc, because the NetBSD guest image
+needs `MAKEDEV`-style device nodes and an explicit FFS byte order that
+OpenBSD's older `makefs` cannot write; it declares
+`meta.platforms = [ "x86_64-linux" ]`, so `bsd-cross` is an x86_64 Linux host
+configuration today. That is a stated bound, not a waiver, and no other host
+platform is claimed for it.
 
 `zig` on this host is the anyzig shim, which resolves the toolchain by reading
 `.minimum_zig_version` from `build.zig.zon`. It is deliberately absent from

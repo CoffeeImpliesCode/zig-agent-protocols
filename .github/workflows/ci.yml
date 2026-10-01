@@ -1,12 +1,24 @@
 # Continuous integration for zig-agent-proto.
 #
 # This runs the half of the house gate that a pinned Zig toolchain can
-# reproduce on any machine: `zig fmt --check`, `zig build`, `zig build test`,
-# `zig ast-check`, plus the `run` and `docs` steps. The developer's `gate`
-# script also runs zlint and zbc, but those are builds of personal checkouts
-# under `~/tools`, not dependencies of this repository, so CI cannot run them
-# without vendoring an unpinned third-party build. A lint gate that only
-# exists on one machine is not a gate; those two stay a developer-side check.
+# reproduce on any machine: `zig fmt --check`, `zig build`, `zig build test` in
+# Debug and again in ReleaseSafe, `zig ast-check`, `zig build fuzz`, `zig build
+# docs`, and the five live examples — `run`, `run-runtime`, `run-sessions`,
+# `run-http` and `run-a2a` — beside one bounded `run-bench` smoke. The
+# developer's `gate` script also runs zlint and zbc, but those are builds of
+# personal checkouts under `~/tools`, not dependencies of this repository, so
+# CI cannot run them without vendoring an unpinned third-party build. A lint
+# gate that only exists on one machine is not a gate; those two stay a
+# developer-side check.
+#
+# The two interoperability participants are built and installed here, because
+# they are executables of this repository, and they are not driven here. Their
+# peers are pinned Python SDKs declared in `devenv.nix` and read at run time
+# from a pin file; reproducing that environment on a runner would mean
+# installing third-party packages this workflow does not pin, which is the
+# thing the rest of this file refuses to do. Those exchanges are run where the
+# SDK is declared, and the report they produce is checked against captured
+# wire bytes.
 name: CI
 
 on:
@@ -38,14 +50,59 @@ jobs:
         os: [ubuntu-latest, macos-latest]
 
     env:
-      # devenv.nix sets this so the project keeps its global cache inside the
-      # checkout; CI uses the same layout so a cache saved here and a cache
-      # saved on the developer machine have the same shape.
+      # CI owns both caches, in the checkout, and names them here rather than
+      # inheriting an answer from elsewhere. `devenv.nix` deliberately puts a
+      # developer's caches on approved per-account scratch mounts outside the
+      # checkout — node-local physical volumes first, approved NFS as a
+      # fallback — because a build is fast there and a rename survives, and
+      # because the interoperability peers refuse a shared temporary
+      # directory by name. So there is no shared layout to match on purpose:
+      # a cache written by a developer belongs to that machine's scratch
+      # root, and restoring it here would write to a path no step of this
+      # job should use. This one is the runner's.
       ZIG_GLOBAL_CACHE_DIR: .zig-global-cache
+      # The local cache beside the global one, named rather than left to zig's
+      # `$PWD/.zig-cache` default so the directory this workflow creates, the
+      # directory `actions/cache` saves, and the directory the toolchain
+      # writes are the same one by construction.
+      ZIG_LOCAL_CACHE_DIR: .zig-cache
 
     steps:
       - name: Check out the repository
         uses: actions/checkout@v4
+
+      # Every socket this build binds and every temporary file the toolchain
+      # writes belongs to this job, in a directory the runner owns and empties
+      # between jobs. `$RUNNER_TEMP` is that directory on both runners here and
+      # is neither `/tmp` nor `/var/tmp` on either of them; the socket names are
+      # rendered out of `TMPDIR` and refuse a directory the machine shares with
+      # every other user, so a step that did not set it would fail later, inside
+      # a test, with the reason two steps away.
+      #
+      # The Zig caches are named in the `env` block above and are created here
+      # too, before the toolchain download rather than by whichever step first
+      # needs them, so a cache save restores into a directory that exists.
+      - name: Initialize this job's temporary and cache directories
+        run: |
+          set -euo pipefail
+          scratch="$RUNNER_TEMP/zig-agent-proto/tmp"
+          case "$scratch" in
+            /tmp | /tmp/* | /var/tmp | /var/tmp/*)
+              echo "RUNNER_TEMP resolved to the system temporary directory: $scratch" >&2
+              exit 1
+              ;;
+          esac
+          mkdir -p "$scratch" "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
+          echo "temporary area: $scratch"
+          # TMP and TEMP are read by nothing here, but a tool the build invokes
+          # may read either, and leaving one of them pointing at a system
+          # directory while the other points here is worse than setting all
+          # three to the same answer.
+          {
+            echo "TMPDIR=$scratch"
+            echo "TMP=$scratch"
+            echo "TEMP=$scratch"
+          } >> "$GITHUB_ENV"
 
       - name: Restore the Zig caches
         uses: actions/cache@v4
@@ -192,6 +249,25 @@ jobs:
       # one POST with a single JSON body and one with an event stream.
       - name: zig build run-http
         run: zig build run-http
+
+      # The A2A 1.0 unary slice over a real socket: an Agent Card discovered
+      # from an origin, a `SendMessage` answered with a task, one answered with
+      # a message, and one refused. It is the only place the A2A codec is
+      # driven by something other than literals.
+      - name: zig build run-a2a
+        run: zig build run-a2a
+
+      # The benchmark driver, sized small. This is a smoke and not a
+      # performance gate: it proves the driver's own refusals do not fire on a
+      # line it should run, that the codec corpus decodes and encodes, and that
+      # the runtime workload opens sockets and reports — on both runners, in
+      # Debug, where the numbers mean nothing. No figure is compared against
+      # anything. A threshold needs a per-machine baseline this workflow cannot
+      # calibrate, and a threshold that fires on a busy runner reports the
+      # runner rather than the code; the measurement belongs to a developer who
+      # sized it on the machine it will be read on.
+      - name: zig build run-bench (bounded smoke)
+        run: zig build run-bench -- --mode all --iterations 4 --samples 3
 
       - name: zig build docs
         run: zig build docs

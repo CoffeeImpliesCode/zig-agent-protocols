@@ -179,7 +179,7 @@ bare.
 | `traceparent` | W3C Trace Context, exempt from the prefix rule |
 | `tracestate` | W3C Trace Context, exempt from the prefix rule |
 | `baggage` | W3C Baggage, exempt from the prefix rule |
-| `progressToken` | `ProgressToken` = string or number. Bare key, exempt from the prefix rule: the schema defines it without one |
+| `progressToken` | `ProgressToken` = string or number. Bare key, exempt from the prefix rule: the schema defines it without one. **Optional** — an opt-in on the request. The same name is a **required payload member** of `notifications/progress`, which is not a `_meta` key; 4.11.2 states both |
 
 ### 4.4 Method inventory
 
@@ -197,14 +197,14 @@ Core, `2026-07-28`. `server/discover` is the only mandatory server method.
 | `prompts/get` | client to server | May return `input_required` under MRTR |
 | `completion/complete` | client to server | |
 | `subscriptions/listen` | client to server | Single long-lived response stream for opted-in notifications |
-| `notifications/progress` | server to client | Request-scoped; travels on the originating request's response stream |
-| `notifications/message` | server to client | Request-scoped. A server MUST NOT emit it for a request that did not set `io.modelcontextprotocol/logLevel` |
-| `notifications/cancelled` | both | A server sends it only for a `subscriptions/listen` teardown, and a client sends it to cancel a request |
-| `notifications/resources/updated` | server to client | Carries the `uri` |
-| `notifications/resources/list_changed` | server to client | |
-| `notifications/tools/list_changed` | server to client | |
-| `notifications/prompts/list_changed` | server to client | |
-| `notifications/subscriptions/acknowledged` | server to client | Carries the subscription filter |
+| `notifications/progress` | server to client | Request-scoped; travels on the originating request's response stream. 4.11.3 |
+| `notifications/message` | server to client | Request-scoped. A server MUST NOT emit it for a request that did not set `io.modelcontextprotocol/logLevel`. 4.11.3 |
+| `notifications/cancelled` | both | A server sends it only for a `subscriptions/listen` teardown, and a client sends it to cancel a request. 4.11.3 |
+| `notifications/resources/updated` | server to client | Carries the `uri`. 4.11.3 |
+| `notifications/resources/list_changed` | server to client | `params` optional. 4.11.3 |
+| `notifications/tools/list_changed` | server to client | `params` optional. 4.11.3 |
+| `notifications/prompts/list_changed` | server to client | `params` optional. 4.11.3 |
+| `notifications/subscriptions/acknowledged` | server to client | Carries the subscription filter. 4.11.3, 4.11.4 |
 
 Removed in `2026-07-28`, and therefore decoded as `UnknownMethod` at that
 revision: `initialize`, `notifications/initialized`, `ping`, `logging/setLevel`,
@@ -313,6 +313,89 @@ URI schemes and media types:
 | `text/html;profile=mcp-app` | MCP Apps required MIME type |
 | `sha256:<64 lowercase hex>` | Skills extension resource digest format |
 
+#### 4.8.1 `ClientCapabilities`
+
+Carried on every request at `2026-07-28` and later, as
+`params._meta["io.modelcontextprotocol/clientCapabilities"]`. Transcribed from
+`schema/2026-07-28/schema.ts` L711–L786, reproduced in
+[`research/normative/mcp-2026-07-28-schema.md`](research/normative/mcp-2026-07-28-schema.md)
+§9 with its JSDoc intact. Every member is optional and the object declares no
+required member at all, so `{}` is a well-formed declaration meaning "no
+optional capability".
+
+| Member | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `experimental` | `{ [key: string]: JSONObject }` | No | Non-standard capabilities |
+| `roots` | `{}` — the empty object type | No | **@deprecated** (SEP-2577). Any JSON object satisfies it; the artifact declares no member |
+| `sampling` | `{ context?: JSONObject; tools?: JSONObject }` | No | **@deprecated** (SEP-2577). Both inner members optional |
+| `elicitation` | `{ form?: JSONObject; url?: JSONObject }` | No | Both inner members optional. The artifact gives these two **no JSDoc** |
+| `extensions` | `{ [key: string]: JSONObject }` | No | Keys are extension identifiers and MUST carry a prefix. `{}` value means support with no settings |
+
+#### 4.8.2 `ServerCapabilities`
+
+Carried as `capabilities` on the `server/discover` result at `2026-07-28` and
+later. Transcribed from L788–L883, reproduced in the same document §9. Also
+every member optional, and — unlike a result — the artifact declares **no**
+`[key: string]: unknown` index signature on it. Its openness comes from the doc
+comment alone, which is the distinction 4.10.6 relies on.
+
+| Member | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `experimental` | `{ [key: string]: JSONObject }` | No | Non-standard capabilities |
+| `logging` | `JSONObject` | No | **@deprecated** (SEP-2577) |
+| `completions` | `JSONObject` | No | |
+| `prompts` | `{ listChanged?: boolean }` | No | Whether `notifications/prompts/list_changed` may be sent. Not the payload |
+| `resources` | `{ subscribe?: boolean; listChanged?: boolean }` | No | Both inner members optional. `subscribe` now means resource updates via the `resourceSubscriptions` filter, not the removed `resources/subscribe` RPC |
+| `tools` | `{ listChanged?: boolean }` | No | Whether `notifications/tools/list_changed` may be sent. Not the payload |
+| `extensions` | `{ [key: string]: JSONObject }` | No | Same key rules as the client map |
+
+#### 4.8.3 Open sets, and what a capability is not
+
+Both interfaces carry a sentence that differs between them in exactly one word —
+`any client can define` on `ClientCapabilities`, `any server can define` on
+`ServerCapabilities` — and a search of all 3,197 lines finds that sentence shape
+exactly twice, on these two declarations and nowhere else:
+
+> Known capabilities are defined here, in this schema, but this is not a closed
+> set: any *client* / any *server* can define its own, additional capabilities.
+
+So a capability object is **open at the member level**, and the source says so in
+prose rather than in the type. A key outside the five or seven named above is not
+an error and is not a decode failure; it is carried and written back, which 2
+requires of anything a decoder accepts. The interfaces themselves declare no index
+signature, so unlike a result they do not *advertise* openness by type either — a
+difference in how the source expresses it, not in what it permits. 4.10.6 has the
+measurement.
+
+Three things follow that are easy to get wrong, so they are stated:
+
+- **A capability is never a notification payload.** `prompts.listChanged`,
+  `resources.subscribe`, `resources.listChanged` and `tools.listChanged` are
+  `boolean` members that say whether the server may send that notification. The
+  notification's own shape is 4.11. The string `notifications/` occurs in no
+  capability interface in the artifact.
+- **The nested objects declare exactly the members tabulated, and nothing closes
+  them.** `sampling`, `elicitation`, `prompts`, `resources` and `tools` each
+  declare the members tabulated above and no index signature, while
+  `experimental`, `extensions` and the `JSONObject`-typed members are open maps
+  by type. But declaring a member set is not closing it, and the source closes
+  none: `schema/2026-07-28/schema.ts` contains no `additionalProperties` and no
+  `unevaluatedProperties` at all, and in the generated `schema.json`
+  (draft 2020-12) the keyword occurs twenty times and **never with `false`** —
+  these five carry no such keyword, which permits undeclared keys. So an
+  undeclared member of a nested capability object is **NOT ESTABLISHED** in either
+  direction, and this library does not invent a rule for it. 4.10.6 records the
+  evidence and 4.10.7 the silence. The closed things here are value sets, not
+  member sets: `listChanged` and `subscribe` are `boolean`, with no `string` arm
+  to widen it. 4.10.6 has the whole table.
+- **`elicitation: {}` means form-only.** `client/elicitation.md` makes an empty
+  `elicitation` equivalent to `{ "form": {} }` for backward compatibility, and
+  requires a client declaring `elicitation` to support at least one mode.
+  6.7 carries the same rule on the ACP side, where each mode must be advertised
+  explicitly; the two protocols deliberately differ here and an adapter between
+  them must not pass an empty ACP capability set through as MCP form-only
+  without saying so.
+
 ### 4.9 Deprecated feature registry
 
 Present in the specification, functional for now, and not to be adopted. Earliest
@@ -348,7 +431,7 @@ reference. Requirement language is from `basic/index.md` §Result Responses,
 `server/utilities/caching.md`. Every row below was checked against that extract
 and against the artifact itself; where the two disagreed, the artifact won.
 
-The sibling document [`research/normative/mcp-2026-07-28.md`](mcp-2026-07-28.md)
+The sibling document [`research/normative/mcp-2026-07-28.md`](research/normative/mcp-2026-07-28.md)
 carries the envelope and the MRTR arm of the same artifact and nothing else. Its
 §5 transcribes `ResultType`, `Result`, `EmptyResult`, `CacheableResult`,
 `PaginatedResult`, `PaginatedRequestParams` and `Cursor`, and tabulates the six
@@ -463,7 +546,7 @@ preference.
 | Field | Type | Required | Notes |
 | --- | --- | --- | --- |
 | `supportedVersions` | `string[]` | **Yes** | The client picks one for later requests |
-| `capabilities` | `ServerCapabilities` | **Yes** | The 4.8 shape |
+| `capabilities` | `ServerCapabilities` | **Yes** | 4.8.2 — the member table, not a pointer to a shape 4.8 does not carry |
 | `instructions` | `string` | No | Natural-language guidance for an LLM |
 | `ttlMs` | `number` | **Yes** | 4.6 |
 | `cacheScope` | `"public" \| "private"` | **Yes** | 4.6 |
@@ -619,16 +702,32 @@ sequences at all.
 
 The rule from `AGENTS.md` — a decoder that accepts a member has to be able to
 write it back — bites hardest here, so which sets are open has to be stated
-rather than left to the implementer.
+rather than left to the implementer. Two questions have to be kept apart, because
+the artifact answers them differently and an earlier revision of this table ran
+them together: **is a set of values closed** — is `type` permitted to be anything
+— and **is a set of members closed** — may a key the type does not name appear.
+The first is answered by a literal union, and where the union is closed the
+generated `schema.json` says so on the wire: the five `ContentBlock` arms emit
+`"type": {"const": "text"}` … `{"const": "resource"}` and `LoggingLevel` emits an
+`enum` of eight literals. The second is answered by `additionalProperties`, and
+**the protocol never uses it**: zero occurrences in the 3,197-line `schema.ts`, and
+twenty in the generated `schema.json` with none of them `false` — five bare `{}`
+and fifteen typed maps. Under draft 2020-12 an absent keyword permits undeclared
+properties, so no object type in this schema is closed. Measured over the
+commit-pinned artifacts in
+[`research/normative/mcp-2026-07-28-schema.md`](research/normative/mcp-2026-07-28-schema.md)
+§9.
 
 | Set | Status | Evidence |
 | --- | --- | --- |
 | Members of any result object | **Open** | `Result` declares `[key: string]: unknown`. `basic/index.md` §Result Responses: *"The `result` **MAY** follow any JSON object structure."* |
-| `ContentBlock.type` | **Closed** — five literals | The union declaration above. No `\| string` arm, no index signature, and the *"this is not a closed set"* sentence appears only on `ClientCapabilities` and `ServerCapabilities` |
-| Members of `TextContent`, `ImageContent`, `AudioContent`, `EmbeddedResource`, `ResourceContents`, `Resource`, `ResourceTemplate`, `Prompt`, `Tool`, `PromptArgument`, `Icon`, `Annotations`, `ToolAnnotations` | **Closed** | None of these interfaces declares an index signature, so the member set of each is exactly the one named. The one open member most of them carry is `_meta`, a `MetaObject = Record<string, unknown>`; `Tool` carries two more of its own — `inputSchema` and `outputSchema`, each `{ …; [key: string]: unknown }` — which is why 4.10.4 and 4.10.5 treat those two as open JSON Schema rather than library types |
+| `ContentBlock.type` | **Closed** — five literals | The union declaration above: no `\| string` arm, and the *"this is not a closed set"* sentence appears only on `ClientCapabilities` and `ServerCapabilities`, so the artifact's own idiom marks an open discriminator explicitly and marks this one closed by omission. The generated `schema.json` confirms it at the wire level, emitting a `const` per arm |
+| Members of `TextContent`, `ImageContent`, `AudioContent`, `EmbeddedResource`, `ResourceContents`, `Resource`, `ResourceTemplate`, `Prompt`, `Tool`, `PromptArgument`, `Icon`, `Annotations`, `ToolAnnotations` | **Declared** member sets — closing **NOT ESTABLISHED** | Each declares the members 4.10.4 and 4.10.5 tabulate and no index signature, which fixes the declared set. It does not close it: none of these thirteen carries `additionalProperties` in the generated `schema.json`. The open members are separate facts, not consequences: `_meta` is a `MetaObject = Record<string, unknown>`, and `Tool` carries `inputSchema` and `outputSchema`, each `{ …; [key: string]: unknown }`, which is why 4.10.4 and 4.10.5 treat those two as open JSON Schema rather than library types |
 | `Role`, `Icon.theme`, the `cacheScope` literal union | **Closed** | Literal unions. The schema writes `cacheScope: "public" \| "private"` **inline** (artifact L1109) and declares no `CacheScope` alias — the name belongs to `mcp.CacheScope` in `src/mcp.zig`, not to the artifact. 4.6 for the field |
 | `InputRequests` keys | **Open** — server-assigned | 4.7 |
 | `resultType` | **Closed set, open carrier** | `"complete" \| "input_required" \| string` admits any string, and `basic/index.md`: *"A `resultType` of any value unrecognized by the client **MUST** be considered invalid."* |
+| Members of `ClientCapabilities` and `ServerCapabilities` | **Open** — by prose, not by signature | Neither interface declares an index signature, and both carry the *"not a closed set"* sentence. 4.8.3 |
+| Nested objects inside a capability — `sampling`, `elicitation`, `prompts`, `resources`, `tools` | **Declared** member sets, **open** `JSONObject` values; closing **NOT ESTABLISHED** | Each declares exactly the members 4.8.1 and 4.8.2 tabulate and no index signature; `experimental`, `extensions` and the `JSONObject`-typed members are open maps by type. As above, declaring is not closing, and none of the five carries `additionalProperties` either. 4.8.3 |
 
 The first row is the one that decides the encoding. A `tools/call` result the
 library accepts may carry a key the shape does not name, because the source
@@ -639,6 +738,18 @@ not model is carried as the borrowed lexeme it arrived as, which is what
 mistake that re-opened a loss that had been closed for the life of the
 repository, and it is the reason no result payload in 4.10.3 is transcribed as
 a closed struct.
+
+The member-set rows say **declared**, not closed, and that is the whole difference
+between them and the first row. The first row rests on a positive statement — a
+result *may* follow any object structure — so accepting an undeclared key is
+following the source. The others rest on an absence: the source never says a
+member set is closed, and the census above shows it never writes the keyword that
+would say so. A decoder is therefore free to model exactly the declared members,
+and if it also accepts an undeclared one it must write it back under 2. This
+library does not reject one — there is no source clause to reject it against —
+and it does not *claim* one either: the member tables in 4.8 and 4.10.3 are the
+declared set, and nothing in `src/` reads a member from a nested object that a
+table does not name.
 
 **What the source does not say.** No primary source states what a receiver
 does with a `ContentBlock` whose `type` is not one of the five. The schema
@@ -695,6 +806,173 @@ explicit decode failure rather than a guess.
 - **Any requirement on the order of `content`.** The schema does not constrain
   it, and `server/tools.md` asks servers to return tools in a deterministic
   order for caching, which is guidance rather than a wire rule.
+- **A member no type names, on an object that is not a result.** A capability
+  object, a nested `sampling` / `elicitation` / `prompts` / `resources` / `tools`
+  object, a notification params object, or a `TextContent`: the schema types none
+  of them closed, and no primary source says what a receiver does with a key it
+  does not recognise. This is the mirror image of the first row, and it is a
+  silence in the other direction — the first row has *"MAY follow any JSON object
+  structure"* to lean on and this has nothing.
+
+### 4.11 Notification payloads
+
+4.4 names the notification methods. This section gives each one the body it
+carries, on the same terms as 4.10: the schema's own requiredness, not this
+library's preference.
+
+Transcribed from `schema/2026-07-28/schema.ts`, which
+[`research/normative/mcp-2026-07-28-schema.md`](research/normative/mcp-2026-07-28-schema.md)
+§10 reproduces value-by-value with artifact line ranges: the notification base
+chain, `NotificationMetaObject`, `RequestMetaObject`'s `progressToken`,
+`ProgressToken`, `SubscriptionFilter`, `LoggingLevel`, all eight notification
+interfaces, the five params interfaces they name, and both notification unions.
+The sibling
+[`research/normative/mcp-2026-07-28.md`](research/normative/mcp-2026-07-28.md)
+§1b tabulates the same eight one line each; its table lists the payload members
+and agrees with every declaration below, but states no requiredness, so this
+section and the §10 declarations are where the two required-vs-optional `params`
+rows and the inherited `_meta` are established.
+
+#### 4.11.1 The base, and the inherited `_meta`
+
+Every notification is a `JSONRPCNotification`: `jsonrpc: "2.0"`, a `method`
+literal, and **no `id`** — which is the whole difference from a request and the
+reason a notification never correlates with a response.
+
+`NotificationParams` has exactly one member and it is optional:
+`_meta?: NotificationMetaObject`. All eight shapes inherit it, so
+`{"method":"notifications/tools/list_changed"}` with no `params` at all is well
+formed, and so is `params` present but empty. A notification's `_meta` is
+**open** — `NotificationMetaObject extends MetaObject`, and `MetaObject =
+Record<string, unknown>` — and its one named key,
+`io.modelcontextprotocol/subscriptionId`, is optional in the type but required by
+the artifact's own doc comment *conditionally*: a server MUST include it on
+every notification delivered via a `subscriptions/listen` stream, and it is
+absent on a notification not delivered on one, which is why the type makes it
+optional. That is established, not a silence. 4.3 carries the key.
+
+The open `{ [key: string]: any }` on the internal `Notification` base is a
+separate layer: it exists so an unofficial extension can add `params` keys
+without touching `NotificationParams`, and each of the eight narrows `params`
+again in its own declaration.
+
+#### 4.11.2 `progressToken`, the two declarations, and why they differ
+
+`ProgressToken = string | number`. It appears twice in the artifact and the two
+declarations have **opposite requiredness**, which reads like a contradiction and
+is not:
+
+| Where | Declaration | Requiredness | Meaning |
+| --- | --- | --- | --- |
+| `RequestMetaObject.progressToken` — a **`_meta` key on a request** | `progressToken?: ProgressToken` (artifact L67) | Optional | An **opt-in**: if specified, the caller requests out-of-band progress for that request. The receiver is not obligated to provide it |
+| `ProgressNotificationParams.progressToken` — a **payload member of the notification** | `progressToken: ProgressToken` (artifact L1013) | Required | The token to associate the notification with, and it is not in `_meta` at all |
+
+The second is required precisely because the first is opt-in: a well-formed
+`notifications/progress` can only exist for a request that carried the token, so
+the payload member must echo it. Nothing needs fixing and nothing needs
+relocating; 4.3 already lists `progressToken` as a bare `_meta` key on the
+request side, and this section is the only place the notification-side member is
+stated.
+
+The generated `schema.json` says the same thing in its own `required` arrays, so
+the difference is not a TypeScript optionality marker that the wire might soften:
+`RequestMetaObject.required` is
+`["io.modelcontextprotocol/clientCapabilities","io.modelcontextprotocol/protocolVersion"]`
+and does **not** contain `progressToken`, while
+`ProgressNotificationParams.required` is `["progress","progressToken"]`. Two
+required members there, so `notifications/progress` cannot be well formed without
+echoing a token it was given.
+
+#### 4.11.3 The eight shapes
+
+Every row sits on 4.11.1, so every one has the optional inherited `_meta`. `params`
+requiredness is the schema's: five rows required, three optional.
+
+| Method | Type | `params` | Payload members beyond `_meta` |
+| --- | --- | --- | --- |
+| `notifications/cancelled` | `CancelledNotification` | **`CancelledNotificationParams`**, required | `requestId: RequestId` **required**; `reason?: string` |
+| `notifications/progress` | `ProgressNotification` | **`ProgressNotificationParams`**, required | `progressToken: ProgressToken` **required**; `progress: number` **required**; `total?: number`; `message?: string` |
+| `notifications/message` | `LoggingMessageNotification` | **`LoggingMessageNotificationParams`**, required | `level: LoggingLevel` **required**; `data: unknown` **required**; `logger?: string`. **@deprecated** (SEP-2577) |
+| `notifications/resources/updated` | `ResourceUpdatedNotification` | **`ResourceUpdatedNotificationParams`**, required | `uri: string` **required**, `@format uri` |
+| `notifications/subscriptions/acknowledged` | `SubscriptionsAcknowledgedNotification` | **`SubscriptionsAcknowledgedNotificationParams`**, required | `notifications: SubscriptionFilter` **required** |
+| `notifications/resources/list_changed` | `ResourceListChangedNotification` | `NotificationParams`, **optional** | none |
+| `notifications/tools/list_changed` | `ToolListChangedNotification` | `NotificationParams`, **optional** | none |
+| `notifications/prompts/list_changed` | `PromptListChangedNotification` | `NotificationParams`, **optional** | none |
+
+Counts read off the artifact rather than the table above: eight interfaces
+extend `JSONRPCNotification`; five declare a named params interface and carry a
+required `params`; three carry `params?: NotificationParams` and declare none.
+`ServerNotification` is the union of all eight and `ClientNotification` is
+`CancelledNotification` alone, so `notifications/cancelled` is the only one
+that travels both directions and it is in both unions.
+
+Four members in that table carry a type but no constraint, and a decoder must
+not narrow them: `progress` and `total` are `number` with no integer
+restriction and no `@minimum`; `data` is `unknown` and the artifact says *"Any
+JSON serializable type is allowed here"*, so a string and an object are both
+legal; `uri` carries `@format uri`, a JSDoc hint with no pattern or format
+constraint in the type. Three of the four are **required** (`progress`, `data`,
+`uri`); `total` is optional. `LoggingLevel` is the one closed literal set among
+them — `debug`, `info`, `notice`, `warning`, `error`, `critical`, `alert`,
+`emergency`, mapping to RFC-5424 syslog severities, with no `| string` arm — and
+it is the same union the request's `io.modelcontextprotocol/logLevel` uses.
+
+Two normative requirements in this section are in the artifact's prose rather
+than in a type, and both are established:
+
+- `CancelledNotificationParams.requestId` MUST *"correspond to the ID of a
+  request the client previously issued"*, and on stdio a server sends this
+  notification **solely** to terminate a `subscriptions/listen` stream.
+  Servers MUST NOT use it to cancel any other request.
+- `SubscriptionsAcknowledgedNotification` MUST be the first message the server
+  sends carrying that subscription's
+  `io.modelcontextprotocol/subscriptionId`, and no notification on the
+  subscription may precede it — ordered per subscription ID, not per channel,
+  so messages from other subscriptions may be interleaved before it.
+
+#### 4.11.4 `SubscriptionFilter`
+
+The gate on a `subscriptions/listen` stream, and the payload of
+`notifications/subscriptions/acknowledged` — the same type in both places. Four
+members, all optional:
+
+| Member | Type | Opts into |
+| --- | --- | --- |
+| `toolsListChanged` | `boolean?` | `notifications/tools/list_changed` |
+| `promptsListChanged` | `boolean?` | `notifications/prompts/list_changed` |
+| `resourcesListChanged` | `boolean?` | `notifications/resources/list_changed` |
+| `resourceSubscriptions` | `string[]?` | `notifications/resources/updated` for those URIs. Replaces the removed `resources/subscribe` RPC |
+
+`SubscriptionsListenRequestParams.notifications` is **required**, so `{}` — an
+empty filter, meaning nothing opted in — is well formed while omitting the
+member is not. Each type is **opt-in** and the server **MUST NOT** send a
+notification type the client has not requested. The acknowledged notification
+reports back a *subset*: *"Only includes notification types the server actually
+supports"*, so an omitted member in that reply means unsupported rather than
+not requested.
+
+#### 4.11.5 Where the notification source is silent
+
+Same sense as 4.10.7 — no primary source defines these, so this library does
+not invent a value and the case is an explicit decode failure:
+
+- **A required member of a notification params interface with the wrong type.**
+  The artifact constrains none of `progress`, `data`, `uri` or `reason` beyond
+  its TypeScript type, and carries no numeric bound on any of them.
+- **A notification with an `id`.** `JSONRPCNotification` declares none, so an
+  `id` is not part of any of the eight; the source says nothing about a peer
+  that sends one anyway.
+- **The bound on `resourceSubscriptions`.** `string[]` with no `@maxItems`.
+- **Whether `params: null` is the same as omitting it.** The artifact types
+  `params?` as an object or absent and does not say.
+- **A member no notification params interface names.** None of the six declares
+  an index signature, which fixes the *declared* member set, and the generated
+  `schema.json` gives none of them an `additionalProperties`, which would be the
+  construct that closes one. 4.10.6 has the census. So an undeclared key in
+  `params` is not an error by any stated rule and is not forbidden by any
+  either — the same silence as the last bullet of 4.10.7, in the same direction.
+  `_meta` is the exception and is **open** by type:
+  `NotificationMetaObject extends MetaObject`, `MetaObject = Record<string, unknown>`.
 
 ## 5. Agent2Agent
 
@@ -1118,6 +1396,46 @@ mechanism, and it is why an unknown capability is not a decode error.
 | `session.delete` | `session/delete` |
 | `session.additionalDirectories` | additional workspace roots |
 
+#### 6.5.1 The `acp` capability — RFD only, in no published schema
+
+The mcp-over-acp binding advertises itself with an `acp` capability. This
+library does **not** invent it, and the distinction below is the reason: the
+`acp` key appears in **neither** released ACP schema. Verified on the published
+artifacts: the literal `"acp"` occurs **zero** times in `schema/v1/schema.json`
+and **zero** times in `schema/v2/schema.json`, and neither `meta.json` lists any
+`mcp/*` method. Full transcription and the RFD fragments:
+[`research/normative/acp-v1-v2.md`](research/normative/acp-v1-v2.md) §10e.
+
+| | Published v1 | Published v2 draft | RFD proposal |
+| --- | --- | --- | --- |
+| Path | `agentCapabilities.mcpCapabilities` | `capabilities.session.mcp` | adds `acp` to whichever the version has |
+| Declared members | `http` `boolean` d=`false`; `sse` `boolean` d=`false`; `_meta` | `stdio` `McpStdioCapabilities` \| `null`; `http` `McpHttpCapabilities` \| `null`; `_meta` | `acp` — **not in the schema** |
+| `acp` present? | **NO** | **NO** | v1 `boolean`; v2 presence object |
+
+So the two paths this library carries — `bridge.capability_path` — are:
+
+| Version | Path | Shape | Absent means |
+| --- | --- | --- | --- |
+| v1 | `mcpCapabilities.acp` | `boolean` | `false`. Verbatim from the RFD: *"Omission is equivalent to `false`."* |
+| v2 | `capabilities.session.mcp.acp` | **object presence**, not a boolean | Not advertised. Verbatim: *"omission or `null` means support is not advertised, and `{}` advertises support"* |
+
+v2 removes the boolean form entirely: the same key means different things at the
+two revisions, and a decoder that reads it as a boolean at v2 would misread
+`{}`. That is the same reason this library pins one revision rather than
+branching on a flag, which is 8's rule applied to a capability.
+
+Two further facts that constrain what a conforming peer can do today. The
+`McpServer` union in the published v2 schema has exactly the branches `http`,
+`stdio` and an `other` catch-all, with **no `acp` branch** — so the RFD's
+`{"type":"acp", …}` declaration falls through to `other` rather than matching a
+declared arm. And v2 renamed `mcpCapabilities` wholesale to
+`capabilities.session.mcp`; the v1 string does not occur in `schema/v2/schema.json`
+at all.
+
+**Source conflict, both values stated.** The RFD specifies the `acp` capability
+key and the `{"type":"acp"}` server declaration; the released schemas declare
+neither. These are a draft RFD and released schemas, and they disagree today.
+
 ### 6.6 Permission options
 
 `session/request_permission` is a request from the Agent to the Client.
@@ -1163,6 +1481,67 @@ The only defined composition between these three protocols is the
 `mcp-over-acp` RFD, which carries stateless MCP `2026-07-28` requests over an
 existing ACP connection. It is a draft, and it is cheap to represent once both
 protocols exist.
+
+### 7.1 Server declaration
+
+The client checks the peer's ACP MCP capability, then includes a declaration in
+a session setup request. `session/new` parameters are the RFD's example:
+
+```json
+{ "type": "acp", "name": "project-tools", "serverId": "project-tools:7a72" }
+```
+
+| Field | Type | In the RFD example | Obligation the RFD states |
+| --- | --- | --- | --- |
+| `type` | `"acp"` | yes | The discriminator. Declared in no published schema — see the limitation below |
+| `name` | string | yes | None stated in prose |
+| `serverId` | string | yes | Provider-generated and opaque. *"A server ID identifies one registration for the lifetime of the ACP connection and must not be rebound to a different registration, including after removal."* Distinct offerings use distinct ids |
+
+**Requiredness is `NOT ESTABLISHED`.** The RFD shows all three in a worked
+example and states obligations for `serverId`, but it declares no `required`
+list and there is no published schema arm to carry one — so this document does
+not mark any of the three required. A decoder accepts an object carrying the
+three it recognises and writes back what it accepted; it does not refuse one
+missing a member on the strength of an example.
+
+Those three values are `bridge.server_declaration`. The provider must be ready
+to serve requests when it publishes the declaration, and an agent may invoke
+tools or discover the server before returning the ACP session id. One
+registration may be offered to several ACP sessions, and omitting a
+previously-declared server from a later setup request does not revoke a
+registration another session is using.
+
+**Published-schema limitation.** `type: "acp"` is in **no released ACP
+schema**. The literal `"acp"` occurs zero times in both `schema/v1/schema.json`
+and `schema/v2/schema.json`. Concretely, in the published v2 schema the
+`McpServer` union has exactly three branches — `http`, `stdio` and an `other`
+catch-all — and no `acp` branch, so this declaration currently validates only
+by falling through to `other`. A peer built against the released schemas will
+accept the object and will not give it ACP transport semantics. This library
+encodes the declaration and says so; it does not claim the released schema
+declares it.
+
+### 7.2 Capability advertisement
+
+A peer accepts `mcp/message` only if it has advertised the `acp` capability,
+and the advertisement is **RFD-only**: it is in neither released ACP schema.
+The two paths and their shapes, and the verbatim rules for what an absent value
+means, are in **6.5.1**. In short: v1 `mcpCapabilities.acp` is a `boolean` where
+omission means `false`; v2 `capabilities.session.mcp.acp` is a **presence
+object** where omission or `null` means not advertised and `{}` means supported.
+v2 removed the boolean form, so the same key has two different types across the
+revisions.
+
+These are ACP capabilities, separate from the MCP client capabilities carried on
+each request (4.8.1) — and separate again from what the capability promises: it
+advertises the MCP **transport**, not every optional MCP feature and not a
+guarantee that every operation can be cancelled. MCP discovery and per-request
+capabilities describe the supported features. An intermediary advertises support
+only when its whole downstream chain can consume the transport, and a proxy
+that provides no adaptation preserves its successor's capabilities rather than
+adding this one unconditionally.
+
+### 7.3 The `mcp/message` envelope
 
 One method, `mcp/message`, in two directions. An Agent-to-provider request invokes
 one MCP operation; a provider-to-agent notification carries an MCP notification
@@ -1225,6 +1604,14 @@ in the corresponding document under [`research/`](research/README.md).
   `modelcontextprotocol.io/specification/2026-07-28/`; extension specifications in
   `modelcontextprotocol/ext-apps` and `modelcontextprotocol/ext-tasks`. See
   [`research/mcp.md`](research/mcp.md).
+  The schema artifact this document's §4.8, §4.10 and §4.11 are transcribed from
+  is also pinned at the immutable commit
+  `3098fe94caa1b9e0afaaa6d30e040b61d5802471`, which serves byte-identical content
+  to the `main` ref — same 98,426 bytes, same 3,197 lines, same sha256
+  `742750af…2cd`. Fetch the commit-pinned URL to re-verify any `artifact L…`
+  line range; `main` is a moving branch. Full provenance and the digest
+  arithmetic:
+  [`research/normative/mcp-2026-07-28-schema.md`](research/normative/mcp-2026-07-28-schema.md).
 - A2A normative proto: `a2aproject/A2A` at `specification/a2a.proto`, tag `v1.0.0`,
   plus the rendered specification at `a2a-protocol.org/latest/specification/`.
   See [`research/a2a.md`](research/a2a.md).

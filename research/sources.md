@@ -144,6 +144,7 @@ excluded; they are listed under `Not verified during research`.
 | https://api.example.com/a2a/v1 | A2A, normative | `normative/a2a-1.0.0.md` |
 | https://api.github.com/orgs/a2aproject/repos?per_page=100&sort=updated | A2A | `a2a.md` |
 | https://api.github.com/repos/a2aproject/A2A/releases?per_page=15 | A2A | `a2a.md` |
+| https://api.github.com/repositories/862570523/commits?sha=main&per_page=1 | MCP, normative | `normative/mcp-2026-07-28-schema.md` |
 | https://api.github.com/search/issues?q=repo:modelcontextprotocol/modelcontextprotocol+type:pr+state:open+SEP | MCP | `mcp.md` |
 | https://api.npmjs.org/downloads/point/last-month/@modelcontextprotocol/sdk | MCP | `mcp.md` |
 | https://api.npmjs.org/downloads/point/last-week/@modelcontextprotocol/sdk | MCP | `mcp.md` |
@@ -207,6 +208,7 @@ excluded; they are listed under `Not verified during research`.
 | https://datatracker.ietf.org/doc/draft-schemacommons-aaif/00/ | Observability | `observability.md` |
 | https://datatracker.ietf.org/doc/draft-singla-agent-identity-protocol | Identity and discovery | `identity-and-discovery.md` |
 | https://datatracker.ietf.org/doc/html/draft-ranjbar-dane-did-01 | Identity and discovery | `identity-and-discovery.md` |
+| https://datatracker.ietf.org/doc/html/rfc5424#section-6.2.1 | MCP, normative | `normative/mcp-2026-07-28-schema.md` |
 | https://datatracker.ietf.org/doc/html/rfc8941 | Commerce, normative | `normative/commerce.md` |
 | https://datatracker.ietf.org/group/agentproto/documents/ | Governance | `governance.md`, `identity-and-discovery.md` |
 | https://datatracker.ietf.org/group/agentproto/history/ | Governance | `governance.md`, `identity-and-discovery.md` |
@@ -604,6 +606,8 @@ excluded; they are listed under `Not verified during research`.
 | https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/main/seps/2577-deprecate-roots-sampling-and-logging.md | Observability | `observability.md` |
 | https://raw.githubusercontent.com/modelcontextprotocol/registry/main/README.md | MCP | `mcp.md` |
 | https://raw.githubusercontent.com/modelcontextprotocol/registry/main/docs/reference/api/openapi.yaml | MCP | `mcp.md` |
+| https://raw.githubusercontent.com/modelcontextprotocol/specification/3098fe94caa1b9e0afaaa6d30e040b61d5802471/schema/2026-07-28/schema.json | MCP, normative — immutable pin of the `main` row below, byte-identical; cited only for the `additionalProperties` census | `normative/mcp-2026-07-28-schema.md` |
+| https://raw.githubusercontent.com/modelcontextprotocol/specification/3098fe94caa1b9e0afaaa6d30e040b61d5802471/schema/2026-07-28/schema.ts | MCP, normative — immutable pin of the `main` ref below, byte-identical | `normative/mcp-2026-07-28-schema.md` |
 | https://raw.githubusercontent.com/modelcontextprotocol/specification/main/schema/2026-07-28/schema.json | MCP, normative | `normative/mcp-2026-07-28.md` |
 | https://raw.githubusercontent.com/modelcontextprotocol/specification/main/schema/2026-07-28/schema.ts | MCP, normative | `normative/mcp-2026-07-28-schema.md`, `normative/mcp-2026-07-28.md` |
 | https://raw.githubusercontent.com/open-telemetry/community/main/README.md | Observability | `observability.md` |
@@ -724,6 +728,24 @@ excluded; they are listed under `Not verified during research`.
 | https://{domain}/.well-known/agent-card.json | A2A | `a2a.md` |
 | https://{id}.gateway.bedrock-agentcore.{region}.amazonaws.com/mcp | Platform support | `platform-support.md` |
 | https://{server_domain}/.well-known/agent-card.json | A2A, normative | `normative/a2a-1.0.0.md` |
+
+### Added after the research date
+
+Four index rows post-date 2026-09-29 and are not in the counts below, which remain
+the research-date measurement they are labelled as. All four are cited by
+`normative/mcp-2026-07-28-schema.md`, which gained them with the §4.8 and §4.11
+revisions:
+
+| URL | Why | Verified |
+| --- | --- | --- |
+| `…/specification/3098fe94caa1b9e0afaaa6d30e040b61d5802471/schema/2026-07-28/schema.ts` | Immutable pin of the `main` ref, so the `artifact L…` ranges have a durable address | 98,426 bytes, 3,197 lines, sha256 `742750af0bb8c716e7030c4977c992b55d1adc4407e9e66997db5846baedc2cd` — byte-identical to the `main` fetch, 2026-10-01 |
+| `…/specification/3098fe94caa1b9e0afaaa6d30e040b61d5802471/schema/2026-07-28/schema.json` | The `additionalProperties` census, which the TypeScript source cannot answer | 181,474 bytes, 3,963 lines, sha256 `ef70b61f99b6d2e5e3b46863822eab08dff6a45bedc7a08914e0e5b133f40203` — byte-identical to the `main` fetch, draft 2020-12 |
+| `https://api.github.com/repositories/862570523/commits?sha=main&per_page=1` | Resolves commit `3098fe94…` to the `main` head of 2026-10-01 | `sha` matches, `committer.date` `2026-10-01T12:55:32Z` |
+| `https://datatracker.ietf.org/doc/html/rfc5424#section-6.2.1` | Quoted inside `LoggingLevel`'s JSDoc; the syslog severity reference | Carried verbatim from the artifact at L2067, inside the `LoggingLevel` block at L2019–L2083 |
+
+So the index holds **711** distinct URLs where *Totals* below says 707, and
+`normative/mcp-2026-07-28-schema.md` cites **5** where its row says 1. The other
+rows are unchanged: the revisions added no URL to any other document.
 
 ## Per-document counts
 

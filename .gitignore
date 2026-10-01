@@ -4,6 +4,11 @@
 .zig-global-cache/
 zig-out/
 zig-pkg/
+zig-cache/
+__pycache__/
+
+# Local-only handoff, never committed
+HANDOFF.md
 
 # Jujutsu VCS
 .jj/
