@@ -4246,6 +4246,18 @@ pub fn encodeMutualTlsSecurityScheme(
 // formatting matter, because a later occurrence then satisfies a field this
 // document does not carry.
 //
+// The arms that do not reach one of the three are the scalar ones, and the
+// rule there is stated where the question is asked, at `isNullMember`: no
+// scalar read in this file can consume a `null` and leave its destination
+// unset, because `string`, `number` and `boolean` refuse one and `rawValue`
+// hands back its four-byte lexeme. So `if (dest != null)` at a `metadata`,
+// `filename` or `contextId` arm, and the `saw_x` flag at a REQUIRED string,
+// are the same record `claimMember` holds, reached by the reader rather than
+// by the walk. They are worth saying out loud, because the destination probe
+// above is exactly what those arms would be wrong to use, and the reason it is
+// wrong there and right here is the reader underneath and not the shape of
+// the member.
+//
 // The nine presence defects this half found and fixed
 //
 // Every one of these is a field the wire may omit that the tables held as a
@@ -4452,16 +4464,45 @@ fn readRawPart(
 
 /// Consume a `null` and report it, when the next value is one.
 ///
-/// A message member sent as `null` is the member missing and wearing a key.
-/// The document is well formed and it names a member whose value is no
-/// message, so this leaves the field null for the caller's own
-/// `error.MissingField` check to report rather than handing `null` to
-/// `beginObject`, which would call it a syntax error and blame the peer's
-/// grammar for a field the peer did send. Every message, `repeated` and map
-/// member in this file asks first, through one of the three `claim*` helpers
-/// below, so one member has three answers and not four: absent and `null` are
-/// both `MissingField`, and a value that is neither is whatever the member's
-/// own walk says.
+/// A member sent as `null` is the member missing and wearing a key. The
+/// document is well formed and it names a member whose value is no message,
+/// so this leaves the field null for the caller's own `error.MissingField`
+/// check to report rather than handing `null` to `beginObject`, which would
+/// call it a syntax error and blame the peer's grammar for a field the peer
+/// did send.
+///
+/// Every member whose value is a message, a `repeated` or a map asks through
+/// one of the three `claim*` helpers below, because those are the members for
+/// which `null` is a value the type has. So for those, one member has three
+/// answers and not four: absent and `null` are both `MissingField`, and a
+/// value that is neither is whatever the member's own walk says.
+///
+/// A member whose value is a **scalar** does not ask, and a claim that every
+/// member in this file does would be false if it were made about it. The
+/// reason it does not have to is a property of the reader rather than of the
+/// walk:
+///
+///   - `Reader.string`, `Reader.number` and `Reader.boolean` **refuse** `null`
+///     with `error.MalformedJson`, so an occurrence that is `null` ends the
+///     decode there and no later occurrence of that name is ever reached;
+///   - `Reader.rawValue` is **not optional** — it returns the value's own
+///     lexeme, and the lexeme of `null` is the four bytes `null` — so an
+///     occurrence that is `null` leaves its destination holding something.
+///
+/// A `oneof` counts by its arms, not by the member it hangs on. `Part.content`
+/// has no member name of its own — `Part.fields[0]` carries `json = null` — so
+/// the members of a `Part` are `text`, `raw`, `url` and `data`, and all four
+/// are scalars. That is why `readPart` guards on its destination and not on
+/// `claimArm`, and it is the same rule rather than an exception to it.
+///
+/// Between them those two say the guard beside a scalar arm is safe by a rule
+/// and not by luck: no scalar read in this file can consume a `null` and
+/// leave its destination unset, so `if (dest != null)` and `if (saw_x)` both
+/// answer "has this name been decided" there, exactly as `claimMember` does.
+/// What a scalar arm must not do is pretend the two agree in the *other*
+/// direction — see the check at `readAuthorizationCodeOAuthFlow`, where the
+/// member cannot be the record at all, because a REQUIRED string defaults to
+/// `""` and `""` is `error.InvalidField`.
 fn isNullMember(reader: *json.Reader) DecodeError!bool {
     reader.skipWhitespace();
     if (reader.peek() != 'n') return false;
@@ -4485,6 +4526,11 @@ fn isNullMember(reader: *json.Reader) DecodeError!bool {
 /// and marks in one step. A caller cannot mark a name without asking and
 /// cannot ask without marking, which is what makes the next site correct by
 /// construction rather than by care.
+///
+/// That is a statement about the arms that reach here, and they are the ones
+/// whose value is a message, a `repeated` or a map. The arms that do not reach
+/// here are the scalar ones, and `isNullMember` gives the rule that makes
+/// their own guards answer the same question.
 ///
 /// The value is consumed on every path: a repeat is read and dropped, and a
 /// `null` is consumed here, so a peer cannot hide a syntax error behind
@@ -8989,6 +9035,74 @@ test "a repeated member takes its first occurrence, and a null one is that occur
     try testing.expectEqualStrings("q", artifact.parts[0].content.text);
 }
 
+test "a scalar arm is first-wins on the guard it already had" {
+    var storage: TestStorage = .{};
+    storage.init();
+
+    // Most arms in this half ask through a `claim*` helper, and the ones that
+    // do not all read a scalar. A scalar read cannot consume a `null` and
+    // leave its destination unset, so the destination probe and the `saw_x`
+    // flag those arms carry answer "has this name been decided" as well, and
+    // these are the documents that say so.
+
+    // `rawValue` is not optional — the lexeme of `null` is the four bytes
+    // `null` — so the destination is set by an occurrence that carried one
+    // and the second occurrence is dropped rather than read.
+    const part = try decodePart(
+        "{\"text\":\"t\",\"metadata\":null,\"metadata\":{\"a\":1}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqualStrings("null", part.metadata.?);
+
+    // The union `readPart` carries is the same walk, and it is the only one in
+    // this half whose arms are all scalars, so `readPart` guards on `content`
+    // rather than on `claimArm`. The first arm decides: the `text` behind a
+    // `data` that was `null` is never read.
+    const spent_data = "{\"data\":null,\"text\":\"t\"}";
+    const arms = try decodePart(spent_data, &storage.arena, &storage.scratch);
+    try testing.expect(arms.content == .data);
+    try testing.expectEqualStrings("null", arms.content.data);
+    // `decodePartContent` is the same union with no members beside it, and it
+    // guards the same way for the same reason.
+    const bare = try decodePartContent(spent_data, &storage.arena, &storage.scratch);
+    try testing.expect(bare == .data);
+    try testing.expectEqualStrings("null", bare.data);
+    // `string` and `boolean` refuse `null` outright, so the occurrence that
+    // decided the name ended the decode there and the one behind it was never
+    // reached. That is the behaviour a `claim*` helper would change, and the
+    // reason these arms do not ask through one.
+    try testing.expectError(
+        error.MalformedJson,
+        decodePart(
+            "{\"text\":\"t\",\"filename\":null,\"filename\":\"x\"}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeTaskArtifactUpdateEvent(
+            "{\"taskId\":\"t\",\"contextId\":\"c\",\"append\":null,\"append\":true}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    // A REQUIRED string is the same, and it is the one arm whose *member*
+    // could not be the record even so: it defaults to `""`, and `""` is
+    // `error.InvalidField`, so absent and empty have to be told apart by the
+    // flag beside it.
+    try testing.expectError(
+        error.MalformedJson,
+        decodeMessage(
+            "{\"messageId\":null,\"messageId\":\"m\",\"role\":\"ROLE_USER\"," ++
+                "\"parts\":[]}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+}
+
 test "an out array that fills is an error and never a truncation" {
     var scratch: [256]u8 = undefined;
     var base64: [64]u8 = undefined;
@@ -9216,6 +9330,17 @@ test "an out array that fills is an error and never a truncation" {
 // occurrence decides in both, and what it decides is no entry in the first
 // and one entry in the second.
 //
+// That record is the tail of the caller's own entry array rather than a frame
+// in this walk, and the difference is the whole of a defect it once had. A
+// fixed-size frame puts a ceiling on the keys one map can spend that no caller
+// can raise, and it reports the ceiling as `error.BufferTooSmall`, which names
+// the caller's buffer as the thing that was too small. A card carrying more
+// null keys than the frame has slots is a legal card — every one of those
+// entries is an entry carrying nothing — and a discovery endpoint that fetches
+// cards a peer chose would refuse it, in the error class that tells the caller
+// to enlarge a buffer that was never the constraint. In the caller's array the
+// ceiling *is* the caller's, so the same refusal now means what it says.
+//
 // A map value sent as `null` is an entry that is not there
 //
 // `{"oauth":null}` names an entry and then declines to give it a value, which
@@ -9226,6 +9351,15 @@ test "an out array that fills is an error and never a truncation" {
 // the stated consequence of skipping a member the shape does not model — and
 // the key is spent, because the occurrence that named it is the occurrence
 // that decided it.
+//
+// "Missing" is the whole of the claim, because it is what ProtoJSON means by
+// it: `null` is how a peer writes a field it did not set, and a map entry
+// whose value was not set is an entry the map does not hold. So this decoder
+// neither invents an entry for it nor refuses the document. Writing an entry
+// with an empty value would be a different statement — that the card defines
+// a scheme named `oauth` and that scheme is empty — and a caller checking
+// this card would take it at its word, so dropping the key is the reading
+// that loses nothing, while refusing would hand a peer the refusal.
 //
 // The thirteen presence defects this half found and fixed
 //
@@ -9277,7 +9411,12 @@ test "an out array that fills is an error and never a truncation" {
 /// overwrites the first one's values.
 ///
 /// The nine arrays are the nine distinct element types a card reaches. A
-/// tenth would be the caller sizing storage for nothing.
+/// tenth would be the caller sizing storage for nothing, which is why the
+/// three map arrays carry a second job: the keys a map spent on a `null`
+/// value are recorded in the tail of the array that map is filling, since
+/// they produce no entry and would otherwise want a tenth array of their own.
+/// A key costs a slot whether it decides a value or nothing, so a caller
+/// sizing for N entries has room for N keys.
 ///
 /// Nothing in here is retained past the call that filled it. The borrowed
 /// strings and lexemes still point into the document and into the caller's
@@ -9291,16 +9430,19 @@ pub const CardArena = struct {
     extensions: []AgentExtension,
     /// The elements of `AgentCard.signatures`.
     signatures: []AgentCardSignature,
-    /// The entries of the `AgentCard.security_schemes` map.
+    /// The entries of the `AgentCard.security_schemes` map. Its tail also holds
+    /// the keys that map spent on a `null` value; see `EmptyKeys`.
     security_schemes: []SecuritySchemeEntry,
     /// The elements of `AgentCard.security_requirements` and of every
     /// `AgentSkill.security_requirements`. They are the same type and are
     /// filled in the order the document spells them, so a card that puts a
     /// requirement on a skill and one on the card takes two runs of one array.
     security_requirements: []SecurityRequirement,
-    /// The entries of every `SecurityRequirement.schemes` map.
+    /// The entries of every `SecurityRequirement.schemes` map, and behind each
+    /// walk the keys that map spent on a `null` value.
     requirement_entries: []SecurityRequirementEntry,
-    /// The entries of every OAuth flow's `scopes` map.
+    /// The entries of every OAuth flow's `scopes` map, and behind each walk
+    /// the keys that map spent on a `null` value.
     scopes: []OAuthScope,
     /// Every `repeated string` element in the document: `AgentCard`'s two mode
     /// lists, a skill's four string lists and every `StringList.list` alike.
@@ -9413,39 +9555,53 @@ fn mapKeySeen(entries: anytype, key: []const u8) bool {
     return false;
 }
 
-/// How many keys one map remembers as used and carrying nothing.
+/// The keys one map has used and carrying nothing.
 ///
 /// A key whose value is `null` does not become an entry, so the run of entries
 /// this map has already filled cannot record that the key was used, and a
 /// later occurrence of it would take the entry — which is the run answering
 /// "did this key produce an entry" for the question "has this key been used".
 /// The names have to be kept somewhere, and a decode allocates nothing, so
-/// they are kept in the walk's own frame. This is far above a card that
-/// carries anything: a peer that sends this many empty keys in one map has
-/// sent this many entries carrying nothing. Overflow is `error.BufferTooSmall`,
-/// the same refusal a full entry array gives, and never a repeat let through.
-const empty_key_capacity = 16;
-
-/// The keys of one map that have been used and decided nothing.
+/// they are kept in the caller's own entry array: the tail of it, which is
+/// the end the entries are growing *away* from.
 ///
-/// The names are borrowed from the document or from the reader's scratch,
-/// exactly as `entry.name` is, and for the same reason they do not move: the
-/// scratch bump only moves forward, so a name read from it stays good for as
-/// long as the entries that name it.
+/// The bound is `entries.len` — the array the caller sized for this map — and
+/// not a constant in this file, and that is the whole of what makes the
+/// refusal an honest one. `error.BufferTooSmall` says the caller-supplied
+/// output buffer was too small, so a walk may not report it for storage the
+/// caller cannot see or raise. A card carrying forty null keys in one map is
+/// legal, and any caller who sized the array for forty entries decodes it;
+/// the same card refuses the caller who sized it for four, and names the
+/// array it was full of.
+///
+/// Only the name goes into a spent slot and only the name is read back out of
+/// it, so a spent key costs a slot and no bytes. The value half of those slots
+/// is left `undefined` and is never read, for the same reason the names are
+/// borrowed rather than copied: nothing here outlives the walk that is
+/// borrowing.
 const EmptyKeys = struct {
-    names: [empty_key_capacity][]const u8 = undefined,
     used: usize = 0,
 
-    fn holds(self: *const EmptyKeys, key: []const u8) bool {
-        for (self.names[0..self.used]) |name| {
-            if (std.mem.eql(u8, name, key)) return true;
+    /// Whether `key` is one this map has used and decided nothing.
+    ///
+    /// Indexed rather than ranged over, because a spent slot holds a name and
+    /// an `undefined` value half, and reading the second one to compare the
+    /// first would read bytes nothing wrote.
+    fn holds(self: *const EmptyKeys, entries: anytype, key: []const u8) bool {
+        var index = entries.len - self.used;
+        while (index < entries.len) : (index += 1) {
+            if (std.mem.eql(u8, entries[index].name, key)) return true;
         }
         return false;
     }
 
-    fn add(self: *EmptyKeys, key: []const u8) DecodeError!void {
-        if (self.used == self.names.len) return error.BufferTooSmall;
-        self.names[self.used] = key;
+    /// Record `key` as used and decided nothing.
+    ///
+    /// `head` is where the entries this map did take end, so this asks whether
+    /// the caller's array still has a slot between that run and this one.
+    fn add(self: *EmptyKeys, entries: anytype, head: usize, key: []const u8) DecodeError!void {
+        if (head + self.used == entries.len) return error.BufferTooSmall;
+        entries[entries.len - 1 - self.used].name = key;
         self.used += 1;
     }
 };
@@ -9454,27 +9610,42 @@ const EmptyKeys = struct {
 ///
 /// The rule is `claimMember`'s, with the record of what a key has been used
 /// split in two, because a key has no index to put a flag beside: `entries` is
-/// where a key that took a value is remembered and `empty` is where a key that
-/// took nothing is. Either answers "has this key been used", which is the
-/// question a repeat has to be answered with, and neither of them is the
-/// destination — which is the whole defect this pair exists to close.
+/// where a key that took a value is remembered — the run at the front of the
+/// caller's array — and `empty` is where a key that took nothing is, at the
+/// back. Either answers "has this key been used", which is the question a
+/// repeat has to be answered with, and neither of them is the destination,
+/// which is the whole defect this pair exists to close.
+///
+/// `start` and `count` say where this map's run begins and how long it is,
+/// because both runs are the caller's one array and a key is refused for want
+/// of a slot only once neither of them has one left.
 fn claimMapKey(
     empty: *EmptyKeys,
     entries: anytype,
+    start: usize,
+    count: usize,
     key: []const u8,
     reader: *json.Reader,
     scratch: []u8,
 ) DecodeError!bool {
-    if (mapKeySeen(entries, key) or empty.holds(key)) {
+    const head = start + count;
+    if (mapKeySeen(entries[start..head], key) or empty.holds(entries, key)) {
         try reader.skipValue(scratch);
         return false;
     }
     if (try isNullMember(reader)) {
         // An entry that is named and then not given a value is an entry that
         // is not there, and its key is spent either way.
-        try empty.add(key);
+        try empty.add(entries, head, key);
         return false;
     }
+    // Asked last, and the order is the rule rather than the order it happens
+    // to be written in. A repeat in a full array is skipped rather than
+    // refused, because the claim above has already consumed it. And a map
+    // carries as many keys as the caller sized its array for, the ones it
+    // spent on `null` counted, so this refusal names the caller's array and
+    // not a frame the caller cannot see.
+    if (head + empty.used == entries.len) return error.BufferTooSmall;
     return true;
 }
 
@@ -9553,11 +9724,15 @@ fn readRequirementEntries(
     const is_empty = try reader.beginObject();
     if (!is_empty) {
         while (try reader.nextKey(scratch)) |key| {
-            const run = arena.requirement_entries[start..][0..count];
-            if (try claimMapKey(&empty, run, key, reader, scratch)) {
-                if (start + count == arena.requirement_entries.len) {
-                    return error.BufferTooSmall;
-                }
+            if (try claimMapKey(
+                &empty,
+                arena.requirement_entries,
+                start,
+                count,
+                key,
+                reader,
+                scratch,
+            )) {
                 arena.requirement_entries[start + count] = .{
                     .name = key,
                     .list = try readStringListObject(reader, arena, scratch),
@@ -9638,9 +9813,7 @@ fn readOAuthScopes(
     const is_empty = try reader.beginObject();
     if (!is_empty) {
         while (try reader.nextKey(scratch)) |key| {
-            const run = arena.scopes[start..][0..count];
-            if (try claimMapKey(&empty, run, key, reader, scratch)) {
-                if (start + count == arena.scopes.len) return error.BufferTooSmall;
+            if (try claimMapKey(&empty, arena.scopes, start, count, key, reader, scratch)) {
                 arena.scopes[start + count] = .{
                     .name = key,
                     .description = try reader.string(scratch),
@@ -9715,8 +9888,16 @@ fn readAuthorizationCodeOAuthFlow(
 
     // `scopes` is REQUIRED and an empty map satisfies it, so `{}` is a flow
     // that authorizes nothing and only the absence of the member is missing.
-    // The check reads the member rather than the flag, because a `null` first
-    // occurrence is the member missing and wearing a key.
+    // It is checked on the member, for the reason `readAgentSkill`'s `tags`
+    // is: a `null` first occurrence spent the name and left the destination
+    // null, so the `orelse` answers for both.
+    //
+    // These two are checked on the flag, and the flag is the only thing here
+    // that can be: each is a string that defaults to `""`, and the line below
+    // makes `""` an `error.InvalidField`, so absent and empty would be the
+    // same value on the member. A `null` under either never reaches the check
+    // — `reader.string` refuses it with `error.MalformedJson` — so the flag is
+    // set only by an occurrence that carried a string.
     if (!saw_authorization_url or !saw_token_url) return error.MissingField;
     if (authorization_url.len == 0 or token_url.len == 0) return error.InvalidField;
     return .{
@@ -10103,9 +10284,15 @@ fn readSecuritySchemes(
     const is_empty = try reader.beginObject();
     if (!is_empty) {
         while (try reader.nextKey(scratch)) |key| {
-            const run = arena.security_schemes[start..][0..count];
-            if (try claimMapKey(&empty, run, key, reader, scratch)) {
-                if (start + count == arena.security_schemes.len) return error.BufferTooSmall;
+            if (try claimMapKey(
+                &empty,
+                arena.security_schemes,
+                start,
+                count,
+                key,
+                reader,
+                scratch,
+            )) {
                 arena.security_schemes[start + count] = .{
                     .name = key,
                     // A `SecurityScheme` MUST contain exactly one of its five
@@ -10454,11 +10641,22 @@ fn readAgentCard(reader: *json.Reader, arena: *CardArena, scratch: []u8) DecodeE
         }
     }
 
-    // Eight members are REQUIRED and none of them may be absent. The four
-    // repeated ones are satisfied by `[]`, so their presence and not their
-    // length is what is checked, and every one of the eight is checked on the
-    // member rather than on the flag: a `null` first occurrence is the member
-    // missing and wearing a key, and the flag says it was seen.
+    // Eight members are REQUIRED and none of them may be absent. Four of them
+    // are `repeated`, `[]` satisfies them, and they are checked on the
+    // **member**: a `null` first occurrence went through `claimMember`, which
+    // spends the name and leaves the destination null, so the `orelse` below
+    // answers for absent and for `null` alike, for the reason
+    // `readAgentSkill`'s `tags` is. `capabilities` is the fifth and is a
+    // message, checked the same way.
+    //
+    // The other three are strings and are checked on the **flag**, because
+    // there the member cannot be the record at all: each defaults to `""` and
+    // `""` is `error.InvalidField` one line below, so absent and empty are the
+    // same value and only the flag separates them. A `null` under one of them
+    // never reaches this check — `reader.string` refuses it with
+    // `error.MalformedJson`, which is the behaviour AGENTS.md pins and which
+    // this file's own test holds — so the flag is set only by an occurrence
+    // that carried a string.
     if (!saw_name or !saw_description or !saw_version) return error.MissingField;
     // A card with no name, no description or no version is not a card. The
     // version is not parsed here: PROTOCOLS.md section 5.1 forbids a patch
@@ -11566,30 +11764,9 @@ test "a repeated card member takes its first occurrence, a null one included" {
         scopes.oauth2.flows.client_credentials.scopes.len,
     );
 
-    // The record of keys that were used and produced nothing is bounded, and
-    // the bound refuses the document rather than dropping a key, because the
-    // alternative is a repeat of an earlier key taking an entry it must not
-    // have. Sixteen of them fit and the seventeenth is the refusal.
-    const sixteen = try decodeSecurityRequirement(
-        "{\"schemes\":{" ++
-            "\"a\":null,\"b\":null,\"c\":null,\"d\":null,\"e\":null,\"f\":null," ++
-            "\"g\":null,\"h\":null,\"i\":null,\"j\":null,\"k\":null,\"l\":null," ++
-            "\"m\":null,\"n\":null,\"o\":null,\"p\":null}}",
-        &storage.arena,
-        &storage.scratch,
-    );
-    try testing.expectEqual(@as(usize, 0), sixteen.schemes.?.len);
-    try testing.expectError(
-        error.BufferTooSmall,
-        decodeSecurityRequirement(
-            "{\"schemes\":{" ++
-                "\"a\":null,\"b\":null,\"c\":null,\"d\":null,\"e\":null,\"f\":null," ++
-                "\"g\":null,\"h\":null,\"i\":null,\"j\":null,\"k\":null,\"l\":null," ++
-                "\"m\":null,\"n\":null,\"o\":null,\"p\":null,\"q\":null}}",
-            &storage.arena,
-            &storage.scratch,
-        ),
-    );
+    // How many null keys one map may carry is the array the caller sized, so
+    // it is not a number this file gets to choose; the test below is where
+    // that is pinned, in both directions.
 
     // `scopes` is REQUIRED on three of the five flows, and an empty map
     // satisfies it, so a `null` first occurrence leaves the flow without the
@@ -11623,6 +11800,55 @@ test "a repeated card member takes its first occurrence, a null one included" {
         &storage.scratch,
     );
     try testing.expect(other_arm == .mtls);
+
+    // The arms this half guards with a destination probe or a `saw_` flag
+    // rather than through a `claim*` helper are the scalar ones, and they are
+    // first-wins for the reason `isNullMember` gives: `string` and `boolean`
+    // refuse a `null`, so the occurrence that decided the name ended the
+    // decode and the one behind it was never read. Converting one of them to
+    // a claim would change this answer from a refusal to a missing field, so
+    // these are here to say which answer each arm gives today.
+    try testing.expectError(
+        error.MalformedJson,
+        decodeAgentCard(
+            "{\"name\":null,\"name\":\"W\",\"description\":\"d\"," ++
+                "\"supportedInterfaces\":[],\"version\":\"1.0\"," ++
+                "\"capabilities\":{},\"defaultInputModes\":[]," ++
+                "\"defaultOutputModes\":[],\"skills\":[]}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeAgentSkill(
+            "{\"id\":null,\"id\":\"s\",\"name\":\"n\",\"description\":\"d\"," ++
+                "\"tags\":[]}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeSecurityScheme(
+            "{\"oauth2SecurityScheme\":{\"flows\":{\"clientCredentials\":" ++
+                "{\"tokenUrl\":\"https://auth.example.com/t\"," ++
+                "\"refreshUrl\":null,\"refreshUrl\":\"https://auth.example.com/r\"}}}}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeSecurityScheme(
+            "{\"oauth2SecurityScheme\":{\"flows\":{\"authorizationCode\":" ++
+                "{\"authorizationUrl\":\"https://auth.example.com/a\"," ++
+                "\"tokenUrl\":\"https://auth.example.com/t\",\"scopes\":{}," ++
+                "\"pkceRequired\":null,\"pkceRequired\":true}}}}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
 }
 
 test "a map value sent as null is an entry that is not there" {
@@ -11676,6 +11902,140 @@ test "a map value sent as null is an entry that is not there" {
     writer = json.Writer.init(&storage.out);
     try encodeSecurityRequirement(bare, &writer);
     try testing.expectEqualStrings("{}", writer.written());
+}
+
+test "how many keys a map may spend is the array the caller sized" {
+    var storage: CardTestStorage = .{};
+    storage.init();
+
+    const head = "{\"name\":\"W\",\"description\":\"d\",\"supportedInterfaces\":[]," ++
+        "\"version\":\"1.0\",\"capabilities\":{},";
+    const modes = "\"defaultInputModes\":[],\"defaultOutputModes\":[],";
+    const seventeen =
+        "\"a\":null,\"b\":null,\"c\":null,\"d\":null,\"e\":null,\"f\":null," ++
+        "\"g\":null,\"h\":null,\"i\":null,\"j\":null,\"k\":null,\"l\":null," ++
+        "\"m\":null,\"n\":null,\"o\":null,\"p\":null,\"q\":null";
+    const thirty =
+        "\"a\":null,\"b\":null,\"c\":null,\"d\":null,\"e\":null,\"f\":null," ++
+        "\"g\":null,\"h\":null,\"i\":null,\"j\":null,\"k\":null,\"l\":null," ++
+        "\"m\":null,\"n\":null,\"o\":null,\"p\":null,\"q\":null,\"r\":null," ++
+        "\"s\":null,\"t\":null,\"u\":null,\"v\":null,\"w\":null,\"x\":null," ++
+        "\"y\":null,\"z\":null,\"aa\":null,\"ab\":null,\"ac\":null,\"ad\":null";
+
+    // A map carrying keys it spent is legal however many the peer chose to
+    // send: each of those keys is an entry that carries nothing, and nothing
+    // in the grammar puts a number on it. The record of the keys is the
+    // caller's own entry array, so what bounds a map is the array this caller
+    // sized and not a frame the caller cannot see or raise.
+    var wide: [40]SecurityRequirementEntry = undefined;
+    var roomy = CardArena.init(
+        &storage.interfaces,
+        &storage.skills,
+        &storage.extensions,
+        &storage.signatures,
+        &storage.security_schemes,
+        &storage.security_requirements,
+        &wide,
+        &storage.scopes,
+        &storage.strings,
+    );
+    const spent = try decodeSecurityRequirement(
+        "{\"schemes\":{" ++ thirty ++ "}}",
+        &roomy,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(usize, 0), spent.schemes.?.len);
+
+    // A repeat of a key this map already spent is still dropped rather than
+    // taking the entry, which is the whole reason the record exists and the
+    // reason it may not be traded away for a smaller one.
+    const repeated = try decodeSecurityRequirement(
+        "{\"schemes\":{\"a\":null,\"b\":null,\"a\":{\"list\":[\"x\"]}}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(usize, 0), repeated.schemes.?.len);
+
+    // The same bound on the map a card carries, which is the one a peer
+    // chooses: seventeen null scheme names in a card of two hundred bytes is
+    // a legal card, and it decodes into an array sized for it.
+    var schemes: [20]SecuritySchemeEntry = undefined;
+    var card_arena = CardArena.init(
+        &storage.interfaces,
+        &storage.skills,
+        &storage.extensions,
+        &storage.signatures,
+        &schemes,
+        &storage.security_requirements,
+        &wide,
+        &storage.scopes,
+        &storage.strings,
+    );
+    const card = try decodeAgentCard(
+        head ++ "\"securitySchemes\":{" ++ seventeen ++ "}," ++ modes ++ "\"skills\":[]}",
+        &card_arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(usize, 0), card.security_schemes.?.len);
+
+    // The refusal is `error.BufferTooSmall` and now it is the caller's array
+    // that is full, so the error names the thing the caller can do something
+    // about. Three keys into a two-slot array is that, two keys is not, and
+    // the same document that fits the array above is the card decoded above.
+    var narrow: [2]SecurityRequirementEntry = undefined;
+    var tight = CardArena.init(
+        &storage.interfaces,
+        &storage.skills,
+        &storage.extensions,
+        &storage.signatures,
+        &storage.security_schemes,
+        &storage.security_requirements,
+        &narrow,
+        &storage.scopes,
+        &storage.strings,
+    );
+    try testing.expectError(
+        error.BufferTooSmall,
+        decodeSecurityRequirement(
+            "{\"schemes\":{\"a\":null,\"b\":null,\"c\":null}}",
+            &tight,
+            &storage.scratch,
+        ),
+    );
+    const pair = try decodeSecurityRequirement(
+        "{\"schemes\":{\"a\":null,\"b\":null}}",
+        &tight,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(usize, 0), pair.schemes.?.len);
+
+    // Both runs are that one array, so a map with entries *and* keys it spent
+    // is bounded by the two together: three keys, two of them spent, is a map
+    // asking for a third slot and not for three slots of its own.
+    try testing.expectError(
+        error.BufferTooSmall,
+        decodeSecurityRequirement(
+            "{\"schemes\":{\"a\":null,\"b\":null,\"c\":{\"list\":[\"x\"]}}}",
+            &tight,
+            &storage.scratch,
+        ),
+    );
+    const mixed = try decodeSecurityRequirement(
+        "{\"schemes\":{\"a\":null,\"b\":{\"list\":[\"x\"]}}}",
+        &tight,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(usize, 1), mixed.schemes.?.len);
+    try testing.expectEqualStrings("x", mixed.schemes.?[0].list.list.?[0]);
+
+    // A repeat is asked about before a slot is, so a peer cannot turn a name
+    // it has already used into `error.BufferTooSmall` by sending it again.
+    const drop = try decodeSecurityRequirement(
+        "{\"schemes\":{\"a\":null,\"a\":null,\"b\":null}}",
+        &tight,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(usize, 0), drop.schemes.?.len);
 }
 
 test "a SecurityScheme carries exactly one of its five arms" {
