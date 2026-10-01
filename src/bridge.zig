@@ -381,7 +381,7 @@ pub fn decodeOutcome(raw: []const u8, scratch: []u8) DecodeError!Outcome {
     if (!reader.atEnd()) return error.MalformedJson;
 
     // Exactly one inner MCP outcome, per the specification.
-    const payload = OutcomePayload{
+    const payload: OutcomePayload = .{
         .text = text orelse return error.MissingField,
         .meta = carrier_meta,
     };
@@ -777,9 +777,16 @@ test "an envelope member the input spells twice resolves first-wins" {
     // Every member the walk compares, not only the one the harm is named
     // against: a repeat of `requestId`, `method` or `params` is the same
     // question and the same answer.
+    // The bytes are spelled as joined escaped strings rather than as a split
+    // `\\` literal because the split form joins its lines with a newline, and
+    // this fixture's bytes are what the first-wins rule is being asked about.
     const repeated = try decodeEnvelope(
-        \\{"serverId":"s","requestId":"first","requestId":"second","method":"first","method":"second","params":{"a":1},"params":{"b":2}}
-    , &scratch, null);
+        "{\"serverId\":\"s\",\"requestId\":\"first\",\"requestId\":\"second\"," ++
+            "\"method\":\"first\",\"method\":\"second\",\"params\":{\"a\":1}," ++
+            "\"params\":{\"b\":2}}",
+        &scratch,
+        null,
+    );
     try testing.expectEqualStrings("first", repeated.request_id);
     try testing.expectEqualStrings("first", repeated.inner_method);
     try testing.expectEqualStrings("{\"a\":1}", repeated.inner_params.?);
@@ -1266,7 +1273,7 @@ test "an outcome round-trips through a whole outer response" {
     try testing.expectEqual(jsonrpc.Kind.response, message.kind);
     try testing.expect(message.rpc_error == null);
 
-    const back = try decodeOutcome(message.result.?, &scratch);
+    const back = try decodeOutcome(message.result orelse return error.TestUnexpectedResult, &scratch);
     try testing.expect(back == .@"error");
     try testing.expectEqualStrings(
         "{\"code\":-32602,\"message\":\"unknown tool\"}",

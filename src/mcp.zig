@@ -514,9 +514,8 @@ fn writeDecimal(value: i64, out: []u8) error{BufferTooSmall}![]const u8 {
     // the non-negative result into the unsigned domain; `@as` cannot, because
     // an `i64` does not coerce to a `u64`. The trailing `+ 1` runs unsigned,
     // where the widest magnitude, `2^63`, is a value and not an overflow.
-    // `magnitude` is undefined only until the arms below assign it: the first
-    // read is after the `if`, and neither arm falls through.
     const negative = value < 0;
+    // SAFETY: both arms of the `if` below assign `magnitude` before the first read at `/ 10`.
     var magnitude: u64 = undefined;
     if (negative) {
         const one_past: i64 = -(value + 1);
@@ -942,7 +941,12 @@ pub const input_requests = [_]MethodInfo{
 pub const previous_top_level_requests = [_]MethodInfo{
     .{ .name = "roots/list", .direction = .client_to_server, .present_at_current = false, .deprecated = true },
     .{ .name = "elicitation/create", .direction = .client_to_server, .present_at_current = false, .deprecated = true },
-    .{ .name = "sampling/createMessage", .direction = .client_to_server, .present_at_current = false, .deprecated = true },
+    .{
+        .name = "sampling/createMessage",
+        .direction = .client_to_server,
+        .present_at_current = false,
+        .deprecated = true,
+    },
 };
 
 /// A method this library removed at `2026-07-28`.
@@ -2378,9 +2382,9 @@ fn writeCacheable(object: *ObjectWriter, cacheable: Cacheable) EncodeError!void 
 
 /// The five `ContentBlock.type` values, section 4.10.4.
 ///
-/// The set is closed: the schema declares the union of five named members
-/// with no `| string` arm and no index signature, and the "this is not a
-/// closed set" sentence appears only on the two capability objects. A sixth
+/// The set is closed: the schema declares five literal `type` discriminators
+/// with no `| string` arm; its generated JSON Schema confirms each with
+/// `const`. This constrains discriminator values, not object member names. A sixth
 /// string is `error.UnknownTag`, which is the rule
 /// `a2a.TaskState.fromTag`, `a2a.Role.fromTag` and `acp.PermissionOptionKind`
 /// already follow and the reason `root.DecodeError` carries `UnknownTag` at
@@ -2973,7 +2977,8 @@ fn decodeOptionalTextLexeme(
     scratch: []u8,
 ) DecodeError!?[]const u8 {
     const lexeme = text orelse return null;
-    return try decodeTextLexeme(lexeme, parent, scratch);
+    const value = try decodeTextLexeme(lexeme, parent, scratch);
+    return value;
 }
 
 /// Decode a `ResourceContents` out of the lexeme its block captured.
@@ -3146,7 +3151,7 @@ fn decodeArray(
     comptime T: type,
     text: []const u8,
     out: []T,
-    decodeOne: *const fn (*json.Reader, *VerbatimStore, []u8) DecodeError!T,
+    decode_one: *const fn (*json.Reader, *VerbatimStore, []u8) DecodeError!T,
     store: *VerbatimStore,
     parent: *json.Reader,
     scratch: []u8,
@@ -3158,7 +3163,7 @@ fn decodeArray(
     if (!try reader.beginArray()) {
         while (try reader.nextArrayElement()) {
             if (count == out.len) return error.BufferTooSmall;
-            out[count] = try decodeOne(&reader, store, scratch);
+            out[count] = try decode_one(&reader, store, scratch);
             count += 1;
         }
     }
@@ -4608,7 +4613,7 @@ test "a client binds a provided value and omits an absent one" {
         &names,
         &values,
         &digits,
-    )).?;
+    )) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("city", city.annotation);
     try testing.expectEqualStrings("Mcp-Param-city", city.header_name);
     // The value is not plain ASCII, so the sentinel wraps it.
@@ -4621,7 +4626,7 @@ test "a client binds a provided value and omits an absent one" {
         &names,
         &values,
         &digits,
-    )).?;
+    )) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("Mcp-Param-count", count.header_name);
     try testing.expectEqualStrings("7", count.header_value);
 
@@ -4632,7 +4637,7 @@ test "a client binds a provided value and omits an absent one" {
         &names,
         &values,
         &digits,
-    )).?;
+    )) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("Mcp-Param-flag", flag.header_name);
     try testing.expectEqualStrings("true", flag.header_value);
 
@@ -4663,7 +4668,7 @@ test "a bound parameter round-trips to the verdict a server reaches" {
         &names,
         &values,
         &digits,
-    )).?;
+    )) orelse return error.TestUnexpectedResult;
 
     // A server decodes the sentinel before comparing, so the value it must
     // agree with is the plaintext the body carries.
@@ -4694,7 +4699,7 @@ test "a bound parameter round-trips to the verdict a server reaches" {
         &names,
         &values,
         &digits,
-    )).?;
+    )) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(ParamVerdict.accepted, try checkParamBinding(
         count.header_value,
         .{ .integer = header_integer_max },
@@ -5107,8 +5112,9 @@ test "an unmodelled member of an interim result round-trips byte for byte" {
     // same rule, one member nearer the specification's own, and it comes back
     // beside the others rather than in place of them.
     const carrier =
-        \\{"resultType":"input_required","inputRequests":{"e1":{"method":"elicitation/create"}},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"s"}}}
-    ;
+        "{\"resultType\":\"input_required\"," ++
+        "\"inputRequests\":{\"e1\":{\"method\":\"elicitation/create\"}}," ++
+        "\"_meta\":{\"io.modelcontextprotocol/serverInfo\":{\"name\":\"s\"}}}";
     const carried = try decodeInputRequiredResult(carrier, verbatim[0..], &scratch);
     try testing.expectEqual(@as(usize, 1), carried.verbatim.len);
     try testing.expectEqualStrings("_meta", carried.verbatim[0].key);
@@ -5495,8 +5501,10 @@ test "a CallToolResult round-trips, refuses what is missing, and refuses a tail"
     var verbatim: [16]VerbatimMember = undefined;
 
     const wire =
-        \\{"resultType":"complete","content":[{"type":"text","text":"h\ti"},{"type":"image","data":"AAEC","mimeType":"image/png"}],"structuredContent":{"ok":true},"isError":false,"_meta":{"io.modelcontextprotocol/x":1}}
-    ;
+        "{\"resultType\":\"complete\",\"content\":[{\"type\":\"text\",\"text\":\"h\\ti\"}," ++
+        "{\"type\":\"image\",\"data\":\"AAEC\",\"mimeType\":\"image/png\"}]," ++
+        "\"structuredContent\":{\"ok\":true},\"isError\":false," ++
+        "\"_meta\":{\"io.modelcontextprotocol/x\":1}}";
     const decoded = try decodeToolCallResult(wire, blocks[0..], verbatim[0..], &scratch);
     try testing.expectEqual(@as(usize, 2), decoded.content.len);
     try testing.expectEqualStrings("h\ti", decoded.content[0].text.text);
@@ -5568,8 +5576,10 @@ test "a ListToolsResult round-trips, refuses what is missing, and refuses a tail
     var verbatim: [16]VerbatimMember = undefined;
 
     const wire =
-        \\{"resultType":"complete","ttlMs":60000,"cacheScope":"public","nextCursor":"c2","tools":[{"name":"ech\no","inputSchema":{"type":"object"},"description":"says it back"}],"_meta":{"a":1},"note":"hi"}
-    ;
+        "{\"resultType\":\"complete\",\"ttlMs\":60000,\"cacheScope\":\"public\",\"nextCursor\":\"c2\"," ++
+        "\"tools\":[{\"name\":\"ech\\no\",\"inputSchema\":{\"type\":\"object\"}," ++
+        "\"description\":\"says it back\"}],\"_meta\":{\"a\":1}," ++
+        "\"note\":\"hi\"}";
     const decoded = try decodeToolListResult(wire, tools[0..], verbatim[0..], &scratch);
     try testing.expectEqual(@as(usize, 1), decoded.tools.len);
     try testing.expectEqualStrings("ech\no", decoded.tools[0].name);
@@ -5630,8 +5640,10 @@ test "a ReadResourceResult round-trips both contents forms" {
     var verbatim: [16]VerbatimMember = undefined;
 
     const wire =
-        \\{"resultType":"complete","ttlMs":300000,"cacheScope":"private","contents":[{"uri":"file:///a","text":"hel\tlo"},{"uri":"file:///b","blob":"AAEC","mimeType":"application/octet-stream"}],"_meta":{}}
-    ;
+        "{\"resultType\":\"complete\",\"ttlMs\":300000,\"cacheScope\":\"private\"," ++
+        "\"contents\":[{\"uri\":\"file:///a\",\"text\":\"hel\\tlo\"},{\"uri\":\"file:///b\"," ++
+        "\"blob\":\"AAEC\",\"mimeType\":\"application/octet-stream\"}]," ++
+        "\"_meta\":{}}";
     const decoded = try decodeResourceReadResult(wire, contents[0..], verbatim[0..], &scratch);
     try testing.expectEqual(@as(usize, 2), decoded.contents.len);
     try testing.expectEqualStrings("hel\tlo", decoded.contents[0].text.text);
@@ -5710,8 +5722,10 @@ test "a GetPromptResult round-trips one block per message" {
     var verbatim: [16]VerbatimMember = undefined;
 
     const wire =
-        \\{"resultType":"complete","messages":[{"role":"user","content":{"type":"text","text":"h\ti"}},{"role":"assistant","content":{"type":"resource_link","uri":"file:///a","name":"a"}}],"description":"a prompt","_meta":{}}
-    ;
+        "{\"resultType\":\"complete\",\"messages\":[{\"role\":\"user\",\"content\":{\"type\":\"text\"," ++
+        "\"text\":\"h\\ti\"}},{\"role\":\"assistant\",\"content\":{\"type\":\"resource_link\"," ++
+        "\"uri\":\"file:///a\",\"name\":\"a\"}}],\"description\":\"a prompt\"," ++
+        "\"_meta\":{}}";
     const decoded = try decodePromptsGetResult(wire, messages[0..], verbatim[0..], &scratch);
     try testing.expectEqual(@as(usize, 2), decoded.messages.len);
     try testing.expectEqual(Role.user, decoded.messages[0].role);
@@ -5746,9 +5760,9 @@ test "a GetPromptResult round-trips one block per message" {
     );
     try testing.expectError(
         error.BufferTooSmall,
-        decodePromptsGetResult(
-            \\{"messages":[{"role":"user","content":{"type":"text","text":"a"}},{"role":"user","content":{"type":"text","text":"b"}}]}
-        , messages[0..1], verbatim[0..], &scratch),
+        decodePromptsGetResult("{\"messages\":[{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":\"a\"}}," ++
+            "{\"role\":\"user\",\"content\":{\"type\":\"text\"," ++
+            "\"text\":\"b\"}}]}", messages[0..1], verbatim[0..], &scratch),
     );
 }
 
@@ -5762,8 +5776,11 @@ test "a DiscoverResult round-trips in the order a session already writes" {
     // body a session built re-encodes to the same bytes rather than to an
     // equivalent document in another order.
     const wire =
-        \\{"resultType":"complete","ttlMs":300000,"cacheScope":"public","supportedVersions":["2026-07-28","2025-11-25"],"capabilities":{"tools":{"listChanged":true},"experimental":{"x/thing":{}}},"instructions":"be\tbrief","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"s"}}}
-    ;
+        "{\"resultType\":\"complete\",\"ttlMs\":300000,\"cacheScope\":\"public\"," ++
+        "\"supportedVersions\":[\"2026-07-28\",\"2025-11-25\"]," ++
+        "\"capabilities\":{\"tools\":{\"listChanged\":true},\"experimental\":{\"x/thing\":{}}}," ++
+        "\"instructions\":\"be\\tbrief\"," ++
+        "\"_meta\":{\"io.modelcontextprotocol/serverInfo\":{\"name\":\"s\"}}}";
     const decoded = try decodeDiscoverResult(wire, versions[0..], verbatim[0..], &scratch);
     try testing.expectEqual(@as(usize, 2), decoded.supported_versions.len);
     try testing.expectEqualStrings("2026-07-28", decoded.supported_versions[0]);
@@ -5823,8 +5840,9 @@ test "a page is read without its payload and written back whole" {
     var verbatim: [16]VerbatimMember = undefined;
 
     const wire =
-        \\{"resultType":"complete","ttlMs":1000,"cacheScope":"public","nextCursor":"c\t2","tools":[{"name":"echo","inputSchema":{}}]}
-    ;
+        "{\"resultType\":\"complete\",\"ttlMs\":1000,\"cacheScope\":\"public\"," ++
+        "\"nextCursor\":\"c\\t2\",\"tools\":[{\"name\":\"echo\"," ++
+        "\"inputSchema\":{}}]}";
     const decoded = try decodePaginatedResult(wire, verbatim[0..], &scratch);
     try testing.expectEqualStrings("c\t2", decoded.page.next_cursor.?);
     // The payload is not the page reader's business, and skipping it would
@@ -6036,16 +6054,24 @@ test "every nested decode takes its own region of the one escape scratch" {
     // `json.Reader.requiredScratchLen` cannot see it, because the writes
     // collide rather than overflow.
     const prompts = try decodePromptsGetResult(
-        \\{"messages":[{"role":"user","content":{"type":"text","text":"a\nb"}},{"role":"assistant","content":{"type":"text","text":"c\nd"}}],"description":"D\nD"}
-    , messages[0..], verbatim[0..], &scratch);
+        "{\"messages\":[{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":\"a\\nb\"}}," ++
+            "{\"role\":\"assistant\",\"content\":{\"type\":\"text\",\"text\":\"c\\nd\"}}]," ++
+            "\"description\":\"D\\nD\"}",
+        messages[0..],
+        verbatim[0..],
+        &scratch,
+    );
     try testing.expectEqualStrings("a\nb", prompts.messages[0].content.text.text);
     try testing.expectEqualStrings("c\nd", prompts.messages[1].content.text.text);
     try testing.expectEqualStrings("D\nD", prompts.description.?);
     var writer = json.Writer.init(&out);
     try encodePromptsGetResult(prompts, &writer);
     try testing.expectEqualStrings(
-        \\{"messages":[{"role":"user","content":{"type":"text","text":"a\nb"}},{"role":"assistant","content":{"type":"text","text":"c\nd"}}],"description":"D\nD"}
-    , writer.written());
+        "{\"messages\":[{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":\"a\\nb\"}}," ++
+            "{\"role\":\"assistant\",\"content\":{\"type\":\"text\",\"text\":\"c\\nd\"}}]," ++
+            "\"description\":\"D\\nD\"}",
+        writer.written(),
+    );
 
     // The same collision between the cursor the result decoder read and the
     // elements it decoded afterwards.
@@ -6141,8 +6167,13 @@ test "a block keeps the members its shape does not model" {
     // to write it back, so they are carried rather than dropped — the same
     // rule `size` and `description` already follow through the `else` arm.
     const link = try decodePromptsGetResult(
-        \\{"messages":[{"role":"user","content":{"type":"resource_link","uri":"file:///a","name":"a","mimeType":"text/plain","annotations":{"audience":["user"]}}}]}
-    , messages[0..], verbatim[0..], &scratch);
+        "{\"messages\":[{\"role\":\"user\",\"content\":{\"type\":\"resource_link\"," ++
+            "\"uri\":\"file:///a\",\"name\":\"a\",\"mimeType\":\"text/plain\"," ++
+            "\"annotations\":{\"audience\":[\"user\"]}}}]}",
+        messages[0..],
+        verbatim[0..],
+        &scratch,
+    );
     const carried = link.messages[0].content.resource_link;
     try testing.expectEqual(@as(usize, 2), carried.verbatim.len);
     try testing.expectEqualStrings("mimeType", carried.verbatim[0].key);
@@ -6151,25 +6182,30 @@ test "a block keeps the members its shape does not model" {
     try testing.expectEqualStrings("{\"audience\":[\"user\"]}", carried.verbatim[1].value);
     var writer = json.Writer.init(&out);
     try encodePromptsGetResult(link, &writer);
-    try testing.expectEqualStrings(
-        \\{"messages":[{"role":"user","content":{"type":"resource_link","uri":"file:///a","name":"a","mimeType":"text/plain","annotations":{"audience":["user"]}}}]}
-    , writer.written());
+    try testing.expectEqualStrings("{\"messages\":[{\"role\":\"user\",\"content\":{\"type\":\"resource_link\"," ++
+        "\"uri\":\"file:///a\",\"name\":\"a\",\"mimeType\":\"text/plain\"," ++
+        "\"annotations\":{\"audience\":[\"user\"]}}}]}", writer.written());
 
     // One member along: the image and audio arms read the same member as the
     // string they require, escape and all, while a block that models no such
     // member carries it.
     const mixed = try decodeToolCallResult(
-        \\{"content":[{"type":"text","text":"t","mimeType":"text/plain"},{"type":"image","data":"AAEC","mimeType":"image/p\nng"}]}
-    , blocks[0..], verbatim[0..], &scratch);
+        "{\"content\":[{\"type\":\"text\",\"text\":\"t\",\"mimeType\":\"text/plain\"}," ++
+            "{\"type\":\"image\",\"data\":\"AAEC\"," ++
+            "\"mimeType\":\"image/p\\nng\"}]}",
+        blocks[0..],
+        verbatim[0..],
+        &scratch,
+    );
     try testing.expectEqualStrings("image/p\nng", mixed.content[1].image.mime_type);
     try testing.expectEqual(@as(usize, 1), mixed.content[0].text.verbatim.len);
     try testing.expectEqualStrings("mimeType", mixed.content[0].text.verbatim[0].key);
     try testing.expectEqualStrings("\"text/plain\"", mixed.content[0].text.verbatim[0].value);
     writer = json.Writer.init(&out);
     try encodeToolCallResult(mixed, &writer);
-    try testing.expectEqualStrings(
-        \\{"content":[{"type":"text","text":"t","mimeType":"text/plain"},{"type":"image","data":"AAEC","mimeType":"image/p\nng"}]}
-    , writer.written());
+    try testing.expectEqualStrings("{\"content\":[{\"type\":\"text\",\"text\":\"t\",\"mimeType\":\"text/plain\"}," ++
+        "{\"type\":\"image\",\"data\":\"AAEC\"," ++
+        "\"mimeType\":\"image/p\\nng\"}]}", writer.written());
 }
 
 test "every claimed member the chosen arm does not model is carried, not dropped" {
@@ -6251,9 +6287,10 @@ test "every claimed member the chosen arm does not model is carried, not dropped
     // success. It is carried whole, escapes and all, and the arm that does model
     // it still reads it as a `ResourceContents`.
     var source = json.Writer.init(&in);
-    try source.slice(
-        \\{"content":[{"type":"resource_link","uri":"file:///a","name":"a","resource":{"uri":"file:///b","text":"b\no","mimeType":"text/plain","size":7}},{"type":"resource","resource":{"uri":"file:///c","text":"c\no"}}]}
-    );
+    try source.slice("{\"content\":[{\"type\":\"resource_link\",\"uri\":\"file:///a\",\"name\":\"a\"," ++
+        "\"resource\":{\"uri\":\"file:///b\",\"text\":\"b\\no\",\"mimeType\":\"text/plain\"," ++
+        "\"size\":7}},{\"type\":\"resource\",\"resource\":{\"uri\":\"file:///c\"," ++
+        "\"text\":\"c\\no\"}}]}");
     const result = try decodeToolCallResult(source.written(), blocks[0..], verbatim[0..], &scratch);
     const carried: []const VerbatimMember = switch (result.content[0]) {
         .text => |value| value.verbatim,

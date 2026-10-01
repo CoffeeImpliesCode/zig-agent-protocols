@@ -44,6 +44,7 @@ const jsonrpc = @import("jsonrpc.zig");
 const mcp = @import("mcp.zig");
 const mcp_session = @import("mcp_session.zig");
 const root = @import("root.zig");
+const testio = @import("testio");
 const Io = std.Io;
 
 /// What a call, a served request or an outcome read can return here.
@@ -258,7 +259,7 @@ pub const Client = struct {
         // own `Error`, so widening absorbs the pair and renames nothing.
         // `self.revision` is `.current` here: the check above refused every
         // other value, which is what makes this the current revision's lookup.
-        //
+
         // After the encoder rather than before it, because the encoder owns
         // the rule that a member is non-empty and an empty `method_name` is
         // that fault rather than either of the two this reports. Running it
@@ -765,7 +766,7 @@ test "a carried call puts the three envelope members on the wire" {
     // again, and a caller that believes that retries on a writer that cannot
     // write, while `error.Closed` is this library's own documented way of
     // saying the connection cannot be reused and belongs to no other fault.
-    //
+
     // The id did not move either. A call refused in `open` is refused before it
     // claims a slot and takes an id, so the sequence holds at the id the
     // refused call would have used and the caller's own ids stay predictable.
@@ -821,7 +822,7 @@ test "an envelope with an empty member is refused before a byte is written" {
     // outer `-32602`. An encoder that wrote one would put a frame on the wire
     // that the far side of this same library refuses to read, and the caller
     // would learn it from the peer instead of from the call that made it.
-    //
+
     // The transport is the one above, so a call that reached it would report
     // `error.Transport`. `error.InvalidField` is the envelope refused before
     // the connection was touched, and the sentinel in the envelope buffer
@@ -878,7 +879,7 @@ test "a method removed at 2026-07-28 is refused before a byte is written" {
     // only send them inside `InputRequiredResult.inputRequests`, never as a
     // request a client makes. The binding is `2026-07-28` only, so all four
     // are names with no meaning on this wire.
-    //
+
     // The transport is the one the empty-member test above uses, so a call
     // that reached the connection would report `error.Transport`, and the
     // connection counts what it framed. `error.MethodNotInRevision` is the
@@ -940,7 +941,7 @@ test "a notification is refused before a byte is written" {
     // bidirectional, so a reader of the inventory alone sees a method this side
     // may send. The other seven are the provider's to send and never this
     // client's to call.
-    //
+
     // The transport is the one the removed-method test above uses, so a call
     // that reached the connection would report `error.Transport` instead. What
     // would come back is nothing at all: PROTOCOLS.md 7 makes the
@@ -948,7 +949,7 @@ test "a notification is refused before a byte is written" {
     // provider reads this frame as a message it must not answer and
     // `bridge.decodeEnvelope` does not refuse it either, and the caller sits in
     // `connection.call` waiting for an answer that never comes.
-    //
+
     // `error.NotARequest` and not `error.MethodNotInRevision`: one gate raises
     // both, and only one of the two names says the revision removed the name.
     // Every name here is one `2026-07-28` carries, so a caller switching on the
@@ -1124,7 +1125,7 @@ test "the refusal for a method this provider does not carry is a readable outcom
         &outcome_scratch,
         &inner,
         &out,
-    )).?;
+    )) orelse return error.DeclinedARequest;
 
     // The outer call succeeded, because the MCP operation failed and the
     // exchange did not. An outer error here would tell the agent the transport
@@ -1154,7 +1155,7 @@ test "the binding carries both outcomes and two refusals over a real socket" {
     // `result` and never as a connection failure, which is the mistake this
     // binding exists to prevent: a caller that saw one would report a tool
     // failure as a broken transport and retry it.
-    //
+
     // The same exchange carries two outer refusals, because a wire is the only
     // place the other half shows: a peer answers a method it does not carry
     // with `-32601` and a server it does not have with the binding's own
@@ -1168,7 +1169,7 @@ test "the binding carries both outcomes and two refusals over a real socket" {
     var address = try listenOn(io, &path_buffer, 0x5eed_0201);
     // Unlinked after the listener closes, not before: a path removed while
     // the server is still bound can no longer be connected to.
-    defer std.Io.Dir.cwd().deleteFile(io, address.path) catch {};
+    defer unlinkSocket(io, address.path);
     defer address.server.deinit(io);
 
     var state: State = .{};
@@ -1179,23 +1180,29 @@ test "the binding carries both outcomes and two refusals over a real socket" {
     // One group drives both sides. Two would deadlock: the caller blocks
     // waiting for an answer only the provider's task can produce.
     var group: Io.Group = .init;
-    var serving = ProviderTask{
+    defer group.cancel(io);
+    var serving: ProviderTask = .{
         .io = io,
         .group = &group,
         .server = &address.server,
         .endpoint = &provider_endpoint,
         .provider = &provider_double,
     };
-    var calling = Caller{
+    var calling: Caller = .{
         .io = io,
         .group = &group,
         .address = &address.address,
         .endpoint = &caller_endpoint,
         .state = &state,
     };
-    group.async(io, ProviderTask.run, .{&serving});
-    group.async(io, Caller.run, .{&calling});
-    group.await(io) catch {};
+    try group.concurrent(io, ProviderTask.run, .{&serving});
+    try group.concurrent(io, Caller.run, .{&calling});
+    // A join that reported a fault is this exchange's fault too: neither task
+    // returns anything, so nothing else would put it in front of the assertion
+    // below and a fault would read as a clean exchange.
+    group.await(io) catch {
+        state.failed = true;
+    };
 
     // The group joined because both sides hung up on their own. Nothing here
     // waits on a timer, so the exchange is over before these assertions run.
@@ -1223,8 +1230,8 @@ test "the binding carries both outcomes and two refusals over a real socket" {
     try testing.expectEqual(@as(?anyerror, error.PeerRefused), state.refusals[1].returned);
     // Each carries the code the peer sent and the peer's own message, so a
     // caller can show the message rather than only the number.
-    const peer_refusal = state.refusals[0].refusal.?;
-    const binding_refusal = state.refusals[1].refusal.?;
+    const peer_refusal = state.refusals[0].refusal orelse return error.ExpectedARefusal;
+    const binding_refusal = state.refusals[1].refusal orelse return error.ExpectedARefusal;
     try testing.expectEqual(@as(i32, -32601), peer_refusal.code);
     try testing.expectEqual(@as(i32, -33001), binding_refusal.code);
     try testing.expect(std.mem.indexOf(u8, peer_refusal.body, "method not found") != null);
@@ -1257,13 +1264,13 @@ test "a provider answers each carried request on the side its failure belongs to
 
     var path_buffer: [Io.net.UnixAddress.max_len]u8 = undefined;
     var address = try listenOn(io, &path_buffer, 0x5eed_0202);
-    defer std.Io.Dir.cwd().deleteFile(io, address.path) catch {};
+    defer unlinkSocket(io, address.path);
     defer address.server.deinit(io);
 
     var state: Served = .{};
     var provider_endpoint: Endpoint = .{};
     var caller_endpoint: Endpoint = .{};
-    var peer = ServedPeer{ .state = &state, .provider = .init(undefined) };
+    var peer: ServedPeer = .{ .state = &state, .provider = .init(undefined) };
     // Handed over here and not at the declaration, because the provider holds
     // a pointer to it and a pointer into a temporary would dangle.
     peer.provider.active = &peer.active;
@@ -1276,27 +1283,32 @@ test "a provider answers each carried request on the side its failure belongs to
     // One group drives both sides. Two would deadlock: the caller blocks
     // waiting for an answer only the provider's task can produce.
     var group: Io.Group = .init;
-    var serving = ServedTask{
+    defer group.cancel(io);
+    var serving: ServedTask = .{
         .io = io,
         .group = &group,
         .server = &address.server,
         .endpoint = &provider_endpoint,
         .peer = &peer,
     };
-    var calling = ServedCaller{
+    var calling: ServedCaller = .{
         .io = io,
         .group = &group,
         .address = &address.address,
         .endpoint = &caller_endpoint,
         .state = &state,
     };
-    group.async(io, ServedTask.run, .{&serving});
-    group.async(io, ServedCaller.run, .{&calling});
-    group.await(io) catch {};
+    try group.concurrent(io, ServedTask.run, .{&serving});
+    try group.concurrent(io, ServedCaller.run, .{&calling});
+    // As above: the join's own failure belongs in the diagnosis printed below,
+    // which is the only place a stopped step says why it stopped.
+    group.await(io) catch {
+        state.failed = true;
+    };
 
     // The group joined because both sides hung up on their own. Nothing here
     // waits on a timer, so the exchange is over before these assertions run.
-    //
+
     // The diagnosis prints before either flag is asserted. A flag on its own
     // cannot say which of the nine steps stopped the caller or what it hit,
     // and a rerun to find that out is one too many.
@@ -1449,12 +1461,29 @@ const Socket = struct {
     path: []const u8,
 };
 
-/// The pid is in the name so that two runs of this file never share a socket.
-/// A fixed name is a rendezvous point: whichever run reaches the unlink second
-/// deletes the other's bound path, the client then connects to nothing, and the
-/// loser of the race aborts in a pump with `BADF` on a socket file that is gone.
-/// It reads as a protocol fault and is not one. The examples already carry the
-/// pid for the same reason, and this is that mechanism rather than a second one.
+/// Remove the socket file a test bound, and say nothing about why it stayed.
+///
+/// Teardown runs while the test is unwinding, so an unlink that fails has
+/// nowhere to report to and reporting it would replace the failure that got
+/// the test here. `listenOn` refuses every unlink error but the absence of the
+/// file, so nothing about this file's own behaviour is hidden by the ignore.
+fn unlinkSocket(io: Io, path: []const u8) void {
+    // gate-reviewed-zlint-next-statement: suppressed-errors
+    // ziglint-ignore: Z026
+    // zwanzig-disable-next-line: empty-catch-engine
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+}
+
+/// The tag is the caller's own discriminator, so the name of a socket is
+/// readable in a directory listing and two tests in this file do not share
+/// one. The nonce that [`testio.socketPath`] draws alongside it is what keeps
+/// two runs of this file apart: a fixed name is a rendezvous point, whichever
+/// run reaches the unlink second deletes the other's bound path, the client
+/// then connects to nothing, and the loser of the race aborts in a pump with
+/// `BADF` on a socket file that is gone. It reads as a protocol fault and is
+/// not one. There is no pid in the name because there does not need to be one:
+/// the nonce separates two runs just as well, and taking it from `Io.random`
+/// keeps the name off a syscall only Linux has.
 ///
 /// The path is built once and handed back in [`Socket.path`], and
 /// [`Socket.address`] is the address the client connects to, so the two halves
@@ -1463,18 +1492,19 @@ const Socket = struct {
 /// `path_buffer` is sized from `Io.net.UnixAddress.max_len` rather than a round
 /// number, because that is the one length that fails: `UnixAddress.init`
 /// refuses a longer name with `error.NameTooLong`, which a test reads as a peer
-/// that never connected. Sized this way a constant that grew past the limit
-/// fails at the format instead, and the widest name this renders — a pid at the
-/// full width of a `pid_t` and a full-width tag — is 60 bytes against the 108
-/// `sockaddr_un.sun_path` allows.
+/// that never connected. Sized this way a scratch directory too long for the
+/// limit is refused by name, as `error.PathTooLong`, rather than failing later
+/// as a peer that never answered.
 fn listenOn(io: Io, path_buffer: []u8, tag: u64) !Socket {
-    const path = try std.fmt.bufPrint(
-        path_buffer,
-        "/tmp/zig-agent-proto-bridge-session-{d}-{x}.sock",
-        .{ std.os.linux.getpid(), tag },
-    );
-    // A socket file left by a killed run would make `listen` fail.
-    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const path = try testio.socketPath(io, testing.environ, path_buffer, tag);
+    // A socket file left by a killed run would make `listen` fail. Only its
+    // absence is the outcome this call is written for; any other is a real
+    // fault and is reported here rather than becoming a `listen` error that
+    // says less about it.
+    std.Io.Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
     const address = try Io.net.UnixAddress.init(path);
     return .{
         .address = address,
@@ -1498,6 +1528,7 @@ const CarriedPeer = struct {
     /// has already spent by the time the carried envelope is decoded. The
     /// escape offset a reader keeps is per reader and not per buffer, so a
     /// second decode into the same buffer starts at offset zero again.
+    // SAFETY: `bridge.decodeEnvelope` copies each escaped member in before the envelope borrows it.
     envelope_scratch: [1024]u8 = undefined,
 
     /// Runs inline on the reader task, so it answers and returns. It makes no
@@ -1516,6 +1547,12 @@ const CarriedPeer = struct {
         decode_scratch: []u8,
         answer: []u8,
     ) conn.Error!?[]const u8 {
+        // The context is the `CarriedPeer` `ProviderTask.run` registered beside
+        // this handler, and it is `provider`: a non-null field of a local in
+        // the test frame that outlives the group join. A null would be a fault
+        // in this file, and declining would answer nothing at all, which the
+        // caller would read as a peer that never spoke.
+        // zwanzig-disable-next-line: optional-unwrap
         const self: *CarriedPeer = @ptrCast(@alignCast(ctx.?));
         const message = jsonrpc.decode(frame, decode_scratch) catch return null;
         if (message.kind != .request) return null;
@@ -1584,7 +1621,7 @@ const ProviderTask = struct {
     endpoint: *Endpoint,
     provider: *CarriedPeer,
 
-    fn run(self: *@This()) void {
+    fn run(self: *ProviderTask) void {
         const stream = self.server.accept(self.io) catch return;
         self.endpoint.open(self.io, self.group, stream, .{
             .ctx = self.provider,
@@ -1717,21 +1754,31 @@ const ServedPeer = struct {
     /// over where the peer itself lives so the pointer does not dangle. The
     /// provider never reads an entry before it claims it, so `undefined` is
     /// all the table needs.
+    // SAFETY: `serve` walks `active[0..free]`, and it writes the slot at `free` before it counts it.
     active: [4]Active = undefined,
     /// Separate from the connection's decode region, which `jsonrpc.decode`
     /// has already spent by the time the carried envelope is decoded. The
     /// escape offset a reader keeps is per reader and not per buffer, so a
     /// second decode into the same buffer starts at offset zero again.
+    // SAFETY: `bridge.decodeEnvelope` copies each escaped member in before the envelope borrows it.
     envelope_scratch: [1024]u8 = undefined,
+    // SAFETY: `bridge.encodeOutcome` writes it here and `writer.written()` slices only what it wrote.
     outcome_scratch: [2048]u8 = undefined,
+    // SAFETY: `resolve` copies the payload in and hands that run back; `encodeOutcome` reads it.
     inner: [2048]u8 = undefined,
+    // SAFETY: `serve` answers through `conn.respond` writing into it and returns `writer.written()`.
     out: [4096]u8 = undefined,
     /// The nested call's own buffers, because the outer call's escaped
     /// envelope is still live inside the resolver.
+    // SAFETY: `json.Writer.init` starts the envelope at 0 and `written()` slices out what it wrote.
     nested_params: [1024]u8 = undefined,
+    // SAFETY: `bridge.decodeEnvelope` copies each escaped member in before the envelope borrows it.
     nested_envelope: [1024]u8 = undefined,
+    // SAFETY: `bridge.encodeOutcome` writes it here and `writer.written()` slices only what it wrote.
     nested_outcome: [1024]u8 = undefined,
+    // SAFETY: the nested `serve` writes the payload here and its `encodeOutcome` reads that run.
     nested_inner: [1024]u8 = undefined,
+    // SAFETY: the nested `serve` answers through `conn.respond` writing into it, then slices it out.
     nested_out: [1024]u8 = undefined,
     /// Whether the nested call has happened.
     reentered: bool = false,
@@ -1761,6 +1808,11 @@ const ServedPeer = struct {
         decode_scratch: []u8,
         answer: []u8,
     ) conn.Error!?[]const u8 {
+        // The context is the `ServedPeer` `ServedTask.run` registered beside
+        // this handler, and it is `peer`: a non-null field of a local in the
+        // test frame. Nothing reaches this line without it, and declining here
+        // would leave the caller waiting on a frame nobody would write.
+        // zwanzig-disable-next-line: optional-unwrap
         const self: *ServedPeer = @ptrCast(@alignCast(ctx.?));
         const message = jsonrpc.decode(frame, decode_scratch) catch {
             self.state.declined += 1;
@@ -1813,7 +1865,7 @@ const ServedPeer = struct {
         // Another method is not this binding's, so this provider's own
         // dispatcher answers it. A `mcp/message` result here would tell the
         // caller this provider carried a request it never read.
-        //
+
         // `request` borrows the frame or `decode_scratch`, and `answer` is a
         // region of its own, so the id this refusal echoes is still the
         // caller's id after the write. One region would have made the two the
@@ -1857,6 +1909,11 @@ const ServedPeer = struct {
 /// decode region or an answer region, and `envelope` is already decoded by
 /// the time it arrives.
 fn resolve(ctx: ?*anyopaque, envelope: bridge.Envelope, out: []u8) Error!?bridge.Outcome {
+    // The context is the `self` `ServedPeer.handle` passed as `.{ .ctx = self,
+    // .call = resolve }`, and that `self` is the `*ServedPeer` it unwrapped on
+    // the line above from the pointer `ServedTask.run` registered. It cannot
+    // be null on the way in or on the way here.
+    // zwanzig-disable-next-line: optional-unwrap
     const self: *ServedPeer = @ptrCast(@alignCast(ctx.?));
     self.state.resolved += 1;
     if (!self.reentered) {
@@ -1879,7 +1936,7 @@ const ServedTask = struct {
     endpoint: *Endpoint,
     peer: *ServedPeer,
 
-    fn run(self: *@This()) void {
+    fn run(self: *ServedTask) void {
         const stream = self.server.accept(self.io) catch return;
         self.endpoint.open(self.io, self.group, stream, .{
             .ctx = self.peer,
@@ -1907,7 +1964,7 @@ const ServedCaller = struct {
     endpoint: *Endpoint,
     state: *Served,
 
-    fn run(self: *@This()) void {
+    fn run(self: *ServedCaller) void {
         const stream = self.address.connect(self.io) catch |err| {
             self.state.failed = true;
             self.state.reason = err;
@@ -1925,7 +1982,7 @@ const ServedCaller = struct {
         self.endpoint.hangUp(self.io);
     }
 
-    fn exchange(self: *@This()) Error!void {
+    fn exchange(self: *ServedCaller) Error!void {
         const state = self.state;
         const side = &self.endpoint.side;
         const connection = &self.endpoint.connection;
@@ -2040,7 +2097,7 @@ const ServedCaller = struct {
     /// `Client` cannot build: a `mcp/message` with no params at all, and a
     /// params object that is not an envelope.
     fn carry(
-        self: *@This(),
+        self: *ServedCaller,
         server_id: []const u8,
         request_id: []const u8,
         inner_method: []const u8,
@@ -2072,7 +2129,7 @@ const Caller = struct {
     endpoint: *Endpoint,
     state: *State,
 
-    fn run(self: *@This()) void {
+    fn run(self: *Caller) void {
         const stream = self.address.connect(self.io) catch {
             self.state.failed = true;
             return;
@@ -2081,6 +2138,11 @@ const Caller = struct {
             self.state.failed = true;
             return;
         };
+        // The failure is not lost: it becomes this exchange's own, and
+        // `try testing.expect(!state.failed)` below reads that flag. `State`
+        // keeps no field for the error itself, so the flag is all there is to
+        // keep, and this arm is what puts it on that field at all.
+        // zwanzig-disable-next-line: swallowed-error
         self.exchange() catch {
             self.state.failed = true;
         };
@@ -2089,7 +2151,7 @@ const Caller = struct {
         self.endpoint.hangUp(self.io);
     }
 
-    fn exchange(self: *@This()) Error!void {
+    fn exchange(self: *Caller) Error!void {
         const side = &self.endpoint.side;
         var client = Client.init(&self.endpoint.connection);
 
@@ -2161,6 +2223,11 @@ const Caller = struct {
                 refusal.answer,
                 &side.out,
                 &side.envelope,
+                // The refusal is what this test asserts: the error and the
+                // client's own record of it are written into
+                // `state.refusals[index]`, which the assertions below read by
+                // index and by code. Catching it here is what puts them there.
+                // zwanzig-disable-next-line: swallowed-error
             ) catch |err| {
                 self.state.refusals[index] = .{
                     .returned = err,
@@ -2197,48 +2264,68 @@ const Caller = struct {
 /// The buffers one side needs, all caller-owned, so the test cannot hide an
 /// allocation behind the binding.
 const Side = struct {
+    // SAFETY: `Conn.init` hands it to `framing.Framer.init`, which writes a frame in before parsing one out.
     frame_buffer: [4096]u8 = undefined,
+    // SAFETY: `Conn.init` runs `slot.* = .{}` over the whole table before it returns the connection.
     pending: [4]conn.Slot = undefined,
+    // SAFETY: `jsonrpc.decode` writes each escaped token in before the message borrows one back out.
     decode_scratch: [1024]u8 = undefined,
     /// Where a handler composes the frame it returns, and its own region: the
     /// connection hands it over per call and overwrites it for the next one.
     /// Separate from `decode_scratch` because a handler decodes into one and
     /// writes into the other, and `init` refuses a pair that shares a byte.
+    // SAFETY: `conn.respond` builds the envelope here and returns `writer.written()`, never reading first.
     answer: [2048]u8 = undefined,
     /// The envelope `call` builds, the bytes it puts on the wire, and the
     /// answer it reads back.
+    // SAFETY: `bridge.encodeEnvelope` writes it here and `writer.written()` slices only what it wrote.
     envelope: [1024]u8 = undefined,
+    // SAFETY: `Conn.call` encodes the request frame into it before the writer writes it to the wire.
     out: [1024]u8 = undefined,
+    // SAFETY: `Conn.call` decodes the answer into it and `classifyOutcome` reads the slice it wrote.
     result: [1024]u8 = undefined,
+    // SAFETY: `classifyOutcome` unescapes the outcome here before it reads a member of it.
     outcome_scratch: [1024]u8 = undefined,
     /// The second call gets its own answer buffers. An outcome borrows the
     /// body it was read from, so one shared result buffer would leave the
     /// first answer pointing at bytes the second call overwrote.
+    // SAFETY: `Conn.call` decodes the answer into it and `classifyOutcome` reads the slice it wrote.
     second_result: [1024]u8 = undefined,
+    // SAFETY: `classifyOutcome` unescapes the outcome here before it reads a member of it.
     second_outcome_scratch: [1024]u8 = undefined,
     /// The two refusals and the call after them keep their own buffers for the
     /// same reason: the test reads what each of them brought back after the
     /// join.
+    // SAFETY: `Conn.call` decodes the answer into it and `classifyOutcome` reads the slice it wrote.
     third_result: [1024]u8 = undefined,
+    // SAFETY: `Conn.call` decodes the answer into it and `classifyOutcome` reads the slice it wrote.
     fourth_result: [1024]u8 = undefined,
+    // SAFETY: `Conn.call` decodes the answer into it and `classifyOutcome` reads the slice it wrote.
     fifth_result: [1024]u8 = undefined,
     /// A third outcome scratch, because an outcome borrows the body it was
     /// read from and the provider exchange keeps three of them alive across
     /// the join.
+    // SAFETY: `classifyOutcome` unescapes the outcome here before it reads a member of it.
     third_outcome_scratch: [1024]u8 = undefined,
 };
 
 /// One end of the connection: the buffers, and the connection over them.
 const Endpoint = struct {
     side: Side = .{},
+    // SAFETY: `open` passes it to `Stream.Reader.init`, which refills it before every read it serves.
     reader_buffer: [4096]u8 = undefined,
+    // SAFETY: `open` passes it to `Stream.Writer.init`, which refills it before every write it serves.
     writer_buffer: [4096]u8 = undefined,
     /// Held here rather than as locals in `open`: the connection keeps raw
     /// pointers to both interfaces, and a local would dangle the moment `open`
     /// returned.
+    // SAFETY: `open` assigns it before it lends `reader.interface` to `Conn.init`.
     reader: Io.net.Stream.Reader = undefined,
+    // SAFETY: `open` assigns it before it lends `writer.interface` to `Conn.init`.
     writer: Io.net.Stream.Writer = undefined,
+    // SAFETY: `open` assigns it before the pump and `hangUp` that read the descriptor.
     stream: Io.net.Stream = undefined,
+    // SAFETY: `open` assigns it before it sets `pumping`, and only a pumping endpoint reads it.
     connection: conn.Conn = undefined,
     /// Set once this side's descriptor is closed, whichever path reaches
     /// `release` first, so neither closes it twice.
@@ -2266,7 +2353,7 @@ const Endpoint = struct {
         group: *Io.Group,
         stream: Io.net.Stream,
         handler: ?conn.Handler,
-    ) conn.Error!void {
+    ) (conn.Error || Io.ConcurrentError)!void {
         self.stream = stream;
         self.reader = Io.net.Stream.Reader.init(stream, io, &self.reader_buffer);
         self.writer = Io.net.Stream.Writer.init(stream, io, &self.writer_buffer);
@@ -2280,13 +2367,14 @@ const Endpoint = struct {
             return err;
         };
         if (handler) |h| self.connection.setHandler(h);
-        // Spawned on the group the test joins, because `Io.Group.async` does
-        // not promise to run its task until the group is awaited or cancelled.
-        // Set before the spawn and not before the connection: an `init` that
-        // refused has already released the descriptor above, and no pump will
-        // run for it.
+        // A blocking reader needs concurrency; `async` may run it inline.
+        // Publish ownership before spawning, but give it back on refusal.
         self.pumping = true;
-        group.async(io, Endpoint.pump, .{self});
+        group.concurrent(io, Endpoint.pump, .{self}) catch |err| {
+            self.pumping = false;
+            self.hangUp(io);
+            return err;
+        };
     }
 
     /// Hang up: stop the reader, wake it, and let the descriptor go once.
@@ -2317,6 +2405,14 @@ const Endpoint = struct {
         if (self.released) return;
         if (self.pumping) {
             self.connection.close();
+            // Best effort, and nothing is lost by it: the reader has already
+            // been told to stop, the pump closes the descriptor on its way
+            // out, and a `shutdown` here has nothing left to interrupt. There
+            // is also nowhere to report a failure to, because this call is
+            // already returning and `close` below is not reachable from here.
+            // gate-reviewed-zlint-next-statement: suppressed-errors
+            // ziglint-ignore: Z026
+            // zwanzig-disable-next-line: empty-catch-engine
             self.stream.shutdown(io, .both) catch {};
             return;
         }
@@ -2327,6 +2423,13 @@ const Endpoint = struct {
     fn release(self: *Endpoint, io: Io) void {
         if (self.released) return;
         self.released = true;
+        // Best effort for the same reason as in `hangUp`: the descriptor is
+        // closed on the next line whatever this returns, and the only caller
+        // that reaches here through a pump has already seen the end of the
+        // stream.
+        // gate-reviewed-zlint-next-statement: suppressed-errors
+        // ziglint-ignore: Z026
+        // zwanzig-disable-next-line: empty-catch-engine
         self.stream.shutdown(io, .both) catch {};
         self.stream.close(io);
     }

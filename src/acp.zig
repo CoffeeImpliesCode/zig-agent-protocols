@@ -1387,7 +1387,7 @@ pub fn decodeCapabilityObject(
     @memcpy(paths[0..prefix.len], prefix);
 
     var reader = json.Reader.init(raw);
-    var walk = CapabilityWalk{
+    var walk: CapabilityWalk = .{
         .version = version,
         .side = side,
         .out = out,
@@ -1594,6 +1594,14 @@ pub fn encodeCapabilityObject(
         try writer.string(key);
         try writer.byte(':');
         switch (entry.form) {
+            // `validateCapabilitySet` has already refused the one value this arm
+            // cannot spell — a `.boolean` member with no `value` is
+            // `error.InvalidField`, and it is checked before the first byte is
+            // written — so the unwrap below is that refusal standing next to
+            // the use it protects rather than a second, quieter answer to the
+            // same question. Writing `false` here instead would say a member
+            // the library refuses to encode advertises "unsupported".
+            // zwanzig-disable-next-line: optional-unwrap
             .boolean => try writer.slice(if (entry.value.?) "true" else "false"),
             .presence_object => {
                 open[depth] = index;
@@ -3458,7 +3466,7 @@ test "the elicitation mode table and the typed set are one set" {
     // have been classified as `undefined_tag` at v1 and as `other` at v2 — the
     // exact reading the version rule is about.
     for (elicitation_modes, 0..) |name, index| {
-        const mode = ElicitationMode.fromString(name).?;
+        const mode = ElicitationMode.fromString(name) orelse return error.TestUnexpectedResult;
         try testing.expectEqual(name, mode.string());
         try testing.expectEqual(mode, @as(ElicitationMode, @enumFromInt(index)));
         for ([_]WireVersion{ .stable, .draft }) |version| {
@@ -4332,20 +4340,20 @@ test "a v1 client capability object decodes to known and unknown members" {
     const set = try decodeCapabilityObject(.stable, .client, source, &out, &paths, &scratch);
     try testing.expect(set.present);
 
-    const read = findCapability(set, "fs.readTextFile").?;
+    const read = findCapability(set, "fs.readTextFile") orelse return error.TestUnexpectedResult;
     try testing.expect(read.known);
     try testing.expectEqual(CapabilityForm.boolean, read.form);
     try testing.expectEqual(@as(?bool, true), read.value);
     try testing.expect(read.advertised());
 
-    const write = findCapability(set, "fs.writeTextFile").?;
+    const write = findCapability(set, "fs.writeTextFile") orelse return error.TestUnexpectedResult;
     try testing.expect(write.known);
     try testing.expectEqual(@as(?bool, false), write.value);
     // A `false` boolean is the v1 spelling of "unsupported": the member is on
     // the wire and it still advertises nothing.
     try testing.expect(!write.advertised());
 
-    const mode = findCapability(set, "elicitation.form").?;
+    const mode = findCapability(set, "elicitation.form") orelse return error.TestUnexpectedResult;
     try testing.expect(mode.known);
     try testing.expectEqual(CapabilityForm.presence_object, mode.form);
     try testing.expectEqual(@as(?bool, null), mode.value);
@@ -4356,7 +4364,7 @@ test "a v1 client capability object decodes to known and unknown members" {
 
     // v1 has no closed capability set, so an extension is carried with the
     // known flag off rather than refused.
-    const vendor = findCapability(set, "vendor.custom").?;
+    const vendor = findCapability(set, "vendor.custom") orelse return error.TestUnexpectedResult;
     try testing.expect(!vendor.known);
     try testing.expect(vendor.advertised());
 }
@@ -4411,7 +4419,7 @@ test "a v2 capability object is spelled from the capabilities root" {
         "\"additionalDirectories\":{}},\"auth\":{}}";
     const set = try decodeCapabilityObject(.draft, .agent, source, &out, &paths, &scratch);
 
-    const image = findCapability(set, "capabilities.session.prompt.image").?;
+    const image = findCapability(set, "capabilities.session.prompt.image") orelse return error.TestUnexpectedResult;
     try testing.expect(image.known);
     try testing.expectEqual(CapabilityForm.presence_object, image.form);
     try testing.expect(image.advertised());
@@ -4452,7 +4460,7 @@ test "a decoded v1 agent set answers isMethodSupported" {
     try testing.expect(findCapability(set, "sessionCapabilities.delete") == null);
     // A `false` boolean is still a known capability: the library knows the gate
     // and knows the peer advertised it as unsupported.
-    const http = findCapability(set, "mcpCapabilities.http").?;
+    const http = findCapability(set, "mcpCapabilities.http") orelse return error.TestUnexpectedResult;
     try testing.expect(http.known);
     try testing.expect(!http.advertised());
 
@@ -4853,7 +4861,7 @@ test "a capability the decoder let through is written for the side that let it" 
     // and `decode(encode(x)) == x` fails on the decoder's own output.
     const source = "{\"promptCapabilities\":{\"image\":{}}}";
     const set = try decodeCapabilityObject(.stable, .client, source, &out, &paths, &scratch);
-    const entry = findCapability(set, "promptCapabilities.image").?;
+    const entry = findCapability(set, "promptCapabilities.image") orelse return error.TestUnexpectedResult;
     try testing.expect(!entry.known);
     try testing.expectEqual(CapabilityForm.presence_object, entry.form);
 
