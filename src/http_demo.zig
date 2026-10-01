@@ -7,11 +7,12 @@
 //! in one `Accept` and the server takes the choice per request, so both
 //! shapes run here against a real server, over a real loopback socket.
 //!
-//! The headers are the ones `2026-07-28` requires, and the two it removed are
-//! absent: `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, the derived
-//! `Mcp-Param-{Name}`, and the two-type `Accept`. `Mcp-Session-Id` and
+//! The headers are the ones `2026-07-28` requires: `MCP-Protocol-Version`,
+//! `Mcp-Method`, `Mcp-Name`, the derived `Mcp-Param-{Name}`, and the two-type
+//! `Accept`. The two it removed are absent: `Mcp-Session-Id` and
 //! `Last-Event-ID` are gone at this revision, so neither is sent and the
-//! answer mints no session to put one in.
+//! answer mints no session to put one in. `showRequest` prints the request as
+//! the transport built it, so the required set is on this run's own output.
 //!
 //! Every buffer below belongs to the caller, on both sides, so the example
 //! doubles as a check that the transport is usable without an allocator. The
@@ -61,14 +62,24 @@ const argument = "hello";
 /// The body of the `tools/call` POST. `params.name` is the value `Mcp-Name`
 /// must agree with, and the id is the only thing the answer can be matched
 /// by.
+///
+/// The `_meta` member declares the revision on every request, as PROTOCOLS.md
+/// 4.3 records it, so it is a part of a conforming client POST rather than
+/// something this example could leave out. It is the same revision the
+/// `MCP-Protocol-Version` header carries, and a server that reads the claim at
+/// one of the two and not the other is exactly what `http.Server` refuses.
 const tools_call_body =
     "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
-    "\"params\":{\"name\":\"echo\",\"arguments\":{\"text\":\"" ++ argument ++ "\"}}}";
+    "\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":" ++
+    "\"2026-07-28\"},\"name\":\"echo\",\"arguments\":{\"text\":\"" ++ argument ++ "\"}}}";
 
 /// The `subscriptions/listen` POST: one long-lived stream, and no name,
 /// because section 4.2 requires `Mcp-Name` for three methods and this is not
-/// one of them.
-const listen_body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"subscriptions/listen\"}";
+/// one of them. The `_meta` is the same per-request revision declaration
+/// `tools_call_body` carries, and it is required on this one too: a POST
+/// carrying a notification is exempt, and this carries a request.
+const listen_body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"subscriptions/listen\"," ++
+    "\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}}}";
 
 /// The notifications the stream carries after its result. Each is one
 /// server-to-client method of the `subscriptions/listen` reply, and the

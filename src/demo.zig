@@ -137,7 +137,16 @@ fn decodeAnMrtrResult(out: *std.Io.Writer) !void {
         \\,"requestState":"eyJzdWIiOiJ1MSJ9"}
     ;
     var scratch: [256]u8 = undefined;
-    const result = try mcp.decodeInputRequiredResult(raw, &scratch);
+    // The store is measured from the message rather than guessed at, on the
+    // rule a caller has to apply: the shortest member this shape does not
+    // model is `"a":0`, five bytes, and every one but the last spends a comma
+    // on its separator, so a document of `raw.len` bytes can hold at most
+    // `(raw.len + 1) / 6` of them. This message names all three members the
+    // shape models, so the store is empty for this one; it is sized for a
+    // vendor member arriving, because `Result` declares an index signature and
+    // a client answers this result with the body it re-encoded.
+    var verbatim: [((raw.len + 1) / 6)]mcp.VerbatimMember = undefined;
+    const result = try mcp.decodeInputRequiredResult(raw, &verbatim, &scratch);
     try out.print("  resultType   {s}\n", .{result.result_type.value.?});
     try out.print("  requests     present={}\n", .{result.input_requests != null});
     try out.print("  requestState {s}  (carried, not parsed)\n", .{result.request_state.?});
@@ -338,12 +347,31 @@ fn showALookup(out: *std.Io.Writer, comptime T: type, comptime name: []const u8)
 fn separateBridgeErrors(out: *std.Io.Writer) !void {
     try heading(out, "mcp-over-acp: an inner MCP error is a successful outer response");
     var scratch: [256]u8 = undefined;
+    var outcome_scratch: [256]u8 = undefined;
 
-    // A successful outer response carrying an inner MCP error object.
+    // The whole outer response, because PROTOCOLS.md section 7's claim is
+    // about the outer half and not about the member inside it. The frame is
+    // composed to the shape that section describes: a successful outer
+    // response carrying exactly one inner MCP outcome, in its `result` member.
+    // `jsonrpc.decode` reads the outer half and `bridge.decodeOutcome` reads
+    // the inner one out of the result member it decoded, so the line below is
+    // two observations rather than a printed word and a silent assumption. The
+    // two scratch regions are separate because the outer message's borrows
+    // are still live while the outcome is being read out of one of them.
+    const outer =
+        \\{"jsonrpc":"2.0","id":1,"result":{"error":{"code":-32602,"message":"unknown tool"}}}
+    ;
+    const message = try jsonrpc.decode(outer, &scratch);
     const inner = try bridge.decodeOutcome(
-        \\{"error":{"code":-32602,"message":"unknown tool"}}
-    , &scratch);
-    try out.print("  outer: success, inner: {s}\n", .{
+        message.result orelse return error.MissingField,
+        &outcome_scratch,
+    );
+    try out.print("  outer response  {s}\n", .{outer});
+    try out.print("  outer: {s}, inner: {s}\n", .{
+        // A response with no `error` member is a success, and that is decided
+        // on the outer message, before anything looks at what the result
+        // member happens to hold.
+        if (message.kind == .response and message.rpc_error == null) "success" else "error",
         if (inner == .@"error") "MCP error" else "MCP result",
     });
 
