@@ -18,6 +18,14 @@
 //!   from here. A notification sent as a request leaves the caller waiting for
 //!   an answer no conforming peer will send, and `mcp.lookupMethod` resolves
 //!   one as readily as a request, so the pin alone does not refuse it.
+//! - A notification goes out through [`Client.notify`], the same check read
+//!   the other way round. PROTOCOLS.md 4.4 lists eight notifications and
+//!   marks seven of them server-to-client, so a client may send one of them
+//!   at `2026-07-28` and two at `2025-11-25`, the revision whose
+//!   `notifications/initialized` is a method. The gate names the two
+//!   directions a client may send rather than the one it may not: the
+//!   complement of a pair is a pair, and taking it from the wrong end admits
+//!   `notifications/progress` and the six notifications beside it.
 //! - At the current revision every request carries the client capabilities in
 //!   `_meta`, because there is no `initialize` to carry them in. A `params`
 //!   that carries `_meta` of its own is merged with it rather than written
@@ -37,11 +45,23 @@
 //! [`Server.methodNotFound`] instead of a guess. What the client sends, the
 //! server reads, so [`Server.observe`] returns the method and the capabilities
 //! one request carried from a single decode. What the server sends, the
-//! server checks, so [`Server.checkResult`] refuses a result that leaves out a
-//! member PROTOCOLS.md 4.6 requires, and [`Server.inputRequired`] refuses an
+//! server checks, so [`checkResult`] refuses a result that leaves out a
+//! member PROTOCOLS.md 4.6 requires, and [`inputRequired`] refuses an
 //! interim result on a method 4.7 does not let answer with one. [`Server.gate`]
 //! refuses the arities the client half does, so a handler is not entered for a
 //! message that expects no answer or for one travelling the other way.
+//!
+//! The server half sends nothing at the top level, and there is no
+//! `Server.notify` for it to send it with. PROTOCOLS.md 4.4 puts
+//! `notifications/progress` and `notifications/message` on the originating
+//! request's response stream, scopes the server's `notifications/cancelled` to
+//! a `subscriptions/listen` teardown, and hands
+//! `notifications/subscriptions/acknowledged` that stream's filter.
+//! [`mcp.Direction`] carries none of that: it says who may send a name, not
+//! where the name travels, and a gate read from it alone lets the first two
+//! out as top-level frames. A second table here would say what `mcp` already
+//! owns, so the half that has to know has no entry point until `mcp` models
+//! where a notification travels.
 //!
 //! ## Allocating
 //!
@@ -81,6 +101,20 @@ pub const Error = error{
     /// a removed name is a method again at the other revision, and a
     /// notification never is.
     NotARequest,
+    /// The method is part of the revision but is not a notification: it is a
+    /// request, or it is a method the other side sends.
+    ///
+    /// The mirror of `NotARequest`, and reported before the wire for the same
+    /// reason. A request sent as a notification reaches the peer as a message
+    /// with no id, which is the whole of what makes one a notification, so
+    /// the handler behind it runs and the peer sends nothing back: the call
+    /// happened, with no result and no error, and nothing the caller can see
+    /// says which of the two it is in.
+    ///
+    /// Distinct from `MethodNotInRevision` because the caller's repair differs:
+    /// a removed name is a notification again at the other revision, and a
+    /// request never is one at any revision.
+    NotANotification,
     /// The `params` a caller passed are not a single JSON object, so `_meta`
     /// cannot be added to them.
     ///
@@ -180,15 +214,41 @@ pub const Client = struct {
         return answer;
     }
 
-    /// Classify a result body without consuming it.
+    /// Send a notification: a method with no id, which expects no answer.
     ///
-    /// A result from a peer on an earlier revision omits `resultType`, and the
-    /// specification requires that to be treated as `complete`.
-    pub fn classify(body: []const u8, scratch: []u8) Error!mcp.ResultType {
-        return mcp.decodeResultType(body, scratch) catch |err| switch (err) {
-            error.BufferTooSmall => error.BufferTooSmall,
-            else => error.NotAResult,
-        };
+    /// Gated the way [`Client.request`] is, read the other way round, and
+    /// refused before the wire rather than as a peer's `-32601`: no revision
+    /// of the method table makes a request a notification or sends a
+    /// server-to-client name from here, so a peer has nothing to add to a
+    /// refusal the caller can make without a round trip.
+    ///
+    /// One name goes out at `2026-07-28` and two at `2025-11-25`. That is
+    /// [`notificationMethod`] deciding it rather than a list written here, and
+    /// the two numbers move when the inventory in [`mcp.notifications`]
+    /// does.
+    ///
+    /// `params` is spliced into the frame verbatim, as it is in
+    /// [`Client.request`] and for the same reason: this layer walks a params
+    /// only when it has to rewrite it, and a notification has nothing to
+    /// rewrite. A params carrying a raw newline is `error.Framing` and leaves
+    /// the connection usable, because those same bytes fail however often
+    /// they are sent. Nothing here checks that it parses — the framer is what
+    /// refuses a body that does not, and the peer's decoder is what reads it.
+    ///
+    /// No `_meta` is added, and there is no buffer to add it into. PROTOCOLS.md
+    /// 4.8 makes the client capabilities a property of a request, and a
+    /// notification is not one, so there is nothing here for the injection
+    /// [`Client.request`] does and no `params_out` for it to do it into. A
+    /// notification that has to carry a `_meta` of its own writes it into
+    /// `params`, and it travels as it was written.
+    pub fn notify(
+        self: *Client,
+        method: []const u8,
+        params: ?[]const u8,
+        out: []u8,
+    ) Error!void {
+        _ = try notificationMethod(self.revision, method);
+        return self.connection.notify(method, params, out);
     }
 
     /// Run one multi-round-trip exchange to completion.
@@ -208,7 +268,7 @@ pub const Client = struct {
     /// by sending one. [`mcp.permitsMrtr`] is the only list of those methods.
     ///
     /// `params_out` does two jobs. `request` builds the `_meta` wrapper into
-    /// it, and [`Client.classify`] then reads the answer with it as its
+    /// it, and [`classifyResult`] then reads the answer with it as its
     /// scratch. That is safe because the wrapper is on the wire by then and the
     /// answer sits in the caller's `result` buffer.
     ///
@@ -228,7 +288,7 @@ pub const Client = struct {
         // An error answer ends the exchange rather than being classified.
         if (first.failed()) return first;
 
-        const kind = try Client.classify(first.body, params_out);
+        const kind = try classifyResult(first.body, params_out);
         if (kind.isComplete()) return first;
         // The value first, then the method. A `resultType` this library does
         // not define is a fault of its own whatever the method sent it, and
@@ -246,7 +306,7 @@ pub const Client = struct {
         // back as the final one. A second `input_required` is not answered here:
         // another round is the caller's to drive, with input this layer has no
         // business inventing.
-        const retried = try Client.classify(retry.body, params_out);
+        const retried = try classifyResult(retry.body, params_out);
         if (retried.isComplete()) return retry;
         // The value first, on this leg as on the first. A `resultType` the
         // revision does not define is a fault of the answer whichever leg it
@@ -267,10 +327,21 @@ pub const Client = struct {
 pub const Server = struct {
     /// The connection this server answers on.
     ///
-    /// Nothing below reads or writes through it. Every builder here returns
+    /// Nothing here reads or writes through it. Every builder below returns
     /// text the caller hands to that connection's handler, because the handler
     /// holds the frame and the scratch. The field is here so a server is one
     /// value with its connection, the way [`Client`] is.
+    ///
+    /// There is no `notify` to go with it, and that is the reason rather than
+    /// an oversight. PROTOCOLS.md 4.4 puts two of the server-to-client
+    /// notifications on the originating request's response stream and scopes
+    /// two more to a `subscriptions/listen`, and [`mcp.Direction`] records
+    /// only who may send a name, not where the name travels. A gate read from
+    /// it alone would put a progress notification on the wire as a message of
+    /// its own, so the half that has to know which is which has no entry point
+    /// until `mcp` carries the distinction. A handler that has one to write
+    /// returns the frame itself, which is what a [`conn.Handler`] already
+    /// answers with.
     connection: *conn.Conn,
     revision: mcp.Revision,
     /// The capabilities object this server advertises in its `server/discover`
@@ -380,96 +451,6 @@ pub const Server = struct {
         return conn.methodNotFound(request, out);
     }
 
-    /// Refuse a result that breaks the rule `info` carries, and accept the rest.
-    ///
-    /// PROTOCOLS.md 4.6 makes `resultType` required on every result and adds
-    /// `ttlMs` and `cacheScope` to one the method table marks cacheable, so a
-    /// handler calls this on the body it built and learns from a return value
-    /// whether the body may be sent, rather than from a review of whether it
-    /// remembered the three members.
-    ///
-    /// `resultType` is required here and absent-tolerant on the reading side,
-    /// which is not an inconsistency: 4.6's "a result from a peer on an
-    /// earlier revision omits `resultType`" is about what this library
-    /// receives, and a body a server built is not that.
-    /// [`Client.classify`] is where such a peer is answered for.
-    /// A value outside the two the revision defines is not refused either: what
-    /// to do with one an extension contributed is the client's decision, and
-    /// this is the sending side.
-    ///
-    /// No session, because the rule does not depend on one. PROTOCOLS.md 4.6
-    /// binds the two caching fields to the method, and [`mcp.lookupMethod`]
-    /// returns the same entry at both revisions for every method it resolves,
-    /// so re-deriving `info` from a session could not change one outcome. A
-    /// caller already holding `info` from [`Server.gate`] passes it on
-    /// unchanged.
-    pub fn checkResult(info: mcp.MethodInfo, result: []const u8, scratch: []u8) Error!void {
-        const kind = mcp.decodeResultType(result, scratch) catch |err| switch (err) {
-            error.BufferTooSmall => return error.BufferTooSmall,
-            else => return error.NotAResult,
-        };
-        // The member is required on a result, so its absence is refused here
-        // even though a peer on an earlier revision may omit one. A body that
-        // is not an object was already reported by the decode above.
-        if (kind.value == null) return error.NotAResult;
-        if (!info.cacheable) return;
-        // `mcp.decodeCacheable` is the one implementation of the caching rule,
-        // and this is where it becomes reachable.
-        _ = mcp.decodeCacheable(result, scratch) catch |err| switch (err) {
-            error.BufferTooSmall => return error.BufferTooSmall,
-            // Both fields are required, so an absent one and a value of the
-            // wrong type are one fault to a server: the body it built is not a
-            // result this method may answer with.
-            else => return error.NotAResult,
-        };
-    }
-
-    /// Write the interim result body for `method`, or refuse the method.
-    ///
-    /// PROTOCOLS.md 4.7 lets `tools/call`, `resources/read` and `prompts/get`
-    /// answer with an interim result, and [`mcp.permitsMrtr`] is that list. A
-    /// server that wants one on any other method is refused here rather than
-    /// on the wire, because a peer has to treat such a result as invalid.
-    ///
-    /// What comes back is the body and not the frame. The caller wraps it with
-    /// [`conn.respond`], so the id the answer echoes is the one the
-    /// connection decoded rather than one written here.
-    ///
-    /// `requests` is spliced as written, because it is a JSON object the
-    /// caller built and keyed by the server-assigned ids. `request_state` is
-    /// a string and not an object, so it is written as a JSON string literal
-    /// with the escapes JSON requires, and what the peer reads back decodes
-    /// to the characters that were passed in. Splicing it would have ended
-    /// the member at the first quote in it and handed the peer a different
-    /// state. It is opaque and attacker controlled besides, and PROTOCOLS.md
-    /// 4.7 requires a server to integrity-protect it wherever it influences
-    /// authorization.
-    ///
-    /// No session, because [`mcp.permitsMrtr`] reads a name and no revision:
-    /// the 4.7 list is the same at both revisions, so a session would have
-    /// nothing to add to the decision.
-    pub fn inputRequired(
-        method: []const u8,
-        requests: []const u8,
-        request_state: []const u8,
-        out: []u8,
-    ) Error![]const u8 {
-        if (!mcp.permitsMrtr(method)) return error.InputRequiredUnexpected;
-        var writer = json.Writer.init(out);
-        // `resultType` first, because PROTOCOLS.md 4.6 puts it on every
-        // result, then the two members 4.7 names beside it in the order the
-        // table lists them. Every write below can fail for want of room and
-        // for no other reason: the writer escapes a string rather than
-        // refusing one.
-        writer.slice("{\"resultType\":\"" ++ mcp.result_type_value.input_required ++
-            "\",\"inputRequests\":") catch return error.BufferTooSmall;
-        writer.slice(requests) catch return error.BufferTooSmall;
-        writer.slice(",\"requestState\":") catch return error.BufferTooSmall;
-        writer.string(request_state) catch return error.BufferTooSmall;
-        writer.byte('}') catch return error.BufferTooSmall;
-        return writer.written();
-    }
-
     /// Write the `server/discover` result body.
     ///
     /// PROTOCOLS.md 4.6 puts `resultType` on every result and adds `ttlMs` and
@@ -481,7 +462,7 @@ pub const Server = struct {
     /// own, and nothing is invented for a caller that has none.
     ///
     /// A session with no caching values is refused rather than handed a body
-    /// [`Server.checkResult`] would refuse. A caller holding a body will send
+    /// [`checkResult`] would refuse. A caller holding a body will send
     /// it, and a body refused on arrival has already travelled; refusing here
     /// leaves no frame to be wrong about.
     ///
@@ -515,6 +496,113 @@ pub const Server = struct {
         return writer.written();
     }
 };
+
+/// Classify a result body without consuming it.
+///
+/// A result from a peer on an earlier revision omits `resultType`, and the
+/// specification requires that to be treated as `complete`.
+///
+/// No session, because a body says nothing about the revision that sent it:
+/// the same reader serves an answer from `2026-07-28` and one from
+/// `2025-11-25`, and the revision is what [`checkResult`] reads on the other
+/// side of the wire. A consumer holding the bytes and no session still has to
+/// be able to ask, and a reader that needed a session to be read would refuse
+/// the very answer PROTOCOLS.md 4.6 tells it to accept.
+pub fn classifyResult(body: []const u8, scratch: []u8) Error!mcp.ResultType {
+    return mcp.decodeResultType(body, scratch) catch |err| switch (err) {
+        error.BufferTooSmall => error.BufferTooSmall,
+        else => error.NotAResult,
+    };
+}
+
+/// Refuse a result that breaks the rule `info` carries, and accept the rest.
+///
+/// PROTOCOLS.md 4.6 makes `resultType` required on every result and adds
+/// `ttlMs` and `cacheScope` to one the method table marks cacheable, so a
+/// handler calls this on the body it built and learns from a return value
+/// whether the body may be sent, rather than from a review of whether it
+/// remembered the three members.
+///
+/// `resultType` is required here and absent-tolerant on the reading side,
+/// which is not an inconsistency: 4.6's "a result from a peer on an earlier
+/// revision omits `resultType`" is about what this library receives, and a
+/// body a server built is not that. [`classifyResult`] is where such a peer
+/// is answered for. A value outside the two the revision defines is not
+/// refused either: what to do with one an extension contributed is the
+/// client's decision, and this is the sending side.
+///
+/// No session, because the rule does not depend on one. PROTOCOLS.md 4.6
+/// binds the two caching fields to the method, and [`mcp.lookupMethod`]
+/// returns the same entry at both revisions for every method it resolves,
+/// so re-deriving `info` from a session could not change one outcome. A
+/// caller already holding `info` from [`Server.gate`] passes it on
+/// unchanged.
+pub fn checkResult(info: mcp.MethodInfo, result: []const u8, scratch: []u8) Error!void {
+    const kind = mcp.decodeResultType(result, scratch) catch |err| switch (err) {
+        error.BufferTooSmall => return error.BufferTooSmall,
+        else => return error.NotAResult,
+    };
+    // The member is required on a result, so its absence is refused here
+    // even though a peer on an earlier revision may omit one. A body that
+    // is not an object was already reported by the decode above.
+    if (kind.value == null) return error.NotAResult;
+    if (!info.cacheable) return;
+    // `mcp.decodeCacheable` is the one implementation of the caching rule,
+    // and this is where it becomes reachable.
+    _ = mcp.decodeCacheable(result, scratch) catch |err| switch (err) {
+        error.BufferTooSmall => return error.BufferTooSmall,
+        // Both fields are required, so an absent one and a value of the
+        // wrong type are one fault to a server: the body it built is not a
+        // result this method may answer with.
+        else => return error.NotAResult,
+    };
+}
+
+/// Write the interim result body for `method`, or refuse the method.
+///
+/// PROTOCOLS.md 4.7 lets `tools/call`, `resources/read` and `prompts/get`
+/// answer with an interim result, and [`mcp.permitsMrtr`] is that list. A
+/// server that wants one on any other method is refused here rather than
+/// on the wire, because a peer has to treat such a result as invalid.
+///
+/// What comes back is the body and not the frame. The caller wraps it with
+/// [`conn.respond`], so the id the answer echoes is the one the
+/// connection decoded rather than one written here.
+///
+/// `requests` is spliced as written, because it is a JSON object the
+/// caller built and keyed by the server-assigned ids. `request_state` is
+/// a string and not an object, so it is written as a JSON string literal
+/// with the escapes JSON requires, and what the peer reads back decodes
+/// to the characters that were passed in. Splicing it would have ended
+/// the member at the first quote in it and handed the peer a different
+/// state. It is opaque and attacker controlled besides, and PROTOCOLS.md
+/// 4.7 requires a server to integrity-protect it wherever it influences
+/// authorization.
+///
+/// No session, because [`mcp.permitsMrtr`] reads a name and no revision:
+/// the 4.7 list is the same at both revisions, so a session would have
+/// nothing to add to the decision.
+pub fn inputRequired(
+    method: []const u8,
+    requests: []const u8,
+    request_state: []const u8,
+    out: []u8,
+) Error![]const u8 {
+    if (!mcp.permitsMrtr(method)) return error.InputRequiredUnexpected;
+    var writer = json.Writer.init(out);
+    // `resultType` first, because PROTOCOLS.md 4.6 puts it on every
+    // result, then the two members 4.7 names beside it in the order the
+    // table lists them. Every write below can fail for want of room and
+    // for no other reason: the writer escapes a string rather than
+    // refusing one.
+    writer.slice("{\"resultType\":\"" ++ mcp.result_type_value.input_required ++
+        "\",\"inputRequests\":") catch return error.BufferTooSmall;
+    writer.slice(requests) catch return error.BufferTooSmall;
+    writer.slice(",\"requestState\":") catch return error.BufferTooSmall;
+    writer.string(request_state) catch return error.BufferTooSmall;
+    writer.byte('}') catch return error.BufferTooSmall;
+    return writer.written();
+}
 
 /// Write a `u64` as decimal digits, with no sign and no separator.
 ///
@@ -570,6 +658,38 @@ fn isNotification(name: []const u8) bool {
         if (removed.notification and std.mem.eql(u8, removed.name, name)) return true;
     }
     return false;
+}
+
+/// The pinned revision's entry for a notification a client may send.
+///
+/// The mirror of [`requestMethod`], and the two are one walk read the other
+/// way round: a name the revision does not have is `MethodNotInRevision`, and
+/// a name it has that is not a notification, or that travels the other way, is
+/// `NotANotification`.
+fn notificationMethod(revision: mcp.Revision, method: []const u8) Error!mcp.MethodInfo {
+    const info = mcp.lookupMethod(revision, method) catch return error.MethodNotInRevision;
+    // The arity, first, and for the reason `requestMethod` gives: the pin
+    // resolves a request as readily as a notification, so nothing but this
+    // tells the two apart.
+    if (!isNotification(method)) return error.NotANotification;
+    // The direction, second, and named as the two a client may send. The gate
+    // that reads it from the other end — refuse `client_to_server` and let the
+    // rest through — is the same two lines with the sides swapped, and it
+    // admits `notifications/progress` and the six notifications beside it.
+    if (sendsFromClient(info.direction)) return info;
+    return error.NotANotification;
+}
+
+/// Whether a client may send a method with this direction.
+///
+/// Every arm written out, so a `Direction` member added later is a compile
+/// error here rather than a direction this decides by falling out of the
+/// switch.
+fn sendsFromClient(direction: mcp.Direction) bool {
+    return switch (direction) {
+        .client_to_server, .bidirectional => true,
+        .server_to_client, .server_to_client_mrtr_only => false,
+    };
 }
 
 /// Add `_meta` to a params object, keeping the caller's members.
@@ -710,6 +830,19 @@ fn readFailure(err: root.DecodeError) root.EncodeError {
 // --- Tests ----------------------------------------------------------------------
 
 const testing = std.testing;
+
+/// Whether `name` is one of `set`, for the lists a test states literally.
+///
+/// The set is written out in the test rather than derived from
+/// [`mcp.notifications`], and this is what compares the two. A set computed
+/// from the same table the gate reads would agree with the gate whatever that
+/// table said, which is the agreement that hides a change.
+fn contains(set: []const []const u8, name: []const u8) bool {
+    for (set) |entry| {
+        if (std.mem.eql(u8, entry, name)) return true;
+    }
+    return false;
+}
 
 test "the current revision wraps params in _meta and keeps the caller's members" {
     var out: [256]u8 = undefined;
@@ -903,24 +1036,66 @@ test "an object holding only whitespace gains no trailing comma" {
 
 test "classify treats an absent resultType as complete, as the spec requires" {
     var scratch: [128]u8 = undefined;
-    const complete = try Client.classify("{\"content\":[]}", &scratch);
+    const complete = try classifyResult("{\"content\":[]}", &scratch);
     try testing.expect(complete.isComplete());
 
-    const interim = try Client.classify("{\"resultType\":\"input_required\"}", &scratch);
+    const interim = try classifyResult("{\"resultType\":\"input_required\"}", &scratch);
     try testing.expect(!interim.isComplete());
     try testing.expectEqual(mcp.KnownResultType.input_required, interim.known().?);
 
     // A value the specification does not define is not guessed at, and not
     // quietly treated as the safe-to-assume case.
-    const unknown = try Client.classify("{\"resultType\":\"weird\"}", &scratch);
+    const unknown = try classifyResult("{\"resultType\":\"weird\"}", &scratch);
     try testing.expect(!unknown.isComplete());
     try testing.expect(unknown.known() == null);
 }
 
 test "a body that is not a result is reported, not classified" {
     var scratch: [128]u8 = undefined;
-    try testing.expectError(error.NotAResult, Client.classify("[1,2]", &scratch));
-    try testing.expectError(error.NotAResult, Client.classify("\"a string\"", &scratch));
+    try testing.expectError(error.NotAResult, classifyResult("[1,2]", &scratch));
+    try testing.expectError(error.NotAResult, classifyResult("\"a string\"", &scratch));
+}
+
+test "the three result rules answer for a body with no session in hand" {
+    // No `Client` and no `Server` is built anywhere in this test, and none of
+    // the three takes one. What a body is does not depend on the session that
+    // put it on the wire, so a consumer holding the bytes and no session has to
+    // be able to ask anyway. Put one of them back inside a struct and this
+    // stops compiling, which is the property rather than a comment about it.
+    var scratch: [256]u8 = undefined;
+    var out: [512]u8 = undefined;
+
+    // The reading side. PROTOCOLS.md 4.6 makes a peer on an earlier revision
+    // omit `resultType`, and an absent one is `complete` rather than a fault.
+    const absent = try classifyResult("{\"content\":[]}", &scratch);
+    try testing.expect(absent.isComplete());
+
+    // The sending side, which is the mirror and not the same rule: `resultType`
+    // is required on a body this library built, and the two caching fields on
+    // one 4.6 marks cacheable.
+    const listing = try mcp.lookupMethod(.current, "tools/list");
+    try testing.expect(listing.cacheable);
+    try checkResult(
+        listing,
+        "{\"resultType\":\"complete\",\"ttlMs\":1,\"cacheScope\":\"public\",\"tools\":[]}",
+        &scratch,
+    );
+    try testing.expectError(error.NotAResult, checkResult(listing, "{\"tools\":[]}", &scratch));
+
+    // The one body PROTOCOLS.md 4.7 defines, on a method that may answer with
+    // it and not on one that may not, read back by the rule above: the two
+    // halves of this file are one exchange rather than two readers that agree
+    // today.
+    try testing.expectError(
+        error.InputRequiredUnexpected,
+        inputRequired("tools/list", "{}", "st", &out),
+    );
+    const interim = try classifyResult(
+        try inputRequired("tools/call", "{}", "st", &out),
+        &scratch,
+    );
+    try testing.expect(!interim.isComplete());
+    try testing.expectEqual(mcp.KnownResultType.input_required, interim.known().?);
 }
 
 test "a method the pinned revision removed never reaches the wire" {
@@ -974,6 +1149,110 @@ test "a notification is never sent as a request, and a request still passes" {
     // A removed method that is a request is a request at the previous revision,
     // so nothing but the pin refuses it there.
     try testing.expectEqualStrings("ping", (try before.gate("ping")).name);
+}
+
+test "a client sends one notification at the current revision and two at the previous" {
+    // The count on its own, and first, because the set below cannot say what
+    // changed if the table does. A ninth name, or an eighth marked the other
+    // way round, is a decision somebody made on purpose, and this number is
+    // where it shows up rather than a set that quietly agrees with it.
+    try testing.expectEqual(@as(usize, 8), mcp.notifications.len);
+    // PROTOCOLS.md 4.4 marks seven of the eight server-to-client and
+    // `notifications/cancelled` the one either side may send. That split is
+    // what makes the counts at the bottom one and two rather than a
+    // coincidence, and the seven are what a gate read from the wrong end of
+    // the pair lets out.
+    var server_to_client: usize = 0;
+    for (mcp.notifications) |notification| {
+        if (notification.direction == .server_to_client) server_to_client += 1;
+    }
+    try testing.expectEqual(@as(usize, 7), server_to_client);
+
+    // The sets, written out rather than derived from the table the gate reads.
+    const at_current = [_][]const u8{"notifications/cancelled"};
+    const at_previous = [_][]const u8{ "notifications/cancelled", "notifications/initialized" };
+
+    // Both connections are `undefined` throughout: a refusal is decided before
+    // anything reaches one, so a gate that let a name through would fault here
+    // rather than pass quietly.
+    var now: Client = .{ .connection = undefined, .revision = .current };
+    var then: Client = .{ .connection = undefined, .revision = .previous };
+    var out: [256]u8 = undefined;
+
+    var accepted_now: usize = 0;
+    var accepted_before: usize = 0;
+    for (mcp.notifications) |notification| {
+        if (contains(&at_current, notification.name)) {
+            accepted_now += 1;
+        } else {
+            try testing.expectError(
+                error.NotANotification,
+                now.notify(notification.name, null, &out),
+            );
+        }
+        if (contains(&at_previous, notification.name)) {
+            accepted_before += 1;
+        } else {
+            try testing.expectError(
+                error.NotANotification,
+                then.notify(notification.name, null, &out),
+            );
+        }
+    }
+    try testing.expectEqual(at_current.len, accepted_now);
+    // The one name the current revision removed is a notification a client does
+    // send at `2025-11-25` and not at `2026-07-28`, and it is not in
+    // `mcp.notifications`, so the loop above never saw it and the count carries
+    // it by hand.
+    try testing.expectEqual(at_previous.len, accepted_before + 1);
+
+    // Named rather than only counted, so the two numbers above are attached to
+    // these and not to whatever the table happens to hold.
+    try testing.expectEqualStrings(
+        "notifications/cancelled",
+        (try notificationMethod(.current, "notifications/cancelled")).name,
+    );
+    try testing.expectEqualStrings(
+        "notifications/initialized",
+        (try notificationMethod(.previous, "notifications/initialized")).name,
+    );
+    try testing.expectError(
+        error.MethodNotInRevision,
+        now.notify("notifications/initialized", null, &out),
+    );
+}
+
+test "notify refuses a request and a notification the direction forbids" {
+    // The two faults behind `NotANotification`, with the revision one beside
+    // them. The connection is `undefined`: a refusal is decided before anything
+    // reaches it, so a gate that let one of these through would fault here.
+    var client: Client = .{ .connection = undefined, .revision = .current };
+    var out: [256]u8 = undefined;
+
+    // A request, which is not a notification at any revision. Sent as one it
+    // reaches the peer with no id, so the handler behind it runs and nothing
+    // comes back: the call happened and nothing the caller can see says it did.
+    try testing.expectError(error.NotANotification, client.notify("tools/call", null, &out));
+    // A name this revision removed, which is a notification the other one still
+    // has. A different fault with a different repair, and a gate that reported
+    // it as an arity would send the caller to look for a method that is there.
+    try testing.expectError(
+        error.MethodNotInRevision,
+        client.notify("notifications/initialized", null, &out),
+    );
+    try testing.expectError(
+        error.MethodNotInRevision,
+        client.notify("notifications/nope", null, &out),
+    );
+    // The one that reads as a bug. `notifications/progress` is a notification
+    // and the table marks it server-to-client, so a gate written as "refuse
+    // `client_to_server`" admits it and the six beside it — and PROTOCOLS.md
+    // 4.4 has this one travel on the originating request's response stream
+    // rather than as a message of its own.
+    try testing.expectError(
+        error.NotANotification,
+        client.notify("notifications/progress", null, &out),
+    );
 }
 
 test "a request whose params are not an object never reaches the wire" {
@@ -1069,25 +1348,38 @@ test "the two halves refuse the same name on both sides of a removal" {
     try testing.expectError(error.MethodNotInRevision, before.gate("tools/nope"));
 }
 
-test "the three methods that live only inside inputRequests pass no gate" {
+test "the three methods that live only inside inputRequests pass no gate now" {
     // PROTOCOLS.md 4.4 removes `elicitation/create`, `sampling/createMessage`
     // and `roots/list` as top-level requests and keeps their types inside
-    // `InputRequiredResult.inputRequests`. `mcp.lookupMethod` models none of
-    // them at any revision, so no pin decides this: the position does.
+    // `InputRequiredResult.inputRequests`. What decides a top-level name is
+    // the position and the revision together: at `2026-07-28` none of the
+    // three resolves as one, and at `2025-11-25` each was the
+    // client-to-server request that revision's own document defines, so
+    // `mcp.previous_top_level_requests` carries them and a session pinned
+    // there answers them as it answers any other request.
     const only_inside = [_][]const u8{
         "elicitation/create",
         "roots/list",
         "sampling/createMessage",
     };
-    for ([_]mcp.Revision{ .current, .previous }) |revision| {
-        const server: Server = .{ .connection = undefined, .revision = revision };
-        for (only_inside) |name| {
-            try testing.expectError(error.MethodNotInRevision, server.gate(name));
-            // `mcp.lookupInputRequest` is where they went, and the only entry
-            // point that finds them at all. The refusal is about the position
-            // a name was found in and not about the name.
-            try testing.expectEqualStrings(name, (try mcp.lookupInputRequest(name)).name);
-        }
+    const now: Server = .{ .connection = undefined, .revision = .current };
+    const before: Server = .{ .connection = undefined, .revision = .previous };
+    for (only_inside) |name| {
+        try testing.expectError(error.MethodNotInRevision, now.gate(name));
+        // `mcp.lookupInputRequest` is where they live inside a result, and it
+        // finds them at every revision: being a value an interim result
+        // carries and being a top-level name are two positions, and 4.4
+        // removed the second without touching the first.
+        try testing.expectEqualStrings(name, (try mcp.lookupInputRequest(name)).name);
+
+        // The previous revision, where the top-level name is a request again
+        // and neither half refuses it. The direction is the point: what was
+        // removed is the position, and the side that sent it is the client's.
+        const found = try before.gate(name);
+        try testing.expectEqualStrings(name, found.name);
+        try testing.expectEqual(mcp.Direction.client_to_server, found.direction);
+        try testing.expect(!found.present_at_current);
+        try testing.expect(found.deprecated);
     }
 }
 
@@ -1172,7 +1464,7 @@ test "a result missing a required field is refused by the call" {
 
     const listing = try server.gate("tools/list");
     try testing.expect(listing.cacheable);
-    try Server.checkResult(
+    try checkResult(
         listing,
         "{\"resultType\":\"complete\",\"ttlMs\":1000,\"cacheScope\":\"private\",\"tools\":[]}",
         &scratch,
@@ -1184,11 +1476,11 @@ test "a result missing a required field is refused by the call" {
     // The caching pair alone is not a result 4.6 describes.
     try testing.expectError(
         error.NotAResult,
-        Server.checkResult(listing, "{\"tools\":[]}", &scratch),
+        checkResult(listing, "{\"tools\":[]}", &scratch),
     );
     try testing.expectError(
         error.NotAResult,
-        Server.checkResult(
+        checkResult(
             listing,
             "{\"ttlMs\":1000,\"cacheScope\":\"private\",\"tools\":[]}",
             &scratch,
@@ -1196,38 +1488,38 @@ test "a result missing a required field is refused by the call" {
     );
     try testing.expectError(
         error.NotAResult,
-        Server.checkResult(listing, "{\"resultType\":\"complete\",\"tools\":[]}", &scratch),
+        checkResult(listing, "{\"resultType\":\"complete\",\"tools\":[]}", &scratch),
     );
     try testing.expectError(
         error.NotAResult,
-        Server.checkResult(listing, "{\"tools\":[],\"ttlMs\":1000}", &scratch),
+        checkResult(listing, "{\"tools\":[],\"ttlMs\":1000}", &scratch),
     );
     try testing.expectError(
         error.NotAResult,
-        Server.checkResult(listing, "{\"tools\":[],\"cacheScope\":\"private\"}", &scratch),
+        checkResult(listing, "{\"tools\":[],\"cacheScope\":\"private\"}", &scratch),
     );
     // A body that is not an object never was a result, whatever it carries,
     // and neither was one whose `resultType` is not a string.
-    try testing.expectError(error.NotAResult, Server.checkResult(listing, "[1,2]", &scratch));
+    try testing.expectError(error.NotAResult, checkResult(listing, "[1,2]", &scratch));
     try testing.expectError(
         error.NotAResult,
-        Server.checkResult(listing, "{\"resultType\":5,\"ttlMs\":1,\"cacheScope\":\"public\"}", &scratch),
+        checkResult(listing, "{\"resultType\":5,\"ttlMs\":1,\"cacheScope\":\"public\"}", &scratch),
     );
 
     // A method whose result carries no caching hints is not read for the two:
     // that rule does not apply to it, and reading it would refuse a result the
     // specification allows. `resultType` is required either way, because 4.6
     // makes it a property of results rather than of the method. The read side
-    // is where an absent one is tolerated, and `Client.classify` is that side
+    // is where an absent one is tolerated, and `classifyResult` is that side
     // — a peer on an earlier revision omits it and the client treats it as
     // `complete`, while a body this server built may not leave it out.
     const call = try server.gate("tools/call");
     try testing.expect(!call.cacheable);
-    try Server.checkResult(call, "{\"resultType\":\"complete\",\"content\":[]}", &scratch);
-    try Server.checkResult(call, "{\"resultType\":\"complete\"}", &scratch);
+    try checkResult(call, "{\"resultType\":\"complete\",\"content\":[]}", &scratch);
+    try checkResult(call, "{\"resultType\":\"complete\"}", &scratch);
     try testing.expectError(
         error.NotAResult,
-        Server.checkResult(call, "{\"content\":[]}", &scratch),
+        checkResult(call, "{\"content\":[]}", &scratch),
     );
 }
 
@@ -1240,10 +1532,10 @@ test "an interim result is written only for a method PROTOCOLS.md 4.7 allows" {
     // body is written.
     try testing.expectError(
         error.InputRequiredUnexpected,
-        Server.inputRequired("tools/list", requests, "st", &out),
+        inputRequired("tools/list", requests, "st", &out),
     );
 
-    const body = try Server.inputRequired("tools/call", requests, "st", &out);
+    const body = try inputRequired("tools/call", requests, "st", &out);
     try testing.expectEqualStrings(
         "{\"resultType\":\"input_required\"," ++
             "\"inputRequests\":{\"e1\":{\"method\":\"elicitation/create\"}}," ++
@@ -1260,7 +1552,7 @@ test "an interim result is written only for a method PROTOCOLS.md 4.7 allows" {
     var tiny: [8]u8 = undefined;
     try testing.expectError(
         error.BufferTooSmall,
-        Server.inputRequired("prompts/get", requests, "st", &tiny),
+        inputRequired("prompts/get", requests, "st", &tiny),
     );
 
     // A state carrying a quote and a backslash round-trips to the same
@@ -1270,7 +1562,7 @@ test "an interim result is written only for a method PROTOCOLS.md 4.7 allows" {
     const awkward_state = "a\"b\\c";
     var escaped: [512]u8 = undefined;
     const read_back = try mcp.decodeInputRequiredResult(
-        try Server.inputRequired("resources/read", requests, awkward_state, &escaped),
+        try inputRequired("resources/read", requests, awkward_state, &escaped),
         &scratch,
     );
     try testing.expectEqualStrings(awkward_state, read_back.request_state.?);
@@ -1283,7 +1575,7 @@ test "an interim result is written only for a method PROTOCOLS.md 4.7 allows" {
     var short_out: [120]u8 = undefined;
     try testing.expectError(
         error.BufferTooSmall,
-        Server.inputRequired("prompts/get", requests, long_state, &short_out),
+        inputRequired("prompts/get", requests, long_state, &short_out),
     );
 }
 
@@ -1309,7 +1601,7 @@ test "the discover body carries every member 4.4 and 4.6 name, in that order" {
     var scratch: [256]u8 = undefined;
     const info = try server.gate("server/discover");
     try testing.expect(info.cacheable);
-    try Server.checkResult(info, try server.discoverBody("be careful", &out), &scratch);
+    try checkResult(info, try server.discoverBody("be careful", &out), &scratch);
 
     // The body is an object a reader walks, and `instructions` is the string
     // the caller passed rather than its own escaping of something else.
@@ -1511,6 +1803,17 @@ const Exchange = struct {
     meta_on_wire: bool = false,
     members_kept: bool = false,
 
+    /// How many notifications the peer saw. A notification carries no id, so
+    /// nothing answers it and no return value reaches the client: the peer's
+    /// own count is the only evidence the frame left at all.
+    notified: usize = 0,
+    /// The method and params it read off that notification, copied because the
+    /// next frame is decoded over the region they were read into.
+    notified_method: [64]u8 = undefined,
+    notified_method_len: usize = 0,
+    notified_params: [128]u8 = undefined,
+    notified_params_len: usize = 0,
+
     /// The name the peer unescaped into the region it decodes into, copied
     /// because the next frame is decoded over it long before the test reads it.
     prompt_name: [32]u8 = undefined,
@@ -1568,7 +1871,25 @@ fn scriptedHandler(
     // answer that comes back is wrong rather than missing. Both regions are the
     // connection's, neither is a local, and the answer stays readable for the
     // write the connection does next.
-    const request = jsonrpc.decodeRequest(frame, decode_scratch) catch return null;
+    const request = jsonrpc.decodeRequest(frame, decode_scratch) catch {
+        // A notification is not a `Request`: JSON-RPC gives it a method and no
+        // id, and the id is what that projection keeps. Looked for here, after
+        // the refusal rather than before it, so the request path decodes
+        // exactly as it did. It has to be looked for at all, because a
+        // notification is the one frame of this exchange nothing answers and
+        // the count below is the only record of it.
+        const message = jsonrpc.decode(frame, decode_scratch) catch return null;
+        if (message.kind != .notification) return null;
+        const sent_method = message.method orelse return null;
+        const params = switch (message.params) {
+            .value => |text| text,
+            else => "",
+        };
+        exchange.notified += 1;
+        keepBody(&exchange.notified_method, &exchange.notified_method_len, sent_method.text);
+        keepBody(&exchange.notified_params, &exchange.notified_params_len, params);
+        return null;
+    };
     const method = request.method;
 
     if (std.mem.eql(u8, method.text, "resources/read")) {
@@ -1722,6 +2043,18 @@ const Calling = struct {
         // the peer checks on the wire.
         var session = Client.init(&self.endpoint.connection, .current);
         session.capabilities = "{\"tools\":{}}";
+
+        // A notification, and the one frame of this exchange that nothing
+        // answers. It goes out before the first call because the peer reads
+        // frames in the order they were written and dispatches each on its
+        // reader task, so the answer to the `resources/read` below is written
+        // only after this has been counted. The count is read long after that
+        // answer, which is what makes it true here without a sleep.
+        session.notify("notifications/cancelled", "{\"requestId\":0}", &side.out) catch {
+            self.exchange.failed = true;
+            self.endpoint.hangUp(self.io);
+            return;
+        };
 
         // A peer error, read once. The code beside the body is the only thing
         // that tells the caller this call failed.
@@ -1963,6 +2296,21 @@ test "a peer error is a failure and an interim result is never the final one" {
     // members beside them.
     try testing.expect(exchange.meta_on_wire);
     try testing.expect(exchange.members_kept);
+
+    // The notification reached the peer as a message with no id, which is the
+    // whole of what makes one a notification: the handler saw it through
+    // `jsonrpc.decode`'s own classification, had no id to answer on, and
+    // returned nothing. Its params are the caller's own bytes, spliced the way
+    // `Client.request` splices a params it has no `_meta` to add to.
+    try testing.expectEqual(@as(usize, 1), exchange.notified);
+    try testing.expectEqualStrings(
+        "notifications/cancelled",
+        exchange.notified_method[0..exchange.notified_method_len],
+    );
+    try testing.expectEqualStrings(
+        "{\"requestId\":0}",
+        exchange.notified_params[0..exchange.notified_params_len],
+    );
 
     // The peer read a name back out of the region it decodes into, after it
     // had written its answer into the other one. Handed a single region, the
