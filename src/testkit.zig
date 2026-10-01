@@ -99,13 +99,18 @@
 //!   battery is not coverage: a decoder that accepts nothing has a
 //!   trailing-byte assertion that never fires and a round trip that never
 //!   runs, and both are green. [`battery_codec_names`] lists every codec the
-//!   battery hands something to, not only the ones this wave added, and
+//!   battery hands something to, not only the ones a wave added, and
 //!   [`expectEveryBatteryCodecReached`] fails a run that fed one of them
 //!   nothing it takes, so "the corpus reaches it" is something the harness
-//!   proves rather than something this file claims. A decoder that cannot be
-//!   reached that way is named in [`tail_rule.unasserted`] with the reason it
-//!   is there instead of being left out quietly, and that list is the complete
-//!   one: a field naming two of twenty-nine was worse than no field at all.
+//!   proves rather than something this file claims. Every public decoder in the
+//!   tree is now in that table and [`tail_rule.unasserted`] is empty, which is
+//!   a statement about measurement rather than about intention: the list held
+//!   twenty-nine rows once and then two of them, and a reader who trusted it
+//!   believed twenty-seven decoders lacked coverage while twenty-seven were
+//!   missing from the statement entirely. Feeding them needed two things each —
+//!   a call site and the caller-owned storage it writes into — and both are
+//!   written down here: the storage and the arithmetic that bounds it in
+//!   [`Storage`], and the calls in [`exerciseEveryDecoder`].
 //! - **A name the current revision removed still resolves at the previous
 //!   one.** `mcp.lookupMethod` takes the revision, and the three `2026-07-28`
 //!   removed were ordinary client-to-server requests at `2025-11-25`. The
@@ -166,6 +171,276 @@ const max_doc_len = 512;
 /// members `jsonrpc.encode` writes between them, so a `BufferTooSmall` here is
 /// a harness bug rather than a tight buffer.
 const encode_buf_len = 2 * max_doc_len + 256;
+
+// --- The storage the arena-taking decoders write into -------------------------
+//
+// Nineteen decoders take a caller-owned array rather than a `scratch` alone:
+// the eleven content-half `a2a` codecs take a `ContentArena`, the eight
+// discovery-half ones a `CardArena`, and the six typed `mcp` results take an
+// out-array and a `VerbatimStore`. Sizing them is the whole of the decision,
+// and it has one failure mode at each end:
+//
+// - Too small, and every document is refused. The refusal arrives before the
+//   decoder reaches the rule it is supposed to be checked against, so the
+//   trailing-byte assertion never fires, the round trip never runs, and the
+//   run is green while checking nothing. `expectEveryBatteryCodecReached` is
+//   what makes that loud, and it is the reason a bound below is worth
+//   deriving rather than guessing.
+// - Too large, and nothing at all is proven about the bound: every document
+//   decodes whether or not the caller sized its storage correctly, which is
+//   the question `BufferTooSmall` exists to answer.
+//
+// So every array below is sized from what the document itself implies. The
+// one fact every bound rests on is [`max_doc_len`]: `Doc.push` and
+// `Doc.pushByte` saturate rather than grow, so no document the corpus builds
+// is longer than that, whatever shape produced it and however much a mutation
+// appended.
+
+/// How many elements of a `repeated` member a corpus document can carry.
+///
+/// `min_element_bytes` is a lower bound on the length of one element: the
+/// shortest JSON the element can legally be, counted with its member names and
+/// not just its values. Every element but the last spends a comma, so `n`
+/// elements cost at least `min_element_bytes * n + (n - 1)` bytes of the
+/// enclosing array, and a document of at most `max_doc_len` bytes cannot hold
+/// more than this many.
+///
+/// The commas are why this is not simply `max_doc_len / min_element_bytes`:
+/// without them the number would overstate the count by about half, which for
+/// a small minimum is the difference between a bound and a guess. The value
+/// passed in is always at or below the true minimum rather than above it, so
+/// the error is in the safe direction — and where a rule cannot tell, the
+/// shortest spelling a decoder *refuses* is used, which only makes the
+/// resulting bound larger.
+fn repeatedCapacity(min_element_bytes: usize) usize {
+    return (max_doc_len + 1) / (min_element_bytes + 1);
+}
+
+// The content half. Each comment names the shortest element its array can
+// hold, and the value beside it is that length or less.
+
+/// `{"url":""}` is nine bytes, and it is the shortest `Part` a decoder takes:
+/// one arm of the `oneof` is all a part carries.
+const content_parts_capacity = repeatedCapacity(9);
+/// `{"artifactId":"a","parts":[]}` is twenty-six; `artifactId` must be there
+/// and must not be empty, and `parts` must be there.
+const content_artifacts_capacity = repeatedCapacity(26);
+/// `{"messageId":"m","role":"agent","parts":[]}` is forty-four, and all three
+/// members are checked on the member rather than on a length.
+const content_messages_capacity = repeatedCapacity(44);
+/// `""` is two. The extensions, the reference task ids and the accepted output
+/// modes share one array and one fill level, so this is the bound for all of
+/// them together.
+const content_strings_capacity = repeatedCapacity(2);
+
+/// The decoded bytes of every `Part.raw` in one document.
+///
+/// `readRawPart` bounds each part from `json.base64.decodedLen` of its own
+/// base64 lexeme, and `floor(a / 4) + floor(b / 4) <= floor((a + b) / 4)`, so
+/// the sum of every part's bound is at most `decodedLen` of the sum of their
+/// lexemes — which is at most `max_doc_len` bytes of the document. This is the
+/// bound that falls out of the codec's own arithmetic rather than a count of
+/// elements, and it is exact: no document can ask for more.
+const content_raw_bytes = json.base64.decodedLen(max_doc_len) orelse max_doc_len;
+
+/// The caller's base64 buffer for the content-half encoders.
+///
+/// Every `Part.raw` the harness can decode is at most `content_raw_bytes`
+/// long, and `encodeX` validates a whole value before it writes its first
+/// byte, so a buffer this size cannot be short. It is exactly `max_doc_len`,
+/// which is the symmetry the derivation predicts and not a coincidence worth
+/// relying on: `encodedLen(decodedLen(n)) == n` for `n` a multiple of four.
+const content_base64_len = json.base64.encodedLen(content_raw_bytes);
+
+/// The scratch `mcp.encodeHeaderValue` needs for the largest value the corpus
+/// can produce.
+///
+/// A header value is bytes rather than a document, so the whole document can
+/// be one: `encodedLen(max_doc_len)`, not `content_base64_len`. The two differ,
+/// and sizing this one from the `Part.raw` bound would refuse the largest
+/// documents the corpus builds for a reason that has nothing to do with the
+/// codec.
+const header_encode_len = json.base64.encodedLen(max_doc_len);
+
+// The discovery half. `a2a.CardArena` is nine arrays over nine element types.
+
+/// `{"url":"","protocolBinding":"","protocolVersion":""}` is forty-eight, and
+/// all three members are checked on the member.
+const card_interfaces_capacity = repeatedCapacity(48);
+/// `{"id":"","name":"","description":"","tags":[]}` is forty-three; a skill
+/// that refuses the empty strings would need more and never less.
+const card_skills_capacity = repeatedCapacity(43);
+/// `{}`. No `AgentExtension` member is REQUIRED.
+const card_extensions_capacity = repeatedCapacity(2);
+/// `{"protected":"a","signature":"b"}` is thirty-three, and both are refused
+/// when empty.
+const card_signatures_capacity = repeatedCapacity(32);
+/// `{"mtlsSecurityScheme":{}}` is twenty-three, and that is the shortest of
+/// the five `SecurityScheme` arms.
+const card_security_schemes_capacity = repeatedCapacity(22);
+/// `{}`. `SecurityRequirement.schemes` is optional.
+const card_security_requirements_capacity = repeatedCapacity(2);
+/// `{"a":{}}` is eight: a map entry is the single member its key names.
+const card_requirement_entries_capacity = repeatedCapacity(7);
+/// `{"a":""}` is seven, for the same reason as the entries above.
+const card_scopes_capacity = repeatedCapacity(7);
+/// `""` is two, for every string list on the card.
+const card_strings_capacity = repeatedCapacity(2);
+
+// The typed MCP results. Every out-array is bounded by the same rule, with the
+// shortest element its type can hold.
+
+/// `{"type":"text","text":""}` is twenty-five; a block names its `type` and
+/// carries the member that type names.
+const mcp_content_blocks_capacity = repeatedCapacity(24);
+/// `{"name":"a","inputSchema":{}}` is twenty-nine; the other five members are
+/// optional.
+const mcp_tools_capacity = repeatedCapacity(28);
+/// `{"uri":"","text":""}` is eighteen, and it is the shorter of the two arms.
+const mcp_resource_contents_capacity = repeatedCapacity(16);
+/// `{"role":"user","content":{"type":"text","text":""}}` is forty-seven; the
+/// content is one block and not a sequence.
+const mcp_prompt_messages_capacity = repeatedCapacity(45);
+/// `""` is two, for `supportedVersions`.
+const mcp_versions_capacity = repeatedCapacity(2);
+
+/// How many members one document can carry that no shape names.
+///
+/// `VerbatimStore.take` records one entry per occurrence, and an occurrence is
+/// a member of some object: `"a":0` is five bytes and every member but the
+/// last spends a comma, so a document of at most `max_doc_len` bytes holds at
+/// most `(max_doc_len + 1) / 6` of them. Nested payloads append to the same
+/// store, which does not change the count: they are members of the document
+/// too, and a decoder that took a member the document did not carry would be
+/// a defect this harness reports rather than a bound it has to make room for.
+const verbatim_capacity = (max_doc_len + 1) / 6;
+
+/// The caller's storage for the decoders that take some, for one document.
+///
+/// Two of everything, and the reason is in [`runPropertyHarness`]: every
+/// public `a2a` decoder calls `reset` on its arena before it reads, so a round
+/// trip that re-decoded into the same arena would overwrite the values the
+/// comparison is about. The `_again` half is the one the re-decode writes
+/// into, and this file is what holds both because the library allocates
+/// nothing.
+///
+/// The arenas are wired to the arrays rather than built from literals because
+/// an arena over `&.{}` would refuse every document before it reached a rule,
+/// which is the failure this whole section exists to avoid.
+const Storage = struct {
+    content_parts: [content_parts_capacity]a2a.Part,
+    content_artifacts: [content_artifacts_capacity]a2a.Artifact,
+    content_messages: [content_messages_capacity]a2a.Message,
+    content_strings: [content_strings_capacity][]const u8,
+    content_bytes: [content_raw_bytes]u8,
+    content_parts_again: [content_parts_capacity]a2a.Part,
+    content_artifacts_again: [content_artifacts_capacity]a2a.Artifact,
+    content_messages_again: [content_messages_capacity]a2a.Message,
+    content_strings_again: [content_strings_capacity][]const u8,
+    content_bytes_again: [content_raw_bytes]u8,
+
+    card_interfaces: [card_interfaces_capacity]a2a.AgentInterface,
+    card_skills: [card_skills_capacity]a2a.AgentSkill,
+    card_extensions: [card_extensions_capacity]a2a.AgentExtension,
+    card_signatures: [card_signatures_capacity]a2a.AgentCardSignature,
+    card_security_schemes: [card_security_schemes_capacity]a2a.SecuritySchemeEntry,
+    card_security_requirements: [card_security_requirements_capacity]a2a.SecurityRequirement,
+    card_requirement_entries: [card_requirement_entries_capacity]a2a.SecurityRequirementEntry,
+    card_scopes: [card_scopes_capacity]a2a.OAuthScope,
+    card_strings: [card_strings_capacity][]const u8,
+    card_interfaces_again: [card_interfaces_capacity]a2a.AgentInterface,
+    card_skills_again: [card_skills_capacity]a2a.AgentSkill,
+    card_extensions_again: [card_extensions_capacity]a2a.AgentExtension,
+    card_signatures_again: [card_signatures_capacity]a2a.AgentCardSignature,
+    card_security_schemes_again: [card_security_schemes_capacity]a2a.SecuritySchemeEntry,
+    card_security_requirements_again: [card_security_requirements_capacity]a2a.SecurityRequirement,
+    card_requirement_entries_again: [card_requirement_entries_capacity]a2a.SecurityRequirementEntry,
+    card_scopes_again: [card_scopes_capacity]a2a.OAuthScope,
+    card_strings_again: [card_strings_capacity][]const u8,
+
+    content_blocks: [mcp_content_blocks_capacity]mcp.ContentBlock,
+    tools: [mcp_tools_capacity]mcp.Tool,
+    resource_contents: [mcp_resource_contents_capacity]mcp.ResourceContents,
+    prompt_messages: [mcp_prompt_messages_capacity]mcp.PromptMessage,
+    versions: [mcp_versions_capacity][]const u8,
+    content_blocks_again: [mcp_content_blocks_capacity]mcp.ContentBlock,
+    tools_again: [mcp_tools_capacity]mcp.Tool,
+    resource_contents_again: [mcp_resource_contents_capacity]mcp.ResourceContents,
+    prompt_messages_again: [mcp_prompt_messages_capacity]mcp.PromptMessage,
+    versions_again: [mcp_versions_capacity][]const u8,
+
+    /// The caller's `VerbatimStore` array, for the six typed MCP results. One
+    /// for the whole document rather than one per result: the store is filled
+    /// across the document and each decoded object keeps the sub-slice that
+    /// belongs to it, which is what `mcp.VerbatimStore.since` is for.
+    verbatim: [verbatim_capacity]mcp.VerbatimMember,
+    verbatim_again: [verbatim_capacity]mcp.VerbatimMember,
+
+    /// The caller's base64 buffer, for the content-half encoders. Separate
+    /// from `content_bytes` because the encoder writes base64 text into one
+    /// while the decoded bytes it came from live in the other, and a buffer
+    /// that held both would be read and written at once.
+    base64: [content_base64_len]u8,
+
+    /// The two buffers the one header-value round trip needs, and the reason
+    /// they are its own: the encode writes base64 text from the value the
+    /// decode just produced, so neither may be the buffer that value lives in.
+    header_encode: [header_encode_len]u8,
+    header_decode: [max_doc_len]u8,
+
+    /// A scratch buffer of its own for the "is this borrowed lexeme still a
+    /// complete value" check.
+    ///
+    /// Not `replay` and not `scratch`, and the reason is the one the check
+    /// itself is about: a re-decoded value borrows its unescaped strings from
+    /// the buffer it was decoded with, so asking `borrowAccepts` to use that
+    /// same buffer would overwrite the very members the comparison is about.
+    borrow: [max_doc_len]u8,
+
+    content: a2a.ContentArena,
+    content_again: a2a.ContentArena,
+    card: a2a.CardArena,
+    card_again: a2a.CardArena,
+
+    fn init(self: *Storage) void {
+        self.content = a2a.ContentArena.init(
+            self.content_parts[0..],
+            self.content_artifacts[0..],
+            self.content_messages[0..],
+            self.content_strings[0..],
+            self.content_bytes[0..],
+        );
+        self.content_again = a2a.ContentArena.init(
+            self.content_parts_again[0..],
+            self.content_artifacts_again[0..],
+            self.content_messages_again[0..],
+            self.content_strings_again[0..],
+            self.content_bytes_again[0..],
+        );
+        self.card = a2a.CardArena.init(
+            self.card_interfaces[0..],
+            self.card_skills[0..],
+            self.card_extensions[0..],
+            self.card_signatures[0..],
+            self.card_security_schemes[0..],
+            self.card_security_requirements[0..],
+            self.card_requirement_entries[0..],
+            self.card_scopes[0..],
+            self.card_strings[0..],
+        );
+        self.card_again = a2a.CardArena.init(
+            self.card_interfaces_again[0..],
+            self.card_skills_again[0..],
+            self.card_extensions_again[0..],
+            self.card_signatures_again[0..],
+            self.card_security_schemes_again[0..],
+            self.card_security_requirements_again[0..],
+            self.card_requirement_entries_again[0..],
+            self.card_scopes_again[0..],
+            self.card_strings_again[0..],
+        );
+    }
+};
 
 // --- Diagnostics ----------------------------------------------------------------
 
@@ -328,16 +603,55 @@ const member_names = [_][]const u8{
     // `bridge.decodeEnvelope`.
     "serverId",
     "requestId",
+    // The caching pair every cacheable result in section 4.10 carries, and the
+    // page marker the paginated rows add. Nothing below spelled either before
+    // the result decoders were fed, so the caching rule was asserted over
+    // documents that could not carry it.
+    "ttlMs",
+    "cacheScope",
+    "nextCursor",
+    // The `tools/call` payload. `content` is REQUIRED, and the other two are
+    // presences an encoder has to be able to write back.
+    "content",
+    "structuredContent",
+    "isError",
+    // The `tools/list`, `resources/read` and `prompts/get` payloads.
+    // `description` is above already, beside the ACP request.
+    "tools",
+    "contents",
+    "messages",
+    // `server/discover`, the one mandatory result. `capabilities` is an object
+    // carried whole, and `instructions` is the one member beside it.
+    "supportedVersions",
+    "capabilities",
+    "instructions",
+    // The retry leg, which is the whole of what `mcp.decodeCacheLeg` reads.
+    "inputResponses",
 };
 
-/// The messages whose members the twenty A2A codecs compare.
+/// The messages whose members the A2A codecs compare.
 ///
 /// One entry per message that has both a decoder and an encoder, and the list
 /// is what makes the derivation below a statement about the codecs rather than
 /// about every message `a2a.zig` declares: a message with no codec compares no
 /// member, so its table would widen the vocabulary with names no rule reads.
-/// Every `json` name in each of these twenty tables is compared by the decoder
-/// for that message, which is why the derivation can be the whole of it.
+/// Every `json` name in each of these tables is compared by the decoder for
+/// that message, which is why the derivation can be the whole of it.
+///
+/// The three groups are the three codec sections `a2a.zig` declares: the flat
+/// half, the content half that takes a `ContentArena`, and the discovery half
+/// that takes a `CardArena`. The last two are here for the same reason the flat
+/// twenty are, and the battery feeding them is what put them here — a message
+/// whose decoder the corpus never calls has no member any rule could be
+/// asserted over, and listing its table anyway would put names in the
+/// vocabulary that reach nothing.
+///
+/// `a2a.PartContent` is beside `a2a.Part` and not inside it, and that is not
+/// tidiness. `Part.fields[0]` is the `oneof` itself and carries no member
+/// name, so the four arms are rows of `PartContent`'s table and of no other;
+/// deriving the vocabulary from `Part` alone would leave `text`, `raw`, `url`
+/// and `data` out of it, and `renameMember` could then never move the arm a
+/// part is required to carry.
 const a2a_codec_messages = [_]type{
     a2a.Empty,
     a2a.GetTaskRequest,
@@ -359,9 +673,30 @@ const a2a_codec_messages = [_]type{
     a2a.HttpAuthSecurityScheme,
     a2a.OpenIdConnectSecurityScheme,
     a2a.MutualTlsSecurityScheme,
+    // The content half.
+    a2a.PartContent,
+    a2a.Part,
+    a2a.Message,
+    a2a.Artifact,
+    a2a.TaskStatus,
+    a2a.Task,
+    a2a.TaskStatusUpdateEvent,
+    a2a.TaskArtifactUpdateEvent,
+    a2a.SendMessageRequest,
+    a2a.SendMessageResponse,
+    a2a.StreamResponse,
+    // The discovery half.
+    a2a.StringList,
+    a2a.SecurityRequirement,
+    a2a.SecurityScheme,
+    a2a.OAuthFlows,
+    a2a.OAuth2SecurityScheme,
+    a2a.AgentCapabilities,
+    a2a.AgentSkill,
+    a2a.AgentCard,
 };
 
-/// How many ProtoJSON rows those twenty tables hold before a repeat is dropped.
+/// How many ProtoJSON rows those tables hold before a repeat is dropped.
 ///
 /// `tenant` is a member of nine of them and `id` of six, so this counts rows
 /// rather than names. It sizes the one scratch array [`collectA2aMemberNames`]
@@ -520,17 +855,26 @@ const hostile_alphabet = [_]u8{
 /// three after them carry a carrier `_meta`, and the comment among the seeds
 /// says why that needed one.
 ///
-/// The last fourteen are the A2A half, and they are the reason the twenty
-/// `a2a` codecs are in the battery at all. A decoder the corpus only ever sees
-/// through random keys is a decoder whose required-member rules are asserted
-/// over a handful of documents in the whole run, and whose arms nothing else
-/// reaches: `id` and `location` together are one draw in ten thousand, so
-/// `decodeAgentProvider` and `decodeApiKeySecurityScheme` were never going to
-/// accept anything at all. One real request per codec is both the coverage and
-/// the reason every ProtoJSON name the twenty `fields` tables carry is spelled
-/// here, which is what lets `a2a_member_names` be derived rather than listed as
-/// grammar-only. Member sets come from `research/normative/a2a-1.0.0.md`; the
-/// values are the ones a tenant-prefixed deployment sends.
+/// The tail is the A2A half, then the MCP results, and they are the reason the
+/// thirty-nine `a2a` codecs and the eight `mcp` ones are in the battery at all.
+/// A decoder the corpus only ever sees through random keys is a decoder whose
+/// required-member rules are asserted over a handful of documents in the whole
+/// run, and whose arms nothing else reaches: `id` and `location` together are
+/// one draw in ten thousand, so `decodeAgentProvider` and
+/// `decodeApiKeySecurityScheme` were never going to accept anything at all. One
+/// real document per codec is both the coverage and the reason every ProtoJSON
+/// name the `fields` tables carry is spelled here, which is what lets
+/// `a2a_member_names` be derived rather than listed as grammar-only. Member
+/// sets come from `research/normative/a2a-1.0.0.md`; the values are the ones a
+/// tenant-prefixed deployment sends.
+///
+/// The A2A tail is in three groups for the same reason: the content half, the
+/// discovery half, and the flat half that came first. Where one codec needs a
+/// shorter document than another, both are here — a card is the longest legal
+/// A2A document and therefore the one a random prefix most often destroys, so
+/// the shortest card the schema allows sits beside the full one rather than
+/// after it. Three cards is not decoration: with only the full one,
+/// `decodeAgentCard` accepted two documents in twenty thousand.
 const seed_documents = [_][]const u8{
     "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
         "\"params\":{\"name\":\"echo\"}}",
@@ -610,6 +954,128 @@ const seed_documents = [_][]const u8{
     "{\"type\":\"start\"}",
     "{\"type\":\"command\",\"command\":\"ls\",\"cwd\":\"/tmp\"}",
     "{\"type\":\"tool_call\",\"toolCall\":{\"toolCallId\":\"tc\"}}",
+    // The A2A content half. Every one of these is a document a real agent
+    // sends, and each is the only shape that reaches a decoder below it:
+    // `decodePart` needs the `oneof` arm the other eleven seeds never spell,
+    // `decodeTask` needs a `status`, and `decodeStreamResponse` needs one of
+    // the four arms its own name carries. The two `raw` seeds are the base64
+    // path, which is the one branch `readRawPart` has and the grammar
+    // generator will not assemble: a base64 lexeme is four characters drawn
+    // from one alphabet, and a random document that produces one produces it
+    // alone.
+    "{\"text\":\"hello\"}",
+    "{\"raw\":\"aGVsbG8=\",\"filename\":\"a.txt\",\"mediaType\":\"text/plain\"}",
+    "{\"data\":{\"a\":1},\"metadata\":{\"k\":1}}",
+    "{\"messageId\":\"m-1\",\"role\":\"ROLE_AGENT\",\"parts\":[{\"text\":\"hi\"}]}",
+    "{\"messageId\":\"m-2\",\"role\":\"ROLE_USER\",\"parts\":[]," ++
+        "\"contextId\":\"ctx-1\",\"taskId\":\"task-1\"," ++
+        "\"extensions\":[\"https://example.com/ext\"]," ++
+        "\"referenceTaskIds\":[\"task-0\"]}",
+    "{\"artifactId\":\"a-1\",\"name\":\"n\",\"parts\":[{\"text\":\"hi\"}]}",
+    "{\"state\":\"TASK_STATE_COMPLETED\",\"timestamp\":\"2026-01-01T00:00:00Z\"}",
+    "{\"id\":\"task-1\",\"contextId\":\"ctx-1\"," ++
+        "\"status\":{\"state\":\"TASK_STATE_WORKING\"}}",
+    "{\"id\":\"task-2\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}," ++
+        "\"artifacts\":[{\"artifactId\":\"a-1\",\"parts\":[]}]," ++
+        "\"history\":[{\"messageId\":\"m-1\",\"role\":\"ROLE_AGENT\",\"parts\":[]}]}",
+    "{\"taskId\":\"task-1\",\"contextId\":\"ctx-1\"," ++
+        "\"status\":{\"state\":\"TASK_STATE_COMPLETED\"}}",
+    "{\"taskId\":\"task-1\",\"contextId\":\"ctx-1\"," ++
+        "\"artifact\":{\"artifactId\":\"a-1\"," ++
+        "\"parts\":[{\"raw\":\"aGVsbG8=\"}]},\"append\":false,\"lastChunk\":true}",
+    "{\"tenant\":\"acme\",\"message\":{\"messageId\":\"m-1\",\"role\":\"ROLE_USER\"," ++
+        "\"parts\":[{\"text\":\"hi\"}]}," ++
+        "\"configuration\":{\"acceptedOutputModes\":[\"text/plain\"]," ++
+        "\"returnImmediately\":false}}",
+    "{\"message\":{\"messageId\":\"m-1\",\"role\":\"ROLE_AGENT\"," ++
+        "\"parts\":[{\"text\":\"hi\"}]}}",
+    "{\"task\":{\"id\":\"task-1\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}}",
+    "{\"statusUpdate\":{\"taskId\":\"task-1\",\"contextId\":\"ctx-1\"," ++
+        "\"status\":{\"state\":\"TASK_STATE_COMPLETED\"}}}",
+    "{\"artifactUpdate\":{\"taskId\":\"task-1\",\"contextId\":\"ctx-1\"," ++
+        "\"artifact\":{\"artifactId\":\"a-1\",\"parts\":[]}}}",
+    // The A2A discovery half. The card is the long one and it is sized to fit
+    // `max_doc_len`, so its values are the short ones; every member of it is
+    // REQUIRED except the six presences, and `securitySchemes` beside
+    // `securityRequirements` is what puts a scheme name in both tables.
+    "{\"list\":[\"read\"]}",
+    "{\"list\":[]}",
+    "{\"schemes\":{\"oauth\":{\"list\":[\"read\"]}}}",
+    "{\"mtlsSecurityScheme\":{}}",
+    "{\"apiKeySecurityScheme\":{\"description\":\"d\"," ++
+        "\"location\":\"header\",\"name\":\"X-Key\"}}",
+    "{\"httpAuthSecurityScheme\":{\"description\":\"d\",\"scheme\":\"bearer\"," ++
+        "\"bearerFormat\":\"JWT\"}}",
+    "{\"oauth2SecurityScheme\":{\"description\":\"d\"," ++
+        "\"flows\":{\"implicit\":{}}}}",
+    "{\"openIdConnectSecurityScheme\":{\"description\":\"d\"," ++
+        "\"openIdConnectUrl\":\"https://example.com/.well-known/o\"}}",
+    "{\"clientCredentials\":{\"tokenUrl\":\"https://example.com/t\"," ++
+        "\"scopes\":{\"read\":\"r\"}}}",
+    "{\"password\":{\"tokenUrl\":\"https://example.com/t\"}}",
+    "{\"deviceCode\":{\"deviceAuthorizationUrl\":\"https://example.com/d\"," ++
+        "\"tokenUrl\":\"https://example.com/t\",\"scopes\":{}}}",
+    "{\"authorizationCode\":{\"authorizationUrl\":\"https://example.com/a\"," ++
+        "\"tokenUrl\":\"https://example.com/t\"," ++
+        "\"scopes\":{\"read\":\"Read access\"},\"pkceRequired\":true}}",
+    "{\"implicit\":{\"authorizationUrl\":\"https://example.com/a\"," ++
+        "\"scopes\":{\"read\":\"Read access\"}}}",
+    "{\"description\":\"d\",\"flows\":{\"implicit\":{}}," ++
+        "\"oauth2MetadataUrl\":\"https://example.com/m\"}",
+    "{\"streaming\":true,\"pushNotifications\":false,\"extendedAgentCard\":true}",
+    "{\"id\":\"s-1\",\"name\":\"n\",\"description\":\"d\",\"tags\":[\"a\"]," ++
+        "\"examples\":[\"e\"],\"inputModes\":[\"t\"],\"outputModes\":[\"o\"]," ++
+        "\"securityRequirements\":[{\"schemes\":{\"k\":{\"list\":[\"sc\"]}}}]}",
+    "{\"name\":\"a\",\"description\":\"d\",\"supportedInterfaces\":" ++
+        "[{\"url\":\"u\",\"protocolBinding\":\"b\",\"protocolVersion\":\"v\"}]," ++
+        "\"version\":\"1.0\",\"documentationUrl\":\"d\"," ++
+        "\"capabilities\":{\"streaming\":true}," ++
+        "\"securitySchemes\":{\"k\":{\"mtlsSecurityScheme\":{}}}," ++
+        "\"securityRequirements\":[{\"schemes\":{\"k\":{\"list\":[\"s\"]}}}]," ++
+        "\"defaultInputModes\":[\"t\"],\"defaultOutputModes\":[\"o\"]," ++
+        "\"skills\":[{\"id\":\"i\",\"name\":\"n\",\"description\":\"d\"," ++
+        "\"tags\":[\"g\"]}]," ++
+        "\"signatures\":[{\"protected\":\"p\",\"signature\":\"s\"}]," ++
+        "\"iconUrl\":\"i\",\"provider\":{\"url\":\"u\",\"organization\":\"E\"}}",
+    // Two more cards, and the reason they are here rather than one long seed is
+    // the corpus: `writeMutated` keeps a random prefix and `writeMemberRenamed`
+    // moves a member the schema requires, so the longer a legal document is the
+    // fewer of its draws survive to reach the decoder. The shortest card this
+    // schema allows is the one below, and it is drawn and decoded far more
+    // often than the full one above, which is the point of having both.
+    "{\"name\":\"a\",\"description\":\"d\",\"supportedInterfaces\":[]," ++
+        "\"version\":\"1.0\",\"capabilities\":{}," ++
+        "\"defaultInputModes\":[],\"defaultOutputModes\":[],\"skills\":[]}",
+    "{\"name\":\"a\",\"description\":\"d\",\"supportedInterfaces\":" ++
+        "[{\"url\":\"u\",\"protocolBinding\":\"b\",\"protocolVersion\":\"v\"}]," ++
+        "\"version\":\"1.0\",\"capabilities\":{\"extensions\":" ++
+        "[{\"uri\":\"u\",\"required\":true}]}," ++
+        "\"defaultInputModes\":[\"t\"],\"defaultOutputModes\":[\"o\"]," ++
+        "\"skills\":[{\"id\":\"i\",\"name\":\"n\",\"description\":\"d\"," ++
+        "\"tags\":[\"g\"]}]}",
+    // The MCP typed results of section 4.10. Three of them are cacheable and
+    // two are not, and which is which is the rule the caching pair below is
+    // there to exercise: `tools/call` and `prompts/get` carry no `ttlMs` and
+    // a decoder that demanded one would refuse a legal answer. The retry leg
+    // is a JSON-RPC request whose `params` carry `inputResponses`, which is
+    // the whole of what `mcp.decodeCacheLeg` reads and the only member that
+    // puts a request on it.
+    "{\"ttlMs\":60000,\"cacheScope\":\"public\"}",
+    "{\"nextCursor\":\"c-1\",\"ttlMs\":60000,\"cacheScope\":\"private\"}",
+    "{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]," ++
+        "\"structuredContent\":{\"ok\":true},\"isError\":false}",
+    "{\"ttlMs\":60000,\"cacheScope\":\"public\"," ++
+        "\"tools\":[{\"name\":\"echo\",\"inputSchema\":{\"type\":\"object\"}}]}",
+    "{\"ttlMs\":60000,\"cacheScope\":\"public\"," ++
+        "\"contents\":[{\"uri\":\"file:///a\",\"text\":\"body\"}]}",
+    "{\"messages\":[{\"role\":\"user\"," ++
+        "\"content\":{\"type\":\"text\",\"text\":\"hi\"}}]," ++
+        "\"description\":\"d\"}",
+    "{\"ttlMs\":60000,\"cacheScope\":\"public\"," ++
+        "\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{}," ++
+        "\"instructions\":\"hi\"}",
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+        "\"params\":{\"inputResponses\":{\"r\":{}}}}",
 };
 
 fn hostileByte(rng: std.Random) u8 {
@@ -1031,15 +1497,24 @@ fn expectSameMessage(first: jsonrpc.Message, second: jsonrpc.Message) !void {
         try testing.expect(second.rpc_error == null);
     }
 
-    switch (first.params) {
-        .absent => try testing.expect(second.params == .absent),
-        .null_value => try testing.expect(second.params == .null_value),
+    try expectSameParams(first.params, second.params);
+}
+
+/// Compare two `params` members.
+///
+/// The specification calls absent, `null` and a value three distinct states,
+/// so a comparison that read the value alone would pass on two documents a
+/// peer told apart.
+fn expectSameParams(first: jsonrpc.Params, second: jsonrpc.Params) !void {
+    switch (first) {
+        .absent => try std.testing.expect(second == .absent),
+        .null_value => try std.testing.expect(second == .null_value),
         .value => |text| {
-            const other = switch (second.params) {
+            const other = switch (second) {
                 .value => |value| value,
                 else => return error.TestUnexpectedResult,
             };
-            try testing.expectEqualStrings(text, other);
+            try std.testing.expectEqualStrings(text, other);
         },
     }
 }
@@ -1307,15 +1782,25 @@ fn expectSameDocumentBytes(
 /// reading.
 ///
 /// This table used to have three halves' worth of meaning and now has two. The
-/// five `acp` decoders that were fed nothing have been fed: `encodeReplayFrom`,
-/// `encodeCapabilityObject`, `encodeInitializeCapabilities`,
-/// `encodePermissionSubject` and `encodePermissionRequest` all landed, so
-/// every one of the ten is in [`tail_rule.round_trip`] beside the two
-/// `bridge` decoders, and the set of decoders this harness re-encodes no
-/// longer has a member outside it. What is left is named in
-/// [`tail_rule.unasserted`], and that list is the whole of what is left: every
-/// row carries the reason it is there, and a decoder in neither half fails
-/// the build rather than going unmentioned.
+/// five `acp` decoders that were fed nothing have been fed:
+/// `encodeReplayFrom`, `encodeCapabilityObject`, `encodeInitializeCapabilities`,
+/// `encodePermissionSubject` and `encodePermissionRequest` all landed, so every
+/// one of the ten is in [`tail_rule.round_trip`] beside the two `bridge`
+/// decoders, and the set of decoders this harness re-encodes no longer has a
+/// member outside it.
+///
+/// The twenty-nine that [`tail_rule.unasserted`] used to name are fed as well,
+/// and this is the wave that emptied it: eleven content-half `a2a` codecs
+/// behind a caller-owned `ContentArena`, eight discovery-half ones behind a
+/// `CardArena`, the six typed `mcp` results behind a `VerbatimStore` and an
+/// out-array, the caching pair, the two `mcp` decoders that take something
+/// other than a document, and `jsonrpc.decodeRequest`. Each needed two things
+/// the battery did not have — a call site and the caller storage that call site
+/// needs — and both are now written down: the call sites in
+/// [`exerciseEveryDecoder`], the storage and the derivation behind it in
+/// [`Storage`]. [`tail_rule.unasserted`] is empty because there is nothing left
+/// to put in it, and it stays a field so that the next decoder this harness
+/// cannot reach has somewhere to be recorded rather than going unmentioned.
 ///
 /// "Fed" is the operative word and it is not a claim about the code. A decoder
 /// in the battery that accepts nothing has a trailing-byte assertion that never
@@ -1327,12 +1812,13 @@ fn expectSameDocumentBytes(
 /// which is what that field is for.
 ///
 /// A decoder named in [`tail_rule.unasserted`] is named with a reason because
-/// the reason is the only part a reader cannot work out. This list used to hold
-/// two of the twenty-nine decoders the battery does not feed, which is worse
-/// than holding none: a reader who trusted it would conclude that two lack
-/// coverage, and the other twenty-seven would be missing from the statement
-/// with nothing saying so. The field is the one place a coverage gap is
-/// allowed to be recorded, so it records all of them.
+/// the reason is the only part a reader cannot work out. The list held two of
+/// the twenty-nine unfed decoders once, which is worse than holding none: a
+/// reader who trusted it would conclude that two lack coverage, and the other
+/// twenty-seven would be missing from the statement with nothing saying so.
+/// The field is the one place a coverage gap is allowed to be recorded, so it
+/// records all of them — which, now that every one of them is fed, means it
+/// records none.
 const TailRule = struct {
     /// Decoders this harness re-encodes, so a tail they accept is a lost
     /// `encode(decode(b))`: `mcp.decodeResultType` and
@@ -1351,10 +1837,20 @@ const TailRule = struct {
     /// both sides can produce, so the tail is visible as a byte difference
     /// before it ever reaches the refusal.
     ///
-    /// The twenty A2A names are the same twenty as
-    /// [`a2a_codec_messages`] paired with their `decode` function, which is
-    /// why none of them is in the round-trip half for a different reason than
-    /// the rest: each has an encoder, and each encoder is called.
+    /// The A2A names are the same as [`a2a_codec_messages`] paired with their
+    /// `decode` function, which is why none of them is in the round-trip half
+    /// for a different reason than the rest: each has an encoder, and each
+    /// encoder is called.
+    ///
+    /// The twenty-seven after the first thirty are the decoders this wave fed:
+    /// eleven content-half A2A codecs, eight discovery-half ones, the six typed
+    /// MCP results, the caching pair, and the `jsonrpc` request projection.
+    /// Each has an encoder and each encoder is called, which is the condition
+    /// this table records. `mcp.decodeCacheLeg` and `mcp.decodeHeaderValue` are
+    /// the two in the battery and not here: one has no encoder by design
+    /// (`mcp.zig` says so) and the other takes bytes rather than a document, so
+    /// neither has a tail a round trip could lose. `acp.nextFrame` and
+    /// `jsonrpc.decode` are here for the same reason.
     round_trip: []const []const u8 = &.{
         "mcp.decodeResultType",
         "mcp.decodeInputRequiredResult",
@@ -1386,68 +1882,63 @@ const TailRule = struct {
         "a2a.decodeHttpAuthSecurityScheme",
         "a2a.decodeOpenIdConnectSecurityScheme",
         "a2a.decodeMutualTlsSecurityScheme",
+        "a2a.decodePartContent",
+        "a2a.decodePart",
+        "a2a.decodeMessage",
+        "a2a.decodeArtifact",
+        "a2a.decodeTaskStatus",
+        "a2a.decodeTask",
+        "a2a.decodeTaskStatusUpdateEvent",
+        "a2a.decodeTaskArtifactUpdateEvent",
+        "a2a.decodeSendMessageRequest",
+        "a2a.decodeSendMessageResponse",
+        "a2a.decodeStreamResponse",
+        "a2a.decodeStringList",
+        "a2a.decodeSecurityRequirement",
+        "a2a.decodeSecurityScheme",
+        "a2a.decodeOAuthFlows",
+        "a2a.decodeOAuth2SecurityScheme",
+        "a2a.decodeAgentCapabilities",
+        "a2a.decodeAgentSkill",
+        "a2a.decodeAgentCard",
+        "mcp.decodePaginatedResult",
+        "mcp.decodeToolCallResult",
+        "mcp.decodeToolListResult",
+        "mcp.decodeResourceReadResult",
+        "mcp.decodePromptsGetResult",
+        "mcp.decodeDiscoverResult",
+        "mcp.decodeCacheable",
+        "jsonrpc.decodeRequest",
     },
 
     /// Decoders this harness does not feed at all, so no assertion above would
     /// ever fire for them. Every one has a matching public encoder: what each
     /// is missing is a call site in [`exerciseEveryDecoder`] and the caller
     /// storage that call site needs, and both are spelled out per row.
-    unasserted: []const UnfedDecoder = &.{
-        .{ .name = "mcp.decodeCacheable", .why = "the cache members are on the input side of a retry, and no seed " ++
-            "spells a result carrying them; `encodeCacheable` exists, so " ++
-            "this is a missing corpus and nothing else" },
-        .{ .name = "mcp.decodeCacheLeg", .why = "no encoder by design: a leg is derived from a caller's own " ++
-            "`params` and there is nothing to write back, which " ++
-            "mcp.zig:1705 states. What it still needs is a call in " ++
-            "`exerciseEveryDecoder`" },
-        .{ .name = "mcp.decodeHeaderValue", .why = "takes one header value rather than a document, so the call " ++
-            "site would have to extract a member first. Every decoder " ++
-            "in the battery is handed the document whole" },
-        .{ .name = "mcp.decodePaginatedResult", .why = "needs a caller-sized `VerbatimStore` this harness sets up for " ++
-            "no other decoder, and no seed spells a result carrying " ++
-            "`nextCursor` beside a payload" },
-        .{ .name = "mcp.decodeToolCallResult", .why = "the `tools/call` payload, and the one result type every seed " ++
-            "names. It needs a caller-sized `ContentBlock` array and a " ++
-            "`VerbatimStore` before it can be called at all" },
-        .{ .name = "mcp.decodeToolListResult", .why = "needs a caller-sized `Tool` array and a `VerbatimStore`, and no " ++
-            "seed spells a `tools` array inside a result" },
-        .{ .name = "mcp.decodeResourceReadResult", .why = "needs a caller-sized `ResourceContents` array and a " ++
-            "`VerbatimStore`, and no seed spells a `resources/read` " ++
-            "payload" },
-        .{ .name = "mcp.decodePromptsGetResult", .why = "needs a caller-sized `PromptMessage` array and a " ++
-            "`VerbatimStore`, and no seed spells a `prompts/get` " ++
-            "payload" },
-        .{ .name = "mcp.decodeDiscoverResult", .why = "needs a caller-sized `[]const []const u8` and a " ++
-            "`VerbatimStore`, and no seed spells a discover payload" },
-        .{ .name = "jsonrpc.decodeRequest", .why = "the `Request` projection of the walk the battery already feeds " ++
-            "through `jsonrpc.decode`, and nothing seeds a document it " ++
-            "alone takes" },
-        .{ .name = "a2a.decodePartContent", .why = "takes a caller-owned `ContentArena`, and sizing one is a " ++
-            "decision rather than a line: five arrays the harness would " ++
-            "have to bound against the document it is looking at" },
-        .{ .name = "a2a.decodePart", .why = "a caller-owned `ContentArena`, as above" },
-        .{ .name = "a2a.decodeMessage", .why = "a caller-owned `ContentArena`, as above" },
-        .{ .name = "a2a.decodeArtifact", .why = "a caller-owned `ContentArena`, as above" },
-        .{ .name = "a2a.decodeTaskStatus", .why = "a caller-owned `ContentArena`, as above" },
-        .{ .name = "a2a.decodeTask", .why = "a caller-owned `ContentArena`, and the one walk it exists for: " ++
-            "a task holds a status that may hold a message, and artifacts " ++
-            "and history besides, so the arena bounds are the assertion" },
-        .{ .name = "a2a.decodeTaskStatusUpdateEvent", .why = "a caller-owned `ContentArena`, as above" },
-        .{ .name = "a2a.decodeTaskArtifactUpdateEvent", .why = "a caller-owned `ContentArena`, as above" },
-        .{ .name = "a2a.decodeSendMessageRequest", .why = "a caller-owned `ContentArena`, as above" },
-        .{ .name = "a2a.decodeSendMessageResponse", .why = "a caller-owned `ContentArena`, as above" },
-        .{ .name = "a2a.decodeStreamResponse", .why = "a caller-owned `ContentArena`, as above" },
-        .{ .name = "a2a.decodeAgentCard", .why = "a caller-owned `CardArena`, which is eight arrays rather than " ++
-            "five, and the one card fixture the battery does have " ++
-            "(`a2a_agent_card_signature.json`) names no required member" },
-        .{ .name = "a2a.decodeAgentSkill", .why = "a caller-owned `CardArena`, as above" },
-        .{ .name = "a2a.decodeAgentCapabilities", .why = "a caller-owned `CardArena`, as above" },
-        .{ .name = "a2a.decodeSecurityRequirement", .why = "a caller-owned `CardArena`, as above" },
-        .{ .name = "a2a.decodeSecurityScheme", .why = "a caller-owned `CardArena`, as above" },
-        .{ .name = "a2a.decodeOAuthFlows", .why = "a caller-owned `CardArena`, as above" },
-        .{ .name = "a2a.decodeOAuth2SecurityScheme", .why = "a caller-owned `CardArena`, as above" },
-        .{ .name = "a2a.decodeStringList", .why = "a caller-owned `CardArena`, as above" },
-    },
+    ///
+    /// ## It is empty, and that is the claim rather than an omission
+    ///
+    /// This list held twenty-nine rows once and every one of them is now fed.
+    /// An empty list is a stronger statement than a short one only if something
+    /// proves it, and two things do:
+    ///
+    /// - [`battery_codec_names`] is every codec the battery hands something
+    ///   to, and [`expectEveryBatteryCodecReached`] fails the run if the
+    ///   corpus fed one of them nothing it accepts. So a decoder in this
+    ///   battery is a decoder the corpus reached — measured, not asserted.
+    /// - `test "the coverage tables agree on what the battery feeds"` walks
+    ///   this table and fails on a row whose name the battery also feeds, on a
+    ///   row with no reason, and on a count that has drifted from the number
+    ///   the prose quotes. A decoder added to the battery and not removed from
+    ///   here is a build failure rather than a quiet double count.
+    ///
+    /// What the list cannot do is make a decoder it names *reached*. That is
+    /// the failure mode this field was rebuilt to avoid: the version before it
+    /// named two of twenty-nine, so a reader who trusted it believed twenty-
+    /// seven decoders lacked coverage while twenty-seven were missing from
+    /// the statement entirely. A row here is now a statement about
+    /// reachability, and [`battery_codec_names`] is what makes it true.
+    unasserted: []const UnfedDecoder = &.{},
 };
 
 /// The two ways a decoder can be named here, as a value and not only as a
@@ -1545,24 +2036,112 @@ const battery_codec_names = [_][]const u8{
     "acp.decodePermissionRequest",
     "bridge.decodeEnvelope",
     "bridge.decodeOutcome",
+    // The twenty-nine this wave fed. They come after the wave's own twenty-three
+    // because that split is what the coverage test checks the shape of, and
+    // because the twenty-three are the ones a reader of the history came here
+    // for.
+    //
+    // The eleven content-half A2A codecs, the eight discovery-half ones, the
+    // six typed MCP results and the caching pair, the two that take something
+    // other than a document, and `jsonrpc.decodeRequest`.
+    "a2a.decodePartContent",
+    "a2a.decodePart",
+    "a2a.decodeMessage",
+    "a2a.decodeArtifact",
+    "a2a.decodeTaskStatus",
+    "a2a.decodeTask",
+    "a2a.decodeTaskStatusUpdateEvent",
+    "a2a.decodeTaskArtifactUpdateEvent",
+    "a2a.decodeSendMessageRequest",
+    "a2a.decodeSendMessageResponse",
+    "a2a.decodeStreamResponse",
+    "a2a.decodeStringList",
+    "a2a.decodeSecurityRequirement",
+    "a2a.decodeSecurityScheme",
+    "a2a.decodeOAuthFlows",
+    "a2a.decodeOAuth2SecurityScheme",
+    "a2a.decodeAgentCapabilities",
+    "a2a.decodeAgentSkill",
+    "a2a.decodeAgentCard",
+    "mcp.decodePaginatedResult",
+    "mcp.decodeToolCallResult",
+    "mcp.decodeToolListResult",
+    "mcp.decodeResourceReadResult",
+    "mcp.decodePromptsGetResult",
+    "mcp.decodeDiscoverResult",
+    "mcp.decodeCacheable",
+    // The two that take something other than a whole document. They are here
+    // because the battery hands them something, which is the only question this
+    // table asks; neither has a trailing-byte case, for the reason the row above
+    // gives for `acp.nextFrame`.
+    "mcp.decodeCacheLeg",
+    "mcp.decodeHeaderValue",
+    "jsonrpc.decodeRequest",
 };
 
-/// How many of [`battery_codec_names`] this wave added, which is where the
-/// tail of the table above begins.
+/// How many of [`battery_codec_names`] the first wave added, which is where
+/// the tail of the table above begins.
 ///
 /// The split is here rather than written into the names because the test that
-/// keeps the tables in step needs the two halves to differ: every name this
-/// wave added is in [`tail_rule.round_trip`], and the nine after them are
-/// named for the reachability guard rather than for the wave.
+/// keeps the tables in step needs the halves to differ: every name this wave
+/// added is in [`tail_rule.round_trip`], and the ones after it are named for
+/// the reachability guard rather than for the wave.
 const wave_codec_count: usize = 23;
+
+/// How many of [`battery_codec_names`] came after that wave: nine decoders that
+/// predated it and twenty-nine this one fed.
+///
+/// A second constant rather than the bare `9` the assertion used to carry,
+/// because the number grew by twenty-nine and a literal would have been a place
+/// for the growth to be recorded in half. The shape check the coverage test
+/// runs is over the wave half alone, and this says how much of the table is
+/// outside it.
+const later_codec_count: usize = 38;
 
 /// Record that one of the codecs in [`battery_codec_names`] accepted something.
 ///
-/// The index is a comptime constant rather than a lookup by name, because a
-/// lookup is a second place for the two lists to disagree and this table
-/// exists to say a codec was reached rather than to say a call happened.
+/// The index is a comptime constant rather than a value read at runtime,
+/// because this table exists to say a codec was reached rather than to say a
+/// call happened, and a lookup that could fail at runtime would put a
+/// fallible lookup on the path between a decoder accepting a document and the
+/// bit that records it. See [`batteryIndex`] for how the twenty-nine rows added
+/// by the latest wave get their index without a second place to disagree.
 fn reachedBatteryCodec(stats: *Stats, comptime index: usize) void {
     stats.reached_battery_codecs[index] = true;
+}
+
+/// Where [`battery_codec_names`] holds `name`, as a compile-time value.
+///
+/// The rows above use bare indices, which is one integer per decoder and a
+/// second place for the table and the call sites to disagree — and a
+/// disagreement there is silent: the wrong bit is set, the guard passes, and
+/// the decoder it names was never fed. This is the same lookup in the other
+/// direction. It runs at comptime and a name that is not in the table is a
+/// `@compileError` rather than a wrong answer, so it cannot drift quietly the
+/// way a hand-counted index can.
+fn batteryIndex(comptime name: []const u8) usize {
+    const found = nameIndex(&battery_codec_names, name) orelse @compileError(
+        std.fmt.comptimePrint(
+            "{s} is not in battery_codec_names, so there is no bit to set for it",
+            .{name},
+        ),
+    );
+    return found;
+}
+
+/// Count a refusal from a decoder this harness sized storage for, and remember
+/// the ones that were the storage rather than the schema.
+///
+/// `error.BufferTooSmall` from one of the arena-taking decoders means the
+/// caller-sized array was too small for a document the corpus built. That is a
+/// harness sizing fault and not a property of the decoder, and it is the exact
+/// failure the whole storage section is built to avoid: every document refused
+/// for want of room is a run that is green while checking nothing. Counting it
+/// apart from the refusal is what lets [`runPropertyHarness`] fail on a
+/// non-zero count instead of on a decoder quietly refusing every document.
+fn refusedWithCallerStorage(stats: *Stats, err: anyerror) void {
+    stats.refused += 1;
+    if (err == error.BufferTooSmall) stats.storage_too_small += 1;
 }
 
 /// Fail unless the corpus reached every codec [`battery_codec_names`] names.
@@ -1615,6 +2194,24 @@ const Stats = struct {
     /// the outcome are two decoders and either one could go quiet alone.
     envelope_meta_round_trips: usize = 0,
     outcome_meta_round_trips: usize = 0,
+    /// Documents one of the arena-taking decoders refused because the
+    /// caller-sized array ran out, rather than because the document was not a
+    /// message of that type.
+    ///
+    /// Not a printed line, for the reason `tails` is not one: this is the check
+    /// that the storage bounds are bounds. A non-zero count means a document
+    /// the corpus built needed more room than the derivation promised, which
+    /// makes every refusal on this counter a schema refusal that was not one —
+    /// so the run fails rather than narrowing silently.
+    storage_too_small: usize = 0,
+    /// Which leg `mcp.decodeCacheLeg` answered, per answer.
+    ///
+    /// Two counters rather than a bit, because the rule is the whole of what
+    /// that decoder reads and a corpus that only ever produced one of the two
+    /// would be checking one. A seed carries `inputResponses` inside `params`
+    /// for the retry leg and every other request is the original one.
+    cache_leg_original: usize = 0,
+    cache_leg_retry: usize = 0,
 };
 
 fn roundTripJsonRpc(
@@ -1800,6 +2397,372 @@ fn roundTripInputRequiredResult(
     try expectSameString(result.result_type.value, again.result_type.value);
     try expectSameString(result.input_requests, again.input_requests);
     try expectSameString(result.request_state, again.request_state);
+    stats.round_trips += 1;
+}
+
+// --- The MCP typed results, and the two decoders that take something else -----
+//
+// Six decoders take a caller-sized out-array and a `VerbatimStore`, so a round
+// trip needs a second of both: the first decode's elements are slices into the
+// first arrays and every element decoder writes into the caller's storage, so
+// a re-decode sharing it would overwrite the values the comparison is about.
+// [`Storage`] holds both halves for the same reason [`Storage`] holds two
+// arenas.
+
+/// Compare two runs of verbatim members, and check that each value is still a
+/// complete JSON value.
+///
+/// The second half is the property the type exists for. A verbatim member is a
+/// borrowed lexeme, so a store that handed out a region a later member
+/// overwrote would produce a `key`/`value` pair naming bytes the peer never
+/// sent, and the encoder would write them back.
+fn expectSameVerbatim(
+    first: []const mcp.VerbatimMember,
+    second: []const mcp.VerbatimMember,
+    scratch: []u8,
+) !void {
+    try std.testing.expectEqual(first.len, second.len);
+    for (first, second) |one, other| {
+        try std.testing.expectEqualStrings(one.key, other.key);
+        try std.testing.expectEqualStrings(one.value, other.value);
+        try std.testing.expect(borrowAccepts(other.value, scratch));
+    }
+}
+
+fn expectSameCacheable(first: mcp.Cacheable, second: mcp.Cacheable) !void {
+    try std.testing.expectEqual(first.ttl_ms, second.ttl_ms);
+    try std.testing.expectEqual(first.cache_scope, second.cache_scope);
+}
+
+fn expectSamePage(first: mcp.Page, second: mcp.Page, scratch: []u8) !void {
+    try expectSameString(first.result_type.value, second.result_type.value);
+    if (first.cacheable) |cacheable| {
+        try expectSameCacheable(cacheable, second.cacheable orelse return error.TestUnexpectedResult);
+    } else {
+        try std.testing.expect(second.cacheable == null);
+    }
+    try expectSameString(first.page.next_cursor, second.page.next_cursor);
+    try expectSameString(first.meta, second.meta);
+    try expectSameVerbatim(first.verbatim, second.verbatim, scratch);
+}
+
+fn expectSameTextContent(first: mcp.TextContent, second: mcp.TextContent, scratch: []u8) !void {
+    try expectSameString(first.text, second.text);
+    try expectSameString(first.annotations, second.annotations);
+    try expectSameString(first.meta, second.meta);
+    try expectSameVerbatim(first.verbatim, second.verbatim, scratch);
+}
+
+fn expectSameImageContent(first: mcp.ImageContent, second: mcp.ImageContent, scratch: []u8) !void {
+    try expectSameString(first.data, second.data);
+    try expectSameString(first.mime_type, second.mime_type);
+    try expectSameString(first.annotations, second.annotations);
+    try expectSameString(first.meta, second.meta);
+    try expectSameVerbatim(first.verbatim, second.verbatim, scratch);
+}
+
+fn expectSameAudioContent(first: mcp.AudioContent, second: mcp.AudioContent, scratch: []u8) !void {
+    try expectSameString(first.data, second.data);
+    try expectSameString(first.mime_type, second.mime_type);
+    try expectSameString(first.annotations, second.annotations);
+    try expectSameString(first.meta, second.meta);
+    try expectSameVerbatim(first.verbatim, second.verbatim, scratch);
+}
+
+fn expectSameResourceLink(first: mcp.ResourceLink, second: mcp.ResourceLink, scratch: []u8) !void {
+    try expectSameString(first.uri, second.uri);
+    try expectSameString(first.name, second.name);
+    try expectSameString(first.title, second.title);
+    try expectSameString(first.icons, second.icons);
+    try expectSameString(first.meta, second.meta);
+    try expectSameVerbatim(first.verbatim, second.verbatim, scratch);
+}
+
+fn expectSameResourceContents(
+    first: mcp.ResourceContents,
+    second: mcp.ResourceContents,
+    scratch: []u8,
+) !void {
+    const testing = std.testing;
+    // No discriminator: section 4.10.7 says an object carrying both matches
+    // both members, so a value that came back as the other one would be a peer
+    // told to read a text body as a blob or the other way round.
+    try testing.expect(std.meta.activeTag(first) == std.meta.activeTag(second));
+    switch (first) {
+        .text => |value| {
+            try expectSameString(value.uri, second.text.uri);
+            try expectSameString(value.text, second.text.text);
+            try expectSameString(value.mime_type, second.text.mime_type);
+            try expectSameString(value.meta, second.text.meta);
+            try expectSameVerbatim(value.verbatim, second.text.verbatim, scratch);
+        },
+        .blob => |value| {
+            try expectSameString(value.uri, second.blob.uri);
+            try expectSameString(value.blob, second.blob.blob);
+            try expectSameString(value.mime_type, second.blob.mime_type);
+            try expectSameString(value.meta, second.blob.meta);
+            try expectSameVerbatim(value.verbatim, second.blob.verbatim, scratch);
+        },
+    }
+}
+
+fn expectSameEmbeddedResource(
+    first: mcp.EmbeddedResource,
+    second: mcp.EmbeddedResource,
+    scratch: []u8,
+) !void {
+    try expectSameResourceContents(first.resource, second.resource, scratch);
+    try expectSameString(first.annotations, second.annotations);
+    try expectSameString(first.meta, second.meta);
+    try expectSameVerbatim(first.verbatim, second.verbatim, scratch);
+}
+
+fn expectSameContentBlock(
+    first: mcp.ContentBlock,
+    second: mcp.ContentBlock,
+    scratch: []u8,
+) !void {
+    const testing = std.testing;
+    // Five arms and five `type` tags: a block written under the wrong tag is a
+    // peer told to read a text body as an image.
+    try testing.expect(std.meta.activeTag(first) == std.meta.activeTag(second));
+    switch (first) {
+        .text => |value| try expectSameTextContent(value, second.text, scratch),
+        .image => |value| try expectSameImageContent(value, second.image, scratch),
+        .audio => |value| try expectSameAudioContent(value, second.audio, scratch),
+        .resource_link => |value| try expectSameResourceLink(value, second.resource_link, scratch),
+        .resource => |value| try expectSameEmbeddedResource(value, second.resource, scratch),
+    }
+}
+
+fn expectSamePromptMessage(
+    first: mcp.PromptMessage,
+    second: mcp.PromptMessage,
+    scratch: []u8,
+) !void {
+    try std.testing.expectEqual(first.role, second.role);
+    try expectSameContentBlock(first.content, second.content, scratch);
+    try expectSameString(first.meta, second.meta);
+    try expectSameVerbatim(first.verbatim, second.verbatim, scratch);
+}
+
+fn expectSameTool(first: mcp.Tool, second: mcp.Tool, scratch: []u8) !void {
+    try expectSameString(first.name, second.name);
+    try expectSameString(first.input_schema, second.input_schema);
+    try expectSameString(first.title, second.title);
+    try expectSameString(first.output_schema, second.output_schema);
+    try expectSameString(first.annotations, second.annotations);
+    try expectSameString(first.icons, second.icons);
+    try expectSameString(first.meta, second.meta);
+    try expectSameVerbatim(first.verbatim, second.verbatim, scratch);
+}
+
+fn roundTripMcpPaginatedResult(
+    result: mcp.Page,
+    storage: *Storage,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    var writer = json.Writer.init(out);
+    try mcp.encodePaginatedResult(result, &writer);
+    const again = try mcp.decodePaginatedResult(
+        writer.written(),
+        storage.verbatim_again[0..],
+        replay,
+    );
+    try expectSamePage(result, again, storage.borrow[0..]);
+    stats.round_trips += 1;
+}
+
+fn roundTripMcpToolCallResult(
+    result: mcp.ToolCallResult,
+    storage: *Storage,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    var writer = json.Writer.init(out);
+    try mcp.encodeToolCallResult(result, &writer);
+    const again = try mcp.decodeToolCallResult(
+        writer.written(),
+        storage.content_blocks_again[0..],
+        storage.verbatim_again[0..],
+        replay,
+    );
+    try expectSameString(result.result_type.value, again.result_type.value);
+    try expectSameString(result.meta, again.meta);
+    try expectSameRun(
+        mcp.ContentBlock,
+        result.content,
+        again.content,
+        storage.borrow[0..],
+        expectSameContentBlock,
+    );
+    try expectSameString(result.structured_content, again.structured_content);
+    // A presence: absent means false and `false` means the tool failed, and
+    // those are two documents rather than one value.
+    try std.testing.expectEqual(result.is_error, again.is_error);
+    try expectSameVerbatim(result.verbatim, again.verbatim, storage.borrow[0..]);
+    stats.round_trips += 1;
+}
+
+fn roundTripMcpToolListResult(
+    result: mcp.ToolListResult,
+    storage: *Storage,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    var writer = json.Writer.init(out);
+    try mcp.encodeToolListResult(result, &writer);
+    const again = try mcp.decodeToolListResult(
+        writer.written(),
+        storage.tools_again[0..],
+        storage.verbatim_again[0..],
+        replay,
+    );
+    try expectSameString(result.result_type.value, again.result_type.value);
+    try expectSameCacheable(result.cacheable, again.cacheable);
+    try expectSameString(result.page.next_cursor, again.page.next_cursor);
+    try expectSameString(result.meta, again.meta);
+    try expectSameRun(mcp.Tool, result.tools, again.tools, storage.borrow[0..], expectSameTool);
+    try expectSameVerbatim(result.verbatim, again.verbatim, storage.borrow[0..]);
+    stats.round_trips += 1;
+}
+
+fn roundTripMcpResourceReadResult(
+    result: mcp.ResourceReadResult,
+    storage: *Storage,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    var writer = json.Writer.init(out);
+    try mcp.encodeResourceReadResult(result, &writer);
+    const again = try mcp.decodeResourceReadResult(
+        writer.written(),
+        storage.resource_contents_again[0..],
+        storage.verbatim_again[0..],
+        replay,
+    );
+    try expectSameString(result.result_type.value, again.result_type.value);
+    try expectSameCacheable(result.cacheable, again.cacheable);
+    try expectSameString(result.meta, again.meta);
+    try expectSameRun(
+        mcp.ResourceContents,
+        result.contents,
+        again.contents,
+        storage.borrow[0..],
+        expectSameResourceContents,
+    );
+    try expectSameVerbatim(result.verbatim, again.verbatim, storage.borrow[0..]);
+    stats.round_trips += 1;
+}
+
+fn roundTripMcpPromptsGetResult(
+    result: mcp.PromptsGetResult,
+    storage: *Storage,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    var writer = json.Writer.init(out);
+    try mcp.encodePromptsGetResult(result, &writer);
+    const again = try mcp.decodePromptsGetResult(
+        writer.written(),
+        storage.prompt_messages_again[0..],
+        storage.verbatim_again[0..],
+        replay,
+    );
+    try expectSameString(result.result_type.value, again.result_type.value);
+    try expectSameString(result.meta, again.meta);
+    try expectSameRun(
+        mcp.PromptMessage,
+        result.messages,
+        again.messages,
+        storage.borrow[0..],
+        expectSamePromptMessage,
+    );
+    try expectSameString(result.description, again.description);
+    try expectSameVerbatim(result.verbatim, again.verbatim, storage.borrow[0..]);
+    stats.round_trips += 1;
+}
+
+fn roundTripMcpDiscoverResult(
+    result: mcp.DiscoverResult,
+    storage: *Storage,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    var writer = json.Writer.init(out);
+    try mcp.encodeDiscoverResult(result, &writer);
+    const again = try mcp.decodeDiscoverResult(
+        writer.written(),
+        storage.versions_again[0..],
+        storage.verbatim_again[0..],
+        replay,
+    );
+    try expectSameString(result.result_type.value, again.result_type.value);
+    try expectSameCacheable(result.cacheable, again.cacheable);
+    try expectSameString(result.meta, again.meta);
+    try expectSameStrings(result.supported_versions, again.supported_versions);
+    // The capability object is carried as a lexeme rather than modelled, so it
+    // has to come back whole and still be one JSON value.
+    try expectSameString(result.capabilities, again.capabilities);
+    try std.testing.expect(borrowAccepts(again.capabilities, storage.borrow[0..]));
+    try expectSameString(result.instructions, again.instructions);
+    try expectSameVerbatim(result.verbatim, again.verbatim, storage.borrow[0..]);
+    stats.round_trips += 1;
+}
+
+/// Re-encode a `Cacheable` with the library's own writer.
+///
+/// `mcp.encodeCacheable` is the constructor half and not the inverse of
+/// `decodeCacheable`, which skips every member the caching rules do not
+/// govern — so this is `decode(encode(x)) == x` and not
+/// `encode(decode(b)) == b`, the same claim [`roundTripResultType`] makes and
+/// for the same reason. What makes the decoder worth a round-trip table entry
+/// is the refusal, not the trip: it closes with `reader.atEnd()` and a tail it
+/// accepted would be bytes no encoder could put back.
+fn roundTripMcpCacheable(
+    cacheable: mcp.Cacheable,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    var writer = json.Writer.init(out);
+    try mcp.encodeCacheable(cacheable, &writer);
+    try expectSameCacheable(cacheable, try mcp.decodeCacheable(writer.written(), replay));
+    stats.round_trips += 1;
+}
+
+/// Re-encode the `Request` projection with the library's own writer.
+///
+/// There is no `encodeRequest`: `jsonrpc.encodeResponse` writes the *answer*,
+/// with the id echoed and no `method` or `params` member at all. So the trip
+/// goes through `jsonrpc.encode`, which takes the `Message` this projection is
+/// a subset of, and the three members are compared on the way back. An encoder
+/// that dropped `params` leaves a request that still looks like a request, and
+/// this is the assertion that says so.
+fn roundTripJsonRpcRequest(
+    request: jsonrpc.Request,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    var writer = json.Writer.init(out);
+    try jsonrpc.encode(.{
+        .kind = .request,
+        .id = request.id,
+        .method = request.method,
+        .params = request.params,
+    }, &writer);
+    const again = try jsonrpc.decodeRequest(writer.written(), replay);
+    try expectSameId(request.id, again.id);
+    try expectSameString(request.method.text, again.method.text);
+    try expectSameParams(request.params, again.params);
     stats.round_trips += 1;
 }
 
@@ -2306,7 +3269,6 @@ fn roundTripA2aSendMessageConfiguration(
     out: []u8,
     stats: *Stats,
 ) !void {
-    const testing = std.testing;
     var writer = json.Writer.init(out);
     try a2a.encodeSendMessageConfiguration(value, &writer);
 
@@ -2316,40 +3278,11 @@ fn roundTripA2aSendMessageConfiguration(
     // copy of itself.
     var modes: [16][]const u8 = undefined;
     const again = try a2a.decodeSendMessageConfiguration(writer.written(), &modes, replay);
-    try testing.expectEqual(value.history_length, again.history_length);
-    try testing.expectEqual(value.return_immediately, again.return_immediately);
-
-    const first = value.accepted_output_modes;
-    const second = again.accepted_output_modes;
-    if (first == null or second == null) {
-        // An absent list and an empty one are different documents, so exactly
-        // one of the two being absent is already a disagreement.
-        try testing.expect((first == null) == (second == null));
-    } else {
-        try testing.expectEqual(first.?.len, second.?.len);
-        for (first.?, second.?) |one, other| {
-            try testing.expectEqualStrings(one, other);
-        }
-    }
-
     // The nested configuration is an ordinary optional struct rather than the
     // `AuthenticationInfo` above, so it gets its own comparison rather than
-    // sharing one with it.
-    const pushed = value.task_push_notification_config;
-    const pushed_again = again.task_push_notification_config;
-    if (pushed == null or pushed_again == null) {
-        try testing.expect((pushed == null) == (pushed_again == null));
-    } else {
-        try expectSameString(pushed.?.tenant, pushed_again.?.tenant);
-        try expectSameString(pushed.?.id, pushed_again.?.id);
-        try expectSameString(pushed.?.task_id, pushed_again.?.task_id);
-        try expectSameString(pushed.?.url, pushed_again.?.url);
-        try expectSameString(pushed.?.token, pushed_again.?.token);
-        try expectAuthenticationInfo(
-            pushed.?.authentication,
-            pushed_again.?.authentication,
-        );
-    }
+    // sharing one with it — and `SendMessageRequest` nests the same message,
+    // so the comparison is shared with that one rather than written twice.
+    try expectSameSendMessageConfiguration(value, again);
     stats.round_trips += 1;
 }
 
@@ -2486,6 +3419,620 @@ fn roundTripA2aMutualTlsSecurityScheme(
     const again = try a2a.decodeMutualTlsSecurityScheme(writer.written(), replay);
     try expectSameString(value.description, again.description);
     stats.round_trips += 1;
+}
+
+// --- The A2A content half ------------------------------------------------------
+//
+// One driver and one `expect` per message, rather than a round trip per
+// message. Every one of the eleven content decoders has the same signature
+// and every one of their encoders has the same one, so the trip is the same
+// three steps eleven times and the only thing that differs is what the
+// comparison has to look at. Writing eleven copies of the three steps would
+// give eleven places for the storage argument to go missing, which is the
+// mistake that makes a round trip compare a value against itself.
+
+/// Encode a content-half value, decode it again into the second arena, and
+/// compare the members.
+///
+/// `storage.content_again` and not `storage.content`: every public `a2a`
+/// decoder calls `reset` before it reads, so a re-decode into the arena the
+/// first decode filled would overwrite the very values `expect` is about to
+/// read. The same is why `replay` rather than `scratch` is the re-decode's
+/// escape buffer, and it is what every round trip in this file already does
+/// for the decoders that take only a scratch.
+fn roundTripA2aContent(
+    comptime T: type,
+    value: T,
+    comptime decode: *const fn ([]const u8, *a2a.ContentArena, []u8) DecodeError!T,
+    comptime encode: *const fn (T, *json.Writer, []u8) proto.EncodeError!void,
+    comptime expect: anytype,
+    storage: *Storage,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    var writer = json.Writer.init(out);
+    try encode(value, &writer, storage.base64[0..]);
+    const again = try decode(writer.written(), &storage.content_again, replay);
+    try expect(value, again, storage.borrow[0..]);
+    stats.round_trips += 1;
+}
+
+/// The same three steps for the discovery half, whose encoders take no base64
+/// buffer because no card member is a `bytes` field.
+fn roundTripA2aCard(
+    comptime T: type,
+    value: T,
+    comptime decode: *const fn ([]const u8, *a2a.CardArena, []u8) DecodeError!T,
+    comptime encode: *const fn (T, *json.Writer) proto.EncodeError!void,
+    comptime expect: anytype,
+    storage: *Storage,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    var writer = json.Writer.init(out);
+    try encode(value, &writer);
+    const again = try decode(writer.written(), &storage.card_again, replay);
+    try expect(value, again, storage.borrow[0..]);
+    stats.round_trips += 1;
+}
+
+/// Compare two `[]const []const u8` the way [`expectSameString`] compares one.
+///
+/// The presence is the property and not an afterthought: `[]` is a list a peer
+/// wrote and no member is a list it did not, and an encoder holding one
+/// `&.{}` could not write either of them back.
+fn expectSameStrings(first: ?[]const []const u8, second: ?[]const []const u8) !void {
+    const testing = std.testing;
+    if (first) |values| {
+        const others = second orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(values.len, others.len);
+        for (values, others) |value, again| try expectSameString(value, again);
+    } else {
+        try testing.expect(second == null);
+    }
+}
+
+/// Compare two lists of the same element type, length included.
+///
+/// `expect_one` takes the borrow buffer as its third argument, so every
+/// element comparison has the same shape and one driver serves all nineteen
+/// codecs.
+fn expectSameRun(
+    comptime T: type,
+    first: []const T,
+    second: []const T,
+    scratch: []u8,
+    comptime expect_one: anytype,
+) !void {
+    try std.testing.expectEqual(first.len, second.len);
+    for (first, second) |one, another| try expect_one(one, another, scratch);
+}
+
+/// One OAuth flow's `scopes`, which is a map and so is a presence on three of
+/// the five flows and a required list on the other two.
+fn expectSameScopes(
+    first: ?[]const a2a.OAuthScope,
+    second: ?[]const a2a.OAuthScope,
+    scratch: []u8,
+) !void {
+    if (first) |scopes| {
+        try expectSameRun(
+            a2a.OAuthScope,
+            scopes,
+            second orelse return error.TestUnexpectedResult,
+            scratch,
+            expectSameScope,
+        );
+    } else {
+        try std.testing.expect(second == null);
+    }
+}
+
+fn expectSameScope(first: a2a.OAuthScope, second: a2a.OAuthScope, scratch: []u8) !void {
+    try expectSameString(first.name, second.name);
+    try expectSameString(first.description, second.description);
+    _ = scratch;
+}
+
+fn expectSamePartContent(
+    first: a2a.PartContent,
+    second: a2a.PartContent,
+    scratch: []u8,
+) !void {
+    const testing = std.testing;
+    try testing.expect(std.meta.activeTag(first) == std.meta.activeTag(second));
+    switch (first) {
+        // `raw` is the one arm the codec converts rather than splices, so the
+        // bytes are the property and the text is not: `aGVsbG8=` has to come
+        // back as the five bytes it stands for.
+        .raw => |value| try testing.expectEqualSlices(u8, value, second.raw),
+        .text => |value| try expectSameString(value, second.text),
+        .url => |value| try expectSameString(value, second.url),
+        // Any JSON value, carried as the lexeme it arrived as, so it has to
+        // still be a complete value to a reader that has not seen this one.
+        .data => |value| {
+            try expectSameString(value, second.data);
+            try testing.expect(borrowAccepts(second.data, scratch));
+        },
+    }
+}
+
+fn expectSamePart(first: a2a.Part, second: a2a.Part, scratch: []u8) !void {
+    try expectSamePartContent(first.content, second.content, scratch);
+    try expectSameString(first.metadata, second.metadata);
+    try expectSameString(first.filename, second.filename);
+    try expectSameString(first.media_type, second.media_type);
+}
+
+fn expectSameA2aMessage(first: a2a.Message, second: a2a.Message, scratch: []u8) !void {
+    const testing = std.testing;
+    try expectSameString(first.message_id, second.message_id);
+    try expectSameString(first.context_id, second.context_id);
+    try expectSameString(first.task_id, second.task_id);
+    // An enum, so a value that came back as a different tag is a peer told to
+    // read the part from somebody who did not write it.
+    try testing.expectEqual(first.role, second.role);
+    try expectSameRun(a2a.Part, first.parts, second.parts, scratch, expectSamePart);
+    try expectSameString(first.metadata, second.metadata);
+    try expectSameStrings(first.extensions, second.extensions);
+    try expectSameStrings(first.reference_task_ids, second.reference_task_ids);
+}
+
+fn expectSameArtifact(first: a2a.Artifact, second: a2a.Artifact, scratch: []u8) !void {
+    try expectSameString(first.artifact_id, second.artifact_id);
+    try expectSameString(first.name, second.name);
+    try expectSameString(first.description, second.description);
+    try expectSameRun(a2a.Part, first.parts, second.parts, scratch, expectSamePart);
+    try expectSameString(first.metadata, second.metadata);
+    try expectSameStrings(first.extensions, second.extensions);
+}
+
+fn expectSameOptionalMessage(
+    first: ?a2a.Message,
+    second: ?a2a.Message,
+    scratch: []u8,
+) !void {
+    if (first) |message| {
+        try expectSameA2aMessage(message, second orelse return error.TestUnexpectedResult, scratch);
+    } else {
+        try std.testing.expect(second == null);
+    }
+}
+
+fn expectSameTaskStatus(first: a2a.TaskStatus, second: a2a.TaskStatus, scratch: []u8) !void {
+    try std.testing.expectEqual(first.state, second.state);
+    try expectSameOptionalMessage(first.message, second.message, scratch);
+    try expectSameString(first.timestamp, second.timestamp);
+}
+
+fn expectSameTask(first: a2a.Task, second: a2a.Task, scratch: []u8) !void {
+    try expectSameString(first.id, second.id);
+    try expectSameString(first.context_id, second.context_id);
+    try expectSameTaskStatus(first.status, second.status, scratch);
+    // `[]` and no member are two documents, and the whole of this pair is that
+    // they are told apart rather than collapsed into one empty slice.
+    if (first.artifacts) |artifacts| {
+        try expectSameRun(
+            a2a.Artifact,
+            artifacts,
+            second.artifacts orelse return error.TestUnexpectedResult,
+            scratch,
+            expectSameArtifact,
+        );
+    } else {
+        try std.testing.expect(second.artifacts == null);
+    }
+    if (first.history) |history| {
+        try expectSameRun(
+            a2a.Message,
+            history,
+            second.history orelse return error.TestUnexpectedResult,
+            scratch,
+            expectSameA2aMessage,
+        );
+    } else {
+        try std.testing.expect(second.history == null);
+    }
+    try expectSameString(first.metadata, second.metadata);
+}
+
+fn expectSameTaskStatusUpdateEvent(
+    first: a2a.TaskStatusUpdateEvent,
+    second: a2a.TaskStatusUpdateEvent,
+    scratch: []u8,
+) !void {
+    try expectSameString(first.task_id, second.task_id);
+    try expectSameString(first.context_id, second.context_id);
+    try expectSameTaskStatus(first.status, second.status, scratch);
+    try expectSameString(first.metadata, second.metadata);
+}
+
+fn expectSameTaskArtifactUpdateEvent(
+    first: a2a.TaskArtifactUpdateEvent,
+    second: a2a.TaskArtifactUpdateEvent,
+    scratch: []u8,
+) !void {
+    try expectSameString(first.task_id, second.task_id);
+    try expectSameString(first.context_id, second.context_id);
+    try expectSameArtifact(first.artifact, second.artifact, scratch);
+    // Both are presences: `append:false` and no `append` are two documents, and
+    // a plain `bool` would collapse them into one.
+    try std.testing.expectEqual(first.append, second.append);
+    try std.testing.expectEqual(first.last_chunk, second.last_chunk);
+    try expectSameString(first.metadata, second.metadata);
+}
+
+fn expectSamePushConfig(
+    first: ?a2a.TaskPushNotificationConfig,
+    second: ?a2a.TaskPushNotificationConfig,
+) !void {
+    const config = first orelse {
+        try std.testing.expect(second == null);
+        return;
+    };
+    const other = second orelse return error.TestUnexpectedResult;
+    try expectSameString(config.tenant, other.tenant);
+    try expectSameString(config.id, other.id);
+    try expectSameString(config.task_id, other.task_id);
+    try expectSameString(config.url, other.url);
+    try expectSameString(config.token, other.token);
+    try expectAuthenticationInfo(config.authentication, other.authentication);
+}
+
+fn expectSameSendMessageConfiguration(
+    first: a2a.SendMessageConfiguration,
+    second: a2a.SendMessageConfiguration,
+) !void {
+    try expectSameStrings(first.accepted_output_modes, second.accepted_output_modes);
+    try expectSamePushConfig(
+        first.task_push_notification_config,
+        second.task_push_notification_config,
+    );
+    // A presence each, for the reason `TaskArtifactUpdateEvent.append` is one.
+    try std.testing.expectEqual(first.history_length, second.history_length);
+    try std.testing.expectEqual(first.return_immediately, second.return_immediately);
+}
+
+fn expectSameSendMessageRequest(
+    first: a2a.SendMessageRequest,
+    second: a2a.SendMessageRequest,
+    scratch: []u8,
+) !void {
+    try expectSameString(first.tenant, second.tenant);
+    try expectSameA2aMessage(first.message, second.message, scratch);
+    if (first.configuration) |configuration| {
+        try expectSameSendMessageConfiguration(
+            configuration,
+            second.configuration orelse return error.TestUnexpectedResult,
+        );
+    } else {
+        try std.testing.expect(second.configuration == null);
+    }
+    try expectSameString(first.metadata, second.metadata);
+}
+
+fn expectSameSendMessageResponse(
+    first: a2a.SendMessageResponse,
+    second: a2a.SendMessageResponse,
+    scratch: []u8,
+) !void {
+    try std.testing.expect(std.meta.activeTag(first) == std.meta.activeTag(second));
+    switch (first) {
+        .task => |value| try expectSameTask(value, second.task, scratch),
+        .message => |value| try expectSameA2aMessage(value, second.message, scratch),
+    }
+}
+
+fn expectSameStreamResponse(
+    first: a2a.StreamResponse,
+    second: a2a.StreamResponse,
+    scratch: []u8,
+) !void {
+    const testing = std.testing;
+    // Four arms and four names: a value written under the wrong member name is
+    // a peer told to read a stream event as something else entirely.
+    try testing.expect(std.meta.activeTag(first) == std.meta.activeTag(second));
+    switch (first) {
+        .task => |value| try expectSameTask(value, second.task, scratch),
+        .message => |value| try expectSameA2aMessage(value, second.message, scratch),
+        .status_update => |value| {
+            try expectSameTaskStatusUpdateEvent(value, second.status_update, scratch);
+        },
+        .artifact_update => |value| {
+            try expectSameTaskArtifactUpdateEvent(value, second.artifact_update, scratch);
+        },
+    }
+}
+
+// --- The A2A discovery half ----------------------------------------------------
+
+fn expectSameStringList(first: a2a.StringList, second: a2a.StringList, scratch: []u8) !void {
+    try expectSameStrings(first.list, second.list);
+    _ = scratch;
+}
+
+fn expectSameRequirementEntry(
+    first: a2a.SecurityRequirementEntry,
+    second: a2a.SecurityRequirementEntry,
+    scratch: []u8,
+) !void {
+    try expectSameString(first.name, second.name);
+    try expectSameStringList(first.list, second.list, scratch);
+}
+
+fn expectSameSecurityRequirement(
+    first: a2a.SecurityRequirement,
+    second: a2a.SecurityRequirement,
+    scratch: []u8,
+) !void {
+    if (first.schemes) |schemes| {
+        try expectSameRun(
+            a2a.SecurityRequirementEntry,
+            schemes,
+            second.schemes orelse return error.TestUnexpectedResult,
+            scratch,
+            expectSameRequirementEntry,
+        );
+    } else {
+        try std.testing.expect(second.schemes == null);
+    }
+}
+
+fn expectSameExtension(
+    first: a2a.AgentExtension,
+    second: a2a.AgentExtension,
+    scratch: []u8,
+) !void {
+    try expectSameString(first.uri, second.uri);
+    try expectSameString(first.description, second.description);
+    try std.testing.expectEqual(first.required, second.required);
+    try expectSameString(first.params, second.params);
+    _ = scratch;
+}
+
+fn expectSameAgentCapabilities(
+    first: a2a.AgentCapabilities,
+    second: a2a.AgentCapabilities,
+    scratch: []u8,
+) !void {
+    try std.testing.expectEqual(first.streaming, second.streaming);
+    try std.testing.expectEqual(first.push_notifications, second.push_notifications);
+    if (first.extensions) |extensions| {
+        try expectSameRun(
+            a2a.AgentExtension,
+            extensions,
+            second.extensions orelse return error.TestUnexpectedResult,
+            scratch,
+            expectSameExtension,
+        );
+    } else {
+        try std.testing.expect(second.extensions == null);
+    }
+    try std.testing.expectEqual(first.extended_agent_card, second.extended_agent_card);
+}
+
+fn expectSameAgentInterface(
+    first: a2a.AgentInterface,
+    second: a2a.AgentInterface,
+    scratch: []u8,
+) !void {
+    try expectSameString(first.url, second.url);
+    try expectSameString(first.protocol_binding, second.protocol_binding);
+    try expectSameString(first.tenant, second.tenant);
+    // Kept as the declared text rather than a parsed `Major.Minor`, because a
+    // normalised spelling of the same version is not the bytes the agent
+    // published.
+    try expectSameString(first.protocol_version, second.protocol_version);
+    _ = scratch;
+}
+
+fn expectSameAgentProvider(
+    first: a2a.AgentProvider,
+    second: a2a.AgentProvider,
+    scratch: []u8,
+) !void {
+    try expectSameString(first.url, second.url);
+    try expectSameString(first.organization, second.organization);
+    _ = scratch;
+}
+
+fn expectSameAgentSkill(first: a2a.AgentSkill, second: a2a.AgentSkill, scratch: []u8) !void {
+    try expectSameString(first.id, second.id);
+    try expectSameString(first.name, second.name);
+    try expectSameString(first.description, second.description);
+    try expectSameStrings(first.tags, second.tags);
+    try expectSameStrings(first.examples, second.examples);
+    try expectSameStrings(first.input_modes, second.input_modes);
+    try expectSameStrings(first.output_modes, second.output_modes);
+    if (first.security_requirements) |requirements| {
+        try expectSameRun(
+            a2a.SecurityRequirement,
+            requirements,
+            second.security_requirements orelse return error.TestUnexpectedResult,
+            scratch,
+            expectSameSecurityRequirement,
+        );
+    } else {
+        try std.testing.expect(second.security_requirements == null);
+    }
+}
+
+fn expectSameSignature(
+    first: a2a.AgentCardSignature,
+    second: a2a.AgentCardSignature,
+    scratch: []u8,
+) !void {
+    try expectSameString(first.protected, second.protected);
+    try expectSameString(first.signature, second.signature);
+    try expectSameString(first.header, second.header);
+    _ = scratch;
+}
+
+fn expectSameSecurityScheme(
+    first: a2a.SecurityScheme,
+    second: a2a.SecurityScheme,
+    scratch: []u8,
+) !void {
+    const testing = std.testing;
+    try testing.expect(std.meta.activeTag(first) == std.meta.activeTag(second));
+    switch (first) {
+        .api_key => |value| {
+            try expectSameString(value.description, second.api_key.description);
+            try testing.expectEqual(value.location, second.api_key.location);
+            try expectSameString(value.name, second.api_key.name);
+        },
+        .http_auth => |value| {
+            try expectSameString(value.description, second.http_auth.description);
+            try expectSameString(value.scheme, second.http_auth.scheme);
+            try expectSameString(value.bearer_format, second.http_auth.bearer_format);
+        },
+        .oauth2 => |value| {
+            try expectSameString(value.description, second.oauth2.description);
+            try expectSameOAuthFlows(value.flows, second.oauth2.flows, scratch);
+            try expectSameString(value.oauth2_metadata_url, second.oauth2.oauth2_metadata_url);
+        },
+        .open_id_connect => |value| {
+            try expectSameString(value.description, second.open_id_connect.description);
+            try expectSameString(
+                value.open_id_connect_url,
+                second.open_id_connect.open_id_connect_url,
+            );
+        },
+        .mtls => |value| {
+            try expectSameString(value.description, second.mtls.description);
+        },
+    }
+}
+
+fn expectSameSchemeEntry(
+    first: a2a.SecuritySchemeEntry,
+    second: a2a.SecuritySchemeEntry,
+    scratch: []u8,
+) !void {
+    try expectSameString(first.name, second.name);
+    try expectSameSecurityScheme(first.scheme, second.scheme, scratch);
+}
+
+fn expectSameOAuthFlows(
+    first: a2a.OAuthFlows,
+    second: a2a.OAuthFlows,
+    scratch: []u8,
+) !void {
+    const testing = std.testing;
+    try testing.expect(std.meta.activeTag(first) == std.meta.activeTag(second));
+    switch (first) {
+        .authorization_code => |value| {
+            const other = second.authorization_code;
+            try expectSameString(value.authorization_url, other.authorization_url);
+            try expectSameString(value.token_url, other.token_url);
+            try expectSameString(value.refresh_url, other.refresh_url);
+            try expectSameRun(a2a.OAuthScope, value.scopes, other.scopes, scratch, expectSameScope);
+            try testing.expectEqual(value.pkce_required, other.pkce_required);
+        },
+        .client_credentials => |value| {
+            const other = second.client_credentials;
+            try expectSameString(value.token_url, other.token_url);
+            try expectSameString(value.refresh_url, other.refresh_url);
+            try expectSameRun(a2a.OAuthScope, value.scopes, other.scopes, scratch, expectSameScope);
+        },
+        .implicit => |value| {
+            const other = second.implicit;
+            try expectSameString(value.authorization_url, other.authorization_url);
+            try expectSameString(value.refresh_url, other.refresh_url);
+            try expectSameScopes(value.scopes, other.scopes, scratch);
+        },
+        .password => |value| {
+            const other = second.password;
+            try expectSameString(value.token_url, other.token_url);
+            try expectSameString(value.refresh_url, other.refresh_url);
+            try expectSameScopes(value.scopes, other.scopes, scratch);
+        },
+        .device_code => |value| {
+            const other = second.device_code;
+            try expectSameString(
+                value.device_authorization_url,
+                other.device_authorization_url,
+            );
+            try expectSameString(value.token_url, other.token_url);
+            try expectSameString(value.refresh_url, other.refresh_url);
+            try expectSameRun(a2a.OAuthScope, value.scopes, other.scopes, scratch, expectSameScope);
+        },
+    }
+}
+
+fn expectSameOAuth2Scheme(
+    first: a2a.OAuth2SecurityScheme,
+    second: a2a.OAuth2SecurityScheme,
+    scratch: []u8,
+) !void {
+    try expectSameString(first.description, second.description);
+    try expectSameOAuthFlows(first.flows, second.flows, scratch);
+    try expectSameString(first.oauth2_metadata_url, second.oauth2_metadata_url);
+}
+
+fn expectSameAgentCard(first: a2a.AgentCard, second: a2a.AgentCard, scratch: []u8) !void {
+    try expectSameString(first.name, second.name);
+    try expectSameString(first.description, second.description);
+    // Ordered: the first interface is the preferred one, so a value that came
+    // back in another order is a peer told a different deployment is preferred.
+    try expectSameRun(
+        a2a.AgentInterface,
+        first.supported_interfaces,
+        second.supported_interfaces,
+        scratch,
+        expectSameAgentInterface,
+    );
+    if (first.provider) |provider| {
+        try expectSameAgentProvider(
+            provider,
+            second.provider orelse return error.TestUnexpectedResult,
+            scratch,
+        );
+    } else {
+        try std.testing.expect(second.provider == null);
+    }
+    try expectSameString(first.version, second.version);
+    try expectSameString(first.documentation_url, second.documentation_url);
+    try expectSameAgentCapabilities(first.capabilities, second.capabilities, scratch);
+    if (first.security_schemes) |schemes| {
+        try expectSameRun(
+            a2a.SecuritySchemeEntry,
+            schemes,
+            second.security_schemes orelse return error.TestUnexpectedResult,
+            scratch,
+            expectSameSchemeEntry,
+        );
+    } else {
+        try std.testing.expect(second.security_schemes == null);
+    }
+    if (first.security_requirements) |requirements| {
+        try expectSameRun(
+            a2a.SecurityRequirement,
+            requirements,
+            second.security_requirements orelse return error.TestUnexpectedResult,
+            scratch,
+            expectSameSecurityRequirement,
+        );
+    } else {
+        try std.testing.expect(second.security_requirements == null);
+    }
+    try expectSameStrings(first.default_input_modes, second.default_input_modes);
+    try expectSameStrings(first.default_output_modes, second.default_output_modes);
+    try expectSameRun(a2a.AgentSkill, first.skills, second.skills, scratch, expectSameAgentSkill);
+    if (first.signatures) |signatures| {
+        try expectSameRun(
+            a2a.AgentCardSignature,
+            signatures,
+            second.signatures orelse return error.TestUnexpectedResult,
+            scratch,
+            expectSameSignature,
+        );
+    } else {
+        try std.testing.expect(second.signatures == null);
+    }
+    try expectSameString(first.icon_url, second.icon_url);
 }
 
 /// Every recorded path must own a region no later path overwrote.
@@ -2875,6 +4422,32 @@ fn exerciseBase64(input: []const u8, stats: *Stats) !void {
     }
 }
 
+/// The `params` member of `input` as the lexeme the peer sent, or null when
+/// the document is not an object carrying one.
+///
+/// `mcp.decodeCacheLeg` answers a question about a caller's `params` rather
+/// than about a whole document, so the call site has to produce one. Cutting
+/// it out of the generated document is what a caller does: a transport hands a
+/// dispatcher the message and the dispatcher hands the retry rule the `params`
+/// member. Nothing is parsed and nothing is trusted here — the lexeme is
+/// whatever the document spells, damaged or not, and the decoder applies its
+/// own rules to it. `rawValue` is what takes it, so a `params` that is a
+/// number or a string comes back as itself rather than as a refusal, which is
+/// the answer the decoder would give it in any case.
+fn paramsLexeme(input: []const u8, scratch: []u8) ?[]const u8 {
+    var reader = json.Reader.init(input);
+    if (reader.beginObject() catch return null) return null;
+    while (reader.nextKey(scratch) catch return null) |key| {
+        if (std.mem.eql(u8, key, "params")) {
+            // The first occurrence, which is the rule every decoder in this
+            // library keeps for a member a peer spells twice.
+            return reader.rawValue(scratch) catch null;
+        }
+        reader.skipValue(scratch) catch return null;
+    }
+    return null;
+}
+
 // --- The decoder battery --------------------------------------------------------
 
 /// Feed one document to every public decoder and check the properties.
@@ -2884,12 +4457,18 @@ fn exerciseBase64(input: []const u8, stats: *Stats) !void {
 /// still intact when the two are compared. `owed` is a third, for the bytes
 /// each `bridge` encoder was supposed to write, and it is never a decode
 /// target: the prediction is spent before the re-decode takes `replay`.
+///
+/// `storage` is the caller-owned storage the nineteen arena-taking decoders and
+/// the six typed MCP results write into, sized by the derivations above and
+/// reused across every document. It is one parameter rather than nine because
+/// it is one thing: an arena and the arrays behind it, wired once.
 fn exerciseEveryDecoder(
     input: []const u8,
     scratch: []u8,
     replay: []u8,
     out: []u8,
     owed: []u8,
+    storage: *Storage,
     stats: *Stats,
 ) !void {
     const testing = std.testing;
@@ -3326,6 +4905,515 @@ fn exerciseEveryDecoder(
         }
     }
 
+    // --- The twenty-nine decoders this wave fed -------------------------------
+    //
+    // One block per decoder and the shape every other block above has: accept
+    // or refuse, count it, refuse a tailed document if it accepted, and put the
+    // value back through its own encoder. What is different is the storage: an
+    // arena the decoder resets itself, an out-array, or a `VerbatimStore`.
+    //
+    // A refusal goes through `refusedWithCallerStorage` rather than a bare
+    // increment, because a `BufferTooSmall` from one of these is the harness's
+    // own sizing fault and not the decoder's answer, and the two have to be
+    // told apart for the bounds above to mean anything.
+
+    if (jsonrpc.decodeRequest(input, scratch)) |request| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("jsonrpc.decodeRequest"));
+        try expectRoundTripHasNoTail("jsonrpc.decodeRequest", input, tail);
+        try roundTripJsonRpcRequest(request, replay, out, stats);
+    } else |_| {
+        stats.refused += 1;
+    }
+
+    if (mcp.decodeCacheable(input, scratch)) |cacheable| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("mcp.decodeCacheable"));
+        try expectRoundTripHasNoTail("mcp.decodeCacheable", input, tail);
+        try roundTripMcpCacheable(cacheable, replay, out, stats);
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    if (mcp.decodePaginatedResult(input, storage.verbatim[0..], scratch)) |page| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("mcp.decodePaginatedResult"));
+        try expectRoundTripHasNoTail("mcp.decodePaginatedResult", input, tail);
+        try roundTripMcpPaginatedResult(page, storage, replay, out, stats);
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    if (mcp.decodeToolCallResult(
+        input,
+        storage.content_blocks[0..],
+        storage.verbatim[0..],
+        scratch,
+    )) |result| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("mcp.decodeToolCallResult"));
+        try expectRoundTripHasNoTail("mcp.decodeToolCallResult", input, tail);
+        try roundTripMcpToolCallResult(result, storage, replay, out, stats);
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    if (mcp.decodeToolListResult(input, storage.tools[0..], storage.verbatim[0..], scratch)) |result| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("mcp.decodeToolListResult"));
+        try expectRoundTripHasNoTail("mcp.decodeToolListResult", input, tail);
+        try roundTripMcpToolListResult(result, storage, replay, out, stats);
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    if (mcp.decodeResourceReadResult(
+        input,
+        storage.resource_contents[0..],
+        storage.verbatim[0..],
+        scratch,
+    )) |result| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("mcp.decodeResourceReadResult"));
+        try expectRoundTripHasNoTail("mcp.decodeResourceReadResult", input, tail);
+        try roundTripMcpResourceReadResult(result, storage, replay, out, stats);
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    if (mcp.decodePromptsGetResult(
+        input,
+        storage.prompt_messages[0..],
+        storage.verbatim[0..],
+        scratch,
+    )) |result| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("mcp.decodePromptsGetResult"));
+        try expectRoundTripHasNoTail("mcp.decodePromptsGetResult", input, tail);
+        try roundTripMcpPromptsGetResult(result, storage, replay, out, stats);
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    if (mcp.decodeDiscoverResult(input, storage.versions[0..], storage.verbatim[0..], scratch)) |result| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("mcp.decodeDiscoverResult"));
+        try expectRoundTripHasNoTail("mcp.decodeDiscoverResult", input, tail);
+        try roundTripMcpDiscoverResult(result, storage, replay, out, stats);
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    // The two MCP decoders that take something other than a document. Neither
+    // has a trailing-byte case, for the reason the battery table gives for
+    // `acp.nextFrame`: a header value and a `params` member are bytes a caller
+    // already holds, not a document whose tail a transport could have split.
+    if (paramsLexeme(input, storage.borrow[0..])) |params| {
+        if (mcp.decodeCacheLeg(params, scratch)) |leg| {
+            stats.accepted += 1;
+            reachedBatteryCodec(stats, batteryIndex("mcp.decodeCacheLeg"));
+            switch (leg) {
+                .mrtr_retry => stats.cache_leg_retry += 1,
+                .original => stats.cache_leg_original += 1,
+            }
+        } else |_| {
+            stats.refused += 1;
+        }
+    }
+
+    if (mcp.decodeHeaderValue(input, storage.borrow[0..])) |value| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("mcp.decodeHeaderValue"));
+        // The whole corpus is hostile bytes, so the sentinel branch is reached
+        // by documents that begin `=?base64?` and the plain branch by every
+        // other one. Three buffers: the value lives in the first, the encoder
+        // writes base64 text from it into the second, and the re-decode of what
+        // it wrote lands in the third.
+        var writer = json.Writer.init(out);
+        try mcp.encodeHeaderValue(value, &writer, storage.header_encode[0..]);
+        try testing.expectEqualStrings(
+            value,
+            try mcp.decodeHeaderValue(writer.written(), storage.header_decode[0..]),
+        );
+        stats.round_trips += 1;
+    } else |_| {
+        stats.refused += 1;
+    }
+
+    // --- The eleven A2A content-half codecs ------------------------------------
+    //
+    // One arena for the whole corpus, which is the contract every public
+    // `a2a` decoder offers: each calls `reset` before it reads, so one arena
+    // serves one document at a time and a second decode overwrites the first
+    // one's values. The round trip re-decodes into `content_again` for the
+    // reason `runPropertyHarness` gives for the two scratch buffers.
+
+    if (a2a.decodePartContent(input, &storage.content, scratch)) |value| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("a2a.decodePartContent"));
+        try expectRoundTripHasNoTail("a2a.decodePartContent", input, tail);
+        try roundTripA2aContent(
+            a2a.PartContent,
+            value,
+            a2a.decodePartContent,
+            a2a.encodePartContent,
+            expectSamePartContent,
+            storage,
+            replay,
+            out,
+            stats,
+        );
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    if (a2a.decodePart(input, &storage.content, scratch)) |value| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("a2a.decodePart"));
+        try expectRoundTripHasNoTail("a2a.decodePart", input, tail);
+        try roundTripA2aContent(
+            a2a.Part,
+            value,
+            a2a.decodePart,
+            a2a.encodePart,
+            expectSamePart,
+            storage,
+            replay,
+            out,
+            stats,
+        );
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    if (a2a.decodeMessage(input, &storage.content, scratch)) |value| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("a2a.decodeMessage"));
+        try expectRoundTripHasNoTail("a2a.decodeMessage", input, tail);
+        try roundTripA2aContent(
+            a2a.Message,
+            value,
+            a2a.decodeMessage,
+            a2a.encodeMessage,
+            expectSameA2aMessage,
+            storage,
+            replay,
+            out,
+            stats,
+        );
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    if (a2a.decodeArtifact(input, &storage.content, scratch)) |value| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("a2a.decodeArtifact"));
+        try expectRoundTripHasNoTail("a2a.decodeArtifact", input, tail);
+        try roundTripA2aContent(
+            a2a.Artifact,
+            value,
+            a2a.decodeArtifact,
+            a2a.encodeArtifact,
+            expectSameArtifact,
+            storage,
+            replay,
+            out,
+            stats,
+        );
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    if (a2a.decodeTaskStatus(input, &storage.content, scratch)) |value| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("a2a.decodeTaskStatus"));
+        try expectRoundTripHasNoTail("a2a.decodeTaskStatus", input, tail);
+        try roundTripA2aContent(
+            a2a.TaskStatus,
+            value,
+            a2a.decodeTaskStatus,
+            a2a.encodeTaskStatus,
+            expectSameTaskStatus,
+            storage,
+            replay,
+            out,
+            stats,
+        );
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    if (a2a.decodeTask(input, &storage.content, scratch)) |value| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("a2a.decodeTask"));
+        try expectRoundTripHasNoTail("a2a.decodeTask", input, tail);
+        try roundTripA2aContent(
+            a2a.Task,
+            value,
+            a2a.decodeTask,
+            a2a.encodeTask,
+            expectSameTask,
+            storage,
+            replay,
+            out,
+            stats,
+        );
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    if (a2a.decodeTaskStatusUpdateEvent(input, &storage.content, scratch)) |value| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("a2a.decodeTaskStatusUpdateEvent"));
+        try expectRoundTripHasNoTail("a2a.decodeTaskStatusUpdateEvent", input, tail);
+        try roundTripA2aContent(
+            a2a.TaskStatusUpdateEvent,
+            value,
+            a2a.decodeTaskStatusUpdateEvent,
+            a2a.encodeTaskStatusUpdateEvent,
+            expectSameTaskStatusUpdateEvent,
+            storage,
+            replay,
+            out,
+            stats,
+        );
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    if (a2a.decodeTaskArtifactUpdateEvent(input, &storage.content, scratch)) |value| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("a2a.decodeTaskArtifactUpdateEvent"));
+        try expectRoundTripHasNoTail("a2a.decodeTaskArtifactUpdateEvent", input, tail);
+        try roundTripA2aContent(
+            a2a.TaskArtifactUpdateEvent,
+            value,
+            a2a.decodeTaskArtifactUpdateEvent,
+            a2a.encodeTaskArtifactUpdateEvent,
+            expectSameTaskArtifactUpdateEvent,
+            storage,
+            replay,
+            out,
+            stats,
+        );
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    if (a2a.decodeSendMessageRequest(input, &storage.content, scratch)) |value| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("a2a.decodeSendMessageRequest"));
+        try expectRoundTripHasNoTail("a2a.decodeSendMessageRequest", input, tail);
+        try roundTripA2aContent(
+            a2a.SendMessageRequest,
+            value,
+            a2a.decodeSendMessageRequest,
+            a2a.encodeSendMessageRequest,
+            expectSameSendMessageRequest,
+            storage,
+            replay,
+            out,
+            stats,
+        );
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    if (a2a.decodeSendMessageResponse(input, &storage.content, scratch)) |value| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("a2a.decodeSendMessageResponse"));
+        try expectRoundTripHasNoTail("a2a.decodeSendMessageResponse", input, tail);
+        try roundTripA2aContent(
+            a2a.SendMessageResponse,
+            value,
+            a2a.decodeSendMessageResponse,
+            a2a.encodeSendMessageResponse,
+            expectSameSendMessageResponse,
+            storage,
+            replay,
+            out,
+            stats,
+        );
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    if (a2a.decodeStreamResponse(input, &storage.content, scratch)) |value| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("a2a.decodeStreamResponse"));
+        try expectRoundTripHasNoTail("a2a.decodeStreamResponse", input, tail);
+        try roundTripA2aContent(
+            a2a.StreamResponse,
+            value,
+            a2a.decodeStreamResponse,
+            a2a.encodeStreamResponse,
+            expectSameStreamResponse,
+            storage,
+            replay,
+            out,
+            stats,
+        );
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    // --- The eight A2A discovery-half codecs -----------------------------------
+    //
+    // One `CardArena` for the whole corpus, on the same contract as the content
+    // half: every public decoder in this section calls `reset` before it reads.
+
+    if (a2a.decodeStringList(input, &storage.card, scratch)) |value| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("a2a.decodeStringList"));
+        try expectRoundTripHasNoTail("a2a.decodeStringList", input, tail);
+        try roundTripA2aCard(
+            a2a.StringList,
+            value,
+            a2a.decodeStringList,
+            a2a.encodeStringList,
+            expectSameStringList,
+            storage,
+            replay,
+            out,
+            stats,
+        );
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    if (a2a.decodeSecurityRequirement(input, &storage.card, scratch)) |value| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("a2a.decodeSecurityRequirement"));
+        try expectRoundTripHasNoTail("a2a.decodeSecurityRequirement", input, tail);
+        try roundTripA2aCard(
+            a2a.SecurityRequirement,
+            value,
+            a2a.decodeSecurityRequirement,
+            a2a.encodeSecurityRequirement,
+            expectSameSecurityRequirement,
+            storage,
+            replay,
+            out,
+            stats,
+        );
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    if (a2a.decodeSecurityScheme(input, &storage.card, scratch)) |value| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("a2a.decodeSecurityScheme"));
+        try expectRoundTripHasNoTail("a2a.decodeSecurityScheme", input, tail);
+        try roundTripA2aCard(
+            a2a.SecurityScheme,
+            value,
+            a2a.decodeSecurityScheme,
+            a2a.encodeSecurityScheme,
+            expectSameSecurityScheme,
+            storage,
+            replay,
+            out,
+            stats,
+        );
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    if (a2a.decodeOAuthFlows(input, &storage.card, scratch)) |value| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("a2a.decodeOAuthFlows"));
+        try expectRoundTripHasNoTail("a2a.decodeOAuthFlows", input, tail);
+        try roundTripA2aCard(
+            a2a.OAuthFlows,
+            value,
+            a2a.decodeOAuthFlows,
+            a2a.encodeOAuthFlows,
+            expectSameOAuthFlows,
+            storage,
+            replay,
+            out,
+            stats,
+        );
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    if (a2a.decodeOAuth2SecurityScheme(input, &storage.card, scratch)) |value| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("a2a.decodeOAuth2SecurityScheme"));
+        try expectRoundTripHasNoTail("a2a.decodeOAuth2SecurityScheme", input, tail);
+        try roundTripA2aCard(
+            a2a.OAuth2SecurityScheme,
+            value,
+            a2a.decodeOAuth2SecurityScheme,
+            a2a.encodeOAuth2SecurityScheme,
+            expectSameOAuth2Scheme,
+            storage,
+            replay,
+            out,
+            stats,
+        );
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    if (a2a.decodeAgentCapabilities(input, &storage.card, scratch)) |value| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("a2a.decodeAgentCapabilities"));
+        try expectRoundTripHasNoTail("a2a.decodeAgentCapabilities", input, tail);
+        try roundTripA2aCard(
+            a2a.AgentCapabilities,
+            value,
+            a2a.decodeAgentCapabilities,
+            a2a.encodeAgentCapabilities,
+            expectSameAgentCapabilities,
+            storage,
+            replay,
+            out,
+            stats,
+        );
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    if (a2a.decodeAgentSkill(input, &storage.card, scratch)) |value| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("a2a.decodeAgentSkill"));
+        try expectRoundTripHasNoTail("a2a.decodeAgentSkill", input, tail);
+        try roundTripA2aCard(
+            a2a.AgentSkill,
+            value,
+            a2a.decodeAgentSkill,
+            a2a.encodeAgentSkill,
+            expectSameAgentSkill,
+            storage,
+            replay,
+            out,
+            stats,
+        );
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    if (a2a.decodeAgentCard(input, &storage.card, scratch)) |value| {
+        stats.accepted += 1;
+        reachedBatteryCodec(stats, batteryIndex("a2a.decodeAgentCard"));
+        try expectRoundTripHasNoTail("a2a.decodeAgentCard", input, tail);
+        try roundTripA2aCard(
+            a2a.AgentCard,
+            value,
+            a2a.decodeAgentCard,
+            a2a.encodeAgentCard,
+            expectSameAgentCard,
+            storage,
+            replay,
+            out,
+            stats,
+        );
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
     // The registries take a name rather than a document, so they are fed a
     // name taken from the document: something a peer could plausibly have sent.
     if (input.len != 0) {
@@ -3371,10 +5459,16 @@ fn runPropertyHarness(run_seed: u64, count: usize) !Stats {
     // read, and it drops the whitespace the input spent, so a
     // `BufferTooSmall` here is a harness bug rather than a tight buffer.
     var owed: [encode_buf_len]u8 = undefined;
+    // The caller-owned storage the arena-taking decoders write into, built
+    // once and reused for every document. The arenas are reset by the decoders
+    // themselves, and the `_again` halves exist so a round trip's re-decode
+    // cannot overwrite the value it is comparing; see [`Storage`].
+    var storage: Storage = undefined;
+    storage.init();
 
     for (0..count) |index| {
         writeShape(rng, &doc, &splice, index);
-        try exerciseEveryDecoder(doc.slice(), &scratch, &replay, &out, &owed, &stats);
+        try exerciseEveryDecoder(doc.slice(), &scratch, &replay, &out, &owed, &storage, &stats);
     }
 
     // A run that generated nothing useful would pass by decoding nothing.
@@ -3403,6 +5497,21 @@ fn runPropertyHarness(run_seed: u64, count: usize) !Stats {
     if (count >= 1000) {
         try testing.expect(stats.envelope_meta_round_trips != 0);
         try testing.expect(stats.outcome_meta_round_trips != 0);
+    }
+    // The storage bounds are only bounds if no document the corpus builds ever
+    // outgrows one. A `BufferTooSmall` here is the harness's own sizing fault
+    // rather than the decoder's answer, and it is the failure the whole storage
+    // section exists to rule out: every document refused for want of room is a
+    // run that is green while checking nothing. A short run says nothing
+    // either way, so it asserts nothing, for the same reason as the guards above.
+    if (count >= 1000) try testing.expect(stats.storage_too_small == 0);
+    // `mcp.decodeCacheLeg` has two answers and the rule is the whole of what it
+    // reads, so a corpus that produced one of them would be checking the other
+    // one not at all. A seed carries `inputResponses` inside `params` for the
+    // retry leg, and every other request is the original.
+    if (count >= 1000) {
+        try testing.expect(stats.cache_leg_original != 0);
+        try testing.expect(stats.cache_leg_retry != 0);
     }
     std.debug.print(
         "  documents={d} accepted={d} refused={d} round-trips={d}\n",
@@ -3482,14 +5591,17 @@ test "the coverage tables agree on what the battery feeds" {
     var reasonless: ?[]const u8 = null;
     var misfiled: ?[]const u8 = null;
 
-    // The prose around these tables quotes their sizes — "twenty-nine", "the
-    // first twenty-three", "the nine after them" — and a count that has
-    // drifted from the number the comment states is the same fault in a new
-    // place: a reader who believes "twenty-nine decoders lack coverage" is
-    // told something false, which is what this test exists to stop.
-    try testing.expectEqual(@as(usize, 29), tail_rule.unasserted.len);
-    try testing.expectEqual(@as(usize, 30), tail_rule.round_trip.len);
-    try testing.expectEqual(wave_codec_count + 9, battery_codec_names.len);
+    // The prose around these tables quotes their sizes — "none", "the first
+    // twenty-three", "the nine after them and the twenty-nine this wave fed" —
+    // and a count that has drifted from the number the comment states is the
+    // same fault in a new place. An empty [`tail_rule.unasserted`] is the
+    // strongest claim any of these tables makes, so it is the one most worth
+    // pinning: a decoder added to the battery and not removed from that list
+    // would otherwise leave the file claiming coverage that the guard below
+    // measures and the table below contradicts.
+    try testing.expectEqual(@as(usize, 0), tail_rule.unasserted.len);
+    try testing.expectEqual(@as(usize, 57), tail_rule.round_trip.len);
+    try testing.expectEqual(wave_codec_count + later_codec_count, battery_codec_names.len);
 
     // And the split the table's doc describes, by name shape rather than by
     // arithmetic: the wave's half is three `acp` rows and then twenty `a2a`
@@ -3577,11 +5689,11 @@ test "every member name is in a seed or listed as grammar-only" {
     // that preprocesses its own skip table. That is more backwards branches
     // than the default thousand allows by a wide margin, and 20 000 was not
     // enough either: the compiler reported the same overflow at that figure.
-    // The A2A half made it worse in both factors at once — twenty-nine more
-    // names and nineteen more seeds — so the number is three orders above the
-    // limit rather than one. Deleting the keyword does not make the check
-    // cheaper, it makes the test fail to compile, so raise the number rather
-    // than drop a name.
+    // Every A2A wave made it worse in both factors at once — more names and
+    // more seeds — and the last one did it by about a hundred names at a time,
+    // so the number is three orders above the limit rather than one. Deleting
+    // the keyword does not make the check cheaper, it makes the test fail to
+    // compile, so raise the number rather than drop a name.
     @setEvalBranchQuota(2_000_000);
 
     // The whole vocabulary and the two ways the corpus can use one have to
