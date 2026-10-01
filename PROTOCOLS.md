@@ -330,6 +330,315 @@ removal is the first revision released on or after **2027-07-28**, with a
 
 No feature has reached the Removed state.
 
+### 4.10 Result payloads
+
+The method inventory in 4.4 names the methods. This section gives each one the
+body it answers with. The envelope every one of them carries — `resultType`, and
+`ttlMs`/`cacheScope` where the result is cacheable — is fixed in 4.6 and is not
+repeated per method below.
+
+Transcribed from `schema/2026-07-28/schema.ts`: the `*ResultResponse` interfaces,
+the result interfaces they name, and the `ServerResult` union. Requirement
+language is from `basic/index.md` §Result Responses, `server/tools.md`,
+`server/resources.md`, `server/prompts.md` and `server/utilities/caching.md`.
+The same artifact is transcribed value-by-value
+in [`research/normative/mcp-2026-07-28.md`](research/normative/mcp-2026-07-28.md)
+§5, §8 and §10; every row here was checked against it and against the artifact
+itself. One value disagrees, and the artifact wins:
+`research/normative/mcp-2026-07-28.md` §1a says *"The three list requests
+extend `PaginatedRequest`"*. **Four** do — `ListPromptsRequest`,
+`ListResourcesRequest`, `ListResourceTemplatesRequest` and `ListToolsRequest` —
+and its own method table a few lines above already gives all four
+`params: PaginatedRequestParams`, so the sentence under-counts its own table.
+4.10.2 uses the artifact's count.
+
+#### 4.10.1 Method to result
+
+| Method | Result type | Payload |
+| --- | --- | --- |
+| `server/discover` | `DiscoverResult` | Supported versions, server capabilities, optional instructions |
+| `completion/complete` | `CompleteResult` | One page of completion values |
+| `prompts/get` | `GetPromptResult` \| `InputRequiredResult` | Messages, or an MRTR interim |
+| `prompts/list` | `ListPromptsResult` | One page of prompts |
+| `resources/list` | `ListResourcesResult` | One page of resources |
+| `resources/templates/list` | `ListResourceTemplatesResult` | One page of templates |
+| `resources/read` | `ReadResourceResult` \| `InputRequiredResult` | Resource contents, or an MRTR interim |
+| `subscriptions/listen` | `SubscriptionsListenResult` | Empty body; identifies the stream it closes |
+| `tools/call` | `CallToolResult` \| `InputRequiredResult` | Content blocks, or an MRTR interim |
+| `tools/list` | `ListToolsResult` | One page of tools |
+
+Exactly three of the ten may answer with `InputRequiredResult`, and then only
+with `resultType: "input_required"`, which is what 4.7 already fixes. The other
+seven have one result type each. `EmptyResult` — spelled `export type
+EmptyResult = Result;` in the schema, the body that says success and carries no
+data — is a member of the `ServerResult` union but is the declared result of
+none of the ten, so a decoder must accept it as a legal result without
+inventing a method for it.
+
+`ServerResult`, verbatim, is the union of twelve types: `EmptyResult`,
+`DiscoverResult`, `CompleteResult`, `GetPromptResult`, `ListPromptsResult`,
+`ListResourceTemplatesResult`, `ListResourcesResult`, `ReadResourceResult`,
+`SubscriptionsListenResult`, `CallToolResult`, `ListToolsResult` and
+`InputRequiredResult`. `InputRequiredResult` is a member of that union and has
+no method of its own; it is the `"input_required"` arm of the three rows above.
+
+#### 4.10.2 Cacheable and paginated
+
+Two base interfaces contribute fields. Both are marked `/** @internal */` in
+the schema, so neither has a wire discriminator: a result is cacheable because
+it carries `ttlMs` and `cacheScope`, and paginated because it carries
+`nextCursor`, not because it announced either.
+
+| Base | Contributes | On which results |
+| --- | --- | --- |
+| `CacheableResult` | `ttlMs: number` `@minimum 0`, required; `cacheScope: "public" \| "private"`, required | `DiscoverResult`, `ListToolsResult`, `ListPromptsResult`, `ListResourcesResult`, `ListResourceTemplatesResult`, `ReadResourceResult` |
+| `PaginatedResult` | `nextCursor?: Cursor`, optional; `Cursor = string` | The same six minus `ReadResourceResult`, which is cacheable but **not** paginated |
+
+Those six are exactly the six `server/utilities/caching.md` requires servers to
+return caching hints for, so the schema's `extends` clauses and the caching
+prose agree with no residue. `completion/complete`, `prompts/get`, `tools/call`
+and `subscriptions/listen` are `extends Result` alone.
+
+Only the four list requests take a `cursor`, and only they are declared
+`extends PaginatedRequest` with `params: PaginatedRequestParams`. So a request
+and its result are not both paginated: `resources/read` returns contents that
+are a sequence but has no `nextCursor`, and the four list results are the only
+ones that do.
+
+#### 4.10.3 Payloads
+
+Every row below sits on top of 4.6, so `resultType` is present unless the peer
+is on an earlier revision, and `_meta` is optional unless the row says
+otherwise. "Required" is the schema's own requiredness, not this library's
+preference.
+
+`DiscoverResult extends CacheableResult`
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `supportedVersions` | `string[]` | **Yes** | The client picks one for later requests |
+| `capabilities` | `ServerCapabilities` | **Yes** | The 4.8 shape |
+| `instructions` | `string` | No | Natural-language guidance for an LLM |
+| `ttlMs` | `number` | **Yes** | 4.6 |
+| `cacheScope` | `"public" \| "private"` | **Yes** | 4.6 |
+
+`CompleteResult extends Result`
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `completion.values` | `string[]` | **Yes** | `@maxItems 100` |
+| `completion.total` | `number` | No | Total options available; **may exceed** the number sent |
+| `completion.hasMore` | `boolean` | No | More exist beyond this response even if `total` is absent |
+
+`completion` itself is required, so `{"resultType":"complete"}` with no
+`completion` is not a `CompleteResult`.
+
+`GetPromptResult extends Result`
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `messages` | `PromptMessage[]` | **Yes** | One block each, not a block each carrying a list |
+| `description` | `string` | No | |
+
+`PromptMessage` is `{ role: Role; content: ContentBlock }`, both required.
+`Role = "user" | "assistant"`. `content` is a **single** block, not a
+sequence — the one place a `ContentBlock` stands alone.
+
+`ListPromptsResult extends PaginatedResult, CacheableResult` carries
+`prompts: Prompt[]` (required) and `nextCursor`.
+`ListResourcesResult` carries `resources: Resource[]` (required) and
+`nextCursor`. `ListResourceTemplatesResult` carries `resourceTemplates:
+ResourceTemplate[]` (required) and `nextCursor`. `ListToolsResult` carries
+`tools: Tool[]` (required) and `nextCursor`. All four also carry `ttlMs` and
+`cacheScope`.
+
+`ReadResourceResult extends CacheableResult`
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `contents` | `(TextResourceContents \| BlobResourceContents)[]` | **Yes** | No `nextCursor`; this is a sequence but not a page |
+
+`contents` may hold more than one entry — `server/resources.md`: *"Servers **MAY**
+return multiple resource contents in response to a single `resources/read`
+request"* — and its two members are the text and binary forms of one resource,
+chosen by which of `text` and `blob` is present. `server/resources.md` also puts
+a **MUST NOT** on the empty case: *"Servers **MUST NOT** return an empty
+`contents` array for a non-existent resource. An empty array is
+ambiguous—it could mean the resource exists but has no content, or that it
+doesn't exist at all."*
+
+`CallToolResult extends Result` — not `CacheableResult`, so `tools/call` results
+carry no `ttlMs` and no `cacheScope`.
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `content` | `ContentBlock[]` | **Yes** | Unstructured result. Present and empty is well formed |
+| `structuredContent` | `unknown` | No | **Any** JSON value, conforming to the tool's `outputSchema` if it has one |
+| `isError` | `boolean` | No | Absent means false. A tool's own failure belongs here, not in a JSON-RPC error, so the model can see it |
+
+`SubscriptionsListenResult extends Result` has no payload member at all: the
+body is empty apart from `_meta`. Its `_meta` is the one place a result's
+`_meta` is **required**, and the narrowed type requires one key of its own —
+`SubscriptionsListenResultMetaObject` carries
+`"io.modelcontextprotocol/subscriptionId": RequestId`, required, whose value is
+the JSON-RPC `id` of the `subscriptions/listen` request and equals this
+response's own `id`. The result is sent only on a graceful teardown; an abrupt
+transport close carries no response.
+
+#### 4.10.4 `ContentBlock`
+
+`ContentBlock` is the union of five named members, discriminated by a `type`
+string that is **required** in all five and is the member's only tag:
+
+```ts
+export type ContentBlock =
+  TextContent | ImageContent | AudioContent | ResourceLink | EmbeddedResource;
+```
+
+| `type` | Interface | Fields beyond `type` |
+| --- | --- | --- |
+| `"text"` | `TextContent` | `text: string` (required); `annotations?`; `_meta?` |
+| `"image"` | `ImageContent` | `data: string` (required, `@format byte`, base64); `mimeType: string` (required); `annotations?`; `_meta?` |
+| `"audio"` | `AudioContent` | `data: string` (required, `@format byte`, base64); `mimeType: string` (required); `annotations?`; `_meta?` |
+| `"resource_link"` | `ResourceLink` | `ResourceLink extends Resource`, so every `Resource` field, plus the `type` tag |
+| `"resource"` | `EmbeddedResource` | `resource: TextResourceContents \| BlobResourceContents` (required); `annotations?`; `_meta?` |
+
+`data` on the image and audio members is a base64 **string**, not bytes:
+`server/prompts.md` states for image content that *"The image data **MUST** be
+base64-encoded and include a valid MIME type"* and the same for audio, so a
+decoder that validates the alphabet is reading a rule the specification states
+and not one it inferred from `@format byte`.
+
+Two consequences a decoder has to get right. `ResourceLink` is a `Resource`
+with a `type` added, so a `Resource` inside `resources/list` has **no** `type`
+member while a `ResourceLink` inside a content block does — the same underlying
+object appears on the wire with and without the tag depending on which result
+carries it. And `EmbeddedResource.resource` and `ReadResourceResult.contents`
+are unions with **no discriminator at all**: see 4.10.6.
+
+`Resource`, `ResourceTemplate`, `Prompt`, `Tool`, `PromptArgument`, `Icon` and
+`Annotations` are the element types, and their member sets are fixed. `Tool`
+carries `inputSchema` (required, and its root `type` is the literal `"object"`)
+and optional `outputSchema`, both open JSON Schema objects rather than library
+types, and `ToolAnnotations` is five optional members. `Resource` and
+`ResourceTemplate` and `Prompt` and `Tool` all take `name` from
+`BaseMetadata` plus optional `title`, and optional `icons?: Icon[]`.
+
+#### 4.10.5 Caller-owned sequences
+
+Which payloads are a sequence and which are a single value, because the decode
+shapes differ and the difference is not visible from the method name. In this
+library a sequence is an `out: []T` slice the caller supplies plus a returned
+count, and a single value is a struct in the returned result; a `[]T` the
+decoder allocates is not available under 2.
+
+| Result | Sequence member | Element |
+| --- | --- | --- |
+| `DiscoverResult` | `supportedVersions` | `string` |
+| `CompleteResult` | `completion.values` | `string`, capped at 100 |
+| `GetPromptResult` | `messages` | `PromptMessage`, each holding one `ContentBlock` |
+| `ListPromptsResult` | `prompts` | `Prompt` |
+| `ListResourcesResult` | `resources` | `Resource` |
+| `ListResourceTemplatesResult` | `resourceTemplates` | `ResourceTemplate` |
+| `ReadResourceResult` | `contents` | `TextResourceContents \| BlobResourceContents` |
+| `CallToolResult` | `content` | `ContentBlock` |
+| `ListToolsResult` | `tools` | `Tool` |
+| `SubscriptionsListenResult` | none | — |
+
+`nextCursor` is not a sequence: it is one optional string, and it is the only
+pagination member on any of the ten. Two of these rows are the ones a decoder
+cannot get right from the field name alone: `contents` is a sequence with no
+`nextCursor`, and `content` is a sequence of a tagged union while
+`PromptMessage.content` is one block of the same union.
+
+Nesting below the top level: `Prompt.arguments?: PromptArgument[]`,
+`Icons.icons?: Icon[]`, `Icon.sizes?: string[]` and `Annotations.audience?:
+Role[]` are sequences inside an element, so an element type either carries its
+own `out` slice or gives up on those members. `Tool.inputSchema` and
+`Tool.outputSchema` are open JSON Schema objects and are not library-typed
+sequences at all.
+
+#### 4.10.6 Open sets, closed sets, and one silence
+
+The rule from `AGENTS.md` — a decoder that accepts a member has to be able to
+write it back — bites hardest here, so which sets are open has to be stated
+rather than left to the implementer.
+
+| Set | Status | Evidence |
+| --- | --- | --- |
+| Members of any result object | **Open** | `Result` declares `[key: string]: unknown`. `basic/index.md` §Result Responses: *"The `result` **MAY** follow any JSON object structure."* |
+| `ContentBlock.type` | **Closed** — five literals | The union declaration above. No `\| string` arm, no index signature, and the *"this is not a closed set"* sentence appears only on `ClientCapabilities` and `ServerCapabilities` |
+| Members of `TextContent`, `ImageContent`, `AudioContent`, `EmbeddedResource`, `ResourceContents`, `Resource`, `ResourceTemplate`, `Prompt`, `Tool`, `PromptArgument`, `Icon`, `Annotations`, `ToolAnnotations` | **Closed** | None declares an index signature. `_meta` is the one open member, and it is a `MetaObject = Record<string, unknown>` |
+| `Role`, `Icon.theme`, `CacheScope` | **Closed** | Literal unions, 4.6 for `CacheScope` |
+| `InputRequests` keys | **Open** — server-assigned | 4.7 |
+| `resultType` | **Closed set, open carrier** | `"complete" \| "input_required" \| string` admits any string, and `basic/index.md`: *"A `resultType` of any value unrecognized by the client **MUST** be considered invalid."* |
+
+The first row is the one that decides the encoding. A `tools/call` result the
+library accepts may carry a key the shape does not name, because the source
+says a result may follow any object structure, and 2 says
+`encode(decode(b)) == b` for every accepted input. So a key a result type does
+not model is carried as the borrowed lexeme it arrived as, which is what
+`bridge.Envelope.meta` and `bridge.OutcomePayload` already do. This is the
+mistake that re-opened a loss that had been closed for the life of the
+repository, and it is the reason no result payload in 4.10.3 is transcribed as
+a closed struct.
+
+**What the source does not say.** No primary source states what a receiver
+does with a `ContentBlock` whose `type` is not one of the five. The schema
+declares a closed union and says nothing further. Every specification page that
+carries one of these results was checked for such a rule — `basic/index.md`,
+`basic/versioning.md`, `server/tools.md`, `server/resources.md`,
+`server/prompts.md` and `server/discover.md` — and none of them mentions an
+unrecognised content type. The one clause in the protocol about ignoring what is
+not recognised — *"the server **SHOULD** ignore any information it does not
+recognize or need"* — is scoped to the `inputResponses` object in **request**
+params, and does not reach a result's content.
+
+The source's own idiom points one way and the risk points the other, so this is
+recorded rather than resolved. The idiom: where a discriminator is meant to be
+open, the schema says so explicitly, and `ResultType` is the one place it does —
+it carries a `| string` arm and the prose resolves it in the same breath.
+`ContentBlock` has neither. The risk: a peer may be speaking a later revision,
+and 2 requires decoding to be total rather than panicking.
+
+`mcp.ResultType` is the precedent already in the tree for the representation:
+the wire string is kept as borrowed text in `ResultType.value`, and the set the
+source defines is exposed separately through `known()`. A `ContentBlock` decoder
+that keeps the `type` lexeme and exposes the five-member set the same way
+satisfies both halves — it writes back anything it accepted, and it does not
+claim a value the source does not state. Whether an unrecognised `type`
+additionally yields `DecodeError.UnknownTag`, which is what 2 says it does for
+an unknown enum tag, or is carried as the lexeme with the decision left to the
+caller as `ResultType` does, is a **decision** for
+[`SPEC-DECISIONS.md`](SPEC-DECISIONS.md) and not a transcription. 4.10 states
+the two sets and the evidence; it does not pick.
+
+#### 4.10.7 Where the source is silent
+
+Every row below is `NOT ESTABLISHED` in the preamble's sense: no primary source
+defines it, this library does not invent one, and the corresponding case is an
+explicit decode failure rather than a guess.
+
+- **A `TextResourceContents` carrying `blob`, or a `BlobResourceContents`
+  carrying `text`.** The two differ only by which required member is present,
+  so an object with both satisfies both union members and the source does not
+  say which to read. Both of the places these appear — `ReadResourceResult
+  .contents` and `EmbeddedResource.resource` — depend on that choice.
+- **A block with neither `text` nor `blob`**, which is well-formed JSON and
+  matches neither member.
+- **An array element that is not an object at all.** A JSON string in
+  `tools/call`'s `content` is not one of the five.
+- **The bound on `nextCursor`, and on `supportedVersions`, `prompts`,
+  `resources`, `resourceTemplates`, `tools`, `messages` and `contents`.** Only
+  `completion.values` carries a numeric bound, `@maxItems 100`. The rest are
+  bounded by whatever the transport imposes.
+- **Whether `annotations.priority` is an integer or a real.** The schema types
+  it `number` with `@minimum 0` and `@maximum 1`; it does not narrow to an
+  integer, and the `Resource` example in `server/resources.md` uses `0.8`.
+- **Any requirement on the order of `content`.** The schema does not constrain
+  it, and `server/tools.md` asks servers to return tools in a deterministic
+  order for caching, which is guidance rather than a wire rule.
+
 ## 5. Agent2Agent
 
 ### 5.1 Normative source and package

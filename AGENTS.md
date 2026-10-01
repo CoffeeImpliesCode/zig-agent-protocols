@@ -192,9 +192,16 @@ style; each one has a failure that is hard to see from the code alone.
   alias, and `skipValue`/`rawValue` consume no scratch. A string with no escape
   borrows the input directly.
 - `mcp.lookupMethod(revision, name)` resolves a top-level method and returns
-  `error.UnknownMethod` for anything removed at `2026-07-28`, including
-  `roots/list`, `sampling/createMessage` and `elicitation/create`.
-  `mcp.lookupInputRequest(name)` resolves those three inside `inputRequests`.
+  `error.UnknownMethod` for anything removed at `2026-07-28` **at that
+  revision** — `roots/list`, `sampling/createMessage` and
+  `elicitation/create` resolve at `2025-11-25`, where all three were live, and
+  `previous_top_level_requests` is the table that says so.
+  `mcp.lookupInputRequest(name)` resolves those three inside `inputRequests` at
+  every revision. The two tables carry different directions on purpose:
+  `input_requests` is a `server_to_client_mrtr_only` value carried in an
+  answer, and `previous_top_level_requests` is an ordinary `client_to_server`
+  request, so reusing one row for the other resolves the name and then refuses
+  it in both directions.
 - `bridge.isBindingFailure(code, level)` takes an explicit `ErrorLevel`
   (`.inner` / `.outer`), so an inner MCP code — even `-32602`, which the outer
   space also uses — is never read as a binding failure. `bridge.decodeEnvelope`

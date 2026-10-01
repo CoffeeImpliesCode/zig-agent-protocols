@@ -72,3 +72,33 @@ invent one; the case is an explicit decode or encode failure instead.
   for a foundation home it does not have. Each is lifted by the condition §9
   names, a chosen host or a donation. The research document stays the deeper
   value source and the protocol document the authority, as for A2A above.
+
+## 5. MCP `ContentBlock` is a closed union; the result object around it is open
+
+- **Decision:** an unrecognised `type` on a `ContentBlock` is
+  `error.UnknownTag`, exactly as an unrecognised tag is on every other closed
+  set in this library. A **member the result object does not model** is carried
+  as the borrowed lexeme it arrived as, and written back verbatim.
+- **Conflict:** no primary source states a decoding policy either way. The
+  schema artifact declares `ContentBlock = TextContent | ImageContent |
+  AudioContent | ResourceLink | EmbeddedResource` with **no `| string` arm, no
+  index signature, and no "not a closed set" sentence** — and that sentence
+  appears verbatim on `ClientCapabilities` and `ServerCapabilities` and
+  nowhere else, so the artifact's own idiom marks an open discriminator
+  explicitly. Meanwhile `Result` declares `[key: string]: unknown` and
+  `basic/index.md` says a result "MAY follow any JSON object structure", so
+  the object is open in its keys whatever the discriminator is.
+- **Resolution:** the two facts are not in tension and the policy follows
+  each. The discriminator is closed, so an unknown `type` has no arm to decode
+  into and refusing it is the only answer that reports a fault rather than
+  inventing one — the same rule `a2a.TaskState.fromTag`, `a2a.Role.fromTag` and
+  `acp.PermissionOptionKind` already follow, and the reason
+  `root.DecodeError` carries `UnknownTag` at all. The object is open, so a key
+  no result type models cannot be dropped: `PROTOCOLS.md` §2 requires
+  `encode(decode(b)) == b`, and a typed shape cannot hold a key it does not
+  name. That is the rule `bridge.Envelope.meta` and `bridge.OutcomePayload`
+  follow, and a typed shape is exactly what re-opened a loss that had been open
+  for the life of this repository.
+- **Note:** an earlier draft of `PROTOCOLS.md` §4.10 described `ContentBlock`
+  as an open union. The artifact does not support that, and the transcription
+  follows the artifact.
