@@ -1202,10 +1202,13 @@ comptime {
 }
 
 pub const ListTaskPushNotificationConfigsResponse = struct {
-    /// 1.
-    configs: []const TaskPushNotificationConfig = &.{},
-    /// 2. Unlike `ListTasksResponse.next_page_token`, this is not required.
-    next_page_token: []const u8 = "",
+    /// 1. Not REQUIRED, so it is a presence: an empty list and no list are two
+    /// documents, and the codec that lands next needs to tell them apart.
+    configs: ?[]const TaskPushNotificationConfig = null,
+    /// 2. Unlike `ListTasksResponse.next_page_token`, this is not required, so
+    /// an empty string and no member are two documents here as well. A `""`
+    /// default would read as "no more pages" for a response that never said so.
+    next_page_token: ?[]const u8 = null,
 
     /// The ProtoJSON name of every field, in field order.
     pub const fields = [_]Field{
@@ -3189,8 +3192,14 @@ fn readAuthenticationInfo(
 
 /// Encode an `AuthenticationInfo`.
 pub fn encodeAuthenticationInfo(info: AuthenticationInfo, writer: *json.Writer) EncodeError!void {
-    if (info.scheme.len == 0) return error.InvalidField;
+    try validateAuthenticationInfo(info);
+    try writeAuthenticationInfo(info, writer);
+}
 
+/// The write half, so `writeTaskPushNotificationConfig` can place one beside
+/// its own members without a second refusal on a buffer that is already part
+/// of a document.
+fn writeAuthenticationInfo(info: AuthenticationInfo, writer: *json.Writer) EncodeError!void {
     try writer.slice("{\"scheme\":");
     try writer.string(info.scheme);
     if (info.credentials) |credentials| {
@@ -3227,6 +3236,7 @@ fn readTaskPushNotificationConfig(
 ) DecodeError!TaskPushNotificationConfig {
     var config: TaskPushNotificationConfig = .{ .url = "" };
     var saw_url = false;
+    var saw_authentication = false;
 
     if (try reader.beginObject()) return error.MissingField;
 
@@ -3263,17 +3273,11 @@ fn readTaskPushNotificationConfig(
                 config.token = try reader.string(scratch);
             }
         } else if (std.mem.eql(u8, key, "authentication")) {
-            if (config.authentication != null) {
-                try reader.skipValue(scratch);
-            } else {
-                if (try isNullMember(reader)) {
-                    // `null` and an absent member agree here: the normative
-                    // row types this member as a message, and a configuration
-                    // with no authentication sends none rather than an empty
-                    // one.
-                } else {
-                    config.authentication = try readAuthenticationInfo(reader, scratch);
-                }
+            // `null` and an absent member agree here: the normative row types
+            // this member as a message, and a configuration with no
+            // authentication sends none rather than an empty one.
+            if (try claimMember(&saw_authentication, reader, scratch)) {
+                config.authentication = try readAuthenticationInfo(reader, scratch);
             }
         } else {
             try reader.skipValue(scratch);
@@ -3290,8 +3294,15 @@ pub fn encodeTaskPushNotificationConfig(
     config: TaskPushNotificationConfig,
     writer: *json.Writer,
 ) EncodeError!void {
-    if (config.url.len == 0) return error.InvalidField;
+    try validateTaskPushNotificationConfig(config);
+    try writeTaskPushNotificationConfig(config, writer);
+}
 
+/// The write half, for the reason `writeAuthenticationInfo` is one.
+fn writeTaskPushNotificationConfig(
+    config: TaskPushNotificationConfig,
+    writer: *json.Writer,
+) EncodeError!void {
     try writer.byte('{');
     var separator: []const u8 = "";
     if (config.tenant) |tenant| {
@@ -3321,7 +3332,7 @@ pub fn encodeTaskPushNotificationConfig(
     }
     if (config.authentication) |authentication| {
         try writer.slice(",\"authentication\":");
-        try encodeAuthenticationInfo(authentication, writer);
+        try writeAuthenticationInfo(authentication, writer);
     }
     try writer.byte('}');
 }
@@ -3366,29 +3377,24 @@ fn readSendMessageConfiguration(
     scratch: []u8,
 ) DecodeError!SendMessageConfiguration {
     var configuration: SendMessageConfiguration = .{};
+    var saw_accepted_output_modes = false;
+    var saw_task_push_notification_config = false;
 
     const is_empty = try reader.beginObject();
     if (!is_empty) {
         while (try reader.nextKey(scratch)) |key| {
             if (std.mem.eql(u8, key, "acceptedOutputModes")) {
-                if (configuration.accepted_output_modes != null) {
-                    try reader.skipValue(scratch);
-                } else {
+                if (try claimMember(&saw_accepted_output_modes, reader, scratch)) {
                     const count = try readStringList(reader, out[used.*..], scratch);
                     configuration.accepted_output_modes = out[used.*..][0..count];
                     used.* += count;
                 }
             } else if (std.mem.eql(u8, key, "taskPushNotificationConfig")) {
-                if (configuration.task_push_notification_config != null) {
-                    try reader.skipValue(scratch);
-                } else {
-                    if (try isNullMember(reader)) {
-                        // `null` and an absent member agree here, for the same
-                        // reason `authentication` above does.
-                    } else {
-                        configuration.task_push_notification_config =
-                            try readTaskPushNotificationConfig(reader, scratch);
-                    }
+                // `null` and an absent member agree here, for the same reason
+                // `authentication` above does.
+                if (try claimMember(&saw_task_push_notification_config, reader, scratch)) {
+                    configuration.task_push_notification_config =
+                        try readTaskPushNotificationConfig(reader, scratch);
                 }
             } else if (std.mem.eql(u8, key, "historyLength")) {
                 if (configuration.history_length != null) {
@@ -3416,6 +3422,7 @@ pub fn encodeSendMessageConfiguration(
     configuration: SendMessageConfiguration,
     writer: *json.Writer,
 ) EncodeError!void {
+    try validateSendMessageConfiguration(configuration);
     try writeSendMessageConfiguration(configuration, writer);
 }
 
@@ -3436,7 +3443,7 @@ fn writeSendMessageConfiguration(
     if (configuration.task_push_notification_config) |config| {
         try writer.slice(separator);
         try writeMemberName(SendMessageConfiguration, 1, writer);
-        try encodeTaskPushNotificationConfig(config, writer);
+        try writeTaskPushNotificationConfig(config, writer);
         separator = ",";
     }
     if (configuration.history_length) |history_length| {
@@ -4224,6 +4231,21 @@ pub fn encodeMutualTlsSecurityScheme(
 // `error.MissingField`. A decoder that refused an empty part list would refuse
 // a legal document.
 //
+// A repeated member resolves first-wins, and `null` is an occurrence
+//
+// The flat half states the rule and says it is not local to that section, so
+// it holds here too: the first occurrence of a name decides it. What the flat
+// half has no member for is an occurrence that decides **nothing** — a
+// message, a `repeated` and a map member sent as `null` — so the destination
+// cannot be the record of it, because a `null` leaves the destination exactly
+// as an absent member leaves it. `claimMember`, `claimArm` and `claimMapKey`
+// are that record, one per shape, and the flag each is handed sits beside the
+// destination rather than in it: `{"status":null,"status":{…}}` is a `Task`
+// whose `status` is missing, where a guard written as `dest != null` reads the
+// second occurrence instead. A REQUIRED member is where that stops being a
+// formatting matter, because a later occurrence then satisfies a field this
+// document does not carry.
+//
 // The nine presence defects this half found and fixed
 //
 // Every one of these is a field the wire may omit that the tables held as a
@@ -4435,15 +4457,67 @@ fn readRawPart(
 /// message, so this leaves the field null for the caller's own
 /// `error.MissingField` check to report rather than handing `null` to
 /// `beginObject`, which would call it a syntax error and blame the peer's
-/// grammar for a field the peer did send. Every message member in this half
-/// asks first, so one member has three answers and not four: absent and `null`
-/// are both `MissingField`, and a value that is neither is whatever the
-/// member's own walk says.
+/// grammar for a field the peer did send. Every message, `repeated` and map
+/// member in this file asks first, through one of the three `claim*` helpers
+/// below, so one member has three answers and not four: absent and `null` are
+/// both `MissingField`, and a value that is neither is whatever the member's
+/// own walk says.
 fn isNullMember(reader: *json.Reader) DecodeError!bool {
     reader.skipWhitespace();
     if (reader.peek() != 'n') return false;
     try reader.nullLiteral();
     return true;
+}
+
+/// Whether this occurrence of a member name is the one that decides it.
+///
+/// A member's **first** occurrence decides it, and an occurrence that took
+/// nothing has still decided it: `null` is the member missing and wearing a
+/// key, so `{"status":null,"status":{…}}` is a `Task` whose `status` is
+/// missing and not a `Task` that read the second occurrence. Those are two
+/// questions, and a guard written as `dest != null` asks the wrong one: it
+/// asks whether the destination holds a value, which a `null` leaves null, so
+/// the next occurrence of the same name finds it unset and takes the member.
+/// On a REQUIRED member that is worse than a lost value, because the later
+/// occurrence then satisfies a field the document does not carry.
+///
+/// So what was seen lives beside the destination and not in it, and this asks
+/// and marks in one step. A caller cannot mark a name without asking and
+/// cannot ask without marking, which is what makes the next site correct by
+/// construction rather than by care.
+///
+/// The value is consumed on every path: a repeat is read and dropped, and a
+/// `null` is consumed here, so a peer cannot hide a syntax error behind
+/// either. `seen` is the flag a walk declares beside its destinations, and it
+/// answers "has this name been decided" rather than "did this member take a
+/// value" — the destination answers that one.
+fn claimMember(seen: *bool, reader: *json.Reader, scratch: []u8) DecodeError!bool {
+    if (seen.*) {
+        try reader.skipValue(scratch);
+        return false;
+    }
+    seen.* = true;
+    return !try isNullMember(reader);
+}
+
+/// Whether this occurrence of a `oneof` arm name is the one that decides it.
+///
+/// A union takes the first arm that carries a value, so `{"task":null,
+/// "message":{…}}` is a `StreamResponse` carrying its message. That is a
+/// statement about **arms**, and it is not the statement about **names** that
+/// `claimMember` makes: `{"statusUpdate":null,"statusUpdate":{…}}` is one arm
+/// named twice, and the first occurrence of a name decides it under the rule
+/// every repeated member in this file follows. One flag per union would
+/// answer the arm question and silently answer the name question the other
+/// way, so the record is one bit per arm.
+fn claimArm(seen: *u8, arm: u3, reader: *json.Reader, scratch: []u8) DecodeError!bool {
+    const mask = @as(u8, 1) << arm;
+    if ((seen.* & mask) != 0) {
+        try reader.skipValue(scratch);
+        return false;
+    }
+    seen.* |= mask;
+    return !try isNullMember(reader);
 }
 
 /// Read a `repeated string` member into the arena's element storage.
@@ -4601,8 +4675,11 @@ fn readMessage(reader: *json.Reader, arena: *ContentArena, scratch: []u8) Decode
     var role: Role = .unspecified;
     var saw_role = false;
     var parts: ?[]const Part = null;
+    var saw_parts = false;
     var metadata: ?[]const u8 = null;
     var extensions: ?[]const []const u8 = null;
+    var saw_extensions = false;
+    var saw_reference_task_ids = false;
     var reference_task_ids: ?[]const []const u8 = null;
 
     const is_empty = try reader.beginObject();
@@ -4635,9 +4712,7 @@ fn readMessage(reader: *json.Reader, arena: *ContentArena, scratch: []u8) Decode
                     saw_role = true;
                 }
             } else if (std.mem.eql(u8, key, "parts")) {
-                if (parts != null) {
-                    try reader.skipValue(scratch);
-                } else {
+                if (try claimMember(&saw_parts, reader, scratch)) {
                     parts = try readParts(reader, arena, scratch);
                 }
             } else if (std.mem.eql(u8, key, "metadata")) {
@@ -4647,15 +4722,11 @@ fn readMessage(reader: *json.Reader, arena: *ContentArena, scratch: []u8) Decode
                     metadata = try reader.rawValue(scratch);
                 }
             } else if (std.mem.eql(u8, key, "extensions")) {
-                if (extensions != null) {
-                    try reader.skipValue(scratch);
-                } else {
+                if (try claimMember(&saw_extensions, reader, scratch)) {
                     extensions = try readStrings(reader, arena, scratch);
                 }
             } else if (std.mem.eql(u8, key, "referenceTaskIds")) {
-                if (reference_task_ids != null) {
-                    try reader.skipValue(scratch);
-                } else {
+                if (try claimMember(&saw_reference_task_ids, reader, scratch)) {
                     reference_task_ids = try readStrings(reader, arena, scratch);
                 }
             } else {
@@ -4689,8 +4760,10 @@ fn readArtifact(reader: *json.Reader, arena: *ContentArena, scratch: []u8) Decod
     var name: ?[]const u8 = null;
     var description: ?[]const u8 = null;
     var parts: ?[]const Part = null;
+    var saw_parts = false;
     var metadata: ?[]const u8 = null;
     var extensions: ?[]const []const u8 = null;
+    var saw_extensions = false;
 
     const is_empty = try reader.beginObject();
     if (!is_empty) {
@@ -4715,9 +4788,7 @@ fn readArtifact(reader: *json.Reader, arena: *ContentArena, scratch: []u8) Decod
                     description = try reader.string(scratch);
                 }
             } else if (std.mem.eql(u8, key, "parts")) {
-                if (parts != null) {
-                    try reader.skipValue(scratch);
-                } else {
+                if (try claimMember(&saw_parts, reader, scratch)) {
                     parts = try readParts(reader, arena, scratch);
                 }
             } else if (std.mem.eql(u8, key, "metadata")) {
@@ -4727,9 +4798,7 @@ fn readArtifact(reader: *json.Reader, arena: *ContentArena, scratch: []u8) Decod
                     metadata = try reader.rawValue(scratch);
                 }
             } else if (std.mem.eql(u8, key, "extensions")) {
-                if (extensions != null) {
-                    try reader.skipValue(scratch);
-                } else {
+                if (try claimMember(&saw_extensions, reader, scratch)) {
                     extensions = try readStrings(reader, arena, scratch);
                 }
             } else {
@@ -4756,6 +4825,7 @@ fn readTaskStatus(reader: *json.Reader, arena: *ContentArena, scratch: []u8) Dec
     var state: TaskState = .unspecified;
     var saw_state = false;
     var message: ?Message = null;
+    var saw_message = false;
     var timestamp: ?[]const u8 = null;
 
     const is_empty = try reader.beginObject();
@@ -4769,15 +4839,8 @@ fn readTaskStatus(reader: *json.Reader, arena: *ContentArena, scratch: []u8) Dec
                     saw_state = true;
                 }
             } else if (std.mem.eql(u8, key, "message")) {
-                if (message != null) {
-                    try reader.skipValue(scratch);
-                } else {
-                    if (try isNullMember(reader)) {
-                        // `null` and an absent member agree, and the check
-                        // after the loop is what reports the difference.
-                    } else {
-                        message = try readMessage(reader, arena, scratch);
-                    }
+                if (try claimMember(&saw_message, reader, scratch)) {
+                    message = try readMessage(reader, arena, scratch);
                 }
             } else if (std.mem.eql(u8, key, "timestamp")) {
                 if (timestamp != null) {
@@ -4806,8 +4869,11 @@ fn readTask(reader: *json.Reader, arena: *ContentArena, scratch: []u8) DecodeErr
     var saw_id = false;
     var context_id: ?[]const u8 = null;
     var status: ?TaskStatus = null;
+    var saw_status = false;
     var artifacts: ?[]const Artifact = null;
+    var saw_artifacts = false;
     var history: ?[]const Message = null;
+    var saw_history = false;
     var metadata: ?[]const u8 = null;
 
     const is_empty = try reader.beginObject();
@@ -4827,25 +4893,15 @@ fn readTask(reader: *json.Reader, arena: *ContentArena, scratch: []u8) DecodeErr
                     context_id = try reader.string(scratch);
                 }
             } else if (std.mem.eql(u8, key, "status")) {
-                if (status != null) {
-                    try reader.skipValue(scratch);
-                } else {
-                    if (try isNullMember(reader)) {
-                        // `null` and an absent member agree here too.
-                    } else {
-                        status = try readTaskStatus(reader, arena, scratch);
-                    }
+                if (try claimMember(&saw_status, reader, scratch)) {
+                    status = try readTaskStatus(reader, arena, scratch);
                 }
             } else if (std.mem.eql(u8, key, "artifacts")) {
-                if (artifacts != null) {
-                    try reader.skipValue(scratch);
-                } else {
+                if (try claimMember(&saw_artifacts, reader, scratch)) {
                     artifacts = try readArtifacts(reader, arena, scratch);
                 }
             } else if (std.mem.eql(u8, key, "history")) {
-                if (history != null) {
-                    try reader.skipValue(scratch);
-                } else {
+                if (try claimMember(&saw_history, reader, scratch)) {
                     history = try readMessages(reader, arena, scratch);
                 }
             } else if (std.mem.eql(u8, key, "metadata")) {
@@ -4920,6 +4976,7 @@ fn readTaskStatusUpdateEvent(
     var context_id: []const u8 = "";
     var saw_context_id = false;
     var status: ?TaskStatus = null;
+    var saw_status = false;
     var metadata: ?[]const u8 = null;
 
     const is_empty = try reader.beginObject();
@@ -4940,14 +4997,8 @@ fn readTaskStatusUpdateEvent(
                     saw_context_id = true;
                 }
             } else if (std.mem.eql(u8, key, "status")) {
-                if (status != null) {
-                    try reader.skipValue(scratch);
-                } else {
-                    if (try isNullMember(reader)) {
-                        // `null` and an absent member agree here too.
-                    } else {
-                        status = try readTaskStatus(reader, arena, scratch);
-                    }
+                if (try claimMember(&saw_status, reader, scratch)) {
+                    status = try readTaskStatus(reader, arena, scratch);
                 }
             } else if (std.mem.eql(u8, key, "metadata")) {
                 if (metadata != null) {
@@ -4983,6 +5034,7 @@ fn readTaskArtifactUpdateEvent(
     var context_id: []const u8 = "";
     var saw_context_id = false;
     var artifact: ?Artifact = null;
+    var saw_artifact = false;
     var append: ?bool = null;
     var last_chunk: ?bool = null;
     var metadata: ?[]const u8 = null;
@@ -5005,14 +5057,8 @@ fn readTaskArtifactUpdateEvent(
                     saw_context_id = true;
                 }
             } else if (std.mem.eql(u8, key, "artifact")) {
-                if (artifact != null) {
-                    try reader.skipValue(scratch);
-                } else {
-                    if (try isNullMember(reader)) {
-                        // `null` and an absent member agree here too.
-                    } else {
-                        artifact = try readArtifact(reader, arena, scratch);
-                    }
+                if (try claimMember(&saw_artifact, reader, scratch)) {
+                    artifact = try readArtifact(reader, arena, scratch);
                 }
             } else if (std.mem.eql(u8, key, "append")) {
                 if (append != null) {
@@ -5059,7 +5105,9 @@ fn readSendMessageRequest(
 ) DecodeError!SendMessageRequest {
     var tenant: ?[]const u8 = null;
     var message: ?Message = null;
+    var saw_message = false;
     var configuration: ?SendMessageConfiguration = null;
+    var saw_configuration = false;
     var metadata: ?[]const u8 = null;
 
     const is_empty = try reader.beginObject();
@@ -5072,24 +5120,15 @@ fn readSendMessageRequest(
                     tenant = try reader.string(scratch);
                 }
             } else if (std.mem.eql(u8, key, "message")) {
-                if (message != null) {
-                    try reader.skipValue(scratch);
-                } else if (try isNullMember(reader)) {
-                    // `null` and an absent member agree, and the check after
-                    // the loop is what reports the difference.
-                } else {
+                if (try claimMember(&saw_message, reader, scratch)) {
                     message = try readMessage(reader, arena, scratch);
                 }
             } else if (std.mem.eql(u8, key, "configuration")) {
-                if (configuration != null) {
-                    try reader.skipValue(scratch);
-                } else if (try isNullMember(reader)) {
-                    // `null` and an absent member agree here too.
-                } else {
-                    // The accepted modes are `repeated string` like every other
-                    // list in the half, so they come from the arena's element
-                    // storage rather than from a second array the caller would
-                    // have to size.
+                // The accepted modes are `repeated string` like every other
+                // list in the half, so they come from the arena's element
+                // storage rather than from a second array the caller would
+                // have to size.
+                if (try claimMember(&saw_configuration, reader, scratch)) {
                     configuration = try readSendMessageConfiguration(
                         reader,
                         arena.strings,
@@ -5121,35 +5160,36 @@ fn readSendMessageRequest(
 ///
 /// The union is the whole message, so the object carries one member out of the
 /// two its table names and every other member is a name no row carries. The
-/// first arm named wins, for the reason every repeated member in this file does,
-/// and the discarded arm is still read as a value so a peer cannot hide a
-/// syntax error behind it.
+/// first arm that carries a value wins, and the discarded arm is still read as
+/// a value so a peer cannot hide a syntax error behind it. An arm sent as
+/// `null` is an arm that is not there, so a *different* arm behind it may still
+/// decide the union; an arm *name* sent twice is a repeated member, and
+/// `claimArm` is what keeps the first occurrence of it deciding.
 fn readSendMessageResponse(
     reader: *json.Reader,
     arena: *ContentArena,
     scratch: []u8,
 ) DecodeError!?SendMessageResponse {
     var found: ?SendMessageResponse = null;
+    var seen: u8 = 0;
 
     const is_empty = try reader.beginObject();
     if (!is_empty) {
         while (try reader.nextKey(scratch)) |key| {
             if (found != null) {
                 try reader.skipValue(scratch);
-            } else if (try isNullMember(reader)) {
-                // An arm with no value is an arm that is not there, so a later
-                // arm that does carry one still decides the union — the same
-                // rule a repeated member takes its first occurrence under.
-                //
-                // This is asked before the arm name on purpose. Asking after
-                // would hand `null` to `beginObject` and call a well-formed
-                // document a syntax error, and it is what the order has to be
-                // for `{"task":null}` to answer "no arm" rather than "broken
-                // JSON".
             } else if (std.mem.eql(u8, key, oneofMemberName(SendMessageResponse, 0))) {
-                found = SendMessageResponse{ .task = try readTask(reader, arena, scratch) };
+                if (try claimArm(&seen, 0, reader, scratch)) {
+                    found = SendMessageResponse{ .task = try readTask(reader, arena, scratch) };
+                }
             } else if (std.mem.eql(u8, key, oneofMemberName(SendMessageResponse, 1))) {
-                found = SendMessageResponse{ .message = try readMessage(reader, arena, scratch) };
+                if (try claimArm(&seen, 1, reader, scratch)) {
+                    found = SendMessageResponse{ .message = try readMessage(
+                        reader,
+                        arena,
+                        scratch,
+                    ) };
+                }
             } else {
                 try reader.skipValue(scratch);
             }
@@ -5168,31 +5208,37 @@ fn readStreamResponse(
     scratch: []u8,
 ) DecodeError!?StreamResponse {
     var found: ?StreamResponse = null;
+    var seen: u8 = 0;
 
     const is_empty = try reader.beginObject();
     if (!is_empty) {
         while (try reader.nextKey(scratch)) |key| {
             if (found != null) {
                 try reader.skipValue(scratch);
-            } else if (try isNullMember(reader)) {
-                // The same rule, and the same order, as
-                // `readSendMessageResponse` above.
             } else if (std.mem.eql(u8, key, oneofMemberName(StreamResponse, 0))) {
-                found = StreamResponse{ .task = try readTask(reader, arena, scratch) };
+                if (try claimArm(&seen, 0, reader, scratch)) {
+                    found = StreamResponse{ .task = try readTask(reader, arena, scratch) };
+                }
             } else if (std.mem.eql(u8, key, oneofMemberName(StreamResponse, 1))) {
-                found = StreamResponse{ .message = try readMessage(reader, arena, scratch) };
+                if (try claimArm(&seen, 1, reader, scratch)) {
+                    found = StreamResponse{ .message = try readMessage(reader, arena, scratch) };
+                }
             } else if (std.mem.eql(u8, key, oneofMemberName(StreamResponse, 2))) {
-                found = StreamResponse{ .status_update = try readTaskStatusUpdateEvent(
-                    reader,
-                    arena,
-                    scratch,
-                ) };
+                if (try claimArm(&seen, 2, reader, scratch)) {
+                    found = StreamResponse{ .status_update = try readTaskStatusUpdateEvent(
+                        reader,
+                        arena,
+                        scratch,
+                    ) };
+                }
             } else if (std.mem.eql(u8, key, oneofMemberName(StreamResponse, 3))) {
-                found = StreamResponse{ .artifact_update = try readTaskArtifactUpdateEvent(
-                    reader,
-                    arena,
-                    scratch,
-                ) };
+                if (try claimArm(&seen, 3, reader, scratch)) {
+                    found = StreamResponse{ .artifact_update = try readTaskArtifactUpdateEvent(
+                        reader,
+                        arena,
+                        scratch,
+                    ) };
+                }
             } else {
                 try reader.skipValue(scratch);
             }
@@ -5468,7 +5514,11 @@ pub fn encodeStreamResponse(
 // the decoder could not have returned — an empty REQUIRED string, or a
 // `Part.raw` that does not fit the caller's base64 buffer — and both are
 // `error.InvalidField` and `error.BufferTooSmall` rather than a truncated
-// document.
+// document. The walk reaches every member that can refuse, which includes the
+// ones nested inside another message: a `SendMessageRequest` whose
+// configuration carries an empty webhook `url` is refused before the writer
+// has been touched, because the write half that would place it no longer
+// validates anything of its own.
 
 fn validatePartContent(content: PartContent, base64: []u8) EncodeError!void {
     switch (content) {
@@ -5534,6 +5584,28 @@ fn validateTaskArtifactUpdateEvent(
 
 fn validateSendMessageRequest(request: SendMessageRequest, base64: []u8) EncodeError!void {
     try validateMessage(request.message, base64);
+    // The configuration carries a REQUIRED member of its own, so it is walked
+    // here rather than left to the write half that follows: a refusal raised
+    // once the buffer holds `{"message":{…},"configuration":{"taskP` is a
+    // truncated document in the caller's buffer.
+    if (request.configuration) |configuration| {
+        try validateSendMessageConfiguration(configuration);
+    }
+}
+
+fn validateAuthenticationInfo(info: AuthenticationInfo) EncodeError!void {
+    if (info.scheme.len == 0) return error.InvalidField;
+}
+
+fn validateTaskPushNotificationConfig(config: TaskPushNotificationConfig) EncodeError!void {
+    if (config.url.len == 0) return error.InvalidField;
+    if (config.authentication) |authentication| try validateAuthenticationInfo(authentication);
+}
+
+fn validateSendMessageConfiguration(configuration: SendMessageConfiguration) EncodeError!void {
+    if (configuration.task_push_notification_config) |config| {
+        try validateTaskPushNotificationConfig(config);
+    }
 }
 
 fn validateSendMessageResponse(
@@ -7123,6 +7195,30 @@ test "ListTaskPushNotificationConfigsRequest keeps an explicit zero page size" {
     );
 }
 
+test "ListTaskPushNotificationConfigsResponse carries two presences and not two defaults" {
+    // Neither member is REQUIRED in the proto, so an empty list and no list
+    // are two documents and an empty token and no member are two documents. A
+    // struct that holds one empty slice and one empty string for both cannot
+    // write either of them back, and a `""` default on the token reads as
+    // "no more pages" for a response that never said so.
+    const bare: ListTaskPushNotificationConfigsResponse = .{};
+    try testing.expect(@TypeOf(bare.configs) == ?[]const TaskPushNotificationConfig);
+    try testing.expect(@TypeOf(bare.next_page_token) == ?[]const u8);
+    try testing.expectEqual(@as(?[]const TaskPushNotificationConfig, null), bare.configs);
+    try testing.expectEqual(@as(?[]const u8, null), bare.next_page_token);
+
+    // The two empty documents are two of the four, and the optional is what
+    // tells them apart: `[]` is a member that arrived and no member is one
+    // that did not.
+    const empty_list: ListTaskPushNotificationConfigsResponse = .{ .configs = &.{} };
+    const empty_token: ListTaskPushNotificationConfigsResponse = .{ .next_page_token = "" };
+    try testing.expectEqual(
+        @as(?[]const TaskPushNotificationConfig, &.{}),
+        empty_list.configs,
+    );
+    try testing.expectEqual(@as(?[]const u8, ""), empty_token.next_page_token);
+}
+
 test "ListTasksRequest keeps an explicit unspecified status" {
     var scratch: [128]u8 = undefined;
     var out: [512]u8 = undefined;
@@ -8491,6 +8587,65 @@ test "a SendMessageRequest round-trips its configuration out of the shared strin
     );
 }
 
+test "an encoder refuses a whole request before it writes a byte" {
+    var storage: TestStorage = .{};
+    storage.init();
+    var out: [256]u8 = undefined;
+
+    // `configuration` is walked before the writer is touched, for the reason
+    // the validation half states: a refusal halfway through leaves
+    // `{"message":{"messageId":"m","role":"ROLE_USER","parts":[]},"confi` in
+    // the caller's buffer, which is neither a request nor nothing. The push
+    // configuration carries a REQUIRED member of its own and so carries a
+    // refusal of its own, and it is reached in that walk.
+    var writer = json.Writer.init(&out);
+    try testing.expectError(
+        error.InvalidField,
+        encodeSendMessageRequest(
+            .{
+                .message = .{ .message_id = "m", .role = .user, .parts = &.{} },
+                .configuration = .{ .task_push_notification_config = .{ .url = "" } },
+            },
+            &writer,
+            &storage.base64,
+        ),
+    );
+    try testing.expectEqualStrings("", writer.written());
+
+    // One member deeper. The authentication carries its own REQUIRED member,
+    // and it is the same walk that reaches it.
+    writer = json.Writer.init(&out);
+    try testing.expectError(
+        error.InvalidField,
+        encodeSendMessageRequest(
+            .{
+                .message = .{ .message_id = "m", .role = .user, .parts = &.{} },
+                .configuration = .{
+                    .task_push_notification_config = .{
+                        .url = "https://c.example.com/hook",
+                        .authentication = .{ .scheme = "" },
+                    },
+                },
+            },
+            &writer,
+            &storage.base64,
+        ),
+    );
+    try testing.expectEqualStrings("", writer.written());
+
+    // And the configuration's own public entry point refuses the same value,
+    // which it could not do while writing into a request half-done.
+    writer = json.Writer.init(&out);
+    try testing.expectError(
+        error.InvalidField,
+        encodeSendMessageConfiguration(
+            .{ .task_push_notification_config = .{ .url = "" } },
+            &writer,
+        ),
+    );
+    try testing.expectEqualStrings("", writer.written());
+}
+
 test "a SendMessageResponse round-trips both arms of its oneof" {
     var storage: TestStorage = .{};
     storage.init();
@@ -8633,8 +8788,11 @@ test "a null message member is a missing field, and the first arm with a value w
         error.MissingField,
         decodeSendMessageResponse("{\"message\":null}", &storage.arena, &storage.scratch),
     );
-    // A later arm that does carry a value still decides the union, for the
-    // same reason a repeated member takes its first occurrence.
+    // A later arm that does carry a value still decides the union, because
+    // `task` and `message` are two names and only one of them was used. That
+    // is a different statement from the one a *repeated* name makes, and
+    // `claimArm` keeps the two apart: one bit per arm name, not one flag per
+    // union.
     const later = try decodeStreamResponse(
         "{\"task\":null,\"message\":{\"messageId\":\"m\",\"role\":\"ROLE_USER\"," ++
             "\"parts\":[]}}",
@@ -8701,6 +8859,134 @@ test "a null message member is a missing field, and the first arm with a value w
     var writer = json.Writer.init(&out);
     try encodeTaskStatus(status, &writer, &storage.base64);
     try testing.expectEqualStrings("{\"state\":\"TASK_STATE_WORKING\"}", writer.written());
+}
+
+test "a repeated member takes its first occurrence, and a null one is that occurrence" {
+    var storage: TestStorage = .{};
+    storage.init();
+
+    // The first occurrence of a name decides it, and an occurrence that took
+    // nothing has still decided it: `null` is the member missing and wearing a
+    // key, so the `Message` the second occurrence spells is not the answer.
+    // Read the other way the document decodes as though the `null` had never
+    // been sent, and the re-encode is not the document that arrived.
+    const status = try decodeTaskStatus(
+        "{\"state\":\"TASK_STATE_WORKING\",\"message\":null,\"message\":" ++
+            "{\"messageId\":\"m\",\"role\":\"ROLE_USER\",\"parts\":[]}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(?Message, null), status.message);
+    var writer = json.Writer.init(&storage.out);
+    try encodeTaskStatus(status, &writer, &storage.base64);
+    try testing.expectEqualStrings("{\"state\":\"TASK_STATE_WORKING\"}", writer.written());
+
+    // The other direction is the same rule: a later occurrence cannot
+    // displace an earlier one either, so the first `message` keeps its value
+    // and the `null` behind it is discarded.
+    const kept = try decodeTaskStatus(
+        "{\"state\":\"TASK_STATE_WORKING\",\"message\":" ++
+            "{\"messageId\":\"m\",\"role\":\"ROLE_USER\",\"parts\":[]}," ++
+            "\"message\":null}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqualStrings("m", kept.message.?.message_id);
+
+    // A REQUIRED member is the same rule and the sharper consequence. The
+    // first occurrence said the member was absent, so a later one cannot
+    // satisfy a field this document does not carry.
+    try testing.expectError(
+        error.MissingField,
+        decodeTask(
+            "{\"id\":\"t\",\"status\":null," ++
+                "\"status\":{\"state\":\"TASK_STATE_WORKING\"}}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeTaskStatusUpdateEvent(
+            "{\"taskId\":\"t\",\"contextId\":\"c\",\"status\":null," ++
+                "\"status\":{\"state\":\"TASK_STATE_WORKING\"}}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeTaskArtifactUpdateEvent(
+            "{\"taskId\":\"t\",\"contextId\":\"c\",\"artifact\":null," ++
+                "\"artifact\":{\"artifactId\":\"a\",\"parts\":[]}}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeSendMessageRequest(
+            "{\"message\":null,\"message\":" ++
+                "{\"messageId\":\"m\",\"role\":\"ROLE_USER\",\"parts\":[]}}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+
+    // A oneof arm named twice is one name repeated, so the first occurrence
+    // decides it and the union is left unset. An arm named once as `null` is
+    // an arm that is not there, so a *different* arm behind it still decides
+    // the union, which is what the test above this one pins.
+    try testing.expectError(
+        error.MissingField,
+        decodeStreamResponse(
+            "{\"statusUpdate\":null,\"statusUpdate\":{\"taskId\":\"t\"," ++
+                "\"contextId\":\"c\"," ++
+                "\"status\":{\"state\":\"TASK_STATE_WORKING\"}}}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeSendMessageResponse(
+            "{\"task\":null,\"task\":{\"id\":\"t\"," ++
+                "\"status\":{\"state\":\"TASK_STATE_WORKING\"}}}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    const other_arm = try decodeStreamResponse(
+        "{\"statusUpdate\":null,\"message\":{\"messageId\":\"m\"," ++
+            "\"role\":\"ROLE_USER\",\"parts\":[]}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expect(other_arm == .message);
+
+    // A `repeated` member sent as `null` is that member missing and wearing a
+    // key, which is the same fact as its absence: both are
+    // `error.MissingField`, and neither is a syntax error for a document the
+    // peer wrote well.
+    try testing.expectError(
+        error.MissingField,
+        decodeArtifact(
+            "{\"artifactId\":\"a-1\",\"parts\":null}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeArtifact("{\"artifactId\":\"a-1\"}", &storage.arena, &storage.scratch),
+    );
+    // And the list itself takes its first occurrence under the same rule.
+    const artifact = try decodeArtifact(
+        "{\"artifactId\":\"a-1\",\"parts\":[{\"text\":\"q\"}],\"parts\":null}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqualStrings("q", artifact.parts[0].content.text);
 }
 
 test "an out array that fills is an error and never a truncation" {
@@ -8915,10 +9201,20 @@ test "an out array that fills is an error and never a truncation" {
 // and a later one is read as a value and dropped, for the reason every other
 // repeated member in this file takes its first occurrence under: a later
 // member must not be able to make a comparison that has already failed pass.
-// Nothing is allocated to compare — it is a scan of the run of entries this
-// same map has already filled — and the discarded value is still read rather
-// than stepped over blindly, so a peer cannot hide a syntax error in the slot a
-// key already used.
+// Nothing is allocated to compare: it is a scan of the run of entries this
+// same map has already filled, and the discarded value is still read rather
+// than stepped over blindly, so a peer cannot hide a syntax error in the slot
+// a key already used.
+//
+// "Decides" has to mean *decided*, not *produced an entry*, and the run alone
+// cannot say which: a key whose value was `null` produced no entry, so the run
+// holds no row for it and a later occurrence of the same key would take the
+// entry. `EmptyKeys` is the other half of that record — the keys this map has
+// used and decided nothing — and `claimMapKey` asks the two together. It is
+// why the two orders of `{"oauth":null,"oauth":{…}}` and
+// `{"oauth":{…},"oauth":null}` are two documents rather than one: the first
+// occurrence decides in both, and what it decides is no entry in the first
+// and one entry in the second.
 //
 // A map value sent as `null` is an entry that is not there
 //
@@ -8927,7 +9223,9 @@ test "an out array that fills is an error and never a truncation" {
 // key. It is asked before the value is read, for the reason `isNullMember` is
 // asked before an arm name, so a well-formed document is not called a syntax
 // error. The key does not become an entry and the re-encode drops it, which is
-// the stated consequence of skipping a member the shape does not model.
+// the stated consequence of skipping a member the shape does not model — and
+// the key is spent, because the occurrence that named it is the occurrence
+// that decided it.
 //
 // The thirteen presence defects this half found and fixed
 //
@@ -9115,6 +9413,71 @@ fn mapKeySeen(entries: anytype, key: []const u8) bool {
     return false;
 }
 
+/// How many keys one map remembers as used and carrying nothing.
+///
+/// A key whose value is `null` does not become an entry, so the run of entries
+/// this map has already filled cannot record that the key was used, and a
+/// later occurrence of it would take the entry — which is the run answering
+/// "did this key produce an entry" for the question "has this key been used".
+/// The names have to be kept somewhere, and a decode allocates nothing, so
+/// they are kept in the walk's own frame. This is far above a card that
+/// carries anything: a peer that sends this many empty keys in one map has
+/// sent this many entries carrying nothing. Overflow is `error.BufferTooSmall`,
+/// the same refusal a full entry array gives, and never a repeat let through.
+const empty_key_capacity = 16;
+
+/// The keys of one map that have been used and decided nothing.
+///
+/// The names are borrowed from the document or from the reader's scratch,
+/// exactly as `entry.name` is, and for the same reason they do not move: the
+/// scratch bump only moves forward, so a name read from it stays good for as
+/// long as the entries that name it.
+const EmptyKeys = struct {
+    names: [empty_key_capacity][]const u8 = undefined,
+    used: usize = 0,
+
+    fn holds(self: *const EmptyKeys, key: []const u8) bool {
+        for (self.names[0..self.used]) |name| {
+            if (std.mem.eql(u8, name, key)) return true;
+        }
+        return false;
+    }
+
+    fn add(self: *EmptyKeys, key: []const u8) DecodeError!void {
+        if (self.used == self.names.len) return error.BufferTooSmall;
+        self.names[self.used] = key;
+        self.used += 1;
+    }
+};
+
+/// Whether this occurrence of a map key is the one that decides its entry.
+///
+/// The rule is `claimMember`'s, with the record of what a key has been used
+/// split in two, because a key has no index to put a flag beside: `entries` is
+/// where a key that took a value is remembered and `empty` is where a key that
+/// took nothing is. Either answers "has this key been used", which is the
+/// question a repeat has to be answered with, and neither of them is the
+/// destination — which is the whole defect this pair exists to close.
+fn claimMapKey(
+    empty: *EmptyKeys,
+    entries: anytype,
+    key: []const u8,
+    reader: *json.Reader,
+    scratch: []u8,
+) DecodeError!bool {
+    if (mapKeySeen(entries, key) or empty.holds(key)) {
+        try reader.skipValue(scratch);
+        return false;
+    }
+    if (try isNullMember(reader)) {
+        // An entry that is named and then not given a value is an entry that
+        // is not there, and its key is spent either way.
+        try empty.add(key);
+        return false;
+    }
+    return true;
+}
+
 /// Write the member one map entry is: its key, then a colon.
 ///
 /// The key is written as a JSON string and escaped like any other, because a
@@ -9150,6 +9513,7 @@ fn readStringListObject(
     scratch: []u8,
 ) DecodeError!StringList {
     var list: ?[]const []const u8 = null;
+    var saw_list = false;
 
     const is_empty = try reader.beginObject();
     if (!is_empty) {
@@ -9158,13 +9522,10 @@ fn readStringListObject(
             // pluralisation lint on this message, so a decoder that pluralised
             // it would read nothing.
             if (std.mem.eql(u8, key, jsonName(StringList, 0).?)) {
-                if (list != null) {
-                    try reader.skipValue(scratch);
-                } else if (try isNullMember(reader)) {
-                    // `null` and an absent member agree, and the encoder writes
-                    // none of the two, so the key the entry was named under
-                    // comes back as `"oauth":{}`.
-                } else {
+                // `null` and an absent member agree, and the encoder writes
+                // none of the two, so the key the entry was named under comes
+                // back as `"oauth":{}`.
+                if (try claimMember(&saw_list, reader, scratch)) {
                     list = try readCardStrings(reader, arena, scratch);
                 }
             } else {
@@ -9187,18 +9548,13 @@ fn readRequirementEntries(
 ) DecodeError![]const SecurityRequirementEntry {
     const start = arena.requirement_entries_used;
     var count: usize = 0;
+    var empty: EmptyKeys = .{};
 
     const is_empty = try reader.beginObject();
     if (!is_empty) {
         while (try reader.nextKey(scratch)) |key| {
             const run = arena.requirement_entries[start..][0..count];
-            if (mapKeySeen(run, key)) {
-                try reader.skipValue(scratch);
-            } else if (try isNullMember(reader)) {
-                // An entry that is named and then not given a value is an
-                // entry that is not there, for the reason the section above
-                // gives.
-            } else {
+            if (try claimMapKey(&empty, run, key, reader, scratch)) {
                 if (start + count == arena.requirement_entries.len) {
                     return error.BufferTooSmall;
                 }
@@ -9226,16 +9582,13 @@ fn readSecurityRequirement(
     scratch: []u8,
 ) DecodeError!SecurityRequirement {
     var schemes: ?[]const SecurityRequirementEntry = null;
+    var saw_schemes = false;
 
     const is_empty = try reader.beginObject();
     if (!is_empty) {
         while (try reader.nextKey(scratch)) |key| {
             if (std.mem.eql(u8, key, jsonName(SecurityRequirement, 0).?)) {
-                if (schemes != null) {
-                    try reader.skipValue(scratch);
-                } else if (try isNullMember(reader)) {
-                    // `null` and an absent member agree.
-                } else {
+                if (try claimMember(&saw_schemes, reader, scratch)) {
                     schemes = try readRequirementEntries(reader, arena, scratch);
                 }
             } else {
@@ -9280,17 +9633,13 @@ fn readOAuthScopes(
 ) DecodeError![]const OAuthScope {
     const start = arena.scopes_used;
     var count: usize = 0;
+    var empty: EmptyKeys = .{};
 
     const is_empty = try reader.beginObject();
     if (!is_empty) {
         while (try reader.nextKey(scratch)) |key| {
             const run = arena.scopes[start..][0..count];
-            if (mapKeySeen(run, key)) {
-                try reader.skipValue(scratch);
-            } else if (try isNullMember(reader)) {
-                // An entry that is named and then not given a value is an
-                // entry that is not there.
-            } else {
+            if (try claimMapKey(&empty, run, key, reader, scratch)) {
                 if (start + count == arena.scopes.len) return error.BufferTooSmall;
                 arena.scopes[start + count] = .{
                     .name = key,
@@ -9349,14 +9698,8 @@ fn readAuthorizationCodeOAuthFlow(
                     refresh_url = try reader.string(scratch);
                 }
             } else if (std.mem.eql(u8, key, jsonName(AuthorizationCodeOAuthFlow, 3).?)) {
-                if (saw_scopes) {
-                    try reader.skipValue(scratch);
-                } else if (try isNullMember(reader)) {
-                    // `null` and an absent member agree, and the check after
-                    // the loop is what reports the difference.
-                } else {
+                if (try claimMember(&saw_scopes, reader, scratch)) {
                     scopes = try readOAuthScopes(reader, arena, scratch);
-                    saw_scopes = true;
                 }
             } else if (std.mem.eql(u8, key, jsonName(AuthorizationCodeOAuthFlow, 4).?)) {
                 if (pkce_required != null) {
@@ -9372,13 +9715,15 @@ fn readAuthorizationCodeOAuthFlow(
 
     // `scopes` is REQUIRED and an empty map satisfies it, so `{}` is a flow
     // that authorizes nothing and only the absence of the member is missing.
-    if (!saw_authorization_url or !saw_token_url or !saw_scopes) return error.MissingField;
+    // The check reads the member rather than the flag, because a `null` first
+    // occurrence is the member missing and wearing a key.
+    if (!saw_authorization_url or !saw_token_url) return error.MissingField;
     if (authorization_url.len == 0 or token_url.len == 0) return error.InvalidField;
     return .{
         .authorization_url = authorization_url,
         .token_url = token_url,
         .refresh_url = refresh_url,
-        .scopes = scopes.?,
+        .scopes = scopes orelse return error.MissingField,
         .pkce_required = pkce_required,
     };
 }
@@ -9412,13 +9757,8 @@ fn readClientCredentialsOAuthFlow(
                     refresh_url = try reader.string(scratch);
                 }
             } else if (std.mem.eql(u8, key, jsonName(ClientCredentialsOAuthFlow, 2).?)) {
-                if (saw_scopes) {
-                    try reader.skipValue(scratch);
-                } else if (try isNullMember(reader)) {
-                    // `null` and an absent member agree.
-                } else {
+                if (try claimMember(&saw_scopes, reader, scratch)) {
                     scopes = try readOAuthScopes(reader, arena, scratch);
-                    saw_scopes = true;
                 }
             } else {
                 try reader.skipValue(scratch);
@@ -9426,9 +9766,13 @@ fn readClientCredentialsOAuthFlow(
         }
     }
 
-    if (!saw_token_url or !saw_scopes) return error.MissingField;
+    if (!saw_token_url) return error.MissingField;
     if (token_url.len == 0) return error.InvalidField;
-    return .{ .token_url = token_url, .refresh_url = refresh_url, .scopes = scopes.? };
+    return .{
+        .token_url = token_url,
+        .refresh_url = refresh_url,
+        .scopes = scopes orelse return error.MissingField,
+    };
 }
 
 /// Read an `ImplicitOAuthFlow`. **Deprecated** in the proto.
@@ -9443,6 +9787,7 @@ fn readImplicitOAuthFlow(
     var authorization_url: ?[]const u8 = null;
     var refresh_url: ?[]const u8 = null;
     var scopes: ?[]const OAuthScope = null;
+    var saw_scopes = false;
 
     const is_empty = try reader.beginObject();
     if (!is_empty) {
@@ -9460,11 +9805,7 @@ fn readImplicitOAuthFlow(
                     refresh_url = try reader.string(scratch);
                 }
             } else if (std.mem.eql(u8, key, jsonName(ImplicitOAuthFlow, 2).?)) {
-                if (scopes != null) {
-                    try reader.skipValue(scratch);
-                } else if (try isNullMember(reader)) {
-                    // `null` and an absent member agree.
-                } else {
+                if (try claimMember(&saw_scopes, reader, scratch)) {
                     scopes = try readOAuthScopes(reader, arena, scratch);
                 }
             } else {
@@ -9489,6 +9830,7 @@ fn readPasswordOAuthFlow(
     var token_url: ?[]const u8 = null;
     var refresh_url: ?[]const u8 = null;
     var scopes: ?[]const OAuthScope = null;
+    var saw_scopes = false;
 
     const is_empty = try reader.beginObject();
     if (!is_empty) {
@@ -9506,11 +9848,7 @@ fn readPasswordOAuthFlow(
                     refresh_url = try reader.string(scratch);
                 }
             } else if (std.mem.eql(u8, key, jsonName(PasswordOAuthFlow, 2).?)) {
-                if (scopes != null) {
-                    try reader.skipValue(scratch);
-                } else if (try isNullMember(reader)) {
-                    // `null` and an absent member agree.
-                } else {
+                if (try claimMember(&saw_scopes, reader, scratch)) {
                     scopes = try readOAuthScopes(reader, arena, scratch);
                 }
             } else {
@@ -9560,13 +9898,8 @@ fn readDeviceCodeOAuthFlow(
                     refresh_url = try reader.string(scratch);
                 }
             } else if (std.mem.eql(u8, key, jsonName(DeviceCodeOAuthFlow, 3).?)) {
-                if (saw_scopes) {
-                    try reader.skipValue(scratch);
-                } else if (try isNullMember(reader)) {
-                    // `null` and an absent member agree.
-                } else {
+                if (try claimMember(&saw_scopes, reader, scratch)) {
                     scopes = try readOAuthScopes(reader, arena, scratch);
-                    saw_scopes = true;
                 }
             } else {
                 try reader.skipValue(scratch);
@@ -9574,15 +9907,13 @@ fn readDeviceCodeOAuthFlow(
         }
     }
 
-    if (!saw_device_authorization_url or !saw_token_url or !saw_scopes) {
-        return error.MissingField;
-    }
+    if (!saw_device_authorization_url or !saw_token_url) return error.MissingField;
     if (device_authorization_url.len == 0 or token_url.len == 0) return error.InvalidField;
     return .{
         .device_authorization_url = device_authorization_url,
         .token_url = token_url,
         .refresh_url = refresh_url,
-        .scopes = scopes.?,
+        .scopes = scopes orelse return error.MissingField,
     };
 }
 
@@ -9594,47 +9925,53 @@ fn readOAuthFlows(
     scratch: []u8,
 ) DecodeError!?OAuthFlows {
     var found: ?OAuthFlows = null;
+    var seen: u8 = 0;
 
     const is_empty = try reader.beginObject();
     if (!is_empty) {
         while (try reader.nextKey(scratch)) |key| {
             if (found != null) {
                 try reader.skipValue(scratch);
-            } else if (try isNullMember(reader)) {
-                // An arm with no value is an arm that is not there, so a later
-                // arm that does carry one still decides the union — the same
-                // rule a repeated member takes its first occurrence under, and
-                // asked in the same order for the same reason.
             } else if (std.mem.eql(u8, key, oneofMemberName(OAuthFlows, 0))) {
-                found = OAuthFlows{ .authorization_code = try readAuthorizationCodeOAuthFlow(
-                    reader,
-                    arena,
-                    scratch,
-                ) };
+                if (try claimArm(&seen, 0, reader, scratch)) {
+                    found = OAuthFlows{ .authorization_code = try readAuthorizationCodeOAuthFlow(
+                        reader,
+                        arena,
+                        scratch,
+                    ) };
+                }
             } else if (std.mem.eql(u8, key, oneofMemberName(OAuthFlows, 1))) {
-                found = OAuthFlows{ .client_credentials = try readClientCredentialsOAuthFlow(
-                    reader,
-                    arena,
-                    scratch,
-                ) };
+                if (try claimArm(&seen, 1, reader, scratch)) {
+                    found = OAuthFlows{ .client_credentials = try readClientCredentialsOAuthFlow(
+                        reader,
+                        arena,
+                        scratch,
+                    ) };
+                }
             } else if (std.mem.eql(u8, key, oneofMemberName(OAuthFlows, 2))) {
-                found = OAuthFlows{ .implicit = try readImplicitOAuthFlow(
-                    reader,
-                    arena,
-                    scratch,
-                ) };
+                if (try claimArm(&seen, 2, reader, scratch)) {
+                    found = OAuthFlows{ .implicit = try readImplicitOAuthFlow(
+                        reader,
+                        arena,
+                        scratch,
+                    ) };
+                }
             } else if (std.mem.eql(u8, key, oneofMemberName(OAuthFlows, 3))) {
-                found = OAuthFlows{ .password = try readPasswordOAuthFlow(
-                    reader,
-                    arena,
-                    scratch,
-                ) };
+                if (try claimArm(&seen, 3, reader, scratch)) {
+                    found = OAuthFlows{ .password = try readPasswordOAuthFlow(
+                        reader,
+                        arena,
+                        scratch,
+                    ) };
+                }
             } else if (std.mem.eql(u8, key, oneofMemberName(OAuthFlows, 4))) {
-                found = OAuthFlows{ .device_code = try readDeviceCodeOAuthFlow(
-                    reader,
-                    arena,
-                    scratch,
-                ) };
+                if (try claimArm(&seen, 4, reader, scratch)) {
+                    found = OAuthFlows{ .device_code = try readDeviceCodeOAuthFlow(
+                        reader,
+                        arena,
+                        scratch,
+                    ) };
+                }
             } else {
                 try reader.skipValue(scratch);
             }
@@ -9665,14 +10002,8 @@ fn readOAuth2SecurityScheme(
                     description = try reader.string(scratch);
                 }
             } else if (std.mem.eql(u8, key, jsonName(OAuth2SecurityScheme, 1).?)) {
-                if (saw_flows) {
-                    try reader.skipValue(scratch);
-                } else if (try isNullMember(reader)) {
-                    // `null` and an absent member agree, and the check after
-                    // the loop is what reports the difference.
-                } else {
+                if (try claimMember(&saw_flows, reader, scratch)) {
                     flows = try readOAuthFlows(reader, arena, scratch);
-                    saw_flows = true;
                 }
             } else if (std.mem.eql(u8, key, jsonName(OAuth2SecurityScheme, 2).?)) {
                 if (oauth2_metadata_url != null) {
@@ -9686,7 +10017,6 @@ fn readOAuth2SecurityScheme(
         }
     }
 
-    if (!saw_flows) return error.MissingField;
     return .{
         .description = description,
         .flows = flows orelse return error.MissingField,
@@ -9708,40 +10038,49 @@ fn readSecuritySchemeObject(
     scratch: []u8,
 ) DecodeError!?SecurityScheme {
     var found: ?SecurityScheme = null;
+    var seen: u8 = 0;
 
     const is_empty = try reader.beginObject();
     if (!is_empty) {
         while (try reader.nextKey(scratch)) |key| {
             if (found != null) {
                 try reader.skipValue(scratch);
-            } else if (try isNullMember(reader)) {
-                // The same rule, and the same order, as `readOAuthFlows`.
             } else if (std.mem.eql(u8, key, oneofMemberName(SecurityScheme, 0))) {
-                found = SecurityScheme{ .api_key = try readApiKeySecurityScheme(
-                    reader,
-                    scratch,
-                ) };
+                if (try claimArm(&seen, 0, reader, scratch)) {
+                    found = SecurityScheme{ .api_key = try readApiKeySecurityScheme(
+                        reader,
+                        scratch,
+                    ) };
+                }
             } else if (std.mem.eql(u8, key, oneofMemberName(SecurityScheme, 1))) {
-                found = SecurityScheme{ .http_auth = try readHttpAuthSecurityScheme(
-                    reader,
-                    scratch,
-                ) };
+                if (try claimArm(&seen, 1, reader, scratch)) {
+                    found = SecurityScheme{ .http_auth = try readHttpAuthSecurityScheme(
+                        reader,
+                        scratch,
+                    ) };
+                }
             } else if (std.mem.eql(u8, key, oneofMemberName(SecurityScheme, 2))) {
-                found = SecurityScheme{ .oauth2 = try readOAuth2SecurityScheme(
-                    reader,
-                    arena,
-                    scratch,
-                ) };
+                if (try claimArm(&seen, 2, reader, scratch)) {
+                    found = SecurityScheme{ .oauth2 = try readOAuth2SecurityScheme(
+                        reader,
+                        arena,
+                        scratch,
+                    ) };
+                }
             } else if (std.mem.eql(u8, key, oneofMemberName(SecurityScheme, 3))) {
-                found = SecurityScheme{ .open_id_connect = try readOpenIdConnectSecurityScheme(
-                    reader,
-                    scratch,
-                ) };
+                if (try claimArm(&seen, 3, reader, scratch)) {
+                    found = SecurityScheme{ .open_id_connect = try readOpenIdConnectSecurityScheme(
+                        reader,
+                        scratch,
+                    ) };
+                }
             } else if (std.mem.eql(u8, key, oneofMemberName(SecurityScheme, 4))) {
-                found = SecurityScheme{ .mtls = try readMutualTlsSecurityScheme(
-                    reader,
-                    scratch,
-                ) };
+                if (try claimArm(&seen, 4, reader, scratch)) {
+                    found = SecurityScheme{ .mtls = try readMutualTlsSecurityScheme(
+                        reader,
+                        scratch,
+                    ) };
+                }
             } else {
                 try reader.skipValue(scratch);
             }
@@ -9759,17 +10098,13 @@ fn readSecuritySchemes(
 ) DecodeError![]const SecuritySchemeEntry {
     const start = arena.security_schemes_used;
     var count: usize = 0;
+    var empty: EmptyKeys = .{};
 
     const is_empty = try reader.beginObject();
     if (!is_empty) {
         while (try reader.nextKey(scratch)) |key| {
             const run = arena.security_schemes[start..][0..count];
-            if (mapKeySeen(run, key)) {
-                try reader.skipValue(scratch);
-            } else if (try isNullMember(reader)) {
-                // An entry that is named and then not given a value is an
-                // entry that is not there.
-            } else {
+            if (try claimMapKey(&empty, run, key, reader, scratch)) {
                 if (start + count == arena.security_schemes.len) return error.BufferTooSmall;
                 arena.security_schemes[start + count] = .{
                     .name = key,
@@ -9820,6 +10155,7 @@ fn readAgentCapabilities(
     var streaming: ?bool = null;
     var push_notifications: ?bool = null;
     var extensions: ?[]const AgentExtension = null;
+    var saw_extensions = false;
     var extended_agent_card: ?bool = null;
 
     const is_empty = try reader.beginObject();
@@ -9838,11 +10174,7 @@ fn readAgentCapabilities(
                     push_notifications = try reader.boolean();
                 }
             } else if (std.mem.eql(u8, key, jsonName(AgentCapabilities, 2).?)) {
-                if (extensions != null) {
-                    try reader.skipValue(scratch);
-                } else if (try isNullMember(reader)) {
-                    // `null` and an absent member agree.
-                } else {
+                if (try claimMember(&saw_extensions, reader, scratch)) {
                     extensions = try readExtensions(reader, arena, scratch);
                 }
             } else if (std.mem.eql(u8, key, jsonName(AgentCapabilities, 3).?)) {
@@ -9885,9 +10217,13 @@ fn readAgentSkill(
     var tags: ?[]const []const u8 = null;
     var saw_tags = false;
     var examples: ?[]const []const u8 = null;
+    var saw_examples = false;
     var input_modes: ?[]const []const u8 = null;
+    var saw_input_modes = false;
     var output_modes: ?[]const []const u8 = null;
+    var saw_output_modes = false;
     var security_requirements: ?[]const SecurityRequirement = null;
+    var saw_security_requirements = false;
 
     const is_empty = try reader.beginObject();
     if (!is_empty) {
@@ -9914,45 +10250,23 @@ fn readAgentSkill(
                     saw_description = true;
                 }
             } else if (std.mem.eql(u8, key, jsonName(AgentSkill, 3).?)) {
-                if (saw_tags) {
-                    try reader.skipValue(scratch);
-                } else if (try isNullMember(reader)) {
-                    // `null` and an absent member agree, and the check after
-                    // the loop is what reports the difference.
-                } else {
+                if (try claimMember(&saw_tags, reader, scratch)) {
                     tags = try readCardStrings(reader, arena, scratch);
-                    saw_tags = true;
                 }
             } else if (std.mem.eql(u8, key, jsonName(AgentSkill, 4).?)) {
-                if (examples != null) {
-                    try reader.skipValue(scratch);
-                } else if (try isNullMember(reader)) {
-                    // `null` and an absent member agree.
-                } else {
+                if (try claimMember(&saw_examples, reader, scratch)) {
                     examples = try readCardStrings(reader, arena, scratch);
                 }
             } else if (std.mem.eql(u8, key, jsonName(AgentSkill, 5).?)) {
-                if (input_modes != null) {
-                    try reader.skipValue(scratch);
-                } else if (try isNullMember(reader)) {
-                    // `null` and an absent member agree.
-                } else {
+                if (try claimMember(&saw_input_modes, reader, scratch)) {
                     input_modes = try readCardStrings(reader, arena, scratch);
                 }
             } else if (std.mem.eql(u8, key, jsonName(AgentSkill, 6).?)) {
-                if (output_modes != null) {
-                    try reader.skipValue(scratch);
-                } else if (try isNullMember(reader)) {
-                    // `null` and an absent member agree.
-                } else {
+                if (try claimMember(&saw_output_modes, reader, scratch)) {
                     output_modes = try readCardStrings(reader, arena, scratch);
                 }
             } else if (std.mem.eql(u8, key, jsonName(AgentSkill, 7).?)) {
-                if (security_requirements != null) {
-                    try reader.skipValue(scratch);
-                } else if (try isNullMember(reader)) {
-                    // `null` and an absent member agree.
-                } else {
+                if (try claimMember(&saw_security_requirements, reader, scratch)) {
                     security_requirements = try readSecurityRequirements(reader, arena, scratch);
                 }
             } else {
@@ -9961,7 +10275,9 @@ fn readAgentSkill(
         }
     }
 
-    if (!saw_id or !saw_name or !saw_description or !saw_tags) return error.MissingField;
+    // `tags` is checked on the member and not on the flag, for the reason
+    // `readTask.status` is: a `null` first occurrence is the member missing.
+    if (!saw_id or !saw_name or !saw_description) return error.MissingField;
     // An untagged skill and a skill with no identifier are not discoverable, so
     // none of the four REQUIRED members may be empty.
     if (id.len == 0 or name.len == 0 or description.len == 0) return error.InvalidField;
@@ -9969,7 +10285,7 @@ fn readAgentSkill(
         .id = id,
         .name = name,
         .description = description,
-        .tags = tags.?,
+        .tags = tags orelse return error.MissingField,
         .examples = examples,
         .input_modes = input_modes,
         .output_modes = output_modes,
@@ -10040,13 +10356,16 @@ fn readAgentCard(reader: *json.Reader, arena: *CardArena, scratch: []u8) DecodeE
     var supported_interfaces: ?[]const AgentInterface = null;
     var saw_supported_interfaces = false;
     var provider: ?AgentProvider = null;
+    var saw_provider = false;
     var version: []const u8 = "";
     var saw_version = false;
     var documentation_url: ?[]const u8 = null;
     var capabilities: ?AgentCapabilities = null;
     var saw_capabilities = false;
     var security_schemes: ?[]const SecuritySchemeEntry = null;
+    var saw_security_schemes = false;
     var security_requirements: ?[]const SecurityRequirement = null;
+    var saw_security_requirements = false;
     var default_input_modes: ?[]const []const u8 = null;
     var saw_default_input_modes = false;
     var default_output_modes: ?[]const []const u8 = null;
@@ -10054,6 +10373,7 @@ fn readAgentCard(reader: *json.Reader, arena: *CardArena, scratch: []u8) DecodeE
     var skills: ?[]const AgentSkill = null;
     var saw_skills = false;
     var signatures: ?[]const AgentCardSignature = null;
+    var saw_signatures = false;
     var icon_url: ?[]const u8 = null;
 
     const is_empty = try reader.beginObject();
@@ -10074,21 +10394,11 @@ fn readAgentCard(reader: *json.Reader, arena: *CardArena, scratch: []u8) DecodeE
                     saw_description = true;
                 }
             } else if (std.mem.eql(u8, key, jsonName(AgentCard, 2).?)) {
-                if (saw_supported_interfaces) {
-                    try reader.skipValue(scratch);
-                } else if (try isNullMember(reader)) {
-                    // `null` and an absent member agree, and the check after
-                    // the loop is what reports the difference.
-                } else {
+                if (try claimMember(&saw_supported_interfaces, reader, scratch)) {
                     supported_interfaces = try readInterfaces(reader, arena, scratch);
-                    saw_supported_interfaces = true;
                 }
             } else if (std.mem.eql(u8, key, jsonName(AgentCard, 3).?)) {
-                if (provider != null) {
-                    try reader.skipValue(scratch);
-                } else if (try isNullMember(reader)) {
-                    // `null` and an absent member agree.
-                } else {
+                if (try claimMember(&saw_provider, reader, scratch)) {
                     provider = try readAgentProvider(reader, scratch);
                 }
             } else if (std.mem.eql(u8, key, jsonName(AgentCard, 4).?)) {
@@ -10105,65 +10415,31 @@ fn readAgentCard(reader: *json.Reader, arena: *CardArena, scratch: []u8) DecodeE
                     documentation_url = try reader.string(scratch);
                 }
             } else if (std.mem.eql(u8, key, jsonName(AgentCard, 6).?)) {
-                if (saw_capabilities) {
-                    try reader.skipValue(scratch);
-                } else if (try isNullMember(reader)) {
-                    // `null` and an absent member agree, and the check after
-                    // the loop is what reports the difference.
-                } else {
+                if (try claimMember(&saw_capabilities, reader, scratch)) {
                     capabilities = try readAgentCapabilities(reader, arena, scratch);
-                    saw_capabilities = true;
                 }
             } else if (std.mem.eql(u8, key, jsonName(AgentCard, 7).?)) {
-                if (security_schemes != null) {
-                    try reader.skipValue(scratch);
-                } else if (try isNullMember(reader)) {
-                    // `null` and an absent member agree.
-                } else {
+                if (try claimMember(&saw_security_schemes, reader, scratch)) {
                     security_schemes = try readSecuritySchemes(reader, arena, scratch);
                 }
             } else if (std.mem.eql(u8, key, jsonName(AgentCard, 8).?)) {
-                if (security_requirements != null) {
-                    try reader.skipValue(scratch);
-                } else if (try isNullMember(reader)) {
-                    // `null` and an absent member agree.
-                } else {
+                if (try claimMember(&saw_security_requirements, reader, scratch)) {
                     security_requirements = try readSecurityRequirements(reader, arena, scratch);
                 }
             } else if (std.mem.eql(u8, key, jsonName(AgentCard, 9).?)) {
-                if (saw_default_input_modes) {
-                    try reader.skipValue(scratch);
-                } else if (try isNullMember(reader)) {
-                    // `null` and an absent member agree, and the check after
-                    // the loop is what reports the difference.
-                } else {
+                if (try claimMember(&saw_default_input_modes, reader, scratch)) {
                     default_input_modes = try readCardStrings(reader, arena, scratch);
-                    saw_default_input_modes = true;
                 }
             } else if (std.mem.eql(u8, key, jsonName(AgentCard, 10).?)) {
-                if (saw_default_output_modes) {
-                    try reader.skipValue(scratch);
-                } else if (try isNullMember(reader)) {
-                    // `null` and an absent member agree.
-                } else {
+                if (try claimMember(&saw_default_output_modes, reader, scratch)) {
                     default_output_modes = try readCardStrings(reader, arena, scratch);
-                    saw_default_output_modes = true;
                 }
             } else if (std.mem.eql(u8, key, jsonName(AgentCard, 11).?)) {
-                if (saw_skills) {
-                    try reader.skipValue(scratch);
-                } else if (try isNullMember(reader)) {
-                    // `null` and an absent member agree.
-                } else {
+                if (try claimMember(&saw_skills, reader, scratch)) {
                     skills = try readSkills(reader, arena, scratch);
-                    saw_skills = true;
                 }
             } else if (std.mem.eql(u8, key, jsonName(AgentCard, 12).?)) {
-                if (signatures != null) {
-                    try reader.skipValue(scratch);
-                } else if (try isNullMember(reader)) {
-                    // `null` and an absent member agree.
-                } else {
+                if (try claimMember(&saw_signatures, reader, scratch)) {
                     signatures = try readSignatures(reader, arena, scratch);
                 }
             } else if (std.mem.eql(u8, key, jsonName(AgentCard, 13).?)) {
@@ -10180,14 +10456,10 @@ fn readAgentCard(reader: *json.Reader, arena: *CardArena, scratch: []u8) DecodeE
 
     // Eight members are REQUIRED and none of them may be absent. The four
     // repeated ones are satisfied by `[]`, so their presence and not their
-    // length is what is checked.
-    if (!saw_name or !saw_description or !saw_supported_interfaces or !saw_version) {
-        return error.MissingField;
-    }
-    if (!saw_capabilities) return error.MissingField;
-    if (!saw_default_input_modes or !saw_default_output_modes or !saw_skills) {
-        return error.MissingField;
-    }
+    // length is what is checked, and every one of the eight is checked on the
+    // member rather than on the flag: a `null` first occurrence is the member
+    // missing and wearing a key, and the flag says it was seen.
+    if (!saw_name or !saw_description or !saw_version) return error.MissingField;
     // A card with no name, no description or no version is not a card. The
     // version is not parsed here: PROTOCOLS.md section 5.1 forbids a patch
     // component, so `parseVersion` is what a consumer reads it with and this
@@ -10197,16 +10469,16 @@ fn readAgentCard(reader: *json.Reader, arena: *CardArena, scratch: []u8) DecodeE
     return .{
         .name = name,
         .description = description,
-        .supported_interfaces = supported_interfaces.?,
+        .supported_interfaces = supported_interfaces orelse return error.MissingField,
         .provider = provider,
         .version = version,
         .documentation_url = documentation_url,
-        .capabilities = capabilities.?,
+        .capabilities = capabilities orelse return error.MissingField,
         .security_schemes = security_schemes,
         .security_requirements = security_requirements,
-        .default_input_modes = default_input_modes.?,
-        .default_output_modes = default_output_modes.?,
-        .skills = skills.?,
+        .default_input_modes = default_input_modes orelse return error.MissingField,
+        .default_output_modes = default_output_modes orelse return error.MissingField,
+        .skills = skills orelse return error.MissingField,
         .signatures = signatures,
         .icon_url = icon_url,
     };
@@ -11207,6 +11479,150 @@ test "a repeated key takes its first occurrence" {
             &storage.scratch,
         ),
     );
+}
+
+test "a repeated card member takes its first occurrence, a null one included" {
+    var storage: CardTestStorage = .{};
+    storage.init();
+
+    // The smallest legal card, with one member left out of the middle so the
+    // repetition reads on its own. `supportedInterfaces` is `[]` because a
+    // repeated REQUIRED member is satisfied by an empty list.
+    const head = "{\"name\":\"W\",\"description\":\"d\",\"supportedInterfaces\":[]," ++
+        "\"version\":\"1.0\",";
+    const modes = "\"defaultInputModes\":[],\"defaultOutputModes\":[],";
+
+    // `capabilities` is REQUIRED, so the `null` first occurrence is a card
+    // with no capabilities and not a card the second occurrence completes.
+    try testing.expectError(
+        error.MissingField,
+        decodeAgentCard(
+            head ++ "\"capabilities\":null,\"capabilities\":{}," ++ modes ++
+                "\"skills\":[]}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    // A repeated REQUIRED list is the same rule, and so is an optional
+    // member: the second occurrence is not read at all.
+    try testing.expectError(
+        error.MissingField,
+        decodeAgentCard(
+            head ++ "\"capabilities\":{},\"defaultInputModes\":null," ++
+                "\"defaultInputModes\":[]," ++ modes ++ "\"skills\":[]}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeAgentCard(
+            head ++ "\"capabilities\":{}," ++ modes ++
+                "\"skills\":null,\"skills\":[]}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    // And `tags` is REQUIRED on a skill, which is the one place the discovery
+    // half reaches the same question through a message of its own.
+    try testing.expectError(
+        error.MissingField,
+        decodeAgentSkill(
+            "{\"id\":\"s\",\"name\":\"S\",\"description\":\"d\"," ++
+                "\"tags\":null,\"tags\":[\"t\"]}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+
+    // A map key is a member name like any other, so the key's first
+    // occurrence decides the entry and a later one under the same key is
+    // dropped. The two orders of the same pair are two documents and each is
+    // resolved by the occurrence that came first.
+    const dropped = try decodeSecurityRequirement(
+        "{\"schemes\":{\"oauth\":null,\"oauth\":{\"list\":[\"a\"]}}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(usize, 0), dropped.schemes.?.len);
+    const kept = try decodeSecurityRequirement(
+        "{\"schemes\":{\"oauth\":{\"list\":[\"a\"]},\"oauth\":null}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(usize, 1), kept.schemes.?.len);
+    try testing.expectEqualStrings("a", kept.schemes.?[0].list.list.?[0]);
+
+    // The same for a scope map, whose value half is a plain string.
+    const scopes = try decodeSecurityScheme(
+        "{\"oauth2SecurityScheme\":{\"flows\":{\"clientCredentials\":" ++
+            "{\"tokenUrl\":\"https://auth.example.com/t\"," ++
+            "\"scopes\":{\"read\":null,\"read\":\"one\"}}}}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(
+        @as(usize, 0),
+        scopes.oauth2.flows.client_credentials.scopes.len,
+    );
+
+    // The record of keys that were used and produced nothing is bounded, and
+    // the bound refuses the document rather than dropping a key, because the
+    // alternative is a repeat of an earlier key taking an entry it must not
+    // have. Sixteen of them fit and the seventeenth is the refusal.
+    const sixteen = try decodeSecurityRequirement(
+        "{\"schemes\":{" ++
+            "\"a\":null,\"b\":null,\"c\":null,\"d\":null,\"e\":null,\"f\":null," ++
+            "\"g\":null,\"h\":null,\"i\":null,\"j\":null,\"k\":null,\"l\":null," ++
+            "\"m\":null,\"n\":null,\"o\":null,\"p\":null}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(usize, 0), sixteen.schemes.?.len);
+    try testing.expectError(
+        error.BufferTooSmall,
+        decodeSecurityRequirement(
+            "{\"schemes\":{" ++
+                "\"a\":null,\"b\":null,\"c\":null,\"d\":null,\"e\":null,\"f\":null," ++
+                "\"g\":null,\"h\":null,\"i\":null,\"j\":null,\"k\":null,\"l\":null," ++
+                "\"m\":null,\"n\":null,\"o\":null,\"p\":null,\"q\":null}}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+
+    // `scopes` is REQUIRED on three of the five flows, and an empty map
+    // satisfies it, so a `null` first occurrence leaves the flow without the
+    // member and a later one cannot put it there.
+    try testing.expectError(
+        error.MissingField,
+        decodeSecurityScheme(
+            "{\"oauth2SecurityScheme\":{\"flows\":{\"authorizationCode\":" ++
+                "{\"authorizationUrl\":\"https://auth.example.com/a\"," ++
+                "\"tokenUrl\":\"https://auth.example.com/t\"," ++
+                "\"scopes\":null,\"scopes\":{}}}}}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+
+    // A oneof arm named twice is one name repeated, so the union is unset. A
+    // different arm behind a `null` one still decides it, which is what
+    // `readSecuritySchemeObject` states.
+    try testing.expectError(
+        error.MissingField,
+        decodeSecurityScheme(
+            "{\"mtlsSecurityScheme\":null,\"mtlsSecurityScheme\":{}}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    const other_arm = try decodeSecurityScheme(
+        "{\"apiKeySecurityScheme\":null,\"mtlsSecurityScheme\":{}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expect(other_arm == .mtls);
 }
 
 test "a map value sent as null is an entry that is not there" {
