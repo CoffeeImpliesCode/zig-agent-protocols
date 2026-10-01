@@ -880,6 +880,168 @@ pub fn memberText(raw: []const u8, name: []const u8, scratch: []u8) ?[]const u8 
     return null;
 }
 
+/// Base64 with `=` padding: the text every protocol in this library uses when
+/// it carries bytes as characters.
+///
+/// RFC 4648 section 4 and section 5 differ in two characters and nowhere
+/// else, so [`Alphabet`] is a parameter of one codec rather than the reason
+/// for two. A second copy of this walk is a second thing to keep correct, and
+/// one lived inside the MCP module until the codec moved here; A2A needs it
+/// for `Part.raw`, and neither module should own a codec both sit on.
+///
+/// Nothing allocates. [`encode`] writes into a buffer the caller sizes from
+/// [`encodedLen`], [`decode`] writes into a buffer the caller sizes from
+/// [`decodedLen`], and both hand back a slice of that buffer, so nothing
+/// outlives the call. Neither takes a `Reader` or a `Writer`: this is not
+/// JSON and does not go through a JSON string.
+///
+/// Decoding is total. Every byte of an encoded value is peer input, so a
+/// character outside the alphabet, a quad opening with `=`, a group that is
+/// not four characters and a pad in the wrong place are all
+/// `error.InvalidField`, never a trap. `error.BufferTooSmall` is the caller's
+/// own sizing mistake and is kept apart from it, because the two have
+/// different repairs.
+pub const base64 = struct {
+    /// The RFC 4648 alphabet a value is written in.
+    ///
+    /// `=` is the pad in both of them. RFC 4648 section 5 defines the
+    /// URL-safe alphabet as carrying the same pad characters, so padding is a
+    /// property of this codec rather than of the alphabet: it emits pads and
+    /// requires them. The one specification that omits them is JWS, whose
+    /// segments are carried here as borrowed text rather than decoded.
+    pub const Alphabet = enum {
+        /// RFC 4648 section 4. The MCP `=?base64?` sentinel and a ProtoJSON
+        /// `bytes` field.
+        standard,
+        /// RFC 4648 section 5.
+        url,
+    };
+
+    fn symbols(alphabet: Alphabet) []const u8 {
+        return switch (alphabet) {
+            .standard => "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
+            .url => "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_",
+        };
+    }
+
+    fn digitOf(byte: u8, alphabet: Alphabet) ?u8 {
+        return switch (byte) {
+            'A'...'Z' => byte - 'A',
+            'a'...'z' => byte - 'a' + 26,
+            '0'...'9' => byte - '0' + 52,
+            // The alphabets differ here and only here: digits 62 and 63 are
+            // the same two numbers in both, and only the characters carrying
+            // them are not. Taking the alphabet as a parameter is what keeps
+            // this one walk rather than two that have to agree.
+            '+' => if (alphabet == .standard) 62 else null,
+            '/' => if (alphabet == .standard) 63 else null,
+            '-' => if (alphabet == .url) 62 else null,
+            '_' => if (alphabet == .url) 63 else null,
+            else => null,
+        };
+    }
+
+    /// The buffer [`encode`] writes `input_len` bytes into.
+    ///
+    /// A partial final group is padded out to four characters, so the bound is
+    /// a multiple of four and an input of every length has one.
+    pub fn encodedLen(input_len: usize) usize {
+        return (input_len + 2) / 3 * 4;
+    }
+
+    /// The most bytes `encoded_len` characters decode to, or null when
+    /// `encoded_len` is not a whole number of groups.
+    ///
+    /// The bound ignores padding and so overstates the result, which is the
+    /// direction that matters: a buffer sized from it is never short, whereas
+    /// one sized from the padded length would report the peer's bytes as the
+    /// caller's mistake.
+    pub fn decodedLen(encoded_len: usize) ?usize {
+        if (encoded_len % 4 != 0) return null;
+        return (encoded_len / 4) * 3;
+    }
+
+    /// Encode `input` into `output` in `alphabet`, padded to a group boundary.
+    ///
+    /// The result is a prefix of `output`, and it is as long as
+    /// [`encodedLen`] for an `input` of that length. A buffer shorter than that
+    /// is `error.BufferTooSmall` with nothing written, so a caller may size,
+    /// retry and grow without this having allocated anything.
+    pub fn encode(input: []const u8, output: []u8, alphabet: Alphabet) EncodeError![]const u8 {
+        // Resolved once, so the alphabet costs a switch outside the loop rather
+        // than a branch per character.
+        const table = symbols(alphabet);
+        var out: usize = 0;
+        var index: usize = 0;
+        while (index + 3 <= input.len) : (index += 3) {
+            const chunk = std.mem.readInt(u24, input[index..][0..3], .big);
+            if (out + 4 > output.len) return error.BufferTooSmall;
+            output[out] = table[(chunk >> 18) & 0x3f];
+            output[out + 1] = table[(chunk >> 12) & 0x3f];
+            output[out + 2] = table[(chunk >> 6) & 0x3f];
+            output[out + 3] = table[chunk & 0x3f];
+            out += 4;
+        }
+        // The final partial group is padded, because a decoder groups four
+        // characters at a time and an unpadded tail is a length error.
+        const rest = input.len - index;
+        if (rest == 1) {
+            const chunk: u32 = @as(u32, input[index]) << 16;
+            if (out + 4 > output.len) return error.BufferTooSmall;
+            output[out] = table[(chunk >> 18) & 0x3f];
+            output[out + 1] = table[(chunk >> 12) & 0x3f];
+            output[out + 2] = '=';
+            output[out + 3] = '=';
+            out += 4;
+        } else if (rest == 2) {
+            const chunk: u32 = @as(u32, input[index]) << 16 |
+                @as(u32, input[index + 1]) << 8;
+            if (out + 4 > output.len) return error.BufferTooSmall;
+            output[out] = table[(chunk >> 18) & 0x3f];
+            output[out + 1] = table[(chunk >> 12) & 0x3f];
+            output[out + 2] = table[(chunk >> 6) & 0x3f];
+            output[out + 3] = '=';
+            out += 4;
+        }
+        return output[0..out];
+    }
+
+    /// Decode `input` into `output` in `alphabet`, returning a prefix of it.
+    ///
+    /// `output` must hold [`decodedLen`] for `input`, which is never more than
+    /// this writes, and a shorter one is `error.BufferTooSmall` rather than a
+    /// truncated value. A character outside the alphabet, a group whose length
+    /// is not four, and a group carrying fewer than two digits are
+    /// `error.InvalidField`.
+    pub fn decode(input: []const u8, output: []u8, alphabet: Alphabet) DecodeError![]const u8 {
+        if (input.len % 4 != 0) return error.InvalidField;
+        var out: usize = 0;
+        var index: usize = 0;
+        while (index < input.len) : (index += 4) {
+            const quad = input[index..][0..4];
+            var bits: u32 = 0;
+            var count: usize = 0;
+            for (quad, 0..) |byte, position| {
+                if (byte == '=') break;
+                const digit = digitOf(byte, alphabet) orelse return error.InvalidField;
+                bits |= @as(u32, digit) << @intCast(18 - 6 * position);
+                count += 1;
+            }
+            // A quad carries at least two digits. One digit is not a whole
+            // byte, and a quad that opens with `=` carries none at all, so
+            // `count - 1` below would underflow a `usize`.
+            if (count < 2) return error.InvalidField;
+            const produced: usize = if (count == 4) 3 else count - 1;
+            if (out + produced > output.len) return error.BufferTooSmall;
+            for (0..produced) |offset| {
+                output[out + offset] = @truncate(bits >> @intCast(16 - 8 * offset));
+            }
+            out += produced;
+        }
+        return output[0..out];
+    }
+};
+
 // The reader's string scratch buffer and the writer's encoding share no state,
 // so a single test buffer is enough to exercise both.
 const testing = std.testing;
@@ -1474,4 +1636,132 @@ test "a fault after the matched member is not read" {
     // The same fault before the member is caught, because the walk has to
     // step over it on the way there.
     try testing.expect(memberText("{\"b\":,\"a\":1}", "a", "") == null);
+}
+
+test "base64 round-trips every length mod 3 in both alphabets" {
+    // Bytes chosen so that most groups carry digits 62 and 63, which is where
+    // the two alphabets part company. A corpus of ASCII would exercise
+    // neither, and a corpus that only ever pads would exercise one length mod
+    // 3 out of three.
+    const corpus = [_][]const u8{
+        "\xfb\xff\xbe",
+        "\xfb\xff\xbf",
+        "\xff\xff\xff\xff\xff",
+        "\x00\x10\x83",
+        "f",
+        "fo",
+        "foo",
+        "foobar",
+        "",
+    };
+    var encoded: [64]u8 = undefined;
+    var decoded: [64]u8 = undefined;
+    for ([_]base64.Alphabet{ .standard, .url }) |alphabet| {
+        for (corpus) |bytes| {
+            const digits = try base64.encode(bytes, &encoded, alphabet);
+            // Exactly what `encodedLen` promised, so a caller that sized the
+            // buffer from the helper neither overflows nor over-allocates.
+            try testing.expectEqual(base64.encodedLen(bytes.len), digits.len);
+            try testing.expectEqualStrings(bytes, try base64.decode(digits, &decoded, alphabet));
+        }
+    }
+}
+
+test "the two alphabets differ only in the characters carrying digits 62 and 63" {
+    // Each vector is one whose standard spelling contains `+` or `/`, because
+    // those are the only characters the tables disagree about. A test built
+    // from vectors that touch neither would pass against two identical
+    // tables.
+    const vectors = [_]struct { bytes: []const u8, standard: []const u8, url: []const u8 }{
+        .{ .bytes = "\xfb\xff\xbe", .standard = "+/++", .url = "-_--" },
+        .{ .bytes = "\xfb\xff\xbf", .standard = "+/+/", .url = "-_-_" },
+        .{ .bytes = "\xfb\xff\x00", .standard = "+/8A", .url = "-_8A" },
+        .{ .bytes = "\xff\xff\xff", .standard = "////", .url = "____" },
+        // One that reaches neither, so the two tables are not a swap of the
+        // whole alphabet.
+        .{ .bytes = "foobar", .standard = "Zm9vYmFy", .url = "Zm9vYmFy" },
+    };
+    var out: [16]u8 = undefined;
+    for (vectors) |vector| {
+        try testing.expectEqualStrings(
+            vector.standard,
+            try base64.encode(vector.bytes, &out, .standard),
+        );
+        try testing.expectEqualStrings(
+            vector.url,
+            try base64.encode(vector.bytes, &out, .url),
+        );
+    }
+}
+
+test "each base64 alphabet refuses the two characters that belong to the other" {
+    // `-_` and `+/` are not interchangeable. A decoder that read either in
+    // place of the other would report the peer's bytes as something this
+    // library happens to spell differently, which is a fault with no repair.
+    var out: [8]u8 = undefined;
+    try testing.expectError(error.InvalidField, base64.decode("-_8A", &out, .standard));
+    try testing.expectError(error.InvalidField, base64.decode("+/8A", &out, .url));
+    // The other sixty-two characters are shared, so each alphabet reads the
+    // other's spelling of a value that reaches neither pair.
+    try testing.expectEqualStrings("foobar", try base64.decode("Zm9vYmFy", &out, .standard));
+    try testing.expectEqualStrings("foobar", try base64.decode("Zm9vYmFy", &out, .url));
+}
+
+test "a malformed base64 group is InvalidField, never a trap" {
+    var out: [8]u8 = undefined;
+    // A group that is not four characters. The encoder always pads the final
+    // group, so an unpadded tail is not something this guesses at.
+    try testing.expectError(error.InvalidField, base64.decode("aGk", &out, .standard));
+    // A character outside the alphabet, which is entirely the peer's to send.
+    try testing.expectError(error.InvalidField, base64.decode("aGk?", &out, .standard));
+    try testing.expectError(error.InvalidField, base64.decode("a k=", &out, .standard));
+    // A group opening with `=` carries no digit at all, and one carrying a
+    // single digit is not a whole byte. Both are the cases `count - 1` would
+    // underflow on.
+    try testing.expectError(error.InvalidField, base64.decode("=AAA", &out, .standard));
+    try testing.expectError(error.InvalidField, base64.decode("A===", &out, .standard));
+    try testing.expectError(error.InvalidField, base64.decode("====", &out, .standard));
+    // The legal forms beside them still decode, so the refusals above are not
+    // a decoder that refuses everything.
+    try testing.expectEqualStrings("hi", try base64.decode("aGk=", &out, .standard));
+    try testing.expectEqualStrings("", try base64.decode("", &out, .standard));
+}
+
+test "a base64 buffer one byte short is the caller's error, not the peer's" {
+    // `aGk=` decodes to two bytes, so a one-byte buffer is a caller-side
+    // sizing mistake. Reporting it as InvalidField would tell the caller the
+    // peer sent something malformed, which is a different fault with a
+    // different repair.
+    var tiny: [1]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, base64.decode("aGk=", &tiny, .standard));
+
+    // The encode side bounds itself before it writes, so a short buffer is
+    // refused with the output untouched rather than half written.
+    var short: [3]u8 = undefined;
+    @memset(&short, 0xff);
+    try testing.expectError(error.BufferTooSmall, base64.encode("foobar", &short, .standard));
+    try testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff }, &short);
+}
+
+test "the base64 length helpers state the bounds both directions need" {
+    // Four characters for every three bytes, rounded up, so that a final
+    // partial group is covered by a buffer sized from the helper.
+    try testing.expectEqual(@as(usize, 0), base64.encodedLen(0));
+    try testing.expectEqual(@as(usize, 4), base64.encodedLen(1));
+    try testing.expectEqual(@as(usize, 4), base64.encodedLen(2));
+    try testing.expectEqual(@as(usize, 4), base64.encodedLen(3));
+    try testing.expectEqual(@as(usize, 8), base64.encodedLen(4));
+
+    // The decode bound ignores padding, so it overstates rather than
+    // understates, and a length that is not a whole number of groups has no
+    // bound at all.
+    try testing.expectEqual(@as(?usize, 0), base64.decodedLen(0));
+    try testing.expectEqual(@as(?usize, 6), base64.decodedLen(8));
+    try testing.expectEqual(@as(?usize, null), base64.decodedLen(3));
+
+    // A buffer sized from the bound holds what the decoder writes.
+    var out: [8]u8 = undefined;
+    const digits = try base64.encode("foob", &out, .standard);
+    const room = base64.decodedLen(digits.len).?;
+    try testing.expectEqualStrings("foob", try base64.decode(digits, out[0..room], .standard));
 }

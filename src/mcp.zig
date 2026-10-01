@@ -195,21 +195,20 @@ pub fn isSentinelEncoded(value: []const u8) bool {
 pub fn decodeHeaderValue(value: []const u8, scratch: []u8) DecodeError![]const u8 {
     if (!isSentinelEncoded(value)) return value;
     const body = value[sentinel_prefix.len .. value.len - sentinel_suffix.len];
-    return base64.decode(body, scratch) catch |err| switch (err) {
-        error.BufferTooSmall => error.BufferTooSmall,
-        error.InvalidField => error.InvalidField,
-    };
+    return json.base64.decode(body, scratch, .standard);
 }
 
 /// The scratch a caller must supply to [`encodeHeaderValue`] for a value of
 /// `value_len` bytes.
 ///
-/// Base64 with padding emits four characters for every three input bytes. The
-/// caller sizes the buffer because nothing in an encode path allocates: a
-/// fixed buffer the caller cannot reach turns an `Mcp-Name` past its size into
-/// an unencodable value rather than a larger one.
+/// Base64 with padding emits four characters for every three input bytes, so
+/// the bound is [`json.base64.encodedLen`] and this is the one place the
+/// sentinel states it. The caller sizes the buffer because nothing in an
+/// encode path allocates: a fixed buffer the caller cannot reach turns an
+/// `Mcp-Name` past its size into an unencodable value rather than a larger
+/// one.
 pub fn sentinelScratchLen(value_len: usize) usize {
-    return (value_len + 2) / 3 * 4;
+    return json.base64.encodedLen(value_len);
 }
 
 /// Encode a header value, applying the sentinel when the specification requires
@@ -224,7 +223,7 @@ pub fn sentinelScratchLen(value_len: usize) usize {
 pub fn encodeHeaderValue(value: []const u8, writer: *json.Writer, scratch: []u8) EncodeError!void {
     if (!needsSentinel(value)) return writer.slice(value);
 
-    const encoded = try base64.encode(value, scratch);
+    const encoded = try json.base64.encode(value, scratch, .standard);
     try writer.slice(sentinel_prefix);
     try writer.slice(encoded);
     try writer.slice(sentinel_suffix);
@@ -905,8 +904,13 @@ pub const notifications = [_]MethodInfo{
     .{ .name = "notifications/subscriptions/acknowledged", .direction = .server_to_client, .present_at_current = true },
 };
 
-/// The `InputRequest` union: the only three server-to-client requests, and only
-/// ever inside `inputRequests`.
+/// The `InputRequest` union: the only three server-to-client requests, and
+/// inside `inputRequests` at every revision this library decodes.
+///
+/// At `2025-11-25` the same three names are also ordinary client-to-server
+/// requests, which is what [`previous_top_level_requests`] records. A name
+/// resolving here says where a value is sent from, not every position it may
+/// occupy.
 pub const input_requests = [_]MethodInfo{
     .{ .name = "elicitation/create", .direction = .server_to_client_mrtr_only, .present_at_current = true },
     .{
@@ -916,6 +920,29 @@ pub const input_requests = [_]MethodInfo{
         .deprecated = true,
     },
     .{ .name = "roots/list", .direction = .server_to_client_mrtr_only, .present_at_current = true, .deprecated = true },
+};
+
+/// The three methods that were top-level requests before `2026-07-28`.
+///
+/// PROTOCOLS.md section 4.4 removes `elicitation/create`,
+/// `sampling/createMessage` and `roots/list` as top-level requests and keeps
+/// their types inside `InputRequiredResult.inputRequests`, so at the previous
+/// revision all three are ordinary client-to-server requests and this table
+/// is what makes them resolve there. A removal is a fact about one revision:
+/// PROTOCOLS.md section 8 says the library accepts `2025-11-25`, and a peer on
+/// it sends `roots/list` as a request.
+///
+/// The direction is the top-level one rather than the one
+/// [`input_requests`] carries. The carried direction is
+/// `server_to_client_mrtr_only` because a server sends those values, and a
+/// `2025-11-25` request is a thing the client sends; a row that reused the
+/// carried direction would resolve the name and then be refused as
+/// `NotARequest` by the session gate, so a previous-revision server would
+/// refuse to answer `roots/list` as well as a client being unable to ask.
+pub const previous_top_level_requests = [_]MethodInfo{
+    .{ .name = "roots/list", .direction = .client_to_server, .present_at_current = false, .deprecated = true },
+    .{ .name = "elicitation/create", .direction = .client_to_server, .present_at_current = false, .deprecated = true },
+    .{ .name = "sampling/createMessage", .direction = .client_to_server, .present_at_current = false, .deprecated = true },
 };
 
 /// A method this library removed at `2026-07-28`.
@@ -935,8 +962,9 @@ pub const RemovedMethod = struct {
 ///
 /// `sampling/createMessage`, `elicitation/create` and `roots/list` are not
 /// listed: what is removed is their use as top-level requests. They survive as
-/// values inside `InputRequiredResult.inputRequests`, and
-/// [`lookupInputRequest`] is the entry point that finds them.
+/// values inside `InputRequiredResult.inputRequests`, found by
+/// [`lookupInputRequest`], and as requests at the previous revision, found by
+/// [`lookupMethod`] through [`previous_top_level_requests`].
 pub const removed_methods = [_]RemovedMethod{
     .{ .name = "initialize", .direction = .client_to_server, .notification = false },
     .{
@@ -966,13 +994,15 @@ pub const removed_methods = [_]RemovedMethod{
 /// the point of pinning a decoder to a revision: a `ping` sent to a
 /// `2026-07-28` server is a method-not-found, not a silently accepted no-op.
 ///
-/// The `InputRequest` methods are deliberately not resolved here. A top-level
-/// server request is forbidden at `2026-07-28`, so `elicitation/create`,
-/// `sampling/createMessage` and `roots/list` are `UnknownMethod` as top-level
-/// names even though they are live methods inside `inputRequests`; one entry
-/// point for both would hand a caller a request it must not send. This library
-/// models those three at no revision, because the source states only where
-/// they may appear now.
+/// `2026-07-28` removed `elicitation/create`, `sampling/createMessage` and
+/// `roots/list` from the top level, which makes them resolve at `2025-11-25`
+/// and not at `2026-07-28`. PROTOCOLS.md section 4.4 reads "removed in
+/// `2026-07-28`, and therefore decoded as `UnknownMethod` at that revision",
+/// and modelling them at no revision would refuse a request the previous
+/// revision's own document defines. [`previous_top_level_requests`] carries
+/// them as the client-to-server requests they were then; they survive as
+/// values inside `inputRequests`, and [`lookupInputRequest`] is the entry
+/// point that finds them there.
 pub fn lookupMethod(revision: Revision, name: []const u8) DecodeError!MethodInfo {
     for ([_][]const MethodInfo{ &client_requests, &notifications }) |set| {
         for (set) |*info| {
@@ -996,6 +1026,15 @@ pub fn lookupMethod(revision: Revision, name: []const u8) DecodeError!MethodInfo
                 .deprecated = true,
             };
         }
+        for (previous_top_level_requests) |info| {
+            if (!std.mem.eql(u8, info.name, name)) continue;
+            return .{
+                .name = info.name,
+                .direction = info.direction,
+                .present_at_current = false,
+                .deprecated = true,
+            };
+        }
     }
     return error.UnknownMethod;
 }
@@ -1012,12 +1051,21 @@ pub fn lookupInputRequest(name: []const u8) DecodeError!MethodInfo {
     return error.UnknownMethod;
 }
 
-/// Whether a method is one this library refuses as a top-level method.
+/// Whether a method is one this library refuses as a top-level method at
+/// `revision`.
 ///
-/// This includes the three `InputRequest` methods: what `2026-07-28` removed
-/// is their use at the top level, so a caller gating on this refuses them
-/// there and uses [`lookupInputRequest`] inside `inputRequests`.
-pub fn isRemovedMethod(name: []const u8) bool {
+/// The revision is a parameter because the answer differs across it. What
+/// `2026-07-28` removed from the top level is a request `2025-11-25` still
+/// defines, so a gate that refused the name at both would turn a legal
+/// previous-revision request away before the codec ever read it.
+///
+/// At `2026-07-28` this includes the three `InputRequest` methods: what was
+/// removed is their use at the top level, so a caller gating on this refuses
+/// them there and uses [`lookupInputRequest`] inside `inputRequests`.
+pub fn isRemovedMethod(revision: Revision, name: []const u8) bool {
+    // Every removal this library models happened at `2026-07-28`, and nothing
+    // was removed before the revision that removed it.
+    if (revision != .current) return false;
     for (removed_methods) |removed| {
         if (std.mem.eql(u8, removed.name, name)) return true;
     }
@@ -1542,86 +1590,6 @@ pub fn isValidSkillDigest(digest: []const u8) bool {
     return true;
 }
 
-// Base64 with `=` padding, which is the form the sentinel carries.
-const base64 = struct {
-    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    fn valueOf(byte: u8) ?u8 {
-        return switch (byte) {
-            'A'...'Z' => byte - 'A',
-            'a'...'z' => byte - 'a' + 26,
-            '0'...'9' => byte - '0' + 52,
-            '+' => 62,
-            '/' => 63,
-            else => null,
-        };
-    }
-
-    fn encode(input: []const u8, output: []u8) ![]const u8 {
-        var out: usize = 0;
-        var index: usize = 0;
-        while (index + 3 <= input.len) : (index += 3) {
-            const chunk = std.mem.readInt(u24, input[index..][0..3], .big);
-            if (out + 4 > output.len) return error.BufferTooSmall;
-            output[out] = alphabet[(chunk >> 18) & 0x3f];
-            output[out + 1] = alphabet[(chunk >> 12) & 0x3f];
-            output[out + 2] = alphabet[(chunk >> 6) & 0x3f];
-            output[out + 3] = alphabet[chunk & 0x3f];
-            out += 4;
-        }
-        // The final partial group is padded, because a decoder groups four
-        // characters at a time and an unpadded tail is a length error.
-        const rest = input.len - index;
-        if (rest == 1) {
-            const chunk: u32 = @as(u32, input[index]) << 16;
-            if (out + 4 > output.len) return error.BufferTooSmall;
-            output[out] = alphabet[(chunk >> 18) & 0x3f];
-            output[out + 1] = alphabet[(chunk >> 12) & 0x3f];
-            output[out + 2] = '=';
-            output[out + 3] = '=';
-            out += 4;
-        } else if (rest == 2) {
-            const chunk: u32 = @as(u32, input[index]) << 16 |
-                @as(u32, input[index + 1]) << 8;
-            if (out + 4 > output.len) return error.BufferTooSmall;
-            output[out] = alphabet[(chunk >> 18) & 0x3f];
-            output[out + 1] = alphabet[(chunk >> 12) & 0x3f];
-            output[out + 2] = alphabet[(chunk >> 6) & 0x3f];
-            output[out + 3] = '=';
-            out += 4;
-        }
-        return output[0..out];
-    }
-
-    fn decode(input: []const u8, output: []u8) ![]const u8 {
-        if (input.len % 4 != 0) return error.InvalidField;
-        var out: usize = 0;
-        var index: usize = 0;
-        while (index < input.len) : (index += 4) {
-            const quad = input[index..][0..4];
-            var bits: u32 = 0;
-            var count: usize = 0;
-            for (quad, 0..) |byte, position| {
-                if (byte == '=') break;
-                const digit = valueOf(byte) orelse return error.InvalidField;
-                bits |= @as(u32, digit) << @intCast(18 - 6 * position);
-                count += 1;
-            }
-            // A quad carries at least two digits. One digit is not a whole
-            // byte, and a quad that opens with `=` carries none at all, so
-            // `count - 1` below would underflow a `usize`.
-            if (count < 2) return error.InvalidField;
-            const produced: usize = if (count == 4) 3 else count - 1;
-            if (out + produced > output.len) return error.BufferTooSmall;
-            for (0..produced) |offset| {
-                output[out + offset] = @truncate(bits >> @intCast(16 - 8 * offset));
-            }
-            out += produced;
-        }
-        return output[0..out];
-    }
-};
-
 const testing = std.testing;
 
 test "revision round-trips through its wire string" {
@@ -1790,7 +1758,10 @@ test "lookupMethod accepts every core client request at the current revision" {
 test "a removed method is UnknownMethod at the current revision" {
     for (removed_methods) |removed| {
         try testing.expectError(error.UnknownMethod, lookupMethod(.current, removed.name));
-        try testing.expect(isRemovedMethod(removed.name));
+        try testing.expect(isRemovedMethod(.current, removed.name));
+        // The same name is a live method at the previous revision. A gate that
+        // did not name a revision would refuse a request that revision defines.
+        try testing.expect(!isRemovedMethod(.previous, removed.name));
     }
     // A `ping` is a live method on the previous revision, which is the whole
     // reason a decoder is pinned rather than switched by a flag.
@@ -1816,7 +1787,7 @@ test "a removed method keeps the direction it had, not the one its name implies"
     try testing.expect(!isRemovedNotification("tools/call"));
 }
 
-test "an InputRequest method resolves inside inputRequests and nowhere else" {
+test "an InputRequest method resolves as a carried value at every revision" {
     for (input_requests) |info| {
         // The three retain their types, so they resolve as carried values at
         // every revision the library decodes.
@@ -1824,14 +1795,66 @@ test "an InputRequest method resolves inside inputRequests and nowhere else" {
         try testing.expectEqualStrings(info.name, carried.name);
         try testing.expectEqual(info.direction, carried.direction);
 
-        // What was removed is their use as top-level names.
+        // What `2026-07-28` removed is their use as top-level names.
         try testing.expectError(error.UnknownMethod, lookupMethod(.current, info.name));
-        try testing.expectError(error.UnknownMethod, lookupMethod(.previous, info.name));
-        try testing.expect(isRemovedMethod(info.name));
+        try testing.expect(isRemovedMethod(.current, info.name));
     }
     // The InputRequest table is not a second top-level registry.
     try testing.expectError(error.UnknownMethod, lookupInputRequest("initialize"));
     try testing.expectError(error.UnknownMethod, lookupInputRequest("tools/call"));
+}
+
+test "the three former top-level requests resolve at the previous revision only" {
+    // PROTOCOLS.md 4.4 removes them in `2026-07-28`, "and therefore decoded as
+    // `UnknownMethod` at that revision". A removal is a fact about one
+    // revision rather than about every one, and section 8 says this library
+    // accepts `2025-11-25`, so a peer on it sends `roots/list` as a request
+    // and this library has to have an answer for it.
+    for (previous_top_level_requests) |info| {
+        const found = try lookupMethod(.previous, info.name);
+        try testing.expectEqualStrings(info.name, found.name);
+        // The top-level direction, which is the whole reason this is a table
+        // rather than a reuse of the `input_requests` row.
+        try testing.expectEqual(Direction.client_to_server, found.direction);
+        try testing.expect(!found.present_at_current);
+        try testing.expect(found.deprecated);
+
+        // And the revision that removed them still refuses each one.
+        try testing.expectError(error.UnknownMethod, lookupMethod(.current, info.name));
+        try testing.expect(isRemovedMethod(.current, info.name));
+        try testing.expect(!isRemovedMethod(.previous, info.name));
+    }
+    // The three the document names, and no fourth.
+    try testing.expectEqual(@as(usize, 3), previous_top_level_requests.len);
+}
+
+test "the previous-revision resolution of these three is not the row they carry" {
+    // One name resolves to two different things, and a caller that reaches for
+    // the wrong one gets either a request it must not send or a request it is
+    // forbidden to answer. A session gate refuses any direction that is not
+    // `client_to_server`, so the carried row would resolve the name and then
+    // be refused as `NotARequest`, and a `2025-11-25` server would not answer
+    // `roots/list`.
+    for (input_requests) |carried| {
+        const top_level = try lookupMethod(.previous, carried.name);
+        try testing.expectEqualStrings(carried.name, top_level.name);
+        try testing.expectEqual(Direction.client_to_server, top_level.direction);
+        try testing.expectEqual(Direction.server_to_client_mrtr_only, carried.direction);
+        try testing.expect(carried.present_at_current);
+        try testing.expect(!top_level.present_at_current);
+    }
+    // And the two tables have to keep naming the same three, in both
+    // directions. A name that entered one and not the other would resolve at
+    // a revision where the document does not define it, or stop resolving
+    // where it does, and a count over either table alone cannot tell those
+    // apart.
+    const three = [_][]const u8{
+        "roots/list",
+        "elicitation/create",
+        "sampling/createMessage",
+    };
+    try testing.expect(namesAre(&previous_top_level_requests, &three));
+    try testing.expect(namesAre(&input_requests, &three));
 }
 
 test "server-initiated requests are MRTR-only, never top level" {
