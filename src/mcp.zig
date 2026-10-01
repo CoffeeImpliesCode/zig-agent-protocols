@@ -1263,7 +1263,7 @@ pub fn decodeResultType(raw: []const u8, scratch: []u8) DecodeError!ResultType {
     if (!try reader.beginObject()) {
         while (try reader.nextKey(scratch)) |key| {
             if (std.mem.eql(u8, key, "resultType")) {
-                result.value = try reader.string(scratch);
+                try claimFirst(&result.value, &reader, scratch, takeString);
             } else {
                 try reader.skipValue(scratch);
             }
@@ -1458,9 +1458,9 @@ pub fn decodeCacheable(raw: []const u8, scratch: []u8) DecodeError!Cacheable {
     if (try reader.beginObject()) return error.MissingField;
     while (try reader.nextKey(scratch)) |key| {
         if (std.mem.eql(u8, key, "ttlMs")) {
-            ttl_ms = try parseMilliseconds(try reader.number());
+            try claimFirst(&ttl_ms, &reader, scratch, takeMilliseconds);
         } else if (std.mem.eql(u8, key, "cacheScope")) {
-            cache_scope = try parseCacheScope(try reader.string(scratch));
+            try claimFirst(&cache_scope, &reader, scratch, takeCacheScope);
         } else {
             try reader.skipValue(scratch);
         }
@@ -1546,13 +1546,11 @@ pub fn decodeInputRequiredResult(
 
     while (try reader.nextKey(scratch)) |key| {
         if (std.mem.eql(u8, key, "resultType")) {
-            const text = try reader.string(scratch);
-            if (!std.mem.eql(u8, text, result_type_value.input_required)) return error.InvalidField;
-            result.result_type = ResultType.parse(text);
+            try claimFirst(&result.result_type.value, &reader, scratch, takeInterimResultType);
         } else if (std.mem.eql(u8, key, "inputRequests")) {
-            result.input_requests = try reader.rawValue(scratch);
+            try claimFirst(&result.input_requests, &reader, scratch, takeRaw);
         } else if (std.mem.eql(u8, key, "requestState")) {
-            result.request_state = try reader.string(scratch);
+            try claimFirst(&result.request_state, &reader, scratch, takeString);
         } else {
             try reader.skipValue(scratch);
         }
@@ -1948,6 +1946,88 @@ fn takeVerbatim(
     _ = try store.take(key, value);
 }
 
+/// Resolve one member this shape names, first-wins.
+///
+/// PROTOCOLS.md section 2 gives the first occurrence the answer, for the reason
+/// `json.memberText` states: a later member must not be able to make a failed
+/// comparison pass. The converse holds here as well — a repeat that has already
+/// been resolved is consumed and not interpreted, so it can neither rewrite the
+/// value nor make a decode that had already passed fail. That second half was
+/// open in `CacheableReader`, where the value parsed on every occurrence and
+/// only the assignment was guarded, and it was open the other way in three
+/// decoders that had no guard at all and so took the last value instead of the
+/// first.
+///
+/// `take` runs on the first occurrence and nowhere else, so a member this
+/// decoder validates is validated once. A repeat goes through `skipValue`
+/// rather than through `take`, and rather than by being left in the document: a
+/// member left behind would be read again as the next key.
+///
+/// One helper rather than a guard written at each walk, because a guard on its
+/// own is what three of the five sites that read these members lacked, and a
+/// guard with the read and the validation left above it is what the other two
+/// had. `ResultEnvelope`, `CacheableReader`, the three standalone result
+/// decoders and the content-block loop all reach for this now, which is what
+/// makes one rule settle a body however it is read.
+fn claimFirst(
+    slot: anytype,
+    reader: *json.Reader,
+    scratch: []u8,
+    comptime take: anytype,
+) DecodeError!void {
+    if (slot.* != null) return reader.skipValue(scratch);
+    slot.* = try take(reader, scratch);
+}
+
+/// `claimFirst`'s value reader for a member that is a JSON string.
+fn takeString(reader: *json.Reader, scratch: []u8) DecodeError![]const u8 {
+    return reader.string(scratch);
+}
+
+/// `claimFirst`'s value reader for a member carried as the lexeme it arrived
+/// as.
+///
+/// Both halves the image and audio arms read as a string and the
+/// `resource_link` arm writes back as raw text need, which is why a loop that
+/// cannot know its arm yet captures the lexeme: the bytes a peer sent are not
+/// the bytes a string decodes to. It costs no scratch, so a captured lexeme
+/// leaves `Reader.requiredScratchLen` unchanged for the decode that follows.
+fn takeRaw(reader: *json.Reader, scratch: []u8) DecodeError![]const u8 {
+    return reader.rawValue(scratch);
+}
+
+/// `claimFirst`'s value reader for `ttlMs`, a whole number of milliseconds.
+fn takeMilliseconds(reader: *json.Reader, _: []u8) DecodeError!u64 {
+    return parseMilliseconds(try reader.number());
+}
+
+/// `claimFirst`'s value reader for `cacheScope`.
+fn takeCacheScope(reader: *json.Reader, scratch: []u8) DecodeError!CacheScope {
+    return parseCacheScope(try reader.string(scratch));
+}
+
+/// `claimFirst`'s value reader for the `resultType` an interim result carries,
+/// which has to be exactly `input_required` for the decoder to accept the
+/// result at all.
+///
+/// The check is inside the reader rather than beside the assignment because a
+/// repeat must not be able to refuse a document whose first `resultType` was the
+/// right one. `{"resultType":"input_required","resultType":"complete"}` is a
+/// peer naming the answer twice, and the library's rule is that the first name
+/// decides.
+fn takeInterimResultType(reader: *json.Reader, scratch: []u8) DecodeError![]const u8 {
+    const text = try reader.string(scratch);
+    if (!std.mem.eql(u8, text, result_type_value.input_required)) return error.InvalidField;
+    return text;
+}
+
+/// `claimFirst`'s value reader for the `type` of a content block, the one
+/// claimed member the loop reads as a value rather than capturing: the tag
+/// chooses the arm, so nothing ever writes it back as raw text.
+fn takeBlockKind(reader: *json.Reader, scratch: []u8) DecodeError!ContentBlockKind {
+    return ContentBlockKind.fromString(try reader.string(scratch)) orelse error.UnknownTag;
+}
+
 /// Open a reader over a lexeme an enclosing walk captured.
 ///
 /// `json.Reader` keeps its escape-scratch offset per reader, and a reader
@@ -2174,11 +2254,12 @@ const ResultEnvelope = struct {
 
     /// Read one envelope member, or report that it is not one.
     ///
-    /// A repeat is read and discarded rather than left unread, because a
-    /// member left in the document would be read again as the next key. The
-    /// first occurrence is the one kept, for the reason `json.memberText`
-    /// states: a later member must not be able to make a failed comparison
-    /// pass.
+    /// A repeat is consumed and discarded rather than left in the document,
+    /// because a member left behind would be read again as the next key, and
+    /// it is not interpreted, because a later member must not be able to make
+    /// a comparison that has already passed fail. The first occurrence is the
+    /// one kept, for the reason `json.memberText` states, and
+    /// [`claimFirst`] is what writes that as one rule rather than five.
     fn read(
         self: *ResultEnvelope,
         key: []const u8,
@@ -2186,11 +2267,9 @@ const ResultEnvelope = struct {
         scratch: []u8,
     ) DecodeError!bool {
         if (std.mem.eql(u8, key, "resultType")) {
-            const value = try reader.string(scratch);
-            if (self.result_type.value == null) self.result_type = ResultType.parse(value);
+            try claimFirst(&self.result_type.value, reader, scratch, takeString);
         } else if (std.mem.eql(u8, key, "_meta")) {
-            const value = try reader.rawValue(scratch);
-            if (self.meta == null) self.meta = value;
+            try claimFirst(&self.meta, reader, scratch, takeRaw);
         } else {
             return false;
         }
@@ -2210,6 +2289,12 @@ const CacheableReader = struct {
     cache_scope: ?CacheScope = null,
 
     /// Read one caching member, or report that it is not one.
+    ///
+    /// [`claimFirst`] resolves the repeat, and resolving it is what keeps the
+    /// parse inside the guard: a second `ttlMs` is consumed and not parsed, so
+    /// `{"ttlMs":60000,"cacheScope":"public","ttlMs":-1}` is the cacheable
+    /// result its first two members describe rather than a refusal blamed on a
+    /// bad freshness hint the peer did not lead with.
     fn read(
         self: *CacheableReader,
         key: []const u8,
@@ -2217,11 +2302,9 @@ const CacheableReader = struct {
         scratch: []u8,
     ) DecodeError!bool {
         if (std.mem.eql(u8, key, "ttlMs")) {
-            const value = try parseMilliseconds(try reader.number());
-            if (self.ttl_ms == null) self.ttl_ms = value;
+            try claimFirst(&self.ttl_ms, reader, scratch, takeMilliseconds);
         } else if (std.mem.eql(u8, key, "cacheScope")) {
-            const value = try parseCacheScope(try reader.string(scratch));
-            if (self.cache_scope == null) self.cache_scope = value;
+            try claimFirst(&self.cache_scope, reader, scratch, takeCacheScope);
         } else {
             return false;
         }
@@ -2488,6 +2571,37 @@ pub const Tool = struct {
     verbatim: []const VerbatimMember = &.{},
 };
 
+/// The members `decodeContentBlock`'s loop claims, and the arms that read each.
+///
+/// One entry per name the loop claims other than the two every arm models, and
+/// the table and the loop are that same list: a name the loop claims and this
+/// table omits is a name the decoder takes and the encoder never writes, which
+/// is the fault the table exists to make impossible to write, and a name here
+/// the loop does not claim is a name nothing reads. `type` and `_meta` are
+/// absent because all five arms model them, so neither can reach the carry, and
+/// a name the loop does not claim arrives through the `else` arm already
+/// carried.
+///
+/// PROTOCOLS.md section 4.10.7 records the five block interfaces as closed, so
+/// at the pinned revision no name outside its own arm is legal. That is why the
+/// carry is not a requirement the schema imposes and is still not optional: the
+/// case it exists for is a peer speaking a later revision, and PROTOCOLS.md
+/// section 2 requires decoding to be total there rather than lossy.
+const content_block_claims = [_]struct {
+    key: []const u8,
+    tags: []const ContentBlockKind,
+}{
+    .{ .key = "text", .tags = &.{.text} },
+    .{ .key = "data", .tags = &.{ .image, .audio } },
+    .{ .key = "mimeType", .tags = &.{ .image, .audio } },
+    .{ .key = "uri", .tags = &.{.resource_link} },
+    .{ .key = "name", .tags = &.{.resource_link} },
+    .{ .key = "title", .tags = &.{.resource_link} },
+    .{ .key = "icons", .tags = &.{.resource_link} },
+    .{ .key = "annotations", .tags = &.{ .text, .image, .audio, .resource } },
+    .{ .key = "resource", .tags = &.{.resource} },
+};
+
 /// Decode one `ContentBlock`.
 ///
 /// An absent `type` is `error.MissingField` and an unrecognised one is
@@ -2511,12 +2625,17 @@ fn decodeContentBlock(
     if (try reader.beginObject()) return error.MissingField;
     const at = store.mark();
 
+    // Every claimed member is captured as the lexeme it arrived as, not decoded
+    // here, because the loop cannot know its arm until the `type` beside it has
+    // been read: the image and audio arms want `mimeType` as a string, the
+    // `resource_link` arm writes it back as raw text, and a block whose tag
+    // models neither has to carry it. One capture serves all three, and
+    // `json.Reader.rawValue` borrows from the input, so the loop costs no
+    // scratch and `requiredScratchLen` still bounds the decodes that follow.
     var kind: ?ContentBlockKind = null;
     var text: ?[]const u8 = null;
     var data: ?[]const u8 = null;
-    // The lexeme, not the string: the `resource_link` arm carries this member
-    // back verbatim, and a decoded string is not the bytes a peer sent.
-    var mime_type_lexeme: ?[]const u8 = null;
+    var mime_type: ?[]const u8 = null;
     var uri: ?[]const u8 = null;
     var name: ?[]const u8 = null;
     var title: ?[]const u8 = null;
@@ -2525,44 +2644,33 @@ fn decodeContentBlock(
     var meta: ?[]const u8 = null;
     var resource: ?[]const u8 = null;
 
+    // [`claimFirst`] settles the repeat for every member here, including `type`
+    // and including the validation each arm does on the way past: a second
+    // `type` is consumed and not parsed, so it can neither rename the block nor
+    // refuse one whose first name was already a tag this revision knows.
     while (try reader.nextKey(scratch)) |key| {
         if (std.mem.eql(u8, key, "type")) {
-            const value = try reader.string(scratch);
-            if (kind == null) {
-                kind = ContentBlockKind.fromString(value) orelse return error.UnknownTag;
-            }
+            try claimFirst(&kind, reader, scratch, takeBlockKind);
         } else if (std.mem.eql(u8, key, "text")) {
-            const value = try reader.string(scratch);
-            if (text == null) text = value;
+            try claimFirst(&text, reader, scratch, takeRaw);
         } else if (std.mem.eql(u8, key, "data")) {
-            const value = try reader.string(scratch);
-            if (data == null) data = value;
+            try claimFirst(&data, reader, scratch, takeRaw);
         } else if (std.mem.eql(u8, key, "mimeType")) {
-            const value = try reader.rawValue(scratch);
-            if (mime_type_lexeme == null) mime_type_lexeme = value;
+            try claimFirst(&mime_type, reader, scratch, takeRaw);
         } else if (std.mem.eql(u8, key, "uri")) {
-            const value = try reader.string(scratch);
-            if (uri == null) uri = value;
+            try claimFirst(&uri, reader, scratch, takeRaw);
         } else if (std.mem.eql(u8, key, "name")) {
-            const value = try reader.string(scratch);
-            if (name == null) name = value;
+            try claimFirst(&name, reader, scratch, takeRaw);
         } else if (std.mem.eql(u8, key, "title")) {
-            const value = try reader.string(scratch);
-            if (title == null) title = value;
+            try claimFirst(&title, reader, scratch, takeRaw);
         } else if (std.mem.eql(u8, key, "icons")) {
-            const value = try reader.rawValue(scratch);
-            if (icons == null) icons = value;
+            try claimFirst(&icons, reader, scratch, takeRaw);
         } else if (std.mem.eql(u8, key, "annotations")) {
-            const value = try reader.rawValue(scratch);
-            if (annotations == null) annotations = value;
+            try claimFirst(&annotations, reader, scratch, takeRaw);
         } else if (std.mem.eql(u8, key, "resource")) {
-            // Captured rather than decoded, for the reason `VerbatimStore`
-            // documents. The first occurrence wins.
-            const value = try reader.rawValue(scratch);
-            if (resource == null) resource = value;
+            try claimFirst(&resource, reader, scratch, takeRaw);
         } else if (std.mem.eql(u8, key, "_meta")) {
-            const value = try reader.rawValue(scratch);
-            if (meta == null) meta = value;
+            try claimFirst(&meta, reader, scratch, takeRaw);
         } else {
             try takeVerbatim(key, reader, store, scratch);
         }
@@ -2570,19 +2678,25 @@ fn decodeContentBlock(
 
     const tag = kind orelse return error.MissingField;
 
-    // The loop above claims `mimeType` and `annotations` for every tag, and
-    // only the image and audio arms read the first and only three of the five
-    // read the second. A member a decoder accepts has to be able to write
-    // itself back — PROTOCOLS.md section 2 — so what the chosen arm does not
-    // model is carried into this block's own slice rather than dropped. That
-    // is what `ResourceLink` documents for `mimeType` and `annotations`, and
-    // what `size` and `description` already do here by arriving through the
-    // `else` arm. Taken before the slice below, so they land inside it.
-    if (mime_type_lexeme) |value| {
-        if (tag != .image and tag != .audio) _ = try store.take("mimeType", value);
-    }
-    if (tag == .resource_link) {
-        if (annotations) |value| _ = try store.take("annotations", value);
+    // The loop above claims eleven members for every tag and each arm reads a
+    // few of them, so most pairs are a member this block accepted and no
+    // encoder could write back. A member a decoder accepts has to be able to
+    // write itself back — PROTOCOLS.md section 2 — so what the chosen arm does
+    // not model is carried into this block's own slice rather than dropped.
+    // Before the repair the loop claimed eleven and the carry named two, so
+    // seven names were read and thrown away; `size` and `description` were
+    // carried the whole time, by arriving through the `else` arm.
+    //
+    // The name recorded is the one `nextKey` unescaped, the same form
+    // `takeVerbatim` records, so a member carried from here and one carried from
+    // the `else` arm cannot differ on the wire.
+    const claimed = [_]?[]const u8{
+        text, data, mime_type, uri, name, title, icons, annotations, resource,
+    };
+    for (content_block_claims, claimed) |claim, maybe| {
+        const value = maybe orelse continue;
+        if (std.mem.indexOfScalar(ContentBlockKind, claim.tags, tag) != null) continue;
+        _ = try store.take(claim.key, value);
     }
 
     // Taken before the embedded resource is decoded, so this block's slice
@@ -2591,15 +2705,23 @@ fn decodeContentBlock(
 
     return switch (tag) {
         .text => .{ .text = .{
-            .text = text orelse return error.MissingField,
+            .text = try decodeTextLexeme(
+                text orelse return error.MissingField,
+                reader,
+                scratch,
+            ),
             .annotations = annotations,
             .meta = meta,
             .verbatim = verbatim,
         } },
         .image => .{ .image = .{
-            .data = data orelse return error.MissingField,
+            .data = try decodeTextLexeme(
+                data orelse return error.MissingField,
+                reader,
+                scratch,
+            ),
             .mime_type = try decodeTextLexeme(
-                mime_type_lexeme orelse return error.MissingField,
+                mime_type orelse return error.MissingField,
                 reader,
                 scratch,
             ),
@@ -2608,9 +2730,13 @@ fn decodeContentBlock(
             .verbatim = verbatim,
         } },
         .audio => .{ .audio = .{
-            .data = data orelse return error.MissingField,
+            .data = try decodeTextLexeme(
+                data orelse return error.MissingField,
+                reader,
+                scratch,
+            ),
             .mime_type = try decodeTextLexeme(
-                mime_type_lexeme orelse return error.MissingField,
+                mime_type orelse return error.MissingField,
                 reader,
                 scratch,
             ),
@@ -2619,9 +2745,17 @@ fn decodeContentBlock(
             .verbatim = verbatim,
         } },
         .resource_link => .{ .resource_link = .{
-            .uri = uri orelse return error.MissingField,
-            .name = name orelse return error.MissingField,
-            .title = title,
+            .uri = try decodeTextLexeme(
+                uri orelse return error.MissingField,
+                reader,
+                scratch,
+            ),
+            .name = try decodeTextLexeme(
+                name orelse return error.MissingField,
+                reader,
+                scratch,
+            ),
+            .title = try decodeOptionalTextLexeme(title, reader, scratch),
             .icons = icons,
             .meta = meta,
             .verbatim = verbatim,
@@ -2799,6 +2933,22 @@ fn decodeTextLexeme(
     if (!reader.atEnd()) return error.MalformedJson;
     adoptScratch(parent, &reader);
     return value;
+}
+
+/// Decode the optional string a member lexeme holds.
+///
+/// The same answer [`decodeTextLexeme`] gives for a member its arm requires,
+/// and kept as its own function because `title` is the one optional string
+/// among them: a `resource_link` without a `title` is one the peer wrote rather
+/// than one this refuses, and an absent member and an empty string stay the two
+/// documents they are.
+fn decodeOptionalTextLexeme(
+    text: ?[]const u8,
+    parent: *json.Reader,
+    scratch: []u8,
+) DecodeError!?[]const u8 {
+    const lexeme = text orelse return null;
+    return try decodeTextLexeme(lexeme, parent, scratch);
 }
 
 /// Decode a `ResourceContents` out of the lexeme its block captured.
@@ -5909,6 +6059,189 @@ test "a block keeps the members its shape does not model" {
     try testing.expectEqualStrings(
         \\{"content":[{"type":"text","text":"t","mimeType":"text/plain"},{"type":"image","data":"AAEC","mimeType":"image/p\nng"}]}
     , writer.written());
+}
+
+test "every claimed member the chosen arm does not model is carried, not dropped" {
+    var scratch: [512]u8 = undefined;
+    var in: [512]u8 = undefined;
+    var out: [512]u8 = undefined;
+    var blocks: [4]ContentBlock = undefined;
+    var verbatim: [16]VerbatimMember = undefined;
+
+    // The member loop claims eleven names for every tag and each arm reads a few
+    // of them, so most pairs are a member this block accepted and no encoder
+    // could write back. `size` and `description` already reach `verbatim`
+    // through the `else` arm; these reach it through the carry. One row per
+    // arm, each naming every member that arm does not model, so a name added to
+    // the loop and left out of `content_block_claims` fails here.
+    const arms = [_]struct {
+        tag: []const u8,
+        /// The members this arm does model, so the decode reaches the member
+        /// under test rather than refusing over one it requires.
+        modelled: []const u8,
+        unmodelled: []const []const u8,
+    }{
+        .{ .tag = "text", .modelled = "\"text\":\"t\"", .unmodelled = &.{
+            "data", "mimeType", "uri", "name", "title", "icons", "resource",
+        } },
+        .{ .tag = "image", .modelled = "\"data\":\"AAEC\",\"mimeType\":\"image/png\"", .unmodelled = &.{
+            "text", "uri", "name", "title", "icons", "resource",
+        } },
+        .{ .tag = "audio", .modelled = "\"data\":\"AAEC\",\"mimeType\":\"audio/mpeg\"", .unmodelled = &.{
+            "text", "uri", "name", "title", "icons", "resource",
+        } },
+        .{ .tag = "resource_link", .modelled = "\"uri\":\"file:///a\",\"name\":\"a\"", .unmodelled = &.{
+            "text", "data", "mimeType", "annotations", "resource",
+        } },
+        .{ .tag = "resource", .modelled = "\"resource\":{\"uri\":\"file:///a\",\"text\":\"r\"}", .unmodelled = &.{
+            "text", "data", "mimeType", "uri", "name", "title", "icons",
+        } },
+    };
+
+    for (arms) |arm| {
+        for (arm.unmodelled) |key| {
+            var source = json.Writer.init(&in);
+            try source.slice("{\"content\":[{\"type\":\"");
+            try source.slice(arm.tag);
+            try source.slice("\",");
+            try source.slice(arm.modelled);
+            try source.slice(",\"");
+            try source.slice(key);
+            try source.slice("\":\"v\"}]}");
+
+            const result = try decodeToolCallResult(
+                source.written(),
+                blocks[0..],
+                verbatim[0..],
+                &scratch,
+            );
+            const carried: []const VerbatimMember = switch (result.content[0]) {
+                .text => |value| value.verbatim,
+                .image => |value| value.verbatim,
+                .audio => |value| value.verbatim,
+                .resource_link => |value| value.verbatim,
+                .resource => |value| value.verbatim,
+            };
+            try testing.expectEqual(@as(usize, 1), carried.len);
+            try testing.expectEqualStrings(key, carried[0].key);
+            try testing.expectEqualStrings("\"v\"", carried[0].value);
+
+            // The inverse is the half a field comparison cannot see, and it is
+            // the half that was broken: the encoder wrote a document with the
+            // member gone while the decoded fields still compared equal.
+            var writer = json.Writer.init(&out);
+            try encodeToolCallResult(result, &writer);
+            try testing.expectEqualStrings(source.written(), writer.written());
+        }
+    }
+
+    // A `resource` lexeme is the sharpest of them, because a peer that mis-tags
+    // an embedded resource used to lose the whole body and the decode reported
+    // success. It is carried whole, escapes and all, and the arm that does model
+    // it still reads it as a `ResourceContents`.
+    var source = json.Writer.init(&in);
+    try source.slice(
+        \\{"content":[{"type":"resource_link","uri":"file:///a","name":"a","resource":{"uri":"file:///b","text":"b\no","mimeType":"text/plain","size":7}},{"type":"resource","resource":{"uri":"file:///c","text":"c\no"}}]}
+    );
+    const result = try decodeToolCallResult(source.written(), blocks[0..], verbatim[0..], &scratch);
+    const carried: []const VerbatimMember = switch (result.content[0]) {
+        .text => |value| value.verbatim,
+        .image => |value| value.verbatim,
+        .audio => |value| value.verbatim,
+        .resource_link => |value| value.verbatim,
+        .resource => |value| value.verbatim,
+    };
+    try testing.expectEqual(@as(usize, 1), carried.len);
+    try testing.expectEqualStrings("resource", carried[0].key);
+    try testing.expectEqualStrings(
+        \\{"uri":"file:///b","text":"b\no","mimeType":"text/plain","size":7}
+    , carried[0].value);
+    try testing.expectEqualStrings("c\no", result.content[1].resource.resource.text.text);
+    var writer = json.Writer.init(&out);
+    try encodeToolCallResult(result, &writer);
+    try testing.expectEqualStrings(source.written(), writer.written());
+}
+
+test "a repeated member resolves first-wins in every decoder that names one" {
+    var scratch: [512]u8 = undefined;
+    var blocks: [4]ContentBlock = undefined;
+    var tools: [4]Tool = undefined;
+    var verbatim: [16]VerbatimMember = undefined;
+
+    // One rule in one place. `claimFirst` is what every walk below reaches for,
+    // so a body that names a member twice has one answer whichever of these
+    // decoders reads it, and a second occurrence can neither rewrite the first
+    // nor refuse a body the first occurrence already settled.
+
+    // The pair the divergence showed in: one public function said the answer was
+    // interim and another read the same bytes as final, and a duplicate member
+    // decided which.
+    const disagreeing =
+        \\{"resultType":"complete","resultType":"input_required","content":[]}
+    ;
+    try testing.expectEqualStrings(
+        result_type_value.complete,
+        (try classifyResult(disagreeing, &scratch)).value.?,
+    );
+    try testing.expectEqualStrings(
+        result_type_value.complete,
+        (try decodeResultType(disagreeing, &scratch)).value.?,
+    );
+    try testing.expectEqualStrings(
+        result_type_value.complete,
+        (try decodeToolCallResult(disagreeing, blocks[0..], verbatim[0..], &scratch))
+            .result_type.value.?,
+    );
+
+    // `decodeCacheable` and `CacheableReader` read the same two members and had
+    // to agree: the first `ttlMs` is the one the result describes.
+    try testing.expectEqual(
+        @as(u64, 60000),
+        (try decodeCacheable(
+            \\{"ttlMs":60000,"cacheScope":"public","ttlMs":5000}
+        , &scratch)).ttl_ms,
+    );
+    // ... and a repeat the parser refuses cannot refuse the body with it. The
+    // fault these two reported was blamed on a freshness hint the peer did not
+    // lead with, which is the wrong member to blame.
+    try testing.expectEqual(
+        @as(u64, 60000),
+        (try decodeCacheable(
+            \\{"ttlMs":60000,"cacheScope":"public","ttlMs":-1}
+        , &scratch)).ttl_ms,
+    );
+    try testing.expectEqual(
+        CacheScope.public,
+        (try decodeCacheable(
+            \\{"ttlMs":60000,"cacheScope":"public","cacheScope":"forever"}
+        , &scratch)).cache_scope,
+    );
+    const cached = try decodeToolListResult(
+        \\{"ttlMs":60000,"cacheScope":"public","tools":[],"ttlMs":-1}
+    , tools[0..], verbatim[0..], &scratch);
+    try testing.expectEqual(@as(u64, 60000), cached.cacheable.ttl_ms);
+    const rescoped = try decodeToolListResult(
+        \\{"ttlMs":60000,"cacheScope":"public","tools":[],"cacheScope":"forever"}
+    , tools[0..], verbatim[0..], &scratch);
+    try testing.expectEqual(CacheScope.public, rescoped.cacheable.cache_scope);
+
+    // The interim result has to be exactly `input_required`, and the check is
+    // part of reading the member rather than a verdict on the body: a peer
+    // naming it twice is not a peer that contradicted itself.
+    const interim = try decodeInputRequiredResult(
+        \\{"resultType":"input_required","resultType":"complete","requestState":"s"}
+    , &scratch);
+    try testing.expectEqualStrings(result_type_value.input_required, interim.result_type.value.?);
+    try testing.expectEqualStrings("s", interim.request_state.?);
+
+    // A repeat that is not even the member's own JSON type is a repeat and
+    // nothing more: the first occurrence settled the arm, so the second is
+    // consumed and not read as a tag, a string, or a number.
+    const mistyped = try decodeToolCallResult(
+        \\{"content":[{"type":"text","type":1,"text":"t"}],"resultType":"complete","resultType":1}
+    , blocks[0..], verbatim[0..], &scratch);
+    try testing.expectEqualStrings("t", mistyped.content[0].text.text);
+    try testing.expectEqualStrings(result_type_value.complete, mistyped.result_type.value.?);
 }
 
 test "a page carries a caching member it cannot read as a pair" {
