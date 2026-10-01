@@ -170,12 +170,16 @@ style; each one has a failure that is hard to see from the code alone.
   answer `error.TooManyPending` forever. Cancellation is the path that does it,
   which is why every mutex acquisition in `conn.zig` is `lockUncancelable`: a
   lock that can fail is a slot that can be dropped.
-- **A response nobody can correlate is surfaced, not dropped.** JSON-RPC 2.0
-  requires `"id": null` on an error response whose request id could not be
-  determined, and that is the one shape `jsonrpc.decode` admits on an error and
-  refuses everywhere else. `Conn` reports it to a `RefusalHandler` rather than
-  discarding it: the peer refused something and could not say which, and
-  silence there reads as "the request is still outstanding".
+- **A response nobody can correlate is surfaced, not dropped.** `Conn` reports
+  every response that matches no pending slot to an `OrphanHandler` rather than
+  discarding it, because a frame the application cannot see is a frame it
+  cannot log, cannot account for, and cannot tell apart from a peer that went
+  quiet. That covers three cases: an error response whose `id` is `null`, which
+  JSON-RPC 2.0 requires where the request's id could not be determined and which
+  is the one shape `jsonrpc.decode` admits on an error and refuses everywhere
+  else; a response carrying a string id, which no slot ever claims; and the id
+  of a call that already returned. One hook rather than a hook per case: two
+  hooks for one event is drift, and the wider one subsumes the narrower.
 - **`Conn.close` ends the reader, and the caller owns the group.** `pump` tests
   the closed flag rather than reading forever, so a connection that declares
   itself dead stops dispatching. The group is the caller's, spawned on it and
