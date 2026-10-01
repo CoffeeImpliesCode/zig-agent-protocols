@@ -100,17 +100,25 @@
 //!   trailing-byte assertion that never fires and a round trip that never
 //!   runs, and both are green. [`battery_codec_names`] lists every codec the
 //!   battery hands something to, not only the ones a wave added, and
-//!   [`expectEveryBatteryCodecReached`] fails a run that fed one of them
-//!   nothing it takes, so "the corpus reaches it" is something the harness
-//!   proves rather than something this file claims. Every public decoder in the
-//!   tree is now in that table and [`tail_rule.unasserted`] is empty, which is
-//!   a statement about measurement rather than about intention: the list held
-//!   twenty-nine rows once and then two of them, and a reader who trusted it
-//!   believed twenty-seven decoders lacked coverage while twenty-seven were
-//!   missing from the statement entirely. Feeding them needed two things each —
-//!   a call site and the caller-owned storage it writes into — and both are
-//!   written down here: the storage and the arithmetic that bounds it in
-//!   [`Storage`], and the calls in [`exerciseEveryDecoder`].
+//!   [`expectEveryBatteryCodecReached`] fails a run that fed one of them nothing
+//!   it takes, so "the corpus reaches it" is something the harness proves
+//!   rather than something this file claims. Every public decoder in the tree
+//!   is in that table, and `test "every public decoder in the tree is in the
+//!   battery table"` is what says so: it reads the root module's own
+//!   declarations and compares them with the table, so a decoder added to a
+//!   module and wired into [`exerciseEveryDecoder`] without a row is a failure
+//!   rather than a silent narrowing of the guard. [`tail_rule.unasserted`] is
+//!   empty for the same kind of reason, and every codec the battery feeds is
+//!   either in [`tail_rule.round_trip`] — re-encoded, so a tail it accepted is a
+//!   lost `encode(decode(b))` — or in [`tail_rule.no_tail`] with the reason it
+//!   has no document whose tail a round trip could lose. Both are statements
+//!   about measurement rather than about intention: the list held twenty-nine
+//!   rows once and then two of them, and a reader who trusted it believed
+//!   twenty-seven decoders lacked coverage while twenty-seven were missing from
+//!   the statement entirely. Feeding them needed two things each — a call site
+//!   and the caller-owned storage it writes into — and both are written down
+//!   here: the storage and the arithmetic that bounds it in [`Storage`], and
+//!   the calls in [`exerciseEveryDecoder`].
 //! - **A name the current revision removed still resolves at the previous
 //!   one.** `mcp.lookupMethod` takes the revision, and the three `2026-07-28`
 //!   removed were ordinary client-to-server requests at `2025-11-25`. The
@@ -212,6 +220,17 @@ const encode_buf_len = 2 * max_doc_len + 256;
 /// the error is in the safe direction — and where a rule cannot tell, the
 /// shortest spelling a decoder *refuses* is used, which only makes the
 /// resulting bound larger.
+///
+/// Every comment below names both numbers, and that is the point of naming
+/// two: the first is what the shortest element measures and the second is what
+/// is passed in, and a reader who takes the second for a typo and raises it to
+/// the first has turned a conservative bound into a wrong one without any test
+/// failing first. The capacity is `(max_doc_len + 1) / (min + 1)`, so raising
+/// the minimum lowers the array and a document the corpus can build no longer
+/// fits. Where a number and its comment disagreed, the comment was wrong in
+/// every case but one, and that one had the two the wrong way round: forty-four
+/// stood beside a forty-two-byte shortest message, which is above the minimum
+/// and so broke the rule this paragraph states.
 fn repeatedCapacity(min_element_bytes: usize) usize {
     return (max_doc_len + 1) / (min_element_bytes + 1);
 }
@@ -219,18 +238,20 @@ fn repeatedCapacity(min_element_bytes: usize) usize {
 // The content half. Each comment names the shortest element its array can
 // hold, and the value beside it is that length or less.
 
-/// `{"url":""}` is nine bytes, and it is the shortest `Part` a decoder takes:
-/// one arm of the `oneof` is all a part carries.
+/// `{"url":""}` is ten bytes, and it is the shortest `Part` a decoder takes:
+/// one arm of the `oneof` is all a part carries. Nine is passed in, below it.
 const content_parts_capacity = repeatedCapacity(9);
-/// `{"artifactId":"a","parts":[]}` is twenty-six; `artifactId` must be there
-/// and must not be empty, and `parts` must be there.
+/// `{"artifactId":"a","parts":[]}` is twenty-nine; `artifactId` must be there
+/// and must not be empty, and `parts` must be there. Twenty-six is passed in.
 const content_artifacts_capacity = repeatedCapacity(26);
-/// `{"messageId":"m","role":"agent","parts":[]}` is forty-four, and all three
-/// members are checked on the member rather than on a length.
-const content_messages_capacity = repeatedCapacity(44);
-/// `""` is two. The extensions, the reference task ids and the accepted output
-/// modes share one array and one fill level, so this is the bound for all of
-/// them together.
+/// `{"messageId":"","role":"user","parts":[]}` is forty-two, and all three
+/// members are checked on the member rather than on a length. Forty is passed
+/// in, which is below it whether or not the decoder refuses the empty id.
+const content_messages_capacity = repeatedCapacity(40);
+/// `""` is two. The extensions and the reference task ids share one array and
+/// one fill level, so this is the bound for both of them together. The accepted
+/// output modes are not among them: `decodeSendMessageConfiguration` fills an
+/// array of its own, and [`output_modes_capacity`] is the bound for that one.
 const content_strings_capacity = repeatedCapacity(2);
 
 /// The decoded bytes of every `Part.raw` in one document.
@@ -264,25 +285,27 @@ const header_encode_len = json.base64.encodedLen(max_doc_len);
 
 // The discovery half. `a2a.CardArena` is nine arrays over nine element types.
 
-/// `{"url":"","protocolBinding":"","protocolVersion":""}` is forty-eight, and
-/// all three members are checked on the member.
+/// `{"url":"","protocolBinding":"","protocolVersion":""}` is fifty-two, and all
+/// three members are checked on the member. Forty-eight is passed in.
 const card_interfaces_capacity = repeatedCapacity(48);
-/// `{"id":"","name":"","description":"","tags":[]}` is forty-three; a skill
-/// that refuses the empty strings would need more and never less.
+/// `{"id":"","name":"","description":"","tags":[]}` is forty-six; a skill that
+/// refuses the empty strings would need more and never less. Forty-three is
+/// passed in.
 const card_skills_capacity = repeatedCapacity(43);
 /// `{}`. No `AgentExtension` member is REQUIRED.
 const card_extensions_capacity = repeatedCapacity(2);
 /// `{"protected":"a","signature":"b"}` is thirty-three, and both are refused
 /// when empty.
 const card_signatures_capacity = repeatedCapacity(32);
-/// `{"mtlsSecurityScheme":{}}` is twenty-three, and that is the shortest of
-/// the five `SecurityScheme` arms.
+/// `{"mtlsSecurityScheme":{}}` is twenty-five, and that is the shortest of the
+/// five `SecurityScheme` arms. Twenty-two is passed in.
 const card_security_schemes_capacity = repeatedCapacity(22);
 /// `{}`. `SecurityRequirement.schemes` is optional.
 const card_security_requirements_capacity = repeatedCapacity(2);
 /// `{"a":{}}` is eight: a map entry is the single member its key names.
 const card_requirement_entries_capacity = repeatedCapacity(7);
-/// `{"a":""}` is seven, for the same reason as the entries above.
+/// `{"a":""}` is eight, for the same reason as the entries above. Seven is
+/// passed in.
 const card_scopes_capacity = repeatedCapacity(7);
 /// `""` is two, for every string list on the card.
 const card_strings_capacity = repeatedCapacity(2);
@@ -296,13 +319,42 @@ const mcp_content_blocks_capacity = repeatedCapacity(24);
 /// `{"name":"a","inputSchema":{}}` is twenty-nine; the other five members are
 /// optional.
 const mcp_tools_capacity = repeatedCapacity(28);
-/// `{"uri":"","text":""}` is eighteen, and it is the shorter of the two arms.
+/// `{"uri":"","text":""}` is twenty, and it is the shorter of the two arms.
+/// Sixteen is passed in.
 const mcp_resource_contents_capacity = repeatedCapacity(16);
-/// `{"role":"user","content":{"type":"text","text":""}}` is forty-seven; the
-/// content is one block and not a sequence.
+/// `{"role":"user","content":{"type":"text","text":""}}` is fifty-one; the
+/// content is one block and not a sequence. Forty-five is passed in.
 const mcp_prompt_messages_capacity = repeatedCapacity(45);
 /// `""` is two, for `supportedVersions`.
 const mcp_versions_capacity = repeatedCapacity(2);
+
+// The two decoders that take one caller-sized array and no arena. Both used to
+// declare a bare `[16]` at the call site, which put them outside this section
+// and outside the counter that is supposed to prove the bounds here are bounds:
+// a `BufferTooSmall` from either was a bare `stats.refused += 1`, so a harness
+// that had mis-sized them would have been green.
+
+/// The accepted output modes of a `SendMessageConfiguration`.
+///
+/// `""` is two, the shortest element [`a2a.decodeSendMessageConfiguration`] can
+/// fill. Not [`content_strings_capacity`] and not its array: the nested walk
+/// hands `readSendMessageConfiguration` a `ContentArena.strings` to share with
+/// every other `repeated string` in the document, while the public codec fills
+/// whatever array it is handed, so a bound derived for the arena bounds the
+/// two together and this one alone.
+const output_modes_capacity = repeatedCapacity(2);
+
+/// The options of a `PermissionRequest`.
+///
+/// `{"optionId":"","name":"","kind":""}` is thirty-five, and it is the shortest
+/// element the draft revision takes because that revision's open `oneOf` keeps
+/// an unrecognised `kind` rather than refusing it; the stable revision refuses
+/// the empty `kind` and needs forty-five for `"allow_once"`. Both arms of
+/// [`acp.decodePermissionRequest`] fill this one array, so a document with
+/// more options than it holds is a `BufferTooSmall` counted apart from the
+/// schema refusals rather than a truncated list of choices a caller would act
+/// on.
+const permission_options_capacity = repeatedCapacity(35);
 
 /// How many members one document can carry that no shape names.
 ///
@@ -396,6 +448,19 @@ const Storage = struct {
     /// the buffer it was decoded with, so asking `borrowAccepts` to use that
     /// same buffer would overwrite the very members the comparison is about.
     borrow: [max_doc_len]u8,
+
+    /// The two out-arrays the arena-taking decoders do not fill, sized by the
+    /// derivations above like every other array here.
+    ///
+    /// They are here rather than declared at the call site for the reason
+    /// `refusedWithCallerStorage` records: a bare `[16]` there had a
+    /// `BufferTooSmall` counted as an ordinary refusal, so a bound nobody
+    /// derived and nobody measured was indistinguishable from a document the
+    /// schema refuses. One array each and not two, because both arms of
+    /// `acp.decodePermissionRequest` read the first of them and the first value
+    /// is finished with before the second is decoded.
+    permission_options: [permission_options_capacity]acp.PermissionOption,
+    output_modes: [output_modes_capacity][]const u8,
 
     content: a2a.ContentArena,
     content_again: a2a.ContentArena,
@@ -1842,15 +1907,28 @@ const TailRule = struct {
     /// for a different reason than the rest: each has an encoder, and each
     /// encoder is called.
     ///
-    /// The twenty-seven after the first thirty are the decoders this wave fed:
-    /// eleven content-half A2A codecs, eight discovery-half ones, the six typed
-    /// MCP results, the caching pair, and the `jsonrpc` request projection.
-    /// Each has an encoder and each encoder is called, which is the condition
-    /// this table records. `mcp.decodeCacheLeg` and `mcp.decodeHeaderValue` are
-    /// the two in the battery and not here: one has no encoder by design
-    /// (`mcp.zig` says so) and the other takes bytes rather than a document, so
-    /// neither has a tail a round trip could lose. `acp.nextFrame` and
-    /// `jsonrpc.decode` are here for the same reason.
+    /// The first thirty are the codecs that predate that wave: two `mcp`
+    /// results, the six `acp` decoders, the two `bridge` ones and the twenty
+    /// `a2a` codecs. The twenty-eight after them are eleven content-half A2A
+    /// codecs, eight discovery-half ones, the six typed MCP results,
+    /// `mcp.decodeCacheable` — one half of the caching pair, because the other
+    /// has no encoder by design — the `jsonrpc` request projection, and
+    /// `jsonrpc.decode` itself.
+    ///
+    /// That last one is the most permissive decoder in the tree and was the one
+    /// row this table did not have: its round trip is a member comparison,
+    /// which by the argument in the module comment is blind to a member the
+    /// encoder dropped, so a tail it accepted was invisible to every other
+    /// assertion in its own block. It is here now, and the helper that sets its
+    /// reach bit is the one that asserts the tail, so the row cannot be deleted
+    /// without a `@compileError` rather than quietly losing the assertion.
+    ///
+    /// Every codec the battery feeds is in this table or in
+    /// [`tail_rule.no_tail`], and `test "the coverage tables agree on what the
+    /// battery feeds"` checks that in both directions over every row. Before
+    /// that check the thirty-eight rows this wave added were compared with
+    /// nothing at all, and two pinned counts were the only thing standing
+    /// between the tables and a codec with a reach bit and no tail rule.
     round_trip: []const []const u8 = &.{
         "mcp.decodeResultType",
         "mcp.decodeInputRequiredResult",
@@ -1909,6 +1987,7 @@ const TailRule = struct {
         "mcp.decodeDiscoverResult",
         "mcp.decodeCacheable",
         "jsonrpc.decodeRequest",
+        "jsonrpc.decode",
     },
 
     /// Decoders this harness does not feed at all, so no assertion above would
@@ -1920,12 +1999,16 @@ const TailRule = struct {
     ///
     /// This list held twenty-nine rows once and every one of them is now fed.
     /// An empty list is a stronger statement than a short one only if something
-    /// proves it, and two things do:
+    /// proves it, and three things do:
     ///
     /// - [`battery_codec_names`] is every codec the battery hands something
     ///   to, and [`expectEveryBatteryCodecReached`] fails the run if the
     ///   corpus fed one of them nothing it accepts. So a decoder in this
     ///   battery is a decoder the corpus reached — measured, not asserted.
+    /// - `test "every public decoder in the tree is in the battery table"` reads
+    ///   the root module's declarations and fails on a public decoder with no
+    ///   row here, so "every public decoder is fed or named" is measured
+    ///   against the tree rather than claimed about a list.
     /// - `test "the coverage tables agree on what the battery feeds"` walks
     ///   this table and fails on a row whose name the battery also feeds, on a
     ///   row with no reason, and on a count that has drifted from the number
@@ -1939,6 +2022,41 @@ const TailRule = struct {
     /// the statement entirely. A row here is now a statement about
     /// reachability, and [`battery_codec_names`] is what makes it true.
     unasserted: []const UnfedDecoder = &.{},
+
+    /// Codecs the battery feeds that have no trailing-byte assertion, and why
+    /// there is nothing for one to catch.
+    ///
+    /// The third table and the last one needed, and it exists because the other
+    /// two are not enough on their own: a codec in the battery is either in
+    /// [`tail_rule.round_trip`] — re-encoded, so a tail it accepted is a lost
+    /// `encode(decode(b))` — or here, with a reason. Without it, "not in the
+    /// round-trip table" meant two different things, and only one of them was
+    /// a reason: `mcp.decodeCacheLeg` has no encoder by design and
+    /// `mcp.decodeHeaderValue` reads bytes, while `jsonrpc.decode` reads a
+    /// document, has an encoder and belonged in the other table all along.
+    ///
+    /// A row here is a claim about the codec's input rather than about the
+    /// corpus, so it cannot be reached or unreached: [`reachedWithoutTail`]
+    /// will not record a reach for a codec that is not named here, which is
+    /// what keeps the list from growing by accident.
+    no_tail: []const TailExemption = &.{
+        .{
+            .name = "acp.nextFrame",
+            .why = "A frame is delimited by a newline rather than by the end of " ++
+                "a document, so there is no second value for it to accept and " ++
+                "drop.",
+        },
+        .{
+            .name = "mcp.decodeCacheLeg",
+            .why = "It reads the `params` member a caller has already isolated, " ++
+                "and the harness hands it exactly that lexeme.",
+        },
+        .{
+            .name = "mcp.decodeHeaderValue",
+            .why = "A header value is bytes rather than a document, so there is " ++
+                "no framing a transport could have split it at.",
+        },
+    },
 };
 
 /// The two ways a decoder can be named here, as a value and not only as a
@@ -1959,6 +2077,18 @@ const UnfedDecoder = struct {
     /// The public decoder, named exactly as its module spells it.
     name: []const u8,
     /// Why the battery does not feed it.
+    why: []const u8,
+};
+
+/// A codec the battery feeds that has no trailing-byte assertion, and why.
+///
+/// The reason is the point, for the reason [`UnfedDecoder`] gives its own: a row
+/// without one is a gap a reader has to guess at, and the coverage test fails it
+/// rather than letting the gap stand in for a decoder that should have been fed.
+const TailExemption = struct {
+    /// The public decoder, named exactly as its module spells it.
+    name: []const u8,
+    /// Why there is no document whose tail it could accept.
     why: []const u8,
 };
 
@@ -2000,9 +2130,15 @@ fn expectRoundTripHasNoTail(
 /// rest is: it accepts something on almost every document, so a bit that
 /// silently never turns on is the failure this table exists to prevent.
 ///
-/// `test "the coverage tables agree on what the battery feeds"` is what keeps
-/// this list, [`tail_rule.round_trip`] and [`tail_rule.unasserted`] from
-/// disagreeing about it, which is the drift two of those tables recorded.
+/// The list is written down rather than derived, and
+/// `test "every public decoder in the tree is in the battery table"` is what
+/// compares it with the tree's own declarations, so a decoder added to a module
+/// and wired into [`exerciseEveryDecoder`] without a row here is a failure
+/// rather than a silent narrowing of the guard.
+///
+/// `test "the coverage tables agree on what the battery feeds"` keeps this
+/// list, [`tail_rule.round_trip`] and [`tail_rule.no_tail`] from disagreeing
+/// about it, which is the drift two of those tables recorded.
 const battery_codec_names = [_][]const u8{
     "acp.decodeReplayFrom",
     "acp.decodePermissionSubject",
@@ -2098,25 +2234,104 @@ const wave_codec_count: usize = 23;
 /// outside it.
 const later_codec_count: usize = 38;
 
-/// Record that one of the codecs in [`battery_codec_names`] accepted something.
+/// Record that one of the codecs in [`battery_codec_names`] accepted something,
+/// and assert the tail rule [`tail_rule.round_trip`] says it carries.
 ///
-/// The index is a comptime constant rather than a value read at runtime,
-/// because this table exists to say a codec was reached rather than to say a
-/// call happened, and a lookup that could fail at runtime would put a
-/// fallible lookup on the path between a decoder accepting a document and the
-/// bit that records it. See [`batteryIndex`] for how the twenty-nine rows added
-/// by the latest wave get their index without a second place to disagree.
-fn reachedBatteryCodec(stats: *Stats, comptime index: usize) void {
+/// One function and not two call sites, which is the whole of the change: the
+/// bit and the assertion used to be independent lines, so a codec in the
+/// round-trip table could be fed with no trailing-byte assertion and every test
+/// in this file stayed green. `jsonrpc.decode` was in exactly that state — the
+/// most permissive decoder in the tree, and the one whose round trip compares
+/// members and so cannot see a tail.
+///
+/// The name is the only way in. A codec the battery table does not hold has no
+/// bit to set, and a codec the round-trip table does not hold has no tail to
+/// lose, so both are `@compileError` rather than a wrong answer at runtime:
+/// this helper's argument is that the codec takes a document, and a name that
+/// says otherwise is a claim about the tables, not about the document in hand.
+///
+/// `label` is what a failure prints and differs from `name` only where one
+/// decoder is read at two revisions.
+fn reachedRoundTripAs(
+    stats: *Stats,
+    comptime name: []const u8,
+    comptime label: []const u8,
+    input: []const u8,
+    tail: bool,
+) !void {
+    comptime {
+        if (nameIndex(tail_rule.round_trip, name) == null) @compileError(
+            std.fmt.comptimePrint(
+                "{s} has no row in tail_rule.round_trip, so reachedRoundTripAs " ++
+                    "is the wrong helper for it",
+                .{name},
+            ),
+        );
+    }
+    // `comptime` and not a bare call: an argument to a comptime parameter is a
+    // comptime context and this statement is not, so without the keyword the
+    // `@compileError` inside `batteryIndex` is analyzed as runtime code and
+    // fires for every name whether or not the table holds it.
+    const index = comptime batteryIndex(name);
     stats.reached_battery_codecs[index] = true;
+    try expectRoundTripHasNoTail(label, input, tail);
+}
+
+/// [`reachedRoundTripAs`] for the sixty call sites whose label is their name.
+fn reachedRoundTrip(
+    stats: *Stats,
+    comptime name: []const u8,
+    input: []const u8,
+    tail: bool,
+) !void {
+    return reachedRoundTripAs(stats, name, name, input, tail);
+}
+
+/// Record a reach for one of the codecs that take bytes rather than a document.
+///
+/// The opposite check from [`reachedRoundTrip`], and both halves of it matter:
+/// a codec in [`tail_rule.round_trip`] takes a document and has an encoder, so
+/// reaching it here would drop the assertion its row promises, and a codec that
+/// is not there still has to say in [`tail_rule.no_tail`] why there is no tail
+/// for it to lose. The second is what keeps that table from going the way the
+/// two others went: a row with a reason cannot be added by accident, and one
+/// without cannot be added at all.
+fn reachedWithoutTail(stats: *Stats, comptime name: []const u8) void {
+    comptime {
+        if (nameIndex(tail_rule.round_trip, name) != null) @compileError(
+            std.fmt.comptimePrint(
+                "{s} is in tail_rule.round_trip, so reachedWithoutTail would " ++
+                    "drop its trailing-byte assertion",
+                .{name},
+            ),
+        );
+        if (!hasTailExemption(name)) @compileError(
+            std.fmt.comptimePrint(
+                "{s} has no row in tail_rule.no_tail saying why there is no tail " ++
+                    "for it to lose",
+                .{name},
+            ),
+        );
+    }
+    const index = comptime batteryIndex(name);
+    stats.reached_battery_codecs[index] = true;
+}
+
+/// Whether [`tail_rule.no_tail`] records `name`, and why.
+fn hasTailExemption(comptime name: []const u8) bool {
+    for (tail_rule.no_tail) |row| {
+        if (std.mem.eql(u8, row.name, name)) return true;
+    }
+    return false;
 }
 
 /// Where [`battery_codec_names`] holds `name`, as a compile-time value.
 ///
-/// The rows above use bare indices, which is one integer per decoder and a
-/// second place for the table and the call sites to disagree — and a
-/// disagreement there is silent: the wrong bit is set, the guard passes, and
-/// the decoder it names was never fed. This is the same lookup in the other
-/// direction. It runs at comptime and a name that is not in the table is a
+/// Every call site names its codec rather than counting to its row, which is
+/// one integer per decoder and a second place for the table and the call sites
+/// to disagree — and a disagreement there is silent: the wrong bit is set, the
+/// guard passes, and the decoder it names was never fed. This is the lookup in
+/// that direction. It runs at comptime and a name that is not in the table is a
 /// `@compileError` rather than a wrong answer, so it cannot drift quietly the
 /// way a hand-counted index can.
 fn batteryIndex(comptime name: []const u8) usize {
@@ -2127,6 +2342,139 @@ fn batteryIndex(comptime name: []const u8) usize {
         ),
     );
     return found;
+}
+
+/// How many rows [`collectTreeDecoders`] is given room for.
+///
+/// More than [`battery_codec_names`] on purpose, since the two sets are meant to
+/// be the same size and a walk that outgrew its buffer would otherwise be an
+/// index-out-of-bounds at comptime rather than the sentence about a new decoder
+/// a reader can act on.
+const tree_decoder_capacity = battery_codec_names.len + 8;
+
+/// Every public decoder the root module declares, written into `out`.
+///
+/// Read out of the module rather than written down beside it, because a
+/// transcribed second copy is the thing that drifted: the module comment's
+/// claim that every public decoder in the tree is in [`battery_codec_names`]
+/// was true and enforced by nothing. Two kinds of declaration are skipped, and
+/// both are asked about rather than assumed:
+///
+/// - a private one, because `@typeInfo` lists those beside the public ones and a
+///   battery that fed a helper would be measuring nothing;
+/// - a declaration that is not a decoder by name, for the reason
+///   [`isDecoderDeclName`] gives.
+///
+/// The walk is one level deep and that is its limit rather than a claim: a
+/// decoder nested inside a type rather than a module is not one this harness
+/// could feed, because [`exerciseEveryDecoder`] has no storage for a value only
+/// some outer type can spell. A public decoder added to a module is caught; one
+/// added inside a struct is not, and saying so is why this is a check with a
+/// stated scope rather than a promise.
+fn collectTreeDecoders(out: [][]const u8) usize {
+    // The quota, for the same reason [`collectA2aMemberNames`] sets one: this
+    // runs at comptime and every row it walks is compared against the whole
+    // battery table.
+    @setEvalBranchQuota(200_000);
+    // `proto` and not `@TypeOf(proto)`: the type of a value that is itself a
+    // type is `type`, and `@typeInfo` of that has no declarations to walk.
+    const root = proto;
+    var count: usize = 0;
+    for (@typeInfo(root).@"struct".decls) |decl| {
+        if (!isPublicDecoder(root, decl.name)) continue;
+        out[count] = decl.name;
+        count += 1;
+    }
+    for (@typeInfo(root).@"struct".decls) |module_decl| {
+        if (!isNamespaceDecl(module_decl.name)) continue;
+        const ns = @field(root, module_decl.name);
+        for (@typeInfo(ns).@"struct".decls) |decl| {
+            if (!isPublicDecoder(ns, decl.name)) continue;
+            out[count] = comptime std.fmt.comptimePrint(
+                "{s}.{s}",
+                .{ module_decl.name, decl.name },
+            );
+            count += 1;
+        }
+    }
+    return count;
+}
+
+/// How many decoders [`collectTreeDecoders`] walks out, counted before the
+/// table that holds them is built.
+const tree_decoder_count = blk: {
+    var scratch: [tree_decoder_capacity][]const u8 = undefined;
+    break :blk collectTreeDecoders(scratch[0..]);
+};
+
+/// Every public decoder the root module declares, in the order the walk finds
+/// them.
+///
+/// Broken out as an array and not wrapped in a struct with its count beside
+/// it, because the array has to be a `const` the runtime code can take the
+/// address of: an array that lives in a `comptime` block is a comptime
+/// variable, and a pointer to one of those is not available outside the block
+/// that made it.
+const tree_decoder_names: [tree_decoder_capacity][]const u8 = blk: {
+    var list: [tree_decoder_capacity][]const u8 = undefined;
+    const written = collectTreeDecoders(list[0..]);
+    if (written != tree_decoder_count) @compileError("the two tree-walk counts disagree");
+    break :blk list;
+};
+
+/// Whether `ns` holds `name` as a declaration another module can reach, and the
+/// name is one this harness has to feed.
+///
+/// `@typeInfo` already lists the public declarations only, so the `@hasDecl`
+/// is belt and braces — and it is the half that would matter if that changed,
+/// because `@field` on a private declaration is an access error rather than a
+/// `false`.
+fn isPublicDecoder(comptime ns: type, comptime name: []const u8) bool {
+    if (!isDecoderDeclName(name)) return false;
+    return @hasDecl(ns, name);
+}
+
+/// Whether a declaration name is shaped like a decoder this harness feeds.
+///
+/// `decode` followed by whatever the codec is called, which is every decoder in
+/// the tree, plus [`acp.nextFrame`]: that one splits a frame on a newline
+/// rather than reading a document and is the one name in the tree a prefix
+/// would miss. The shape is the check rather than a list of names because a
+/// list of names is a second copy of the tree's decisions.
+fn isDecoderDeclName(comptime name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "decode") or
+        std.mem.eql(u8, name, "nextFrame");
+}
+
+/// Whether `name` is a namespace in the root module rather than a value.
+fn isNamespaceDecl(comptime name: []const u8) bool {
+    if (!@hasDecl(proto, name)) return false;
+    return switch (@typeInfo(@field(proto, name))) {
+        .@"struct" => true,
+        else => false,
+    };
+}
+
+/// Whether `name` is one of the decoders [`collectTreeDecoders`] walked out.
+fn inTree(comptime names: []const []const u8, comptime name: []const u8) bool {
+    for (names) |candidate| {
+        if (std.mem.eql(u8, candidate, name)) return true;
+    }
+    return false;
+}
+
+/// Count a refusal from a decoder that writes into no caller-owned array.
+///
+/// The same split as [`refusedWithCallerStorage`] and a different diagnosis:
+/// the only buffer such a decoder writes into is the scratch, so a
+/// `BufferTooSmall` is a `requiredScratchLen` that under-measured or a bound
+/// inside the library that the derivations above cannot see. Calling it a
+/// caller-storage fault would be right that the run fails and wrong about
+/// which of the two is at fault, and a counter a reader cannot act on is not
+/// much of a counter.
+fn refusedWithBorrowedScratch(stats: *Stats, err: anyerror) void {
+    stats.refused += 1;
+    if (err == error.BufferTooSmall) stats.scratch_too_small += 1;
 }
 
 /// Count a refusal from a decoder this harness sized storage for, and remember
@@ -2194,7 +2542,7 @@ const Stats = struct {
     /// the outcome are two decoders and either one could go quiet alone.
     envelope_meta_round_trips: usize = 0,
     outcome_meta_round_trips: usize = 0,
-    /// Documents one of the arena-taking decoders refused because the
+    /// Documents a decoder that takes caller-owned storage refused because a
     /// caller-sized array ran out, rather than because the document was not a
     /// message of that type.
     ///
@@ -2204,6 +2552,17 @@ const Stats = struct {
     /// makes every refusal on this counter a schema refusal that was not one —
     /// so the run fails rather than narrowing silently.
     storage_too_small: usize = 0,
+    /// Documents a decoder that writes into no caller-owned array refused with
+    /// `error.BufferTooSmall`.
+    ///
+    /// A second counter rather than a wider first one, because the diagnosis is
+    /// a different one: there the caller's array was too small and a derivation
+    /// above was wrong, and here the only buffer is the scratch, so the fault is
+    /// a `requiredScratchLen` that under-measured or a bound inside the library
+    /// that no derivation here can see. Both fail the run, which is what
+    /// matters; a counter that named the wrong one of the two would not be much
+    /// of a counter. `mcp.decodeCacheable` is the decoder this exists for.
+    scratch_too_small: usize = 0,
     /// Which leg `mcp.decodeCacheLeg` answered, per answer.
     ///
     /// Two counters rather than a bit, because the rule is the whole of what
@@ -4458,10 +4817,21 @@ fn paramsLexeme(input: []const u8, scratch: []u8) ?[]const u8 {
 /// each `bridge` encoder was supposed to write, and it is never a decode
 /// target: the prediction is spent before the re-decode takes `replay`.
 ///
-/// `storage` is the caller-owned storage the nineteen arena-taking decoders and
-/// the six typed MCP results write into, sized by the derivations above and
-/// reused across every document. It is one parameter rather than nine because
-/// it is one thing: an arena and the arrays behind it, wired once.
+/// `storage` is the caller-owned storage every decoder that takes some writes
+/// into, sized by the derivations above and reused across every document. It is
+/// one parameter rather than nine because it is one thing: the arenas and the
+/// arrays behind them, wired once. The two out-arrays that are not an arena's
+/// — the permission options and the accepted output modes — are here for the
+/// same reason as the rest: a caller-sized array declared at the call site is a
+/// bound nobody derived and nobody measured, and a `BufferTooSmall` from one
+/// read as an ordinary schema refusal.
+///
+/// Every block below records its reach through [`reachedRoundTrip`] or
+/// [`reachedWithoutTail`] rather than by writing a bit, so a codec cannot be
+/// fed here without the trailing-byte assertion [`tail_rule.round_trip`] says it
+/// carries. The one block that records no reach of its own is the
+/// direction-only `bridge.decodeEnvelope` below: it is the same decoder at
+/// another `outer_id`, and the block above it has already recorded the name.
 fn exerciseEveryDecoder(
     input: []const u8,
     scratch: []u8,
@@ -4494,7 +4864,13 @@ fn exerciseEveryDecoder(
 
     if (jsonrpc.decode(input, scratch)) |message| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 23);
+        // The one whole-document block that had no trailing-byte assertion, and
+        // the worst place for one to be missing: `jsonrpc.decode` takes a
+        // document, its round trip is a member comparison that cannot see a
+        // member the encoder dropped, and a spliced document decoded as the
+        // first message with the second silently discarded would have left
+        // every other assertion in this block green.
+        try reachedRoundTrip(stats, "jsonrpc.decode", input, tail);
         try roundTripJsonRpc(message, replay, out, stats);
     } else |_| {
         stats.refused += 1;
@@ -4502,8 +4878,7 @@ fn exerciseEveryDecoder(
 
     if (mcp.decodeResultType(input, scratch)) |result| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 24);
-        try expectRoundTripHasNoTail("mcp.decodeResultType", input, tail);
+        try reachedRoundTrip(stats, "mcp.decodeResultType", input, tail);
         try roundTripResultType(result, replay, out, stats);
     } else |_| {
         stats.refused += 1;
@@ -4511,8 +4886,7 @@ fn exerciseEveryDecoder(
 
     if (mcp.decodeInputRequiredResult(input, scratch)) |result| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 25);
-        try expectRoundTripHasNoTail("mcp.decodeInputRequiredResult", input, tail);
+        try reachedRoundTrip(stats, "mcp.decodeInputRequiredResult", input, tail);
         try roundTripInputRequiredResult(result, replay, out, stats);
     } else |_| {
         stats.refused += 1;
@@ -4520,7 +4894,7 @@ fn exerciseEveryDecoder(
 
     if (acp.nextFrame(input)) |frame| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 26);
+        reachedWithoutTail(stats, "acp.nextFrame");
         var writer = json.Writer.init(out);
         try acp.writeFrame(frame.bytes, &writer);
         const again = try acp.nextFrame(writer.written());
@@ -4534,8 +4908,7 @@ fn exerciseEveryDecoder(
 
     if (acp.decodePermissionOutcome(input, scratch)) |outcome| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 27);
-        try expectRoundTripHasNoTail("acp.decodePermissionOutcome", input, tail);
+        try reachedRoundTrip(stats, "acp.decodePermissionOutcome", input, tail);
         try roundTripPermissionOutcome(outcome, replay, out, stats);
     } else |_| {
         stats.refused += 1;
@@ -4543,8 +4916,7 @@ fn exerciseEveryDecoder(
 
     if (acp.decodeReplayFrom(input, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 0);
-        try expectRoundTripHasNoTail("acp.decodeReplayFrom", input, tail);
+        try reachedRoundTrip(stats, "acp.decodeReplayFrom", input, tail);
         try roundTripReplayFrom(value, replay, out, stats);
     } else |_| {
         stats.refused += 1;
@@ -4552,24 +4924,35 @@ fn exerciseEveryDecoder(
 
     if (acp.decodePermissionSubject(input, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 1);
-        try expectRoundTripHasNoTail("acp.decodePermissionSubject", input, tail);
+        try reachedRoundTrip(stats, "acp.decodePermissionSubject", input, tail);
         try roundTripPermissionSubject(value, replay, out, stats);
     } else |_| {
         stats.refused += 1;
     }
 
-    // The option array every permission-request decode writes into. A document
-    // with more options than this is a `BufferTooSmall`, which a caller sees as
-    // a decode error rather than a truncated list of choices.
-    var permission_options: [16]acp.PermissionOption = undefined;
-    if (acp.decodePermissionRequest(.stable, input, &permission_options, scratch)) |request| {
+    // Both arms of the one permission-request decode write their options into
+    // [`Storage.permission_options`], sized by
+    // [`permission_options_capacity`] and counted by
+    // [`refusedWithCallerStorage`]. It used to be a bare `[16]` declared here,
+    // which put a `BufferTooSmall` from it in the same bucket as a document the
+    // schema refuses and so left the bound unmeasured.
+    if (acp.decodePermissionRequest(
+        .stable,
+        input,
+        storage.permission_options[0..],
+        scratch,
+    )) |request| {
         stats.accepted += 1;
         // The stable arm records the reach for the decoder, because the draft
         // arm two blocks down is the same function read at another revision
         // and a corpus that reached only one of them has still reached it.
-        reachedBatteryCodec(stats, 29);
-        try expectRoundTripHasNoTail("acp.decodePermissionRequest stable", input, tail);
+        try reachedRoundTripAs(
+            stats,
+            "acp.decodePermissionRequest",
+            "acp.decodePermissionRequest stable",
+            input,
+            tail,
+        );
         const v1 = switch (request) {
             .stable => |value| value,
             .draft => return error.TestUnexpectedResult,
@@ -4579,13 +4962,24 @@ fn exerciseEveryDecoder(
         // above rather than before it: the two would otherwise be reading one
         // buffer at the same time.
         try roundTripPermissionRequest(request, replay, out, stats);
-    } else |_| {
-        stats.refused += 1;
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
     }
 
-    if (acp.decodePermissionRequest(.draft, input, &permission_options, scratch)) |request| {
+    if (acp.decodePermissionRequest(
+        .draft,
+        input,
+        storage.permission_options[0..],
+        scratch,
+    )) |request| {
         stats.accepted += 1;
-        try expectRoundTripHasNoTail("acp.decodePermissionRequest draft", input, tail);
+        try reachedRoundTripAs(
+            stats,
+            "acp.decodePermissionRequest",
+            "acp.decodePermissionRequest draft",
+            input,
+            tail,
+        );
         const v2 = switch (request) {
             .draft => |value| value,
             .stable => return error.TestUnexpectedResult,
@@ -4599,16 +4993,15 @@ fn exerciseEveryDecoder(
             }
         }
         try roundTripPermissionRequest(request, replay, out, stats);
-    } else |_| {
-        stats.refused += 1;
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
     }
 
     if (bridge.decodeEnvelope(input, scratch, .{ .integer = 1 })) |envelope| {
         stats.accepted += 1;
         // The round-trip block rather than the direction-only one below: they
         // are the same decoder, and the bit is about the decoder being fed.
-        reachedBatteryCodec(stats, 30);
-        try expectRoundTripHasNoTail("bridge.decodeEnvelope", input, tail);
+        try reachedRoundTrip(stats, "bridge.decodeEnvelope", input, tail);
         try roundTripEnvelope(input, envelope, replay, out, owed, stats);
     } else |_| {
         stats.refused += 1;
@@ -4625,8 +5018,7 @@ fn exerciseEveryDecoder(
 
     if (bridge.decodeOutcome(input, scratch)) |outcome| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 31);
-        try expectRoundTripHasNoTail("bridge.decodeOutcome", input, tail);
+        try reachedRoundTrip(stats, "bridge.decodeOutcome", input, tail);
         try roundTripOutcome(input, outcome, replay, out, owed, stats);
     } else |_| {
         stats.refused += 1;
@@ -4642,8 +5034,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeEmpty(input, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 3);
-        try expectRoundTripHasNoTail("a2a.decodeEmpty", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeEmpty", input, tail);
         try roundTripA2aEmpty(input, value, replay, out, stats);
     } else |_| {
         stats.refused += 1;
@@ -4651,8 +5042,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeGetTaskRequest(input, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 4);
-        try expectRoundTripHasNoTail("a2a.decodeGetTaskRequest", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeGetTaskRequest", input, tail);
         try roundTripA2aGetTaskRequest(value, replay, out, stats);
     } else |_| {
         stats.refused += 1;
@@ -4660,8 +5050,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeCancelTaskRequest(input, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 5);
-        try expectRoundTripHasNoTail("a2a.decodeCancelTaskRequest", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeCancelTaskRequest", input, tail);
         try roundTripA2aCancelTaskRequest(value, replay, out, stats);
     } else |_| {
         stats.refused += 1;
@@ -4669,8 +5058,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeSubscribeToTaskRequest(input, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 6);
-        try expectRoundTripHasNoTail("a2a.decodeSubscribeToTaskRequest", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeSubscribeToTaskRequest", input, tail);
         try roundTripA2aSubscribeToTaskRequest(value, replay, out, stats);
     } else |_| {
         stats.refused += 1;
@@ -4678,12 +5066,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeGetTaskPushNotificationConfigRequest(input, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 7);
-        try expectRoundTripHasNoTail(
-            "a2a.decodeGetTaskPushNotificationConfigRequest",
-            input,
-            tail,
-        );
+        try reachedRoundTrip(stats, "a2a.decodeGetTaskPushNotificationConfigRequest", input, tail);
         try roundTripA2aGetTaskPushNotificationConfigRequest(value, replay, out, stats);
     } else |_| {
         stats.refused += 1;
@@ -4691,8 +5074,8 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeDeleteTaskPushNotificationConfigRequest(input, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 8);
-        try expectRoundTripHasNoTail(
+        try reachedRoundTrip(
+            stats,
             "a2a.decodeDeleteTaskPushNotificationConfigRequest",
             input,
             tail,
@@ -4704,8 +5087,8 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeListTaskPushNotificationConfigsRequest(input, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 9);
-        try expectRoundTripHasNoTail(
+        try reachedRoundTrip(
+            stats,
             "a2a.decodeListTaskPushNotificationConfigsRequest",
             input,
             tail,
@@ -4717,8 +5100,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeGetExtendedAgentCardRequest(input, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 10);
-        try expectRoundTripHasNoTail("a2a.decodeGetExtendedAgentCardRequest", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeGetExtendedAgentCardRequest", input, tail);
         try roundTripA2aGetExtendedAgentCardRequest(value, replay, out, stats);
     } else |_| {
         stats.refused += 1;
@@ -4726,8 +5108,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeListTasksRequest(input, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 11);
-        try expectRoundTripHasNoTail("a2a.decodeListTasksRequest", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeListTasksRequest", input, tail);
         try roundTripA2aListTasksRequest(value, replay, out, stats);
     } else |_| {
         stats.refused += 1;
@@ -4735,8 +5116,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeAuthenticationInfo(input, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 12);
-        try expectRoundTripHasNoTail("a2a.decodeAuthenticationInfo", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeAuthenticationInfo", input, tail);
         try roundTripA2aAuthenticationInfo(value, replay, out, stats);
     } else |_| {
         stats.refused += 1;
@@ -4744,30 +5124,32 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeTaskPushNotificationConfig(input, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 13);
-        try expectRoundTripHasNoTail("a2a.decodeTaskPushNotificationConfig", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeTaskPushNotificationConfig", input, tail);
         try roundTripA2aTaskPushNotificationConfig(value, replay, out, stats);
     } else |_| {
         stats.refused += 1;
     }
 
-    // The accepted-mode array the configuration decoder fills. A document with
-    // more modes than this is a `BufferTooSmall`, which a caller reads as a
-    // decode error rather than as a truncated list of what it will accept.
-    var output_modes: [16][]const u8 = undefined;
-    if (a2a.decodeSendMessageConfiguration(input, &output_modes, scratch)) |value| {
+    // The accepted-mode array the configuration decoder fills, sized by
+    // [`output_modes_capacity`] and counted by [`refusedWithCallerStorage`]
+    // rather than declared here: a document with more modes than it holds is a
+    // `BufferTooSmall`, and a bare `[16]` with a plain refusal behind it made
+    // that indistinguishable from a document the schema refuses.
+    if (a2a.decodeSendMessageConfiguration(
+        input,
+        storage.output_modes[0..],
+        scratch,
+    )) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 14);
-        try expectRoundTripHasNoTail("a2a.decodeSendMessageConfiguration", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeSendMessageConfiguration", input, tail);
         try roundTripA2aSendMessageConfiguration(value, replay, out, stats);
-    } else |_| {
-        stats.refused += 1;
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
     }
 
     if (a2a.decodeAgentInterface(input, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 15);
-        try expectRoundTripHasNoTail("a2a.decodeAgentInterface", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeAgentInterface", input, tail);
         try roundTripA2aAgentInterface(value, replay, out, stats);
     } else |_| {
         stats.refused += 1;
@@ -4775,8 +5157,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeAgentProvider(input, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 16);
-        try expectRoundTripHasNoTail("a2a.decodeAgentProvider", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeAgentProvider", input, tail);
         try roundTripA2aAgentProvider(value, replay, out, stats);
     } else |_| {
         stats.refused += 1;
@@ -4784,8 +5165,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeAgentCardSignature(input, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 17);
-        try expectRoundTripHasNoTail("a2a.decodeAgentCardSignature", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeAgentCardSignature", input, tail);
         try roundTripA2aAgentCardSignature(value, replay, out, stats);
     } else |_| {
         stats.refused += 1;
@@ -4793,8 +5173,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeAgentExtension(input, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 18);
-        try expectRoundTripHasNoTail("a2a.decodeAgentExtension", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeAgentExtension", input, tail);
         try roundTripA2aAgentExtension(value, replay, out, stats);
     } else |_| {
         stats.refused += 1;
@@ -4802,8 +5181,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeApiKeySecurityScheme(input, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 19);
-        try expectRoundTripHasNoTail("a2a.decodeApiKeySecurityScheme", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeApiKeySecurityScheme", input, tail);
         try roundTripA2aApiKeySecurityScheme(value, replay, out, stats);
     } else |_| {
         stats.refused += 1;
@@ -4811,8 +5189,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeHttpAuthSecurityScheme(input, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 20);
-        try expectRoundTripHasNoTail("a2a.decodeHttpAuthSecurityScheme", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeHttpAuthSecurityScheme", input, tail);
         try roundTripA2aHttpAuthSecurityScheme(value, replay, out, stats);
     } else |_| {
         stats.refused += 1;
@@ -4820,8 +5197,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeOpenIdConnectSecurityScheme(input, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 21);
-        try expectRoundTripHasNoTail("a2a.decodeOpenIdConnectSecurityScheme", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeOpenIdConnectSecurityScheme", input, tail);
         try roundTripA2aOpenIdConnectSecurityScheme(value, replay, out, stats);
     } else |_| {
         stats.refused += 1;
@@ -4829,8 +5205,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeMutualTlsSecurityScheme(input, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, 22);
-        try expectRoundTripHasNoTail("a2a.decodeMutualTlsSecurityScheme", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeMutualTlsSecurityScheme", input, tail);
         try roundTripA2aMutualTlsSecurityScheme(value, replay, out, stats);
     } else |_| {
         stats.refused += 1;
@@ -4854,8 +5229,7 @@ fn exerciseEveryDecoder(
                 scratch,
             )) |set| {
                 stats.accepted += 1;
-                reachedBatteryCodec(stats, 28);
-                try expectRoundTripHasNoTail("acp.decodeCapabilityObject", input, tail);
+                try reachedRoundTrip(stats, "acp.decodeCapabilityObject", input, tail);
                 // No assertion on `set.present` here, and the absence is the
                 // point: `decodeCapabilityObject` has one success path and it
                 // returns `present = true`, so `expect(set.present)` could not
@@ -4895,8 +5269,7 @@ fn exerciseEveryDecoder(
                 scratch,
             )) |set| {
                 stats.accepted += 1;
-                reachedBatteryCodec(stats, 2);
-                try expectRoundTripHasNoTail("acp.decodeInitializeCapabilities", input, tail);
+                try reachedRoundTrip(stats, "acp.decodeInitializeCapabilities", input, tail);
                 try expectDisjointPaths(set.entries, paths[0..]);
                 try roundTripInitializeCapabilities(version, side, set, replay, out, stats);
             } else |_| {
@@ -4919,8 +5292,7 @@ fn exerciseEveryDecoder(
 
     if (jsonrpc.decodeRequest(input, scratch)) |request| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("jsonrpc.decodeRequest"));
-        try expectRoundTripHasNoTail("jsonrpc.decodeRequest", input, tail);
+        try reachedRoundTrip(stats, "jsonrpc.decodeRequest", input, tail);
         try roundTripJsonRpcRequest(request, replay, out, stats);
     } else |_| {
         stats.refused += 1;
@@ -4928,17 +5300,18 @@ fn exerciseEveryDecoder(
 
     if (mcp.decodeCacheable(input, scratch)) |cacheable| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("mcp.decodeCacheable"));
-        try expectRoundTripHasNoTail("mcp.decodeCacheable", input, tail);
+        try reachedRoundTrip(stats, "mcp.decodeCacheable", input, tail);
         try roundTripMcpCacheable(cacheable, replay, out, stats);
     } else |err| {
-        refusedWithCallerStorage(stats, err);
+        // Not `refusedWithCallerStorage`: this decoder writes into no
+        // caller-owned array, so a `BufferTooSmall` from it is a scratch or an
+        // internal bound and not a derivation above being wrong.
+        refusedWithBorrowedScratch(stats, err);
     }
 
     if (mcp.decodePaginatedResult(input, storage.verbatim[0..], scratch)) |page| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("mcp.decodePaginatedResult"));
-        try expectRoundTripHasNoTail("mcp.decodePaginatedResult", input, tail);
+        try reachedRoundTrip(stats, "mcp.decodePaginatedResult", input, tail);
         try roundTripMcpPaginatedResult(page, storage, replay, out, stats);
     } else |err| {
         refusedWithCallerStorage(stats, err);
@@ -4951,8 +5324,7 @@ fn exerciseEveryDecoder(
         scratch,
     )) |result| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("mcp.decodeToolCallResult"));
-        try expectRoundTripHasNoTail("mcp.decodeToolCallResult", input, tail);
+        try reachedRoundTrip(stats, "mcp.decodeToolCallResult", input, tail);
         try roundTripMcpToolCallResult(result, storage, replay, out, stats);
     } else |err| {
         refusedWithCallerStorage(stats, err);
@@ -4960,8 +5332,7 @@ fn exerciseEveryDecoder(
 
     if (mcp.decodeToolListResult(input, storage.tools[0..], storage.verbatim[0..], scratch)) |result| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("mcp.decodeToolListResult"));
-        try expectRoundTripHasNoTail("mcp.decodeToolListResult", input, tail);
+        try reachedRoundTrip(stats, "mcp.decodeToolListResult", input, tail);
         try roundTripMcpToolListResult(result, storage, replay, out, stats);
     } else |err| {
         refusedWithCallerStorage(stats, err);
@@ -4974,8 +5345,7 @@ fn exerciseEveryDecoder(
         scratch,
     )) |result| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("mcp.decodeResourceReadResult"));
-        try expectRoundTripHasNoTail("mcp.decodeResourceReadResult", input, tail);
+        try reachedRoundTrip(stats, "mcp.decodeResourceReadResult", input, tail);
         try roundTripMcpResourceReadResult(result, storage, replay, out, stats);
     } else |err| {
         refusedWithCallerStorage(stats, err);
@@ -4988,8 +5358,7 @@ fn exerciseEveryDecoder(
         scratch,
     )) |result| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("mcp.decodePromptsGetResult"));
-        try expectRoundTripHasNoTail("mcp.decodePromptsGetResult", input, tail);
+        try reachedRoundTrip(stats, "mcp.decodePromptsGetResult", input, tail);
         try roundTripMcpPromptsGetResult(result, storage, replay, out, stats);
     } else |err| {
         refusedWithCallerStorage(stats, err);
@@ -4997,8 +5366,7 @@ fn exerciseEveryDecoder(
 
     if (mcp.decodeDiscoverResult(input, storage.versions[0..], storage.verbatim[0..], scratch)) |result| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("mcp.decodeDiscoverResult"));
-        try expectRoundTripHasNoTail("mcp.decodeDiscoverResult", input, tail);
+        try reachedRoundTrip(stats, "mcp.decodeDiscoverResult", input, tail);
         try roundTripMcpDiscoverResult(result, storage, replay, out, stats);
     } else |err| {
         refusedWithCallerStorage(stats, err);
@@ -5011,7 +5379,7 @@ fn exerciseEveryDecoder(
     if (paramsLexeme(input, storage.borrow[0..])) |params| {
         if (mcp.decodeCacheLeg(params, scratch)) |leg| {
             stats.accepted += 1;
-            reachedBatteryCodec(stats, batteryIndex("mcp.decodeCacheLeg"));
+            reachedWithoutTail(stats, "mcp.decodeCacheLeg");
             switch (leg) {
                 .mrtr_retry => stats.cache_leg_retry += 1,
                 .original => stats.cache_leg_original += 1,
@@ -5023,7 +5391,7 @@ fn exerciseEveryDecoder(
 
     if (mcp.decodeHeaderValue(input, storage.borrow[0..])) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("mcp.decodeHeaderValue"));
+        reachedWithoutTail(stats, "mcp.decodeHeaderValue");
         // The whole corpus is hostile bytes, so the sentinel branch is reached
         // by documents that begin `=?base64?` and the plain branch by every
         // other one. Three buffers: the value lives in the first, the encoder
@@ -5050,8 +5418,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodePartContent(input, &storage.content, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("a2a.decodePartContent"));
-        try expectRoundTripHasNoTail("a2a.decodePartContent", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodePartContent", input, tail);
         try roundTripA2aContent(
             a2a.PartContent,
             value,
@@ -5069,8 +5436,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodePart(input, &storage.content, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("a2a.decodePart"));
-        try expectRoundTripHasNoTail("a2a.decodePart", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodePart", input, tail);
         try roundTripA2aContent(
             a2a.Part,
             value,
@@ -5088,8 +5454,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeMessage(input, &storage.content, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("a2a.decodeMessage"));
-        try expectRoundTripHasNoTail("a2a.decodeMessage", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeMessage", input, tail);
         try roundTripA2aContent(
             a2a.Message,
             value,
@@ -5107,8 +5472,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeArtifact(input, &storage.content, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("a2a.decodeArtifact"));
-        try expectRoundTripHasNoTail("a2a.decodeArtifact", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeArtifact", input, tail);
         try roundTripA2aContent(
             a2a.Artifact,
             value,
@@ -5126,8 +5490,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeTaskStatus(input, &storage.content, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("a2a.decodeTaskStatus"));
-        try expectRoundTripHasNoTail("a2a.decodeTaskStatus", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeTaskStatus", input, tail);
         try roundTripA2aContent(
             a2a.TaskStatus,
             value,
@@ -5145,8 +5508,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeTask(input, &storage.content, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("a2a.decodeTask"));
-        try expectRoundTripHasNoTail("a2a.decodeTask", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeTask", input, tail);
         try roundTripA2aContent(
             a2a.Task,
             value,
@@ -5164,8 +5526,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeTaskStatusUpdateEvent(input, &storage.content, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("a2a.decodeTaskStatusUpdateEvent"));
-        try expectRoundTripHasNoTail("a2a.decodeTaskStatusUpdateEvent", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeTaskStatusUpdateEvent", input, tail);
         try roundTripA2aContent(
             a2a.TaskStatusUpdateEvent,
             value,
@@ -5183,8 +5544,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeTaskArtifactUpdateEvent(input, &storage.content, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("a2a.decodeTaskArtifactUpdateEvent"));
-        try expectRoundTripHasNoTail("a2a.decodeTaskArtifactUpdateEvent", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeTaskArtifactUpdateEvent", input, tail);
         try roundTripA2aContent(
             a2a.TaskArtifactUpdateEvent,
             value,
@@ -5202,8 +5562,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeSendMessageRequest(input, &storage.content, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("a2a.decodeSendMessageRequest"));
-        try expectRoundTripHasNoTail("a2a.decodeSendMessageRequest", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeSendMessageRequest", input, tail);
         try roundTripA2aContent(
             a2a.SendMessageRequest,
             value,
@@ -5221,8 +5580,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeSendMessageResponse(input, &storage.content, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("a2a.decodeSendMessageResponse"));
-        try expectRoundTripHasNoTail("a2a.decodeSendMessageResponse", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeSendMessageResponse", input, tail);
         try roundTripA2aContent(
             a2a.SendMessageResponse,
             value,
@@ -5240,8 +5598,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeStreamResponse(input, &storage.content, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("a2a.decodeStreamResponse"));
-        try expectRoundTripHasNoTail("a2a.decodeStreamResponse", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeStreamResponse", input, tail);
         try roundTripA2aContent(
             a2a.StreamResponse,
             value,
@@ -5264,8 +5621,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeStringList(input, &storage.card, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("a2a.decodeStringList"));
-        try expectRoundTripHasNoTail("a2a.decodeStringList", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeStringList", input, tail);
         try roundTripA2aCard(
             a2a.StringList,
             value,
@@ -5283,8 +5639,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeSecurityRequirement(input, &storage.card, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("a2a.decodeSecurityRequirement"));
-        try expectRoundTripHasNoTail("a2a.decodeSecurityRequirement", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeSecurityRequirement", input, tail);
         try roundTripA2aCard(
             a2a.SecurityRequirement,
             value,
@@ -5302,8 +5657,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeSecurityScheme(input, &storage.card, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("a2a.decodeSecurityScheme"));
-        try expectRoundTripHasNoTail("a2a.decodeSecurityScheme", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeSecurityScheme", input, tail);
         try roundTripA2aCard(
             a2a.SecurityScheme,
             value,
@@ -5321,8 +5675,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeOAuthFlows(input, &storage.card, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("a2a.decodeOAuthFlows"));
-        try expectRoundTripHasNoTail("a2a.decodeOAuthFlows", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeOAuthFlows", input, tail);
         try roundTripA2aCard(
             a2a.OAuthFlows,
             value,
@@ -5340,8 +5693,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeOAuth2SecurityScheme(input, &storage.card, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("a2a.decodeOAuth2SecurityScheme"));
-        try expectRoundTripHasNoTail("a2a.decodeOAuth2SecurityScheme", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeOAuth2SecurityScheme", input, tail);
         try roundTripA2aCard(
             a2a.OAuth2SecurityScheme,
             value,
@@ -5359,8 +5711,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeAgentCapabilities(input, &storage.card, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("a2a.decodeAgentCapabilities"));
-        try expectRoundTripHasNoTail("a2a.decodeAgentCapabilities", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeAgentCapabilities", input, tail);
         try roundTripA2aCard(
             a2a.AgentCapabilities,
             value,
@@ -5378,8 +5729,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeAgentSkill(input, &storage.card, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("a2a.decodeAgentSkill"));
-        try expectRoundTripHasNoTail("a2a.decodeAgentSkill", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeAgentSkill", input, tail);
         try roundTripA2aCard(
             a2a.AgentSkill,
             value,
@@ -5397,8 +5747,7 @@ fn exerciseEveryDecoder(
 
     if (a2a.decodeAgentCard(input, &storage.card, scratch)) |value| {
         stats.accepted += 1;
-        reachedBatteryCodec(stats, batteryIndex("a2a.decodeAgentCard"));
-        try expectRoundTripHasNoTail("a2a.decodeAgentCard", input, tail);
+        try reachedRoundTrip(stats, "a2a.decodeAgentCard", input, tail);
         try roundTripA2aCard(
             a2a.AgentCard,
             value,
@@ -5504,7 +5853,13 @@ fn runPropertyHarness(run_seed: u64, count: usize) !Stats {
     // section exists to rule out: every document refused for want of room is a
     // run that is green while checking nothing. A short run says nothing
     // either way, so it asserts nothing, for the same reason as the guards above.
+    //
+    // Two counters and not one, because the two name different faults: this one
+    // is a derivation above that did not hold, and the next is a scratch that
+    // under-measured or a bound inside a library the derivations cannot see.
+    // Both fail the run. Neither is a count an author can bump.
     if (count >= 1000) try testing.expect(stats.storage_too_small == 0);
+    if (count >= 1000) try testing.expect(stats.scratch_too_small == 0);
     // `mcp.decodeCacheLeg` has two answers and the rule is the whole of what it
     // reads, so a corpus that produced one of them would be checking the other
     // one not at all. A seed carries `inputResponses` inside `params` for the
@@ -5574,7 +5929,7 @@ test "the generator can spell every member jsonrpc.decode branches on" {
 
 test "the coverage tables agree on what the battery feeds" {
     const testing = std.testing;
-    // Three tables say what this harness does, and while they agreed there was
+    // Four tables say what this harness does, and while they agreed there was
     // no way to tell whether any of them was right. The checks below are what
     // makes disagreement a failure rather than a paragraph nobody reads.
     //
@@ -5589,6 +5944,9 @@ test "the coverage tables agree on what the battery feeds" {
     var unlisted_wave_codec: ?[]const u8 = null;
     var fed: ?[]const u8 = null;
     var reasonless: ?[]const u8 = null;
+    var untabled: ?[]const u8 = null;
+    var doubled: ?[]const u8 = null;
+    var reasonless_exemption: ?[]const u8 = null;
     var misfiled: ?[]const u8 = null;
 
     // The prose around these tables quotes their sizes — "none", "the first
@@ -5600,7 +5958,7 @@ test "the coverage tables agree on what the battery feeds" {
     // would otherwise leave the file claiming coverage that the guard below
     // measures and the table below contradicts.
     try testing.expectEqual(@as(usize, 0), tail_rule.unasserted.len);
-    try testing.expectEqual(@as(usize, 57), tail_rule.round_trip.len);
+    try testing.expectEqual(@as(usize, 58), tail_rule.round_trip.len);
     try testing.expectEqual(wave_codec_count + later_codec_count, battery_codec_names.len);
 
     // And the split the table's doc describes, by name shape rather than by
@@ -5648,6 +6006,36 @@ test "the coverage tables agree on what the battery feeds" {
         if (nameIndex(round_trip_names, name) == null) unlisted_wave_codec = name;
     }
 
+    // And the direction the two loops above leave open, over every row rather
+    // than the wave's: a codec the battery feeds is either re-encoded, and so
+    // carries the trailing-byte assertion, or recorded in
+    // [`tail_rule.no_tail`] with the reason it has no document whose tail a
+    // round trip could lose. The wave's twenty-three were checked by the loop
+    // above and the other thirty-eight were checked by nothing at all, which
+    // is the shape the two tables recorded as drift: a decoder with a reach
+    // bit and no tail rule and no round trip, and two literal counts the only
+    // thing standing between the tables and that state. A count is something an
+    // author bumps; a set equality is not.
+    //
+    // Both directions of the failure are recorded, because they are different
+    // faults: a row in neither list is a codec that is fed and never checked,
+    // and a row in both is one that claims a document it does not take.
+    inline for (battery_names) |name| {
+        const in_round_trip = nameIndex(round_trip_names, name) != null;
+        const exempt = hasTailExemption(name);
+        if (in_round_trip == exempt and untabled == null and doubled == null) {
+            if (in_round_trip) doubled = name else untabled = name;
+        }
+    }
+
+    // Every exemption says why, for the reason every row of
+    // [`tail_rule.unasserted`] does: a name without one is a gap a reader has
+    // to guess at, and this field exists to close the gap rather than record
+    // that there is one.
+    inline for (tail_rule.no_tail) |row| {
+        if (row.why.len == 0 and reasonless_exemption == null) reasonless_exemption = row.name;
+    }
+
     // A decoder named as unfed that the battery feeds is the same fault in the
     // other direction, and the more dangerous one: it tells a reader the
     // coverage is absent when the run is exercising it. `inline for` here for
@@ -5679,6 +6067,69 @@ test "the coverage tables agree on what the battery feeds" {
     if (reasonless) |name| {
         std.debug.print("\ncoverage: '{s}' is named as unfed with no reason\n", .{name});
         return error.UnfedCodecWithoutReason;
+    }
+    if (untabled) |name| {
+        std.debug.print(
+            "\ncoverage: '{s}' is fed and is in neither round_trip nor no_tail\n",
+            .{name},
+        );
+        return error.BatteryCodecWithoutTailRule;
+    }
+    if (doubled) |name| {
+        std.debug.print(
+            "\ncoverage: '{s}' claims a tail rule and an exemption at once\n",
+            .{name},
+        );
+        return error.CodecExemptAndRoundTripped;
+    }
+    if (reasonless_exemption) |name| {
+        std.debug.print("\ncoverage: '{s}' is exempt from the tail rule with no reason\n", .{name});
+        return error.TailExemptionWithoutReason;
+    }
+}
+
+test "every public decoder in the tree is in the battery table" {
+    const testing = std.testing;
+    // The claim the module comment makes about coverage, checked against the
+    // tree and not against the table. Every other check in this file compares
+    // [`battery_codec_names`] with [`tail_rule.round_trip`], which can only say
+    // the table is self-consistent. The state nothing here could see is a
+    // decoder added to `a2a.zig` and wired into [`exerciseEveryDecoder`] the
+    // ordinary way with no row in it: no count changes, no test fails, and the
+    // reach guard has no bit for a codec it was never told about. That is the
+    // class the last wave closed and the next decoder opens again, so the check
+    // is the tree's own declarations rather than a list written beside them —
+    // a second copy of a list is the thing that drifted.
+
+    // The counts are a corollary of the set checks below and are checked
+    // because they say something the set checks do not: equal counts with a
+    // differing element on each side is a decoder renamed rather than added,
+    // which is the one difference two names in a row would hide.
+    try testing.expectEqual(battery_codec_names.len, tree_decoder_count);
+
+    const battery_names: []const []const u8 = &battery_codec_names;
+    var unfed: ?[]const u8 = null;
+    var absent: ?[]const u8 = null;
+    inline for (tree_decoder_names[0..tree_decoder_count]) |name| {
+        if (nameIndex(battery_names, name) == null and unfed == null) unfed = name;
+    }
+    inline for (battery_names) |name| {
+        if (!inTree(&tree_decoder_names, name) and absent == null) absent = name;
+    }
+
+    if (unfed) |name| {
+        std.debug.print(
+            "\ncoverage: the tree declares '{s}' and no battery row names it\n",
+            .{name},
+        );
+        return error.TreeDecoderNotInBattery;
+    }
+    if (absent) |name| {
+        std.debug.print(
+            "\ncoverage: '{s}' is in the battery table and no longer in the tree\n",
+            .{name},
+        );
+        return error.BatteryCodecNotInTree;
     }
 }
 
