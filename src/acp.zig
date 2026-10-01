@@ -906,7 +906,50 @@ pub fn advertisedPaths(set: CapabilitySet, out: [][]const u8) DecodeError![]cons
     return out[0..count];
 }
 
+/// Whether `path` is the path `key` takes inside `parent`.
+///
+/// A recorded path is compared rather than rebuilt, because a repeat must not
+/// cost the caller a region of `paths` that the first occurrence has already
+/// paid for. The comparison is by segments rather than by a joined copy for the
+/// same reason: a second copy of the joined spelling would be a second region
+/// per member, and no caller reads one.
+fn isPathOf(path: []const u8, parent: []const u8, key: []const u8) bool {
+    // A v1 path at the top of its object is the bare key, so there is no parent
+    // segment and no dot to match.
+    if (parent.len == 0) return std.mem.eql(u8, path, key);
+    return path.len == parent.len + 1 + key.len and
+        std.mem.eql(u8, path[0..parent.len], parent) and
+        path[parent.len] == '.' and
+        std.mem.eql(u8, path[parent.len + 1 ..], key);
+}
+
+/// What an earlier occurrence of a member name decided.
+///
+/// Three answers rather than one, because a member is decided whether or not it
+/// recorded: a name the walk recorded is found in the entries, a name whose
+/// occurrence recorded nothing is found in the claims, and a name it has not
+/// seen is neither.
+const First = union(enum) {
+    /// The name is new in this object, so this occurrence decides it.
+    free,
+    /// The name is a recorded path, and that path is the one a form check on
+    /// this occurrence is asked about. Reusing it is what lets a repeat of a
+    /// recorded member cost the caller no region of `paths`.
+    recorded: []const u8,
+    /// The name is claimed by an occurrence that recorded nothing. No path
+    /// exists for it — a member that records nothing costs no region of
+    /// `paths` — so a form check on this occurrence has to build one.
+    unrecorded,
+};
+
 /// The buffers and counters one capability decode works through.
+///
+/// `out` carries two things. The entries the caller is handed are written from
+/// the front, and the claims — the names of members whose occurrence decided
+/// nothing — are written from the back, so the one can never be read as the
+/// other. Every write checks that the two have not met before it makes one, and
+/// running out of room is `error.BufferTooSmall` about the caller's own array,
+/// which is whose fault it is.
 const CapabilityWalk = struct {
     version: WireVersion,
     side: Side,
@@ -916,8 +959,12 @@ const CapabilityWalk = struct {
     /// Bytes of `paths` written so far. It never rewinds, so every recorded
     /// path owns a region that no later path overwrites.
     end: usize = 0,
-    /// Entries written to `out`.
+    /// Entries written to the front of `out`.
     count: usize = 0,
+    /// Claims written to the back of `out`. They are the whole record of a
+    /// member whose occurrence recorded nothing, and they are what a later
+    /// occurrence of the same name is answered by.
+    claims: usize = 0,
 
     /// Append `parent`, a dot and `key`, and return the new path.
     fn appendPath(
@@ -936,21 +983,158 @@ const CapabilityWalk = struct {
         return path;
     }
 
+    /// The claim at `index`, counted from the back of `out`.
+    fn claimAt(self: *CapabilityWalk, index: usize) *Capability {
+        return &self.out[self.out.len - 1 - index];
+    }
+
+    /// Whether an earlier occurrence of `parent.key` already decided this name.
+    ///
+    /// A repeated member resolves first-wins, as it does in every other member
+    /// walk in this library, and this walk needs two memories to apply the rule
+    /// where a walk over a fixed shape carries one flag per member. A capability
+    /// object is an open object: v1 has no closed capability set and v2 replaced
+    /// the set with a documented extension point, so "have I seen this name" is
+    /// a question about a set rather than about a bit, and the set has to be
+    /// somewhere the caller already owns.
+    ///
+    /// A recorded member is its own record. The entries carry the whole path, so
+    /// a member of another object cannot answer for this one, and neither can a
+    /// member that is an ancestor of the path or a child of it. An occurrence
+    /// that recorded nothing left no entry behind, so the name it decided is
+    /// claimed in the claims instead, and `base` is where this object's claims
+    /// begin: the claims of an object that has closed are spent with it, so the
+    /// same name at two levels stays two members.
+    fn claimed(
+        self: *CapabilityWalk,
+        parent: []const u8,
+        key: []const u8,
+        base: usize,
+    ) First {
+        for (self.out[0..self.count]) |entry| {
+            if (isPathOf(entry.path, parent, key)) return .{ .recorded = entry.path };
+        }
+        var index = base;
+        while (index < self.claims) : (index += 1) {
+            if (std.mem.eql(u8, self.claimAt(index).path, key)) return .unrecorded;
+        }
+        return .free;
+    }
+
+    /// Claim the name of a member whose occurrence decided nothing.
+    ///
+    /// An explicit `null` is the member missing and wearing a key, and a value
+    /// neither schema declares is not a capability at all, so neither records
+    /// anything. Both are still the first occurrence of the name, and the rule
+    /// is about the name: a peer that answered `null` and then `true` for
+    /// `loadSession` did not advertise session loading, and a walk that let the
+    /// second occurrence through would hand `acp_session` a capability the peer
+    /// refused in its own `initialize`. This is the case a guard written as
+    /// "is this path already in the entries" leaves open, and it is why the
+    /// claims are not the entries.
+    ///
+    /// A claim costs a slot of `out` and no region of `paths`, because a member
+    /// that records nothing costs the caller no region of that buffer, and the
+    /// bare name is all there is to compare, because a claim belongs to the
+    /// object it was made in: a name at another level is never asked of it.
+    fn claim(self: *CapabilityWalk, key: []const u8) DecodeError!void {
+        if (self.count + self.claims == self.out.len) return error.BufferTooSmall;
+        self.claimAt(self.claims).* = .{
+            .path = key,
+            // Neither field is a fact about a claim: a claim has no path to ask
+            // the tables about and no form the wire carried. They are written
+            // so that the pair is one `validateCapabilityEntry` refuses, which
+            // is the same answer the walk gives a boolean with no value, so a
+            // claim cannot be read as a capability even if one ever escaped the
+            // claims.
+            .known = false,
+            .form = .boolean,
+            .value = null,
+        };
+        self.claims += 1;
+    }
+
+    /// The path a form check on a repeated member is asked about.
+    ///
+    /// A recorded member's own path is the answer, so a repeat the entries
+    /// matched costs the caller no region of `paths`. A name whose first
+    /// occurrence recorded nothing has no path behind it, so one is built for
+    /// the check and spent with the value. `.free` cannot reach here: a name no
+    /// earlier occurrence claimed is walked rather than spent.
+    fn repeatPath(
+        self: *CapabilityWalk,
+        parent: []const u8,
+        key: []const u8,
+        first: First,
+    ) DecodeError![]const u8 {
+        return switch (first) {
+            .free, .unrecorded => try self.appendPath(parent, key),
+            .recorded => |path| path,
+        };
+    }
+
+    /// Spend a member whose name an earlier occurrence decided.
+    ///
+    /// The value is stepped over whole, so nothing inside it is interpreted: a
+    /// repeat supplies neither a capability of its own nor one for a child of a
+    /// name the first occurrence settled. `skipValue` reads what it steps over,
+    /// so a peer cannot hide a syntax error in the slot a name already used.
+    ///
+    /// The form is checked before the value is spent, and on a repeat as well as
+    /// on a first occurrence, for the reason `bridge.decodeEnvelope` gives for
+    /// `params`: the first occurrence is the one that is carried, and a document
+    /// whose second `loadSession` is a presence object is malformed whatever the
+    /// first one said. A value that is not a form is spent without a check,
+    /// which is what a first occurrence of one does too — the schema declares no
+    /// form for it, so there is nothing to ask the table.
+    fn spendRepeat(
+        self: *CapabilityWalk,
+        reader: *json.Reader,
+        parent: []const u8,
+        key: []const u8,
+        first: First,
+    ) DecodeError!void {
+        reader.skipWhitespace();
+        const byte = reader.peek() orelse return error.Truncated;
+        switch (byte) {
+            't', 'f' => try self.checkFormAt(try self.repeatPath(parent, key, first), .boolean),
+            '{' => try self.checkFormAt(try self.repeatPath(parent, key, first), .presence_object),
+            else => {},
+        }
+        try reader.skipValue(self.scratch);
+    }
+
     /// Walk the members of an object whose own path is `parent`.
+    ///
+    /// `base` is where this object's claims begin, so a name a member of it
+    /// decided is not answered for by a name a member of an object inside it
+    /// claimed and has since spent.
     fn walkMembers(
         self: *CapabilityWalk,
         reader: *json.Reader,
         parent: []const u8,
         depth: u32,
+        base: usize,
     ) DecodeError!void {
         while (try reader.nextKey(self.scratch)) |key| {
             // `_meta` is metadata on every type in both schemas and never a
-            // capability, so it never becomes a path.
+            // capability, so it never becomes a path. It needs no claim
+            // either: a repeat of it is spent by the same `skipValue` that
+            // spent the first, and there is no path for a later occurrence to
+            // be answered with.
             if (std.mem.eql(u8, key, "_meta")) {
                 try reader.skipValue(self.scratch);
                 continue;
             }
-            try self.walkMember(reader, parent, key, depth);
+            // First-wins, for the reason the doc above gives. The repeat is
+            // spent rather than walked, so a later occurrence of a name cannot
+            // become the answer, and it is shape-checked first, for the reason
+            // `spendRepeat` gives.
+            const first = self.claimed(parent, key, base);
+            switch (first) {
+                .free => try self.walkMember(reader, parent, key, depth),
+                else => try self.spendRepeat(reader, parent, key, first),
+            }
         }
     }
 
@@ -961,6 +1145,9 @@ const CapabilityWalk = struct {
     /// nothing — an explicit `null`, a string, a number, an array — therefore
     /// costs the caller no region of `paths`, so a caller who sized that buffer
     /// by the paths the entries borrow is not asked for bytes no entry borrows.
+    /// It costs a slot of `out` instead, because it is still the first
+    /// occurrence of the name and the walk has to be able to answer a later one
+    /// from it.
     fn walkMember(
         self: *CapabilityWalk,
         reader: *json.Reader,
@@ -976,8 +1163,12 @@ const CapabilityWalk = struct {
         switch (byte) {
             'n' => {
                 // An explicit `null` is the absent case for a nested capability
-                // object, so it advertises nothing and gets no path.
+                // object, so it advertises nothing and gets no path. The name
+                // is claimed, because the member is missing rather than
+                // undecided, and a later occurrence of a missing member does
+                // not make it present.
                 try reader.nullLiteral();
+                try self.claim(key);
             },
             't', 'f' => {
                 const value = try reader.boolean();
@@ -989,13 +1180,22 @@ const CapabilityWalk = struct {
                 const path = try self.appendPath(parent, key);
                 try self.record(path, .presence_object, null);
                 if (try reader.beginObject()) return;
-                try self.walkMembers(reader, childPath(self.version, path), depth + 1);
+                // The claims of the object that just closed are spent with it.
+                // A name inside it said nothing about a member of this object,
+                // and one of those is a different path even where the spelling
+                // is the same, so carrying them would answer for a member that
+                // was never sent.
+                const inner = self.claims;
+                try self.walkMembers(reader, childPath(self.version, path), depth + 1, inner);
+                self.claims = inner;
             },
             else => {
                 // A string, a number or an array is not a capability form
                 // either schema declares, so it is stepped over rather than
-                // guessed at.
+                // guessed at. It is still the first occurrence of the name, so
+                // it is claimed like the `null` beside it.
                 try reader.skipValue(self.scratch);
+                try self.claim(key);
             },
         }
     }
@@ -1007,7 +1207,11 @@ const CapabilityWalk = struct {
         form: CapabilityForm,
         value: ?bool,
     ) DecodeError!void {
-        if (self.count == self.out.len) return error.BufferTooSmall;
+        // The entries and the claims share `out`, so the room left is what the
+        // claims have not taken. Reporting it as `BufferTooSmall` is honest: it
+        // is the caller's own output array, and it is the array the walk ran
+        // out of.
+        if (self.count + self.claims == self.out.len) return error.BufferTooSmall;
         const known = self.isKnown(path);
         try self.checkForm(path, known, form);
         self.out[self.count] = .{
@@ -1021,6 +1225,15 @@ const CapabilityWalk = struct {
 
     fn isKnown(self: *CapabilityWalk, path: []const u8) bool {
         return isKnownCapability(self.version, self.side, path);
+    }
+
+    /// Refuse a form no version declares for a path the walk did not record.
+    ///
+    /// The repeated member this is asked for is spent rather than carried, so
+    /// the entry that would hold the path is not written and the question is
+    /// asked of a path borrowed from the first occurrence instead.
+    fn checkFormAt(self: *CapabilityWalk, path: []const u8, form: CapabilityForm) DecodeError!void {
+        try self.checkForm(path, self.isKnown(path), form);
     }
 
     /// Refuse a member whose form is not the one its version declares.
@@ -1058,7 +1271,14 @@ const CapabilityWalk = struct {
 /// asked side-independently, so it form-checked a path the walk had already
 /// let through as an extension point and refused a value
 /// `decodeCapabilityObject` had returned.
-fn isKnownCapability(version: WireVersion, side: Side, path: []const u8) bool {
+///
+/// Public for the same reason, one level out: a caller that builds a
+/// [`CapabilitySet`] by hand is asked the same question, and
+/// [`encodeCapabilityObject`] is where it is told to ask. Reassembling this
+/// answer from the three per-side tables below is the dispatch this function
+/// exists to be. The tables stay public in their own right, because a caller
+/// holding a path and nothing else still has a question about one side.
+pub fn isKnownCapability(version: WireVersion, side: Side, path: []const u8) bool {
     return switch (version) {
         .stable => switch (side) {
             .client => isKnownV1ClientCapability(path),
@@ -1115,7 +1335,7 @@ fn childPath(version: WireVersion, path: []const u8) []const u8 {
 
 /// Decode a capability object into caller-owned entries.
 ///
-/// `out` receives one entry per object or boolean member, `paths` is where the
+/// `out` receives one slot per member the object carries, `paths` is where the
 /// dotted paths are built and `scratch` is the reader's escape buffer. Nothing
 /// allocates, and every buffer belongs to the caller. `paths` must hold the sum
 /// of every path recorded, not the longest one, because each entry borrows its
@@ -1123,12 +1343,27 @@ fn childPath(version: WireVersion, path: []const u8) []const u8 {
 /// `error.BufferTooSmall`. At v2 it must also hold the `capabilities` root,
 /// which is written ahead of the first member and forms the head of that
 /// member's region rather than a path of its own. A member that records nothing
-/// costs no region at all.
+/// costs no region of it at all.
+///
+/// It does cost a slot of `out`, because an occurrence is the first occurrence
+/// of a name whether or not it recorded and a later one has to be answered from
+/// it — see `CapabilityWalk.claim`. The entries are written from the front of
+/// `out` and the claims from the back, so `out` has to hold every member of the
+/// object, and the entries handed back are the members that recorded. The one
+/// case where a member that recorded nothing reaches `paths` is a repeat whose
+/// first occurrence recorded nothing: the form check is asked of a path, so one
+/// is built for it and spent with the value.
 ///
 /// Every object member is recorded, not only the empty ones, because a presence
 /// object advertises by existing: a `elicitation.form` object that also carries
 /// an extension still advertises form mode, and the gate has to appear in the
 /// list for the method to be callable.
+///
+/// A member a peer spells twice resolves first-wins, as it does in every other
+/// member walk in this library, so a refusal cannot be overwritten by a claim
+/// the peer appended behind it. The repeat's form is still checked wherever it
+/// stands, and a repeat's value is stepped over whole, so nothing inside it is
+/// interpreted.
 ///
 /// A member in the wrong form for its version is refused. That is stricter than
 /// the v1 extension rule on purpose: the rule keeps an unknown *capability*
@@ -1165,7 +1400,7 @@ pub fn decodeCapabilityObject(
     // walk is skipped and the check below is not, because the check is the
     // one thing every path out of this function has to make.
     if (!(try reader.beginObject())) {
-        try walk.walkMembers(&reader, paths[0..prefix.len], 1);
+        try walk.walkMembers(&reader, paths[0..prefix.len], 1, 0);
     }
 
     // A capability object is one JSON value. Bytes after the closing brace
@@ -1285,7 +1520,11 @@ fn isCapabilityAncestor(
 /// The exact inverse of [`decodeCapabilityObject`] over the set it returns. A
 /// document the walk can produce re-encodes to the same bytes: the entries
 /// are recorded parent first, so the nesting comes back in the order it went
-/// out, and nothing is written for a member that recorded nothing.
+/// out, and nothing is written for a member that recorded nothing. A member a
+/// peer spelled twice is one the walk spent, so it is one member here: the
+/// re-encoded document carries the occurrence that was read and not the one
+/// that was dropped, which is the same loss the decoder made on the way in and
+/// the one every other member walk in this library already makes.
 ///
 /// The entries are expected in the order the walk recorded them, which is
 /// what a decoded set carries. The nesting is read from the paths, so a
@@ -3658,6 +3897,343 @@ test "a repeated replayFrom type resolves first-wins" {
     const other = try decodeReplayFrom("{\"type\":\"checkpoint\",\"type\":\"start\"}", &scratch);
     try testing.expect(other == .other);
     try testing.expectEqualStrings("checkpoint", other.other);
+}
+
+test "a repeated capability member resolves first-wins" {
+    var scratch: [128]u8 = undefined;
+    var paths: [64]u8 = undefined;
+    var out: [4]Capability = undefined;
+    // This walk took the last occurrence of every member it read, so a peer
+    // that answered `false` and then `true` for `loadSession` had its refusal
+    // overwritten by its own later claim. `isMethodSupported` is the question
+    // `acp_session.checkCall` asks before it lets a call through, so the gate
+    // opened on a member the peer had already answered. The first occurrence is
+    // the answer every other walk in this library gives, and it is the one that
+    // is read.
+    const refused = try decodeCapabilityObject(
+        .stable,
+        .agent,
+        "{\"loadSession\":false,\"loadSession\":true}",
+        &out,
+        &paths,
+        &scratch,
+    );
+    try testing.expectEqual(@as(usize, 1), refused.entries.len);
+    try testing.expect(!refused.entries[0].advertised());
+    var list: [4][]const u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), (try advertisedPaths(refused, &list)).len);
+    // The gate, and the method that shares it: PROTOCOLS.md section 6.5 gates
+    // `session/load` and `session/resume` on `loadSession` between them.
+    try testing.expect(!isMethodSupported(try lookupMethod(.stable, "session/load"), list[0..0]));
+    try testing.expect(!isMethodSupported(try lookupMethod(.stable, "session/resume"), list[0..0]));
+
+    // The other order is the same document read the other way round, and it is
+    // the one order that is support: the member is on the wire, and the value
+    // the peer named first is the one it advertised with.
+    var other_out: [4]Capability = undefined;
+    var other_paths: [64]u8 = undefined;
+    var other_scratch: [128]u8 = undefined;
+    const offered = try decodeCapabilityObject(
+        .stable,
+        .agent,
+        "{\"loadSession\":true,\"loadSession\":false}",
+        &other_out,
+        &other_paths,
+        &other_scratch,
+    );
+    try testing.expectEqual(@as(usize, 1), offered.entries.len);
+    var other_list: [4][]const u8 = undefined;
+    const offered_paths = try advertisedPaths(offered, &other_list);
+    try testing.expectEqual(@as(usize, 1), offered_paths.len);
+    try testing.expect(isMethodSupported(try lookupMethod(.stable, "session/load"), offered_paths));
+
+    // A repeat inside a nested object is the same rule one level down, on the
+    // other side: `fs.readTextFile` is a v1 boolean that gates
+    // `fs/read_text_file`, and the object around it advertises by being there,
+    // so the only path left in the list is `fs`.
+    var client_out: [4]Capability = undefined;
+    var client_paths: [64]u8 = undefined;
+    var client_scratch: [128]u8 = undefined;
+    const client = try decodeCapabilityObject(
+        .stable,
+        .client,
+        "{\"fs\":{\"readTextFile\":false,\"readTextFile\":true}}",
+        &client_out,
+        &client_paths,
+        &client_scratch,
+    );
+    var client_list: [4][]const u8 = undefined;
+    const client_paths_list = try advertisedPaths(client, &client_list);
+    try testing.expectEqual(@as(usize, 1), client_paths_list.len);
+    try testing.expectEqualStrings("fs", client_paths_list[0]);
+    try testing.expect(!isMethodSupported(
+        try lookupMethod(.stable, "fs/read_text_file"),
+        client_paths_list,
+    ));
+    // The name is compared decoded, not by its spelling on the wire, so a peer
+    // cannot write the same member two ways to slip a second occurrence past
+    // the guard. `json.Reader.string` unescapes the key, and the entry's path
+    // is the member's name whichever way it arrived.
+    var spelled_out: [4]Capability = undefined;
+    var spelled_paths: [64]u8 = undefined;
+    var spelled_scratch: [128]u8 = undefined;
+    const spelled = try decodeCapabilityObject(
+        .stable,
+        .client,
+        "{\"\\u0074erminal\":true,\"terminal\":false}",
+        &spelled_out,
+        &spelled_paths,
+        &spelled_scratch,
+    );
+    try testing.expectEqual(@as(usize, 1), spelled.entries.len);
+    try testing.expectEqualStrings("terminal", spelled.entries[0].path);
+    try testing.expect(spelled.entries[0].advertised());
+}
+
+test "a capability member that recorded nothing still claims its name" {
+    var scratch: [128]u8 = undefined;
+    var paths: [64]u8 = undefined;
+    var out: [4]Capability = undefined;
+    // The rule is about the name, and an explicit `null` is the member missing
+    // and wearing a key. A walk that answered only from the members that
+    // recorded reads the `true` behind it as the member's value, so a peer that
+    // answered `null` and then `true` for `loadSession` opened a gate it had
+    // already refused. The name is claimed, and the claim is the whole of what
+    // the later occurrence is answered by.
+    const nulled = try decodeCapabilityObject(
+        .stable,
+        .agent,
+        "{\"loadSession\":null,\"loadSession\":true}",
+        &out,
+        &paths,
+        &scratch,
+    );
+    try testing.expectEqual(@as(usize, 0), nulled.entries.len);
+    var list: [4][]const u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), (try advertisedPaths(nulled, &list)).len);
+    try testing.expect(!isMethodSupported(try lookupMethod(.stable, "session/load"), list[0..0]));
+
+    // A value neither schema declares is not a capability either, and it is
+    // still the first occurrence of the name.
+    var junk_out: [4]Capability = undefined;
+    var junk_paths: [64]u8 = undefined;
+    var junk_scratch: [128]u8 = undefined;
+    const junked = try decodeCapabilityObject(
+        .stable,
+        .agent,
+        "{\"loadSession\":7,\"loadSession\":true}",
+        &junk_out,
+        &junk_paths,
+        &junk_scratch,
+    );
+    try testing.expectEqual(@as(usize, 0), junked.entries.len);
+
+    // A claim costs a slot of `out` and no region of `paths`. The member above
+    // that recorded nothing still costs the caller no region of that buffer
+    // even where it is repeated, because a repeat that carries no form is spent
+    // without a path to ask the table about.
+    var no_paths: [0]u8 = undefined;
+    var one_slot: [2]Capability = undefined;
+    const spent = try decodeCapabilityObject(
+        .stable,
+        .agent,
+        "{\"a\":null,\"a\":null}",
+        &one_slot,
+        &no_paths,
+        &scratch,
+    );
+    try testing.expectEqual(@as(usize, 0), spent.entries.len);
+
+    // So `out` has to hold every member of the object, and a caller who sized
+    // it for the entries alone is told so rather than silently handed a set the
+    // walk could not finish resolving.
+    var two_slots: [2]Capability = undefined;
+    try testing.expectEqual(
+        @as(usize, 0),
+        (try decodeCapabilityObject(
+            .stable,
+            .agent,
+            "{\"a\":null,\"b\":null}",
+            &two_slots,
+            &paths,
+            &scratch,
+        )).entries.len,
+    );
+    var no_room: [1]Capability = undefined;
+    try testing.expectError(error.BufferTooSmall, decodeCapabilityObject(
+        .stable,
+        .agent,
+        "{\"a\":null,\"b\":null}",
+        &no_room,
+        &paths,
+        &scratch,
+    ));
+}
+
+test "the same capability name at two levels is two members" {
+    var scratch: [128]u8 = undefined;
+    var paths: [64]u8 = undefined;
+    var out: [8]Capability = undefined;
+    // v1 has no closed capability set, so the names here are extension points,
+    // which is the point: the walk has to tell a member of the top object from
+    // a member of the object inside it even where the two are spelled alike.
+    const nested = try decodeCapabilityObject(
+        .stable,
+        .agent,
+        "{\"a\":{\"x\":null},\"x\":true}",
+        &out,
+        &paths,
+        &scratch,
+    );
+    // `a.x` recorded nothing, so the claim it left behind says nothing about a
+    // member of the top object named `x`, which is a different path. The claims
+    // of an object that has closed are spent with it.
+    try testing.expectEqual(@as(usize, 2), nested.entries.len);
+    try testing.expectEqualStrings("a", nested.entries[0].path);
+    try testing.expectEqualStrings("x", nested.entries[1].path);
+    try testing.expect(findCapability(nested, "x").?.advertised());
+    try testing.expect(findCapability(nested, "a.x") == null);
+
+    // The other way round, with the member of the top object the one that
+    // decided nothing this time.
+    var other_out: [8]Capability = undefined;
+    var other_paths: [64]u8 = undefined;
+    var other_scratch: [128]u8 = undefined;
+    const outer = try decodeCapabilityObject(
+        .stable,
+        .agent,
+        "{\"a\":{\"x\":true},\"x\":null}",
+        &other_out,
+        &other_paths,
+        &other_scratch,
+    );
+    try testing.expectEqual(@as(usize, 2), outer.entries.len);
+    try testing.expect(findCapability(outer, "a.x").?.advertised());
+    try testing.expect(findCapability(outer, "x") == null);
+
+    // And a repeat inside one object is one member of that object, with the
+    // first occurrence the answer.
+    var inner_out: [8]Capability = undefined;
+    var inner_paths: [64]u8 = undefined;
+    var inner_scratch: [128]u8 = undefined;
+    const inner = try decodeCapabilityObject(
+        .stable,
+        .agent,
+        "{\"a\":{\"x\":true,\"x\":false}}",
+        &inner_out,
+        &inner_paths,
+        &inner_scratch,
+    );
+    try testing.expectEqual(@as(usize, 2), inner.entries.len);
+    try testing.expect(findCapability(inner, "a.x").?.advertised());
+
+    // Two members can reach one path — a key spelled `a.x` at the top of the
+    // object, and the `x` inside an `a` beside it — and the path is the
+    // identity the rest of this module speaks, so the first one is kept and the
+    // second is spent. Two entries with one path would also have re-encoded as
+    // one object with the member spelled twice, which no walk here produces.
+    var joined_out: [8]Capability = undefined;
+    var joined_paths: [64]u8 = undefined;
+    var joined_scratch: [128]u8 = undefined;
+    const joined = try decodeCapabilityObject(
+        .stable,
+        .agent,
+        "{\"a\":{\"x\":true},\"a.x\":false}",
+        &joined_out,
+        &joined_paths,
+        &joined_scratch,
+    );
+    try testing.expectEqual(@as(usize, 2), joined.entries.len);
+    try testing.expect(findCapability(joined, "a.x").?.advertised());
+}
+
+test "a repeated capability member is shape-checked wherever it appears" {
+    var scratch: [128]u8 = undefined;
+    var out: [4]Capability = undefined;
+    // `terminal` is a boolean at v1, so a document that spells it twice has one
+    // occurrence this schema does not define whichever position it is in. The
+    // check runs on the repeat as well as on the first occurrence, for the
+    // reason `bridge.decodeEnvelope` gives for `params`: the first occurrence is
+    // the one that is carried, and a document whose second `terminal` is a
+    // presence object is malformed whatever the first one said. A first-wins
+    // walk that spent a repeat unchecked would answer
+    // `{"terminal":true,"terminal":{}}` and refuse `{"terminal":{}}`, and those
+    // are one member in one form.
+    //
+    // The buffer is sized for the single path the first occurrence borrowed,
+    // and the repeat is still refused rather than reported short: the recorded
+    // path is the one the check is asked of, so a repeat of a recorded member
+    // costs the caller no region.
+    var one_path: [8]u8 = undefined;
+    try testing.expectError(error.InvalidField, decodeCapabilityObject(
+        .stable,
+        .client,
+        "{\"terminal\":true,\"terminal\":{}}",
+        &out,
+        &one_path,
+        &scratch,
+    ));
+
+    // The same document where the first occurrence recorded nothing, and so left
+    // no path behind: the check is asked of one built for it, and the member
+    // that recorded nothing still costs no region where the repeat carries no
+    // form.
+    var paths: [64]u8 = undefined;
+    try testing.expectError(error.InvalidField, decodeCapabilityObject(
+        .stable,
+        .client,
+        "{\"terminal\":null,\"terminal\":{}}",
+        &out,
+        &paths,
+        &scratch,
+    ));
+
+    // v2 replaced every boolean with a presence object, so a boolean anywhere
+    // in a v2 capability object is a shape the draft does not define — at the
+    // second occurrence of a name as much as at the first.
+    try testing.expectError(error.InvalidField, decodeCapabilityObject(
+        .draft,
+        .agent,
+        "{\"session\":{\"delete\":{},\"delete\":true}}",
+        &out,
+        &paths,
+        &scratch,
+    ));
+
+    // A name neither schema names has no declared form, so a repeat of one is
+    // spent without a check: there is no table to ask, and an extension point
+    // may take either form by the rule that keeps it legal in the first place.
+    const extension = try decodeCapabilityObject(
+        .stable,
+        .client,
+        "{\"vendor\":5,\"vendor\":{}}",
+        &out,
+        &paths,
+        &scratch,
+    );
+    try testing.expectEqual(@as(usize, 0), extension.entries.len);
+}
+
+test "the known-capability answer is read per side and per version" {
+    // `encodeCapabilityObject` tells a caller that builds a set by hand to ask
+    // this, so the answer has to be the one the walk derives on the way in and
+    // the validator asks on the way out. A path this library names for one side
+    // is not a capability of the other, and a v1 path is not a v2 one.
+    try testing.expect(isKnownCapability(.stable, .agent, "loadSession"));
+    try testing.expect(!isKnownCapability(.stable, .client, "loadSession"));
+    try testing.expect(isKnownCapability(.stable, .client, "fs.readTextFile"));
+    try testing.expect(!isKnownCapability(.stable, .agent, "fs.readTextFile"));
+    try testing.expect(!isKnownCapability(.stable, .agent, "capabilities.session.delete"));
+    try testing.expect(isKnownCapability(.draft, .agent, "capabilities.session.delete"));
+    try testing.expect(!isKnownCapability(.draft, .client, "capabilities.session.delete"));
+    // Neither schema gives a capability object to a side-independent method, so
+    // the side that has none answers no at both versions rather than reaching
+    // for a table.
+    try testing.expect(!isKnownCapability(.stable, .protocol, "loadSession"));
+    try testing.expect(!isKnownCapability(.draft, .protocol, "capabilities.session.delete"));
+    // An extension point is a capability neither schema names, at either side.
+    try testing.expect(!isKnownCapability(.stable, .agent, "vendor.custom"));
+    try testing.expect(!isKnownCapability(.draft, .agent, "capabilities.vendor.custom"));
 }
 
 test "a paths buffer sized to the recorded paths is enough" {
