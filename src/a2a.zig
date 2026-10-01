@@ -58,16 +58,23 @@
 //! one entry as the single member its key names, so those rows carry `json =
 //! null`: there is no member name, because the key is data. `Part.content` is
 //! null for the other reason, that a `oneof` has no member name of its own.
+//! `isMapEntry` is the question a decoder asks before it walks one of the
+//! three, and the answer decides whether it reads member names or keys.
 //!
 //! **What this file encodes, and what it does not.** The tables below say
-//! which name and which number a field has, and the last two sections turn them
-//! into codecs. Every message in the flat half and every message in the content
-//! half has a decoder and an encoder: `PartContent`, `Part`, `Message`,
-//! `Artifact`, `TaskStatus`, `Task`, `TaskStatusUpdateEvent`,
+//! which name and which number a field has, and the last three sections turn
+//! them into codecs. Every message in the flat half and every message in the
+//! content half has a decoder and an encoder: `PartContent`, `Part`,
+//! `Message`, `Artifact`, `TaskStatus`, `Task`, `TaskStatusUpdateEvent`,
 //! `TaskArtifactUpdateEvent`, `SendMessageRequest`, `SendMessageResponse` and
-//! `StreamResponse` joined the twenty the flat half already had. What is left
-//! without a codec is `AgentCard`, `SecurityScheme`, `OAuthFlows` and the five
-//! `AgentExtension` and skill fields that reach a map.
+//! `StreamResponse` joined the twenty the flat half already had, and the
+//! discovery half then gave `AgentCard` and everything it reaches one: both
+//! `oneof` unions, `AgentCapabilities`, `AgentSkill`, `StringList`,
+//! `SecurityRequirement` and the three map entries between them. What is left
+//! without a codec is `ListTasksResponse` and
+//! `ListTaskPushNotificationConfigsResponse`, which are the two list
+//! *responses*; both hold a `repeated` message and so need a codec for their
+//! own halves, and neither is reached from a card.
 //!
 //! Three encodings an earlier revision of this note named as missing are not
 //! encodings. `TaskStatus.timestamp` and
@@ -1726,7 +1733,15 @@ pub const AgentCapabilities = struct {
     /// 2.
     push_notifications: ?bool = null,
     /// 3.
-    extensions: []const AgentExtension = &.{},
+    ///
+    /// A presence, and not a `[]const AgentExtension = &.{}` default:
+    /// `"extensions":[]` is a card that declares no extension and no
+    /// `extensions` member is a card that never answered the question, and
+    /// those are two documents. Section 2.13 of
+    /// `research/normative/a2a-1.0.0.md` puts `Req` at `no`, so the member may
+    /// be absent and the shape has to be able to say so. The elements live in
+    /// `CardArena.extensions`.
+    extensions: ?[]const AgentExtension = null,
     /// 4. Gates `GetExtendedAgentCard`.
     extended_agent_card: ?bool = null,
 
@@ -1788,15 +1803,29 @@ pub const AgentSkill = struct {
     /// it is for: an untagged skill is not discoverable.
     tags: []const []const u8,
     /// 5. Example prompts, which the proto does not require.
-    examples: []const []const u8 = &.{},
+    ///
+    /// A presence, and not a `&.{}` default: `"examples":[]` is a skill that
+    /// published no example prompt and no `examples` member is a skill that
+    /// never mentioned the subject. Section 2.15 of
+    /// `research/normative/a2a-1.0.0.md` puts `Req` at `no` for all four of
+    /// these, so all four may be absent. The elements live in
+    /// `CardArena.strings`.
+    examples: ?[]const []const u8 = null,
     /// 6. Narrows `AgentCard.default_input_modes` for this skill.
-    input_modes: []const []const u8 = &.{},
+    ///
+    /// A presence, for the reason `examples` above is one.
+    input_modes: ?[]const []const u8 = null,
     /// 7. Narrows `AgentCard.default_output_modes` for this skill.
-    output_modes: []const []const u8 = &.{},
+    ///
+    /// A presence, for the reason `examples` above is one.
+    output_modes: ?[]const []const u8 = null,
     /// 8. The scopes this skill needs. A skill that asks for a scope the
     /// client did not activate is what `ExtensionSupportRequiredError`
     /// follows from.
-    security_requirements: []const SecurityRequirement = &.{},
+    ///
+    /// A presence, for the reason `examples` above is one. The entries live in
+    /// `CardArena.security_requirements`.
+    security_requirements: ?[]const SecurityRequirement = null,
 
     /// The ProtoJSON name of every field, in field order.
     pub const fields = [_]Field{
@@ -1842,10 +1871,20 @@ pub const AgentCard = struct {
     /// 7. Required.
     capabilities: AgentCapabilities,
     /// 8. Keyed by the scheme name a `SecurityRequirement` names.
-    security_schemes: []const SecuritySchemeEntry = &.{},
+    ///
+    /// A presence, and not a `&.{}` default: `"securitySchemes":{}` is a card
+    /// that published a scheme table with nothing in it and no
+    /// `securitySchemes` member is a card that published no table at all.
+    /// Section 2.11 of `research/normative/a2a-1.0.0.md` puts `Req` at `no`,
+    /// so the member may be absent. The entries live in
+    /// `CardArena.security_schemes`.
+    security_schemes: ?[]const SecuritySchemeEntry = null,
     /// 9. Each entry is an alternative to the next; the schemes inside one
     /// entry are a conjunction.
-    security_requirements: []const SecurityRequirement = &.{},
+    ///
+    /// A presence, for the reason `security_schemes` above is one. The
+    /// entries live in `CardArena.security_requirements`.
+    security_requirements: ?[]const SecurityRequirement = null,
     /// 10. Required.
     default_input_modes: []const []const u8,
     /// 11. Required.
@@ -1853,7 +1892,13 @@ pub const AgentCard = struct {
     /// 12. Required.
     skills: []const AgentSkill,
     /// 13. A JWS signature over the canonicalized card, `signatures` excluded.
-    signatures: []const AgentCardSignature = &.{},
+    ///
+    /// A presence, for the reason `security_schemes` above is one, and the one
+    /// that matters most here: a card the publisher did not sign and a card
+    /// whose signature list is empty are different statements about trust, and
+    /// a verifier asked to check one of them must be able to tell which it
+    /// holds. The entries live in `CardArena.signatures`.
+    signatures: ?[]const AgentCardSignature = null,
     /// 14. `optional` in the proto, so presence is explicit.
     icon_url: ?[]const u8 = null,
 
@@ -1889,7 +1934,14 @@ comptime {
 /// that pluralised the name would read nothing.
 pub const StringList = struct {
     /// 1.
-    list: []const []const u8 = &.{},
+    ///
+    /// A presence, and not a `&.{}` default. This message is the value of a
+    /// `SecurityRequirement.schemes` entry, and ProtoJSON renders a message
+    /// value whose every field is default as `{}`, so `{"oauth":{}}` and
+    /// `{"oauth":{"list":[]}}` are two documents a peer may send and one
+    /// empty slice cannot write either of back. Section 2.18 puts `Req` at
+    /// `no`. The elements live in `CardArena.strings`.
+    list: ?[]const []const u8 = null,
 
     /// The ProtoJSON name of every field, in field order.
     pub const fields = [_]Field{
@@ -1953,7 +2005,12 @@ comptime {
 /// alternatives to each other.
 pub const SecurityRequirement = struct {
     /// 1.
-    schemes: []const SecurityRequirementEntry = &.{},
+    ///
+    /// A presence, and not a `&.{}` default: `"schemes":{}` is a requirement
+    /// that names no scheme and no `schemes` member is a requirement that never
+    /// said what it requires. Section 2.19 puts `Req` at `no`. The entries live
+    /// in `CardArena.requirement_entries`.
+    schemes: ?[]const SecurityRequirementEntry = null,
 
     /// The ProtoJSON name of every field, in field order.
     pub const fields = [_]Field{
@@ -2080,10 +2137,16 @@ pub const AuthorizationCodeOAuthFlow = struct {
     /// 4. Required. What the flow can obtain, and what a client has to ask
     /// for; an empty list is a flow that authorizes nothing.
     scopes: []const OAuthScope,
-    /// 5. A plain `bool`, because the proto declares the field singular and it
-    /// therefore has no presence bit. False is a published flow without PKCE,
-    /// which is a weaker flow rather than an absent one.
-    pkce_required: bool = false,
+    /// 5. A plain `bool` on the wire, so ProtoJSON rejects `null` for it and a
+    /// decoder refuses one. It is `?bool` anyway, for the reason
+    /// `AgentExtension.required` is one: the proto declares the field singular
+    /// and so gives it no presence bit, but a peer that wrote
+    /// `"pkceRequired":false` and a peer that wrote no `pkceRequired` sent two
+    /// documents, and a struct holding one `false` for both could write
+    /// neither of them back. False is a published flow without PKCE, which is
+    /// a weaker flow rather than an absent one, so the value is still `false`
+    /// when the member is there.
+    pkce_required: ?bool = null,
 
     /// The ProtoJSON name of every field, in field order.
     pub const fields = [_]Field{
@@ -2134,7 +2197,13 @@ pub const ImplicitOAuthFlow = struct {
     /// 2.
     refresh_url: ?[]const u8 = null,
     /// 3.
-    scopes: []const OAuthScope = &.{},
+    ///
+    /// A presence, and not a `&.{}` default: `"scopes":{}` is a flow that
+    /// published a scope table with nothing in it and no `scopes` member is a
+    /// flow that never mentioned scopes. Section 2.23 puts `Req` at `no` for
+    /// all three fields of this message, so all three may be absent. The
+    /// entries live in `CardArena.scopes`.
+    scopes: ?[]const OAuthScope = null,
 
     /// The ProtoJSON name of every field, in field order.
     pub const fields = [_]Field{
@@ -2160,7 +2229,10 @@ pub const PasswordOAuthFlow = struct {
     /// 2.
     refresh_url: ?[]const u8 = null,
     /// 3.
-    scopes: []const OAuthScope = &.{},
+    ///
+    /// A presence, for the reason `ImplicitOAuthFlow.scopes` above is one. The
+    /// entries live in `CardArena.scopes`.
+    scopes: ?[]const OAuthScope = null,
 
     /// The ProtoJSON name of every field, in field order.
     pub const fields = [_]Field{
@@ -3390,6 +3462,23 @@ fn writeSendMessageConfiguration(
 /// back what the agent published.
 pub fn decodeAgentInterface(raw: []const u8, scratch: []u8) DecodeError!AgentInterface {
     var reader = json.Reader.init(raw);
+    const interface = try readAgentInterface(&reader, scratch);
+
+    // The message is one JSON value and the three strings above are
+    // sub-slices of it, so a tail behind the closing brace is a second
+    // document this function would answer as though it had not arrived. The
+    // check is the caller's and the walk below does not make it.
+    if (!reader.atEnd()) return error.MalformedJson;
+    return interface;
+}
+
+/// The walk `decodeAgentInterface` opens, so `readAgentCard` can read one
+/// interface per element of `supportedInterfaces` on the same reader.
+///
+/// Every check except the one-value check stays here, because a nested
+/// interface is closed by the object its parent opened and a tail behind that
+/// parent's brace is the parent's business, not this message's.
+fn readAgentInterface(reader: *json.Reader, scratch: []u8) DecodeError!AgentInterface {
     var interface: AgentInterface = .{
         .url = "",
         .protocol_binding = "",
@@ -3434,8 +3523,6 @@ pub fn decodeAgentInterface(raw: []const u8, scratch: []u8) DecodeError!AgentInt
         }
     }
 
-    if (!reader.atEnd()) return error.MalformedJson;
-
     if (!saw_url or !saw_binding or !saw_version) return error.MissingField;
     if (interface.url.len == 0 or interface.protocol_binding.len == 0) return error.InvalidField;
     if (interface.protocol_version.len == 0) return error.InvalidField;
@@ -3447,9 +3534,27 @@ pub fn encodeAgentInterface(
     interface: AgentInterface,
     writer: *json.Writer,
 ) EncodeError!void {
+    try validateAgentInterface(interface);
+    try writeAgentInterface(interface, writer);
+}
+
+/// Whether `interface` is a value `decodeAgentInterface` could have returned.
+///
+/// Three members are REQUIRED and none of them may be empty. The check is a
+/// separate function and not part of the writer because `validateAgentCard`
+/// has to walk every interface in a card before the card writes its first
+/// byte, and a refusal halfway through leaves `{"name":"W","suppo` in the
+/// caller's buffer, which is neither a card nor nothing.
+fn validateAgentInterface(interface: AgentInterface) EncodeError!void {
     if (interface.url.len == 0 or interface.protocol_binding.len == 0) return error.InvalidField;
     if (interface.protocol_version.len == 0) return error.InvalidField;
+}
 
+/// Write an `AgentInterface` without checking it first.
+///
+/// The public encoder above is what checks, and the discovery half calls this
+/// one because `validateAgentCard` has already walked the whole card.
+fn writeAgentInterface(interface: AgentInterface, writer: *json.Writer) EncodeError!void {
     try writer.slice("{\"url\":");
     try writer.string(interface.url);
     try writer.slice(",\"protocolBinding\":");
@@ -3466,6 +3571,18 @@ pub fn encodeAgentInterface(
 /// Decode an `AgentProvider`.
 pub fn decodeAgentProvider(raw: []const u8, scratch: []u8) DecodeError!AgentProvider {
     var reader = json.Reader.init(raw);
+    const provider = try readAgentProvider(&reader, scratch);
+
+    // The message is one JSON value and the two strings above are sub-slices
+    // of it, so a tail behind the closing brace is a second document this
+    // function would answer as though it had not arrived.
+    if (!reader.atEnd()) return error.MalformedJson;
+    return provider;
+}
+
+/// The walk `decodeAgentProvider` opens, so `readAgentCard` can read the card's
+/// one optional provider on the same reader.
+fn readAgentProvider(reader: *json.Reader, scratch: []u8) DecodeError!AgentProvider {
     var provider: AgentProvider = .{ .url = "", .organization = "" };
     var saw_url = false;
     var saw_organization = false;
@@ -3492,8 +3609,6 @@ pub fn decodeAgentProvider(raw: []const u8, scratch: []u8) DecodeError!AgentProv
         }
     }
 
-    if (!reader.atEnd()) return error.MalformedJson;
-
     if (!saw_url or !saw_organization) return error.MissingField;
     if (provider.url.len == 0 or provider.organization.len == 0) return error.InvalidField;
     return provider;
@@ -3501,8 +3616,18 @@ pub fn decodeAgentProvider(raw: []const u8, scratch: []u8) DecodeError!AgentProv
 
 /// Encode an `AgentProvider`.
 pub fn encodeAgentProvider(provider: AgentProvider, writer: *json.Writer) EncodeError!void {
-    if (provider.url.len == 0 or provider.organization.len == 0) return error.InvalidField;
+    try validateAgentProvider(provider);
+    try writeAgentProvider(provider, writer);
+}
 
+/// Whether `provider` is a value `decodeAgentProvider` could have returned.
+/// The reason the check is its own function is `validateAgentInterface` gives.
+fn validateAgentProvider(provider: AgentProvider) EncodeError!void {
+    if (provider.url.len == 0 or provider.organization.len == 0) return error.InvalidField;
+}
+
+/// Write an `AgentProvider` without checking it first.
+fn writeAgentProvider(provider: AgentProvider, writer: *json.Writer) EncodeError!void {
     try writer.slice("{\"url\":");
     try writer.string(provider.url);
     try writer.slice(",\"organization\":");
@@ -3521,6 +3646,21 @@ pub fn decodeAgentCardSignature(
     scratch: []u8,
 ) DecodeError!AgentCardSignature {
     var reader = json.Reader.init(raw);
+    const signature = try readAgentCardSignature(&reader, scratch);
+
+    // The message is one JSON value and the lexemes above are sub-slices of
+    // it, so a tail behind the closing brace is a second document this
+    // function would answer as though it had not arrived.
+    if (!reader.atEnd()) return error.MalformedJson;
+    return signature;
+}
+
+/// The walk `decodeAgentCardSignature` opens, so `readAgentCard` can read one
+/// signature per element of `signatures` on the same reader.
+fn readAgentCardSignature(
+    reader: *json.Reader,
+    scratch: []u8,
+) DecodeError!AgentCardSignature {
     var signature: AgentCardSignature = .{ .protected = "", .signature = "" };
     var saw_protected = false;
     var saw_signature = false;
@@ -3553,8 +3693,6 @@ pub fn decodeAgentCardSignature(
         }
     }
 
-    if (!reader.atEnd()) return error.MalformedJson;
-
     if (!saw_protected or !saw_signature) return error.MissingField;
     if (signature.protected.len == 0 or signature.signature.len == 0) return error.InvalidField;
     return signature;
@@ -3565,8 +3703,22 @@ pub fn encodeAgentCardSignature(
     signature: AgentCardSignature,
     writer: *json.Writer,
 ) EncodeError!void {
-    if (signature.protected.len == 0 or signature.signature.len == 0) return error.InvalidField;
+    try validateAgentCardSignature(signature);
+    try writeAgentCardSignature(signature, writer);
+}
 
+/// Whether `signature` is a value `decodeAgentCardSignature` could have
+/// returned. The reason the check is its own function is `validateAgentInterface`
+/// gives, and it matters here more than anywhere else in the card: a
+/// half-written card is a card whose `signatures` member is truncated, and a
+/// verifier that reads the buffer rather than the error sees a signature that
+/// verifies against nothing.
+fn validateAgentCardSignature(signature: AgentCardSignature) EncodeError!void {
+    if (signature.protected.len == 0 or signature.signature.len == 0) return error.InvalidField;
+}
+
+/// Write an `AgentCardSignature` without checking it first.
+fn writeAgentCardSignature(signature: AgentCardSignature, writer: *json.Writer) EncodeError!void {
     try writer.slice("{\"protected\":");
     try writer.string(signature.protected);
     try writer.slice(",\"signature\":");
@@ -3588,6 +3740,18 @@ pub fn encodeAgentCardSignature(
 /// `"required":false` gets that member back rather than none.
 pub fn decodeAgentExtension(raw: []const u8, scratch: []u8) DecodeError!AgentExtension {
     var reader = json.Reader.init(raw);
+    const extension = try readAgentExtension(&reader, scratch);
+
+    // The message is one JSON value and the lexemes above are sub-slices of
+    // it, so a tail behind the closing brace is a second document this
+    // function would answer as though it had not arrived.
+    if (!reader.atEnd()) return error.MalformedJson;
+    return extension;
+}
+
+/// The walk `decodeAgentExtension` opens, so `readAgentCapabilities` can read
+/// one extension per element of `capabilities.extensions` on the same reader.
+fn readAgentExtension(reader: *json.Reader, scratch: []u8) DecodeError!AgentExtension {
     var extension: AgentExtension = .{};
 
     const is_empty = try reader.beginObject();
@@ -3623,7 +3787,6 @@ pub fn decodeAgentExtension(raw: []const u8, scratch: []u8) DecodeError!AgentExt
         }
     }
 
-    if (!reader.atEnd()) return error.MalformedJson;
     return extension;
 }
 
@@ -3659,17 +3822,33 @@ pub fn encodeAgentExtension(extension: AgentExtension, writer: *json.Writer) Enc
 
 /// Decode an `ApiKeySecurityScheme`.
 ///
-/// This is one of the four `SecurityScheme` arms that stand alone. The
-/// `oauth2` arm does not, because it reaches `OAuthFlows`, whose `scopes` is a
-/// `map<string, string>`: that walk is over keys rather than member names, so
-/// `findField` is the wrong tool for it and the union above has no codec until
-/// that arm has one. These four are decoded as the messages they are, which is
-/// what a caller holding one entry of a card's `securitySchemes` needs.
+/// This is one of the four `SecurityScheme` arms that stand alone, and the
+/// fifth, `OAuth2SecurityScheme`, is the one that does not: it reaches
+/// `OAuthFlows`, whose `scopes` is a `map<string, string>`, so that walk is
+/// over keys rather than member names and it needs the arena a lone flow does
+/// not. These four are decoded as the messages they are, which is what a
+/// caller holding one entry of a card's `securitySchemes` needs, and the
+/// discovery half reads the fifth as the `SecurityScheme` arm it is.
 pub fn decodeApiKeySecurityScheme(
     raw: []const u8,
     scratch: []u8,
 ) DecodeError!ApiKeySecurityScheme {
     var reader = json.Reader.init(raw);
+    const scheme = try readApiKeySecurityScheme(&reader, scratch);
+
+    // The message is one JSON value and the strings above are sub-slices of
+    // it, so a tail behind the closing brace is a second document this
+    // function would answer as though it had not arrived.
+    if (!reader.atEnd()) return error.MalformedJson;
+    return scheme;
+}
+
+/// The walk `decodeApiKeySecurityScheme` opens, so `readSecurityScheme` can
+/// read this arm of the union on the same reader.
+fn readApiKeySecurityScheme(
+    reader: *json.Reader,
+    scratch: []u8,
+) DecodeError!ApiKeySecurityScheme {
     var scheme: ApiKeySecurityScheme = .{ .location = .query, .name = "" };
     var saw_location = false;
     var saw_name = false;
@@ -3702,8 +3881,6 @@ pub fn decodeApiKeySecurityScheme(
         }
     }
 
-    if (!reader.atEnd()) return error.MalformedJson;
-
     if (!saw_location or !saw_name) return error.MissingField;
     // An empty header name names no header, and a query parameter with no name
     // is not a credential the receiver can read.
@@ -3716,8 +3893,22 @@ pub fn encodeApiKeySecurityScheme(
     scheme: ApiKeySecurityScheme,
     writer: *json.Writer,
 ) EncodeError!void {
-    if (scheme.name.len == 0) return error.InvalidField;
+    try validateApiKeySecurityScheme(scheme);
+    try writeApiKeySecurityScheme(scheme, writer);
+}
 
+/// Whether `scheme` is a value `decodeApiKeySecurityScheme` could have
+/// returned. The reason the check is its own function is `validateAgentInterface`
+/// gives.
+fn validateApiKeySecurityScheme(scheme: ApiKeySecurityScheme) EncodeError!void {
+    if (scheme.name.len == 0) return error.InvalidField;
+}
+
+/// Write an `ApiKeySecurityScheme` without checking it first.
+fn writeApiKeySecurityScheme(
+    scheme: ApiKeySecurityScheme,
+    writer: *json.Writer,
+) EncodeError!void {
     try writer.byte('{');
     if (scheme.description) |description| {
         try writer.slice("\"description\":");
@@ -3737,6 +3928,21 @@ pub fn decodeHttpAuthSecurityScheme(
     scratch: []u8,
 ) DecodeError!HttpAuthSecurityScheme {
     var reader = json.Reader.init(raw);
+    const scheme = try readHttpAuthSecurityScheme(&reader, scratch);
+
+    // The message is one JSON value and the strings above are sub-slices of
+    // it, so a tail behind the closing brace is a second document this
+    // function would answer as though it had not arrived.
+    if (!reader.atEnd()) return error.MalformedJson;
+    return scheme;
+}
+
+/// The walk `decodeHttpAuthSecurityScheme` opens, so `readSecurityScheme` can
+/// read this arm of the union on the same reader.
+fn readHttpAuthSecurityScheme(
+    reader: *json.Reader,
+    scratch: []u8,
+) DecodeError!HttpAuthSecurityScheme {
     var scheme: HttpAuthSecurityScheme = .{ .scheme = "" };
     var saw_scheme = false;
 
@@ -3767,8 +3973,6 @@ pub fn decodeHttpAuthSecurityScheme(
         }
     }
 
-    if (!reader.atEnd()) return error.MalformedJson;
-
     if (!saw_scheme) return error.MissingField;
     if (scheme.scheme.len == 0) return error.InvalidField;
     return scheme;
@@ -3779,8 +3983,22 @@ pub fn encodeHttpAuthSecurityScheme(
     scheme: HttpAuthSecurityScheme,
     writer: *json.Writer,
 ) EncodeError!void {
-    if (scheme.scheme.len == 0) return error.InvalidField;
+    try validateHttpAuthSecurityScheme(scheme);
+    try writeHttpAuthSecurityScheme(scheme, writer);
+}
 
+/// Whether `scheme` is a value `decodeHttpAuthSecurityScheme` could have
+/// returned. The reason the check is its own function is `validateAgentInterface`
+/// gives.
+fn validateHttpAuthSecurityScheme(scheme: HttpAuthSecurityScheme) EncodeError!void {
+    if (scheme.scheme.len == 0) return error.InvalidField;
+}
+
+/// Write an `HttpAuthSecurityScheme` without checking it first.
+fn writeHttpAuthSecurityScheme(
+    scheme: HttpAuthSecurityScheme,
+    writer: *json.Writer,
+) EncodeError!void {
     try writer.byte('{');
     if (scheme.description) |description| {
         try writer.slice("\"description\":");
@@ -3802,6 +4020,21 @@ pub fn decodeOpenIdConnectSecurityScheme(
     scratch: []u8,
 ) DecodeError!OpenIdConnectSecurityScheme {
     var reader = json.Reader.init(raw);
+    const scheme = try readOpenIdConnectSecurityScheme(&reader, scratch);
+
+    // The message is one JSON value and the strings above are sub-slices of
+    // it, so a tail behind the closing brace is a second document this
+    // function would answer as though it had not arrived.
+    if (!reader.atEnd()) return error.MalformedJson;
+    return scheme;
+}
+
+/// The walk `decodeOpenIdConnectSecurityScheme` opens, so
+/// `readSecurityScheme` can read this arm of the union on the same reader.
+fn readOpenIdConnectSecurityScheme(
+    reader: *json.Reader,
+    scratch: []u8,
+) DecodeError!OpenIdConnectSecurityScheme {
     var scheme: OpenIdConnectSecurityScheme = .{ .open_id_connect_url = "" };
     var saw_url = false;
 
@@ -3826,8 +4059,6 @@ pub fn decodeOpenIdConnectSecurityScheme(
         }
     }
 
-    if (!reader.atEnd()) return error.MalformedJson;
-
     if (!saw_url) return error.MissingField;
     if (scheme.open_id_connect_url.len == 0) return error.InvalidField;
     return scheme;
@@ -3838,8 +4069,24 @@ pub fn encodeOpenIdConnectSecurityScheme(
     scheme: OpenIdConnectSecurityScheme,
     writer: *json.Writer,
 ) EncodeError!void {
-    if (scheme.open_id_connect_url.len == 0) return error.InvalidField;
+    try validateOpenIdConnectSecurityScheme(scheme);
+    try writeOpenIdConnectSecurityScheme(scheme, writer);
+}
 
+/// Whether `scheme` is a value `decodeOpenIdConnectSecurityScheme` could have
+/// returned. The reason the check is its own function is `validateAgentInterface`
+/// gives.
+fn validateOpenIdConnectSecurityScheme(
+    scheme: OpenIdConnectSecurityScheme,
+) EncodeError!void {
+    if (scheme.open_id_connect_url.len == 0) return error.InvalidField;
+}
+
+/// Write an `OpenIdConnectSecurityScheme` without checking it first.
+fn writeOpenIdConnectSecurityScheme(
+    scheme: OpenIdConnectSecurityScheme,
+    writer: *json.Writer,
+) EncodeError!void {
     try writer.byte('{');
     if (scheme.description) |description| {
         try writer.slice("\"description\":");
@@ -3861,6 +4108,21 @@ pub fn decodeMutualTlsSecurityScheme(
     scratch: []u8,
 ) DecodeError!MutualTlsSecurityScheme {
     var reader = json.Reader.init(raw);
+    const scheme = try readMutualTlsSecurityScheme(&reader, scratch);
+
+    // The message is one JSON value and the description above is a sub-slice
+    // of it, so a tail behind the closing brace is a second document this
+    // function would answer as though it had not arrived.
+    if (!reader.atEnd()) return error.MalformedJson;
+    return scheme;
+}
+
+/// The walk `decodeMutualTlsSecurityScheme` opens, so `readSecurityScheme` can
+/// read this arm of the union on the same reader.
+fn readMutualTlsSecurityScheme(
+    reader: *json.Reader,
+    scratch: []u8,
+) DecodeError!MutualTlsSecurityScheme {
     var scheme: MutualTlsSecurityScheme = .{};
 
     const is_empty = try reader.beginObject();
@@ -3878,7 +4140,6 @@ pub fn decodeMutualTlsSecurityScheme(
         }
     }
 
-    if (!reader.atEnd()) return error.MalformedJson;
     return scheme;
 }
 
@@ -6238,8 +6499,12 @@ test "StringList is field 1 and keeps the singular JSON name" {
     // The proto disables the pluralisation lint on this message, so the wire
     // name is `list`. A decoder that looked for `lists` would read nothing.
     const scopes: StringList = .{ .list = &.{ "openid", "a2a.tasks" } };
-    try testing.expectEqual(@as(usize, 2), scopes.list.len);
-    try testing.expectEqualStrings("a2a.tasks", scopes.list[1]);
+    try testing.expectEqual(@as(usize, 2), scopes.list.?.len);
+    try testing.expectEqualStrings("a2a.tasks", scopes.list.?[1]);
+    // `{}` is a list a peer may send as a map value, so the absent list and
+    // the empty one are told apart rather than collapsed into one `&.{}`.
+    try testing.expectEqual(?[]const []const u8, fieldType(StringList, "list"));
+    try testing.expectEqual(@as(?[]const []const u8, null), (StringList{}).list);
 }
 
 test "a security requirement maps a scheme name to the scopes it needs" {
@@ -6248,9 +6513,13 @@ test "a security requirement maps a scheme name to the scopes it needs" {
     const requirement: SecurityRequirement = .{ .schemes = &.{
         .{ .name = "oauth", .list = .{ .list = &.{"a2a.tasks"} } },
     } };
-    try testing.expectEqual(@as(usize, 1), requirement.schemes.len);
-    try testing.expectEqualStrings("oauth", requirement.schemes[0].name);
-    try testing.expectEqualStrings("a2a.tasks", requirement.schemes[0].list.list[0]);
+    try testing.expectEqual(@as(usize, 1), requirement.schemes.?.len);
+    try testing.expectEqualStrings("oauth", requirement.schemes.?[0].name);
+    try testing.expectEqualStrings("a2a.tasks", requirement.schemes.?[0].list.list.?[0]);
+    // The map itself is a presence too, and `fieldType` is what a `&.{}` default
+    // on it would have hidden.
+    try testing.expectEqual(?[]const SecurityRequirementEntry, fieldType(SecurityRequirement, "schemes"));
+    try testing.expectEqual(@as(?[]const SecurityRequirementEntry, null), (SecurityRequirement{}).schemes);
 }
 
 test "a card scheme entry pairs the name a requirement names with its scheme" {
@@ -6288,7 +6557,7 @@ test "an unset capability is not a capability of false" {
     try testing.expectEqual(@as(?bool, null), unset.streaming);
     try testing.expectEqual(@as(?bool, null), unset.push_notifications);
     try testing.expectEqual(@as(?bool, null), unset.extended_agent_card);
-    try testing.expectEqual(@as(usize, 0), unset.extensions.len);
+    try testing.expectEqual(@as(?[]const AgentExtension, null), unset.extensions);
     const declined: AgentCapabilities = .{ .streaming = false };
     try testing.expectEqual(@as(?bool, false), declined.streaming);
 }
@@ -6327,10 +6596,16 @@ test "AgentSkill numbers four required fields ahead of four optional ones" {
         .description = "A seven-day forecast.",
         .tags = &.{"weather"},
     };
-    try testing.expectEqual(@as(usize, 0), skill.examples.len);
-    try testing.expectEqual(@as(usize, 0), skill.input_modes.len);
-    try testing.expectEqual(@as(usize, 0), skill.output_modes.len);
-    try testing.expectEqual(@as(usize, 0), skill.security_requirements.len);
+    // Fields 5 to 8 are presences rather than `&.{}` defaults, so a skill that
+    // published no example is not the same value as a skill that never
+    // mentioned one, and the encoder can put back whichever bytes arrived.
+    try testing.expectEqual(@as(?[]const []const u8, null), skill.examples);
+    try testing.expectEqual(@as(?[]const []const u8, null), skill.input_modes);
+    try testing.expectEqual(@as(?[]const []const u8, null), skill.output_modes);
+    try testing.expectEqual(@as(?[]const SecurityRequirement, null), skill.security_requirements);
+    // `tags` is REQUIRED, so it keeps no default and an empty array is a
+    // skill that is tagged with nothing rather than one that is untagged.
+    try testing.expectEqual([]const []const u8, fieldType(AgentSkill, "tags"));
     try testing.expectEqual(@as(u32, 8), fieldNumber(AgentSkill, 7));
 }
 
@@ -6363,13 +6638,16 @@ test "the AgentCard requires exactly the eight fields the proto marks required" 
         .default_output_modes = &.{"text/plain"},
         .skills = &skills,
     };
-    // The other six are optional, and absent here.
+    // The other six are optional, and absent here. The three lists are
+    // presences and not `&.{}` defaults, so a card that published an empty
+    // scheme table is not the same value as a card that published none, and a
+    // verifier asked whether this card is signed can tell the two apart.
     try testing.expectEqual(@as(?AgentProvider, null), card.provider);
     try testing.expectEqual(@as(?[]const u8, null), card.documentation_url);
     try testing.expectEqual(@as(?[]const u8, null), card.icon_url);
-    try testing.expectEqual(@as(usize, 0), card.security_schemes.len);
-    try testing.expectEqual(@as(usize, 0), card.security_requirements.len);
-    try testing.expectEqual(@as(usize, 0), card.signatures.len);
+    try testing.expectEqual(@as(?[]const SecuritySchemeEntry, null), card.security_schemes);
+    try testing.expectEqual(@as(?[]const SecurityRequirement, null), card.security_requirements);
+    try testing.expectEqual(@as(?[]const AgentCardSignature, null), card.signatures);
     // `supported_interfaces` is ordered and the first entry is preferred, so
     // the list the card carries is the list the agent published.
     try testing.expectEqual(@as(usize, 1), card.supported_interfaces.len);
@@ -6488,14 +6766,18 @@ test "the two live OAuth flows require their URLs and their scopes" {
         .scopes = &.{.{ .name = "a2a.tasks", .description = "Task read and write" }},
     };
     try testing.expectEqual(@as(?[]const u8, null), machine.refresh_url);
-    // `pkce_required` defaults to false, which is a published flow without
-    // PKCE rather than an absent one.
+    // `pkce_required` is a presence rather than a `false` default. A peer that
+    // wrote `"pkceRequired":false` and a peer that wrote no `pkceRequired` sent
+    // two documents, and a struct holding one `false` for both could write
+    // neither of them back. False is a published flow without PKCE, which is a
+    // weaker flow rather than an absent one, so the value is `false` when the
+    // member is there.
     const interactive: AuthorizationCodeOAuthFlow = .{
         .authorization_url = "https://auth.example.com/authorize",
         .token_url = "https://auth.example.com/token",
         .scopes = &.{.{ .name = "openid", .description = "OpenID Connect" }},
     };
-    try testing.expect(!interactive.pkce_required);
+    try testing.expectEqual(@as(?bool, null), interactive.pkce_required);
     try testing.expectEqual(@as(?[]const u8, null), interactive.refresh_url);
     const pinned: AuthorizationCodeOAuthFlow = .{
         .authorization_url = "https://auth.example.com/authorize",
@@ -6503,7 +6785,11 @@ test "the two live OAuth flows require their URLs and their scopes" {
         .scopes = &.{},
         .pkce_required = true,
     };
-    try testing.expect(pinned.pkce_required);
+    try testing.expectEqual(@as(?bool, true), pinned.pkce_required);
+    // And the type is what pins it, because `hasDefault` answers true for a
+    // `?bool = null` just as it does for the `false` default that was the
+    // defect, so it could not have told the two apart.
+    try testing.expectEqual(?bool, fieldType(AuthorizationCodeOAuthFlow, "pkce_required"));
 }
 
 test "the two deprecated OAuth flows have no required field" {
@@ -6514,9 +6800,13 @@ test "the two deprecated OAuth flows have no required field" {
     const implicit: ImplicitOAuthFlow = .{};
     const password: PasswordOAuthFlow = .{};
     try testing.expectEqual(@as(?[]const u8, null), implicit.authorization_url);
-    try testing.expectEqual(@as(usize, 0), implicit.scopes.len);
+    try testing.expectEqual(@as(?[]const OAuthScope, null), implicit.scopes);
     try testing.expectEqual(@as(?[]const u8, null), password.token_url);
-    try testing.expectEqual(@as(usize, 0), password.scopes.len);
+    try testing.expectEqual(@as(?[]const OAuthScope, null), password.scopes);
+    // The three live flows keep their REQUIRED scope maps, so an encoder
+    // always writes one and `"scopes":{}` is a flow that authorizes nothing
+    // rather than a flow with no scope member.
+    try testing.expectEqual([]const OAuthScope, fieldType(ClientCredentialsOAuthFlow, "scopes"));
     // They are variants 3 and 4, either side of device code at 5.
     try testing.expectEqual(@as(u32, 3), fieldNumber(OAuthFlows, 2));
     try testing.expectEqual(@as(u32, 4), fieldNumber(OAuthFlows, 3));
@@ -8561,4 +8851,3105 @@ test "an out array that fills is an error and never a truncation" {
     // `00 01 02 03 04` is `AAEC` then `AwQ=`: five bytes, so the tail carries
     // one pad and not two.
     try testing.expectEqualStrings("{\"raw\":\"AAECAwQ=\"}", fits.written());
+}
+
+// --- Codec: the discovery half --------------------------------------------------
+
+// What this section carries
+//
+// `AgentCard` and everything it reaches: `AgentInterface`, `AgentProvider`,
+// `AgentCardSignature`, `AgentCapabilities`, `AgentExtension`, `AgentSkill`,
+// `StringList`, `SecurityRequirement`, the `SecurityScheme` union and its five
+// arms, the `OAuthFlows` union and its five arms, `OAuthScope`, and the three
+// map entries between them. Every one of them has a decoder and an encoder, and
+// the two are exact inverses.
+//
+// A card, not a task
+//
+// `CardArena` is a second arena rather than a wider `ContentArena`. A card is a
+// discovery document: it is fetched once, it is held for as long as the caller
+// cares about the agent, and it reaches no type the content half walks. A
+// caller that decodes both would otherwise size one set of arrays for the
+// union of two disjoint sets, and the slack in the middle would be the
+// caller's problem for no reason. Nine arrays here and five there, and a caller
+// that wants both names both.
+//
+// The two leaves that are its own
+//
+// `AgentCardSignature.protected` and `.signature` are base64url text, and the
+// normative table types them as `string`, so encoding one is a splice and there
+// is no codec to write. `AgentCardSignature.header` and `AgentExtension.params`
+// are `google.protobuf.Struct` and are borrowed as the lexeme the peer wrote,
+// for the reason `bridge.Envelope.meta` is. Nothing in the card decodes into
+// the caller's own `bytes`, so no encoder here takes a base64 buffer and the
+// only buffer a card decode needs beyond the arena is the reader's scratch.
+//
+// What a map entry writes and what a decoder matches against
+//
+// `SecurityRequirementEntry`, `SecuritySchemeEntry` and `OAuthScope` are the
+// synthetic messages a protobuf compiler generates for one `map<K, V>` pair,
+// and ProtoJSON renders one entry as the single object member its **key**
+// names. So the two halves are:
+//
+//   the encoder writes `"<entry.name>":` and then the entry's value. The name
+//   is the key and not a row of the entry's own `fields` table, which is why
+//   those tables carry `json = null` on both rows and `writeMemberName` refuses
+//   them at comptime rather than writing a `null` that would slice;
+//
+//   the decoder matches **nothing**. It takes the member key from
+//   `reader.nextKey`, and that key *is* `entry.name`; the value is whatever the
+//   map's value type is, read by that type's own walk.
+//
+// `findField` is therefore the wrong tool for exactly these three and answers
+// null for every input, and that is the trap this section is built around: a
+// decoder that looked a member name up in `SecurityRequirementEntry` would
+// find nothing, and would then either drop every security requirement in a card
+// or invent a member name for one. `assertMapEntry` is the comptime statement
+// of the rule and fails the build if a row of any of the three ever grows a
+// `json` name.
+//
+// A repeated key takes its first occurrence, like every repeated member here
+//
+// RFC 8259 section 4 says the names within an object *should* be unique, and a
+// map whose key repeats is that case. The first occurrence decides the entry
+// and a later one is read as a value and dropped, for the reason every other
+// repeated member in this file takes its first occurrence under: a later
+// member must not be able to make a comparison that has already failed pass.
+// Nothing is allocated to compare — it is a scan of the run of entries this
+// same map has already filled — and the discarded value is still read rather
+// than stepped over blindly, so a peer cannot hide a syntax error in the slot a
+// key already used.
+//
+// A map value sent as `null` is an entry that is not there
+//
+// `{"oauth":null}` names an entry and then declines to give it a value, which
+// is what a message member sent as `null` is: the member missing and wearing a
+// key. It is asked before the value is read, for the reason `isNullMember` is
+// asked before an arm name, so a well-formed document is not called a syntax
+// error. The key does not become an entry and the re-encode drops it, which is
+// the stated consequence of skipping a member the shape does not model.
+//
+// The thirteen presence defects this half found and fixed
+//
+// Every one of these is a field the wire may omit that the tables held as a
+// plain value carrying a default, so an absent member and a present one holding
+// that default were the same value and the encoder could not tell which bytes
+// to write back. Each is named by the normative table that settles it.
+//
+//   `AgentCard.security_schemes`              `&.{}`  section 2.11 no
+//   `AgentCard.security_requirements`         `&.{}`  section 2.11 no
+//   `AgentCard.signatures`                    `&.{}`  section 2.11 no
+//   `AgentCapabilities.extensions`            `&.{}`  section 2.13 no
+//   `AgentSkill.examples`                     `&.{}`  section 2.15 no
+//   `AgentSkill.input_modes`                  `&.{}`  section 2.15 no
+//   `AgentSkill.output_modes`                 `&.{}`  section 2.15 no
+//   `AgentSkill.security_requirements`        `&.{}`  section 2.15 no
+//   `StringList.list`                         `&.{}`  section 2.18 no
+//   `SecurityRequirement.schemes`             `&.{}`  section 2.19 no
+//   `AuthorizationCodeOAuthFlow.pkce_required` `false` section 2.23 no
+//   `ImplicitOAuthFlow.scopes`                `&.{}`  section 2.23 no
+//   `PasswordOAuthFlow.scopes`                `&.{}`  section 2.23 no
+//
+// The last column is the `Req` column of that table, and every row is `no`:
+// each field is optional in the proto, so each may be absent, so each has to
+// be able to represent its absence.
+//
+// `AgentCard.signatures` is the one of the thirteen whose loss is a security
+// statement rather than a formatting one. An unsigned card and a card whose
+// signature list is empty are different answers to "is this card signed?", and
+// a verifier asked the question must be able to give it.
+//
+// Four fields the other half already made presences were **not** defects here
+// and kept their shape: `AgentInterface.tenant`, `AgentCard.documentation_url`
+// and `AgentCard.icon_url` are `?[]const u8` already, and the three
+// `AgentCapabilities` booleans are `?bool` already. `AgentSkill.tags` is
+// REQUIRED, so it keeps no default and no emptiness rule: `[]` is a skill
+// tagged with nothing, and only the absence of the member is
+// `error.MissingField`. The three live OAuth flows keep their REQUIRED scope
+// maps for the same reason, so `"scopes":{}` is a flow that authorizes nothing
+// rather than a flow with no scope member.
+
+/// The caller-owned storage a discovery-half decode writes into.
+///
+/// Every array here is sized by the caller, and a decode that finds more
+/// elements than an array holds is `error.BufferTooSmall` rather than a
+/// truncated card. The `*_used` fields are the fill levels: they start at zero,
+/// and every public decoder in this section resets them before it reads, so one
+/// arena serves one document at a time. Reusing an arena for a second document
+/// overwrites the first one's values.
+///
+/// The nine arrays are the nine distinct element types a card reaches. A
+/// tenth would be the caller sizing storage for nothing.
+///
+/// Nothing in here is retained past the call that filled it. The borrowed
+/// strings and lexemes still point into the document and into the caller's
+/// scratch, so all of it dies with the buffers the caller named.
+pub const CardArena = struct {
+    /// The elements of `AgentCard.supported_interfaces`.
+    interfaces: []AgentInterface,
+    /// The elements of `AgentCard.skills`.
+    skills: []AgentSkill,
+    /// The elements of `AgentCapabilities.extensions`.
+    extensions: []AgentExtension,
+    /// The elements of `AgentCard.signatures`.
+    signatures: []AgentCardSignature,
+    /// The entries of the `AgentCard.security_schemes` map.
+    security_schemes: []SecuritySchemeEntry,
+    /// The elements of `AgentCard.security_requirements` and of every
+    /// `AgentSkill.security_requirements`. They are the same type and are
+    /// filled in the order the document spells them, so a card that puts a
+    /// requirement on a skill and one on the card takes two runs of one array.
+    security_requirements: []SecurityRequirement,
+    /// The entries of every `SecurityRequirement.schemes` map.
+    requirement_entries: []SecurityRequirementEntry,
+    /// The entries of every OAuth flow's `scopes` map.
+    scopes: []OAuthScope,
+    /// Every `repeated string` element in the document: `AgentCard`'s two mode
+    /// lists, a skill's four string lists and every `StringList.list` alike.
+    /// They share one array because they are the same type, they are all
+    /// bounded by the same caller, and sharing it is what keeps the fill level
+    /// to one number.
+    strings: [][]const u8,
+
+    interfaces_used: usize = 0,
+    skills_used: usize = 0,
+    extensions_used: usize = 0,
+    signatures_used: usize = 0,
+    security_schemes_used: usize = 0,
+    security_requirements_used: usize = 0,
+    requirement_entries_used: usize = 0,
+    scopes_used: usize = 0,
+    strings_used: usize = 0,
+
+    /// An arena over storage the caller already has.
+    pub fn init(
+        interfaces: []AgentInterface,
+        skills: []AgentSkill,
+        extensions: []AgentExtension,
+        signatures: []AgentCardSignature,
+        security_schemes: []SecuritySchemeEntry,
+        security_requirements: []SecurityRequirement,
+        requirement_entries: []SecurityRequirementEntry,
+        scopes: []OAuthScope,
+        strings: [][]const u8,
+    ) CardArena {
+        return .{
+            .interfaces = interfaces,
+            .skills = skills,
+            .extensions = extensions,
+            .signatures = signatures,
+            .security_schemes = security_schemes,
+            .security_requirements = security_requirements,
+            .requirement_entries = requirement_entries,
+            .scopes = scopes,
+            .strings = strings,
+        };
+    }
+
+    /// Forget what a previous decode wrote, keeping the storage.
+    pub fn reset(self: *CardArena) void {
+        self.interfaces_used = 0;
+        self.skills_used = 0;
+        self.extensions_used = 0;
+        self.signatures_used = 0;
+        self.security_schemes_used = 0;
+        self.security_requirements_used = 0;
+        self.requirement_entries_used = 0;
+        self.scopes_used = 0;
+        self.strings_used = 0;
+    }
+};
+
+/// Whether message `T` is the synthetic entry of a protobuf `map<K, V>`.
+///
+/// A map reaches the wire as a repeated message the compiler generates, with
+/// field 1 the key and field 2 the value, and ProtoJSON renders one such entry
+/// as the single object member its key names. Neither half of it is a member
+/// of its own, so the table beside the struct carries `json = null` on both
+/// rows, and `findField` cannot name either of them. That is the whole of what
+/// makes these three the one kind of message in this file whose walk is over
+/// keys rather than over member names.
+///
+/// The shape checked is the whole of the entry: two rows, numbered 1 and 2,
+/// both without a member name and both with a `zig_name` to stand in for it. A
+/// message that is not an entry answers false, and a caller that branches on
+/// this gets the right answer for the two kinds rather than for the three types
+/// that happen to be entries today.
+pub fn isMapEntry(comptime T: type) bool {
+    return comptime blk: {
+        if (T.fields.len != 2) break :blk false;
+        if (T.fields[0].number != 1 or T.fields[1].number != 2) break :blk false;
+        if (T.fields[0].zig_name == null or T.fields[1].zig_name == null) break :blk false;
+        break :blk T.fields[0].json == null and T.fields[1].json == null;
+    };
+}
+
+comptime {
+    // The three walks below are over keys, and this is what makes that a
+    // checked property of the types rather than a sentence in a comment. Give
+    // any of the three a `json` name and the table is describing an ordinary
+    // message, so the walk beside it is reading the wrong thing and the build
+    // stops saying so.
+    for ([_]type{ SecurityRequirementEntry, SecuritySchemeEntry, OAuthScope }) |T| {
+        if (!isMapEntry(T)) {
+            @compileError(std.fmt.comptimePrint(
+                "{s} is walked over keys, so both of its rows must carry json = null" ++
+                    " and a zig_name. A json name here would make findField find it," ++
+                    " and a decoder that trusted findField would read nothing.",
+                .{@typeName(T)},
+            ));
+        }
+    }
+}
+
+/// Whether the run `entries` of a map already holds `key`.
+///
+/// This is the first-wins test for a map, and it is a scan of the run this same
+/// map has already filled rather than a set built alongside it: the runs are
+/// short, and a second structure would be a second thing to keep correct for a
+/// comparison of a handful of borrowed keys.
+fn mapKeySeen(entries: anytype, key: []const u8) bool {
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.name, key)) return true;
+    }
+    return false;
+}
+
+/// Write the member one map entry is: its key, then a colon.
+///
+/// The key is written as a JSON string and escaped like any other, because a
+/// scope name is data a peer may spell with a quote or a newline in it. It is
+/// never looked up in the entry's own table, for the reason the section above
+/// gives: there is no member name on a map entry, because the key *is* the
+/// name.
+fn writeMapKey(key: []const u8, writer: *json.Writer) EncodeError!void {
+    try writer.string(key);
+    try writer.byte(':');
+}
+
+/// Read a `repeated string` member into the arena's element storage.
+///
+/// The fill starts where the arena already stands, so two lists in one document
+/// take two runs of one array and neither overwrites the other. An array
+/// carrying no element is well formed and takes a zero-length run.
+fn readCardStrings(
+    reader: *json.Reader,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError![]const []const u8 {
+    const start = arena.strings_used;
+    const count = try readStringList(reader, arena.strings[start..], scratch);
+    arena.strings_used = start + count;
+    return arena.strings[start..][0..count];
+}
+
+/// Read a `StringList`, the value half of a `SecurityRequirement` map entry.
+fn readStringListObject(
+    reader: *json.Reader,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError!StringList {
+    var list: ?[]const []const u8 = null;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            // The name is singular because the proto disables the
+            // pluralisation lint on this message, so a decoder that pluralised
+            // it would read nothing.
+            if (std.mem.eql(u8, key, jsonName(StringList, 0).?)) {
+                if (list != null) {
+                    try reader.skipValue(scratch);
+                } else if (try isNullMember(reader)) {
+                    // `null` and an absent member agree, and the encoder writes
+                    // none of the two, so the key the entry was named under
+                    // comes back as `"oauth":{}`.
+                } else {
+                    list = try readCardStrings(reader, arena, scratch);
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    return .{ .list = list };
+}
+
+/// Read the `map<string, StringList>` a `SecurityRequirement` carries.
+///
+/// The whole walk is this: the key is the entry, the value is a `StringList`,
+/// and no member name is involved at either step.
+fn readRequirementEntries(
+    reader: *json.Reader,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError![]const SecurityRequirementEntry {
+    const start = arena.requirement_entries_used;
+    var count: usize = 0;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            const run = arena.requirement_entries[start..][0..count];
+            if (mapKeySeen(run, key)) {
+                try reader.skipValue(scratch);
+            } else if (try isNullMember(reader)) {
+                // An entry that is named and then not given a value is an
+                // entry that is not there, for the reason the section above
+                // gives.
+            } else {
+                if (start + count == arena.requirement_entries.len) {
+                    return error.BufferTooSmall;
+                }
+                arena.requirement_entries[start + count] = .{
+                    .name = key,
+                    .list = try readStringListObject(reader, arena, scratch),
+                };
+                count += 1;
+            }
+        }
+    }
+
+    arena.requirement_entries_used = start + count;
+    return arena.requirement_entries[start..][0..count];
+}
+
+/// Read a `SecurityRequirement` on its own.
+///
+/// `schemes` is the one member and it is optional in the proto, so `{}` is a
+/// complete requirement: a requirement that names no scheme constrains nothing,
+/// and that is a statement rather than a missing field.
+fn readSecurityRequirement(
+    reader: *json.Reader,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError!SecurityRequirement {
+    var schemes: ?[]const SecurityRequirementEntry = null;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, jsonName(SecurityRequirement, 0).?)) {
+                if (schemes != null) {
+                    try reader.skipValue(scratch);
+                } else if (try isNullMember(reader)) {
+                    // `null` and an absent member agree.
+                } else {
+                    schemes = try readRequirementEntries(reader, arena, scratch);
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    return .{ .schemes = schemes };
+}
+
+/// Read a `repeated SecurityRequirement` member into the arena.
+fn readSecurityRequirements(
+    reader: *json.Reader,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError![]const SecurityRequirement {
+    const start = arena.security_requirements_used;
+    if (try reader.beginArray()) return arena.security_requirements[start..start];
+    var count: usize = 0;
+    while (try reader.nextArrayElement()) {
+        if (start + count == arena.security_requirements.len) return error.BufferTooSmall;
+        arena.security_requirements[start + count] =
+            try readSecurityRequirement(reader, arena, scratch);
+        count += 1;
+    }
+    arena.security_requirements_used = start + count;
+    return arena.security_requirements[start..][0..count];
+}
+
+/// Read the `map<string, string>` an OAuth flow's `scopes` carries.
+///
+/// The value half is a plain string, so an entry is a key and a description and
+/// there is nothing else in it. Neither is checked for emptiness: the proto
+/// places no requirement on either, a key is data rather than a name, and the
+/// OpenAPI 3.2 Security Scheme Object this mirrors lets a scope carry an empty
+/// description.
+fn readOAuthScopes(
+    reader: *json.Reader,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError![]const OAuthScope {
+    const start = arena.scopes_used;
+    var count: usize = 0;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            const run = arena.scopes[start..][0..count];
+            if (mapKeySeen(run, key)) {
+                try reader.skipValue(scratch);
+            } else if (try isNullMember(reader)) {
+                // An entry that is named and then not given a value is an
+                // entry that is not there.
+            } else {
+                if (start + count == arena.scopes.len) return error.BufferTooSmall;
+                arena.scopes[start + count] = .{
+                    .name = key,
+                    .description = try reader.string(scratch),
+                };
+                count += 1;
+            }
+        }
+    }
+
+    arena.scopes_used = start + count;
+    return arena.scopes[start..][0..count];
+}
+
+/// Read an `AuthorizationCodeOAuthFlow`.
+///
+/// `pkceRequired` is a plain `bool` on the wire, so a `null` under it is
+/// refused rather than read as an absent member. `"pkceRequired":false` and no
+/// `pkceRequired` are two documents and only the presence records which one
+/// arrived.
+fn readAuthorizationCodeOAuthFlow(
+    reader: *json.Reader,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError!AuthorizationCodeOAuthFlow {
+    var authorization_url: []const u8 = "";
+    var saw_authorization_url = false;
+    var token_url: []const u8 = "";
+    var saw_token_url = false;
+    var refresh_url: ?[]const u8 = null;
+    var scopes: ?[]const OAuthScope = null;
+    var saw_scopes = false;
+    var pkce_required: ?bool = null;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, jsonName(AuthorizationCodeOAuthFlow, 0).?)) {
+                if (saw_authorization_url) {
+                    try reader.skipValue(scratch);
+                } else {
+                    authorization_url = try reader.string(scratch);
+                    saw_authorization_url = true;
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AuthorizationCodeOAuthFlow, 1).?)) {
+                if (saw_token_url) {
+                    try reader.skipValue(scratch);
+                } else {
+                    token_url = try reader.string(scratch);
+                    saw_token_url = true;
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AuthorizationCodeOAuthFlow, 2).?)) {
+                if (refresh_url != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    refresh_url = try reader.string(scratch);
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AuthorizationCodeOAuthFlow, 3).?)) {
+                if (saw_scopes) {
+                    try reader.skipValue(scratch);
+                } else if (try isNullMember(reader)) {
+                    // `null` and an absent member agree, and the check after
+                    // the loop is what reports the difference.
+                } else {
+                    scopes = try readOAuthScopes(reader, arena, scratch);
+                    saw_scopes = true;
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AuthorizationCodeOAuthFlow, 4).?)) {
+                if (pkce_required != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    pkce_required = try reader.boolean();
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    // `scopes` is REQUIRED and an empty map satisfies it, so `{}` is a flow
+    // that authorizes nothing and only the absence of the member is missing.
+    if (!saw_authorization_url or !saw_token_url or !saw_scopes) return error.MissingField;
+    if (authorization_url.len == 0 or token_url.len == 0) return error.InvalidField;
+    return .{
+        .authorization_url = authorization_url,
+        .token_url = token_url,
+        .refresh_url = refresh_url,
+        .scopes = scopes.?,
+        .pkce_required = pkce_required,
+    };
+}
+
+/// Read a `ClientCredentialsOAuthFlow`.
+fn readClientCredentialsOAuthFlow(
+    reader: *json.Reader,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError!ClientCredentialsOAuthFlow {
+    var token_url: []const u8 = "";
+    var saw_token_url = false;
+    var refresh_url: ?[]const u8 = null;
+    var scopes: ?[]const OAuthScope = null;
+    var saw_scopes = false;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, jsonName(ClientCredentialsOAuthFlow, 0).?)) {
+                if (saw_token_url) {
+                    try reader.skipValue(scratch);
+                } else {
+                    token_url = try reader.string(scratch);
+                    saw_token_url = true;
+                }
+            } else if (std.mem.eql(u8, key, jsonName(ClientCredentialsOAuthFlow, 1).?)) {
+                if (refresh_url != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    refresh_url = try reader.string(scratch);
+                }
+            } else if (std.mem.eql(u8, key, jsonName(ClientCredentialsOAuthFlow, 2).?)) {
+                if (saw_scopes) {
+                    try reader.skipValue(scratch);
+                } else if (try isNullMember(reader)) {
+                    // `null` and an absent member agree.
+                } else {
+                    scopes = try readOAuthScopes(reader, arena, scratch);
+                    saw_scopes = true;
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    if (!saw_token_url or !saw_scopes) return error.MissingField;
+    if (token_url.len == 0) return error.InvalidField;
+    return .{ .token_url = token_url, .refresh_url = refresh_url, .scopes = scopes.? };
+}
+
+/// Read an `ImplicitOAuthFlow`. **Deprecated** in the proto.
+///
+/// No field is REQUIRED, so `{}` is a complete flow and a decoder holds it
+/// rather than refusing the card around it.
+fn readImplicitOAuthFlow(
+    reader: *json.Reader,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError!ImplicitOAuthFlow {
+    var authorization_url: ?[]const u8 = null;
+    var refresh_url: ?[]const u8 = null;
+    var scopes: ?[]const OAuthScope = null;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, jsonName(ImplicitOAuthFlow, 0).?)) {
+                if (authorization_url != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    authorization_url = try reader.string(scratch);
+                }
+            } else if (std.mem.eql(u8, key, jsonName(ImplicitOAuthFlow, 1).?)) {
+                if (refresh_url != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    refresh_url = try reader.string(scratch);
+                }
+            } else if (std.mem.eql(u8, key, jsonName(ImplicitOAuthFlow, 2).?)) {
+                if (scopes != null) {
+                    try reader.skipValue(scratch);
+                } else if (try isNullMember(reader)) {
+                    // `null` and an absent member agree.
+                } else {
+                    scopes = try readOAuthScopes(reader, arena, scratch);
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    return .{
+        .authorization_url = authorization_url,
+        .refresh_url = refresh_url,
+        .scopes = scopes,
+    };
+}
+
+/// Read a `PasswordOAuthFlow`. **Deprecated** in the proto.
+fn readPasswordOAuthFlow(
+    reader: *json.Reader,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError!PasswordOAuthFlow {
+    var token_url: ?[]const u8 = null;
+    var refresh_url: ?[]const u8 = null;
+    var scopes: ?[]const OAuthScope = null;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, jsonName(PasswordOAuthFlow, 0).?)) {
+                if (token_url != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    token_url = try reader.string(scratch);
+                }
+            } else if (std.mem.eql(u8, key, jsonName(PasswordOAuthFlow, 1).?)) {
+                if (refresh_url != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    refresh_url = try reader.string(scratch);
+                }
+            } else if (std.mem.eql(u8, key, jsonName(PasswordOAuthFlow, 2).?)) {
+                if (scopes != null) {
+                    try reader.skipValue(scratch);
+                } else if (try isNullMember(reader)) {
+                    // `null` and an absent member agree.
+                } else {
+                    scopes = try readOAuthScopes(reader, arena, scratch);
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    return .{ .token_url = token_url, .refresh_url = refresh_url, .scopes = scopes };
+}
+
+/// Read a `DeviceCodeOAuthFlow`.
+fn readDeviceCodeOAuthFlow(
+    reader: *json.Reader,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError!DeviceCodeOAuthFlow {
+    var device_authorization_url: []const u8 = "";
+    var saw_device_authorization_url = false;
+    var token_url: []const u8 = "";
+    var saw_token_url = false;
+    var refresh_url: ?[]const u8 = null;
+    var scopes: ?[]const OAuthScope = null;
+    var saw_scopes = false;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, jsonName(DeviceCodeOAuthFlow, 0).?)) {
+                if (saw_device_authorization_url) {
+                    try reader.skipValue(scratch);
+                } else {
+                    device_authorization_url = try reader.string(scratch);
+                    saw_device_authorization_url = true;
+                }
+            } else if (std.mem.eql(u8, key, jsonName(DeviceCodeOAuthFlow, 1).?)) {
+                if (saw_token_url) {
+                    try reader.skipValue(scratch);
+                } else {
+                    token_url = try reader.string(scratch);
+                    saw_token_url = true;
+                }
+            } else if (std.mem.eql(u8, key, jsonName(DeviceCodeOAuthFlow, 2).?)) {
+                if (refresh_url != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    refresh_url = try reader.string(scratch);
+                }
+            } else if (std.mem.eql(u8, key, jsonName(DeviceCodeOAuthFlow, 3).?)) {
+                if (saw_scopes) {
+                    try reader.skipValue(scratch);
+                } else if (try isNullMember(reader)) {
+                    // `null` and an absent member agree.
+                } else {
+                    scopes = try readOAuthScopes(reader, arena, scratch);
+                    saw_scopes = true;
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    if (!saw_device_authorization_url or !saw_token_url or !saw_scopes) {
+        return error.MissingField;
+    }
+    if (device_authorization_url.len == 0 or token_url.len == 0) return error.InvalidField;
+    return .{
+        .device_authorization_url = device_authorization_url,
+        .token_url = token_url,
+        .refresh_url = refresh_url,
+        .scopes = scopes.?,
+    };
+}
+
+/// The walk `readOAuth2SecurityScheme` opens, and what
+/// `decodeOAuthFlows` opens when a caller holds one flow on its own.
+fn readOAuthFlows(
+    reader: *json.Reader,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError!?OAuthFlows {
+    var found: ?OAuthFlows = null;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (found != null) {
+                try reader.skipValue(scratch);
+            } else if (try isNullMember(reader)) {
+                // An arm with no value is an arm that is not there, so a later
+                // arm that does carry one still decides the union — the same
+                // rule a repeated member takes its first occurrence under, and
+                // asked in the same order for the same reason.
+            } else if (std.mem.eql(u8, key, oneofMemberName(OAuthFlows, 0))) {
+                found = OAuthFlows{ .authorization_code = try readAuthorizationCodeOAuthFlow(
+                    reader,
+                    arena,
+                    scratch,
+                ) };
+            } else if (std.mem.eql(u8, key, oneofMemberName(OAuthFlows, 1))) {
+                found = OAuthFlows{ .client_credentials = try readClientCredentialsOAuthFlow(
+                    reader,
+                    arena,
+                    scratch,
+                ) };
+            } else if (std.mem.eql(u8, key, oneofMemberName(OAuthFlows, 2))) {
+                found = OAuthFlows{ .implicit = try readImplicitOAuthFlow(
+                    reader,
+                    arena,
+                    scratch,
+                ) };
+            } else if (std.mem.eql(u8, key, oneofMemberName(OAuthFlows, 3))) {
+                found = OAuthFlows{ .password = try readPasswordOAuthFlow(
+                    reader,
+                    arena,
+                    scratch,
+                ) };
+            } else if (std.mem.eql(u8, key, oneofMemberName(OAuthFlows, 4))) {
+                found = OAuthFlows{ .device_code = try readDeviceCodeOAuthFlow(
+                    reader,
+                    arena,
+                    scratch,
+                ) };
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    return found;
+}
+
+/// Read an `OAuth2SecurityScheme`.
+fn readOAuth2SecurityScheme(
+    reader: *json.Reader,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError!OAuth2SecurityScheme {
+    var description: ?[]const u8 = null;
+    var flows: ?OAuthFlows = null;
+    var saw_flows = false;
+    var oauth2_metadata_url: ?[]const u8 = null;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, jsonName(OAuth2SecurityScheme, 0).?)) {
+                if (description != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    description = try reader.string(scratch);
+                }
+            } else if (std.mem.eql(u8, key, jsonName(OAuth2SecurityScheme, 1).?)) {
+                if (saw_flows) {
+                    try reader.skipValue(scratch);
+                } else if (try isNullMember(reader)) {
+                    // `null` and an absent member agree, and the check after
+                    // the loop is what reports the difference.
+                } else {
+                    flows = try readOAuthFlows(reader, arena, scratch);
+                    saw_flows = true;
+                }
+            } else if (std.mem.eql(u8, key, jsonName(OAuth2SecurityScheme, 2).?)) {
+                if (oauth2_metadata_url != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    oauth2_metadata_url = try reader.string(scratch);
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    if (!saw_flows) return error.MissingField;
+    return .{
+        .description = description,
+        .flows = flows orelse return error.MissingField,
+        .oauth2_metadata_url = oauth2_metadata_url,
+    };
+}
+
+/// The walk `decodeSecurityScheme` opens, and what `readSecuritySchemes`
+/// opens per entry.
+///
+/// The union is the whole message, so the object carries one member out of the
+/// five its table names and every other member is a name no row carries. The
+/// arm is named by `SecurityScheme`'s own table and never by
+/// `SecuritySchemeEntry`, which is the map entry and has no table row to name
+/// an arm with.
+fn readSecuritySchemeObject(
+    reader: *json.Reader,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError!?SecurityScheme {
+    var found: ?SecurityScheme = null;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (found != null) {
+                try reader.skipValue(scratch);
+            } else if (try isNullMember(reader)) {
+                // The same rule, and the same order, as `readOAuthFlows`.
+            } else if (std.mem.eql(u8, key, oneofMemberName(SecurityScheme, 0))) {
+                found = SecurityScheme{ .api_key = try readApiKeySecurityScheme(
+                    reader,
+                    scratch,
+                ) };
+            } else if (std.mem.eql(u8, key, oneofMemberName(SecurityScheme, 1))) {
+                found = SecurityScheme{ .http_auth = try readHttpAuthSecurityScheme(
+                    reader,
+                    scratch,
+                ) };
+            } else if (std.mem.eql(u8, key, oneofMemberName(SecurityScheme, 2))) {
+                found = SecurityScheme{ .oauth2 = try readOAuth2SecurityScheme(
+                    reader,
+                    arena,
+                    scratch,
+                ) };
+            } else if (std.mem.eql(u8, key, oneofMemberName(SecurityScheme, 3))) {
+                found = SecurityScheme{ .open_id_connect = try readOpenIdConnectSecurityScheme(
+                    reader,
+                    scratch,
+                ) };
+            } else if (std.mem.eql(u8, key, oneofMemberName(SecurityScheme, 4))) {
+                found = SecurityScheme{ .mtls = try readMutualTlsSecurityScheme(
+                    reader,
+                    scratch,
+                ) };
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    return found;
+}
+
+/// Read the `map<string, SecurityScheme>` an `AgentCard` carries.
+fn readSecuritySchemes(
+    reader: *json.Reader,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError![]const SecuritySchemeEntry {
+    const start = arena.security_schemes_used;
+    var count: usize = 0;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            const run = arena.security_schemes[start..][0..count];
+            if (mapKeySeen(run, key)) {
+                try reader.skipValue(scratch);
+            } else if (try isNullMember(reader)) {
+                // An entry that is named and then not given a value is an
+                // entry that is not there.
+            } else {
+                if (start + count == arena.security_schemes.len) return error.BufferTooSmall;
+                arena.security_schemes[start + count] = .{
+                    .name = key,
+                    // A `SecurityScheme` MUST contain exactly one of its five
+                    // arms, section 4.5.1 of the rendered specification as the
+                    // normative table quotes it, so a scheme with no arm is a
+                    // missing field and not an empty scheme.
+                    .scheme = try readSecuritySchemeObject(reader, arena, scratch) orelse
+                        return error.MissingField,
+                };
+                count += 1;
+            }
+        }
+    }
+
+    arena.security_schemes_used = start + count;
+    return arena.security_schemes[start..][0..count];
+}
+
+/// Read a `repeated AgentExtension` member into the arena.
+fn readExtensions(
+    reader: *json.Reader,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError![]const AgentExtension {
+    const start = arena.extensions_used;
+    if (try reader.beginArray()) return arena.extensions[start..start];
+    var count: usize = 0;
+    while (try reader.nextArrayElement()) {
+        if (start + count == arena.extensions.len) return error.BufferTooSmall;
+        arena.extensions[start + count] = try readAgentExtension(reader, scratch);
+        count += 1;
+    }
+    arena.extensions_used = start + count;
+    return arena.extensions[start..][0..count];
+}
+
+/// Read an `AgentCapabilities` on its own.
+///
+/// No field is REQUIRED, so `{}` is a complete set of capabilities: an agent
+/// that answered nothing is not an agent that answered no, and the three
+/// booleans are `?bool` for exactly that reason.
+fn readAgentCapabilities(
+    reader: *json.Reader,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError!AgentCapabilities {
+    var streaming: ?bool = null;
+    var push_notifications: ?bool = null;
+    var extensions: ?[]const AgentExtension = null;
+    var extended_agent_card: ?bool = null;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, jsonName(AgentCapabilities, 0).?)) {
+                if (streaming != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    streaming = try reader.boolean();
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AgentCapabilities, 1).?)) {
+                if (push_notifications != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    push_notifications = try reader.boolean();
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AgentCapabilities, 2).?)) {
+                if (extensions != null) {
+                    try reader.skipValue(scratch);
+                } else if (try isNullMember(reader)) {
+                    // `null` and an absent member agree.
+                } else {
+                    extensions = try readExtensions(reader, arena, scratch);
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AgentCapabilities, 3).?)) {
+                if (extended_agent_card != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    extended_agent_card = try reader.boolean();
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    return .{
+        .streaming = streaming,
+        .push_notifications = push_notifications,
+        .extensions = extensions,
+        .extended_agent_card = extended_agent_card,
+    };
+}
+
+/// Read an `AgentSkill` on its own.
+///
+/// `tags` is REQUIRED and an empty array satisfies it, so `[]` is a skill that
+/// is tagged with nothing and only the absence of the member is refused. The
+/// four optional lists are presences, and `securityRequirements` shares
+/// `arena.security_requirements` with the card's own.
+fn readAgentSkill(
+    reader: *json.Reader,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError!AgentSkill {
+    var id: []const u8 = "";
+    var saw_id = false;
+    var name: []const u8 = "";
+    var saw_name = false;
+    var description: []const u8 = "";
+    var saw_description = false;
+    var tags: ?[]const []const u8 = null;
+    var saw_tags = false;
+    var examples: ?[]const []const u8 = null;
+    var input_modes: ?[]const []const u8 = null;
+    var output_modes: ?[]const []const u8 = null;
+    var security_requirements: ?[]const SecurityRequirement = null;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, jsonName(AgentSkill, 0).?)) {
+                if (saw_id) {
+                    try reader.skipValue(scratch);
+                } else {
+                    id = try reader.string(scratch);
+                    saw_id = true;
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AgentSkill, 1).?)) {
+                if (saw_name) {
+                    try reader.skipValue(scratch);
+                } else {
+                    name = try reader.string(scratch);
+                    saw_name = true;
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AgentSkill, 2).?)) {
+                if (saw_description) {
+                    try reader.skipValue(scratch);
+                } else {
+                    description = try reader.string(scratch);
+                    saw_description = true;
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AgentSkill, 3).?)) {
+                if (saw_tags) {
+                    try reader.skipValue(scratch);
+                } else if (try isNullMember(reader)) {
+                    // `null` and an absent member agree, and the check after
+                    // the loop is what reports the difference.
+                } else {
+                    tags = try readCardStrings(reader, arena, scratch);
+                    saw_tags = true;
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AgentSkill, 4).?)) {
+                if (examples != null) {
+                    try reader.skipValue(scratch);
+                } else if (try isNullMember(reader)) {
+                    // `null` and an absent member agree.
+                } else {
+                    examples = try readCardStrings(reader, arena, scratch);
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AgentSkill, 5).?)) {
+                if (input_modes != null) {
+                    try reader.skipValue(scratch);
+                } else if (try isNullMember(reader)) {
+                    // `null` and an absent member agree.
+                } else {
+                    input_modes = try readCardStrings(reader, arena, scratch);
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AgentSkill, 6).?)) {
+                if (output_modes != null) {
+                    try reader.skipValue(scratch);
+                } else if (try isNullMember(reader)) {
+                    // `null` and an absent member agree.
+                } else {
+                    output_modes = try readCardStrings(reader, arena, scratch);
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AgentSkill, 7).?)) {
+                if (security_requirements != null) {
+                    try reader.skipValue(scratch);
+                } else if (try isNullMember(reader)) {
+                    // `null` and an absent member agree.
+                } else {
+                    security_requirements = try readSecurityRequirements(reader, arena, scratch);
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    if (!saw_id or !saw_name or !saw_description or !saw_tags) return error.MissingField;
+    // An untagged skill and a skill with no identifier are not discoverable, so
+    // none of the four REQUIRED members may be empty.
+    if (id.len == 0 or name.len == 0 or description.len == 0) return error.InvalidField;
+    return .{
+        .id = id,
+        .name = name,
+        .description = description,
+        .tags = tags.?,
+        .examples = examples,
+        .input_modes = input_modes,
+        .output_modes = output_modes,
+        .security_requirements = security_requirements,
+    };
+}
+
+/// Read a `repeated AgentInterface` member into the arena.
+fn readInterfaces(
+    reader: *json.Reader,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError![]const AgentInterface {
+    const start = arena.interfaces_used;
+    if (try reader.beginArray()) return arena.interfaces[start..start];
+    var count: usize = 0;
+    while (try reader.nextArrayElement()) {
+        if (start + count == arena.interfaces.len) return error.BufferTooSmall;
+        arena.interfaces[start + count] = try readAgentInterface(reader, scratch);
+        count += 1;
+    }
+    arena.interfaces_used = start + count;
+    return arena.interfaces[start..][0..count];
+}
+
+/// Read a `repeated AgentSkill` member into the arena.
+fn readSkills(
+    reader: *json.Reader,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError![]const AgentSkill {
+    const start = arena.skills_used;
+    if (try reader.beginArray()) return arena.skills[start..start];
+    var count: usize = 0;
+    while (try reader.nextArrayElement()) {
+        if (start + count == arena.skills.len) return error.BufferTooSmall;
+        arena.skills[start + count] = try readAgentSkill(reader, arena, scratch);
+        count += 1;
+    }
+    arena.skills_used = start + count;
+    return arena.skills[start..][0..count];
+}
+
+/// Read a `repeated AgentCardSignature` member into the arena.
+fn readSignatures(
+    reader: *json.Reader,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError![]const AgentCardSignature {
+    const start = arena.signatures_used;
+    if (try reader.beginArray()) return arena.signatures[start..start];
+    var count: usize = 0;
+    while (try reader.nextArrayElement()) {
+        if (start + count == arena.signatures.len) return error.BufferTooSmall;
+        arena.signatures[start + count] = try readAgentCardSignature(reader, scratch);
+        count += 1;
+    }
+    arena.signatures_used = start + count;
+    return arena.signatures[start..][0..count];
+}
+
+/// The walk `decodeAgentCard` opens.
+fn readAgentCard(reader: *json.Reader, arena: *CardArena, scratch: []u8) DecodeError!AgentCard {
+    var name: []const u8 = "";
+    var saw_name = false;
+    var description: []const u8 = "";
+    var saw_description = false;
+    var supported_interfaces: ?[]const AgentInterface = null;
+    var saw_supported_interfaces = false;
+    var provider: ?AgentProvider = null;
+    var version: []const u8 = "";
+    var saw_version = false;
+    var documentation_url: ?[]const u8 = null;
+    var capabilities: ?AgentCapabilities = null;
+    var saw_capabilities = false;
+    var security_schemes: ?[]const SecuritySchemeEntry = null;
+    var security_requirements: ?[]const SecurityRequirement = null;
+    var default_input_modes: ?[]const []const u8 = null;
+    var saw_default_input_modes = false;
+    var default_output_modes: ?[]const []const u8 = null;
+    var saw_default_output_modes = false;
+    var skills: ?[]const AgentSkill = null;
+    var saw_skills = false;
+    var signatures: ?[]const AgentCardSignature = null;
+    var icon_url: ?[]const u8 = null;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, jsonName(AgentCard, 0).?)) {
+                if (saw_name) {
+                    try reader.skipValue(scratch);
+                } else {
+                    name = try reader.string(scratch);
+                    saw_name = true;
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 1).?)) {
+                if (saw_description) {
+                    try reader.skipValue(scratch);
+                } else {
+                    description = try reader.string(scratch);
+                    saw_description = true;
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 2).?)) {
+                if (saw_supported_interfaces) {
+                    try reader.skipValue(scratch);
+                } else if (try isNullMember(reader)) {
+                    // `null` and an absent member agree, and the check after
+                    // the loop is what reports the difference.
+                } else {
+                    supported_interfaces = try readInterfaces(reader, arena, scratch);
+                    saw_supported_interfaces = true;
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 3).?)) {
+                if (provider != null) {
+                    try reader.skipValue(scratch);
+                } else if (try isNullMember(reader)) {
+                    // `null` and an absent member agree.
+                } else {
+                    provider = try readAgentProvider(reader, scratch);
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 4).?)) {
+                if (saw_version) {
+                    try reader.skipValue(scratch);
+                } else {
+                    version = try reader.string(scratch);
+                    saw_version = true;
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 5).?)) {
+                if (documentation_url != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    documentation_url = try reader.string(scratch);
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 6).?)) {
+                if (saw_capabilities) {
+                    try reader.skipValue(scratch);
+                } else if (try isNullMember(reader)) {
+                    // `null` and an absent member agree, and the check after
+                    // the loop is what reports the difference.
+                } else {
+                    capabilities = try readAgentCapabilities(reader, arena, scratch);
+                    saw_capabilities = true;
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 7).?)) {
+                if (security_schemes != null) {
+                    try reader.skipValue(scratch);
+                } else if (try isNullMember(reader)) {
+                    // `null` and an absent member agree.
+                } else {
+                    security_schemes = try readSecuritySchemes(reader, arena, scratch);
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 8).?)) {
+                if (security_requirements != null) {
+                    try reader.skipValue(scratch);
+                } else if (try isNullMember(reader)) {
+                    // `null` and an absent member agree.
+                } else {
+                    security_requirements = try readSecurityRequirements(reader, arena, scratch);
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 9).?)) {
+                if (saw_default_input_modes) {
+                    try reader.skipValue(scratch);
+                } else if (try isNullMember(reader)) {
+                    // `null` and an absent member agree, and the check after
+                    // the loop is what reports the difference.
+                } else {
+                    default_input_modes = try readCardStrings(reader, arena, scratch);
+                    saw_default_input_modes = true;
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 10).?)) {
+                if (saw_default_output_modes) {
+                    try reader.skipValue(scratch);
+                } else if (try isNullMember(reader)) {
+                    // `null` and an absent member agree.
+                } else {
+                    default_output_modes = try readCardStrings(reader, arena, scratch);
+                    saw_default_output_modes = true;
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 11).?)) {
+                if (saw_skills) {
+                    try reader.skipValue(scratch);
+                } else if (try isNullMember(reader)) {
+                    // `null` and an absent member agree.
+                } else {
+                    skills = try readSkills(reader, arena, scratch);
+                    saw_skills = true;
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 12).?)) {
+                if (signatures != null) {
+                    try reader.skipValue(scratch);
+                } else if (try isNullMember(reader)) {
+                    // `null` and an absent member agree.
+                } else {
+                    signatures = try readSignatures(reader, arena, scratch);
+                }
+            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 13).?)) {
+                if (icon_url != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    icon_url = try reader.string(scratch);
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    // Eight members are REQUIRED and none of them may be absent. The four
+    // repeated ones are satisfied by `[]`, so their presence and not their
+    // length is what is checked.
+    if (!saw_name or !saw_description or !saw_supported_interfaces or !saw_version) {
+        return error.MissingField;
+    }
+    if (!saw_capabilities) return error.MissingField;
+    if (!saw_default_input_modes or !saw_default_output_modes or !saw_skills) {
+        return error.MissingField;
+    }
+    // A card with no name, no description or no version is not a card. The
+    // version is not parsed here: PROTOCOLS.md section 5.1 forbids a patch
+    // component, so `parseVersion` is what a consumer reads it with and this
+    // decoder keeps the bytes so a re-encode puts back what the agent
+    // published.
+    if (name.len == 0 or description.len == 0 or version.len == 0) return error.InvalidField;
+    return .{
+        .name = name,
+        .description = description,
+        .supported_interfaces = supported_interfaces.?,
+        .provider = provider,
+        .version = version,
+        .documentation_url = documentation_url,
+        .capabilities = capabilities.?,
+        .security_schemes = security_schemes,
+        .security_requirements = security_requirements,
+        .default_input_modes = default_input_modes.?,
+        .default_output_modes = default_output_modes.?,
+        .skills = skills.?,
+        .signatures = signatures,
+        .icon_url = icon_url,
+    };
+}
+
+/// Decode an `AgentCard`.
+///
+/// The card is the entry point to a deployment: it is what
+/// `discovery_path` serves and what `GetExtendedAgentCard` answers with, and
+/// every other message in this file is something a card describes how to
+/// reach. Eight members are REQUIRED and six are optional, and the six are
+/// presences rather than defaults so the bytes the agent published are the
+/// bytes that come back.
+///
+/// `arena` is the caller's own storage and the decoded elements borrow from
+/// both the document and `scratch`; nothing is retained past the buffers the
+/// caller named.
+pub fn decodeAgentCard(
+    raw: []const u8,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError!AgentCard {
+    arena.reset();
+    var reader = json.Reader.init(raw);
+    const card = try readAgentCard(&reader, arena, scratch);
+
+    // The body is one JSON value, and every lexeme above is a sub-slice of it,
+    // so a tail behind the closing brace is a second document this function
+    // would answer as though it had not arrived.
+    if (!reader.atEnd()) return error.MalformedJson;
+    return card;
+}
+
+/// Decode an `AgentSkill` on its own.
+pub fn decodeAgentSkill(
+    raw: []const u8,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError!AgentSkill {
+    arena.reset();
+    var reader = json.Reader.init(raw);
+    const skill = try readAgentSkill(&reader, arena, scratch);
+
+    if (!reader.atEnd()) return error.MalformedJson;
+    return skill;
+}
+
+/// Decode an `AgentCapabilities` on its own.
+pub fn decodeAgentCapabilities(
+    raw: []const u8,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError!AgentCapabilities {
+    arena.reset();
+    var reader = json.Reader.init(raw);
+    const capabilities = try readAgentCapabilities(&reader, arena, scratch);
+
+    if (!reader.atEnd()) return error.MalformedJson;
+    return capabilities;
+}
+
+/// Decode a `SecurityRequirement` on its own.
+pub fn decodeSecurityRequirement(
+    raw: []const u8,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError!SecurityRequirement {
+    arena.reset();
+    var reader = json.Reader.init(raw);
+    const requirement = try readSecurityRequirement(&reader, arena, scratch);
+
+    if (!reader.atEnd()) return error.MalformedJson;
+    return requirement;
+}
+
+/// Decode a `SecurityScheme` on its own.
+///
+/// The union carries exactly one arm, so an object with none is
+/// `error.MissingField` and an object with two is first-wins.
+pub fn decodeSecurityScheme(
+    raw: []const u8,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError!SecurityScheme {
+    arena.reset();
+    var reader = json.Reader.init(raw);
+    const scheme = try readSecuritySchemeObject(&reader, arena, scratch);
+
+    if (!reader.atEnd()) return error.MalformedJson;
+    return scheme orelse return error.MissingField;
+}
+
+/// Decode an `OAuthFlows` on its own.
+pub fn decodeOAuthFlows(
+    raw: []const u8,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError!OAuthFlows {
+    arena.reset();
+    var reader = json.Reader.init(raw);
+    const flows = try readOAuthFlows(&reader, arena, scratch);
+
+    if (!reader.atEnd()) return error.MalformedJson;
+    return flows orelse return error.MissingField;
+}
+
+/// Decode an `OAuth2SecurityScheme` on its own.
+pub fn decodeOAuth2SecurityScheme(
+    raw: []const u8,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError!OAuth2SecurityScheme {
+    arena.reset();
+    var reader = json.Reader.init(raw);
+    const scheme = try readOAuth2SecurityScheme(&reader, arena, scratch);
+
+    if (!reader.atEnd()) return error.MalformedJson;
+    return scheme;
+}
+
+/// Decode a `StringList` on its own.
+pub fn decodeStringList(
+    raw: []const u8,
+    arena: *CardArena,
+    scratch: []u8,
+) DecodeError!StringList {
+    arena.reset();
+    var reader = json.Reader.init(raw);
+    const list = try readStringListObject(&reader, arena, scratch);
+
+    if (!reader.atEnd()) return error.MalformedJson;
+    return list;
+}
+
+/// Write a `StringList`, the value half of a `SecurityRequirement` map entry.
+///
+/// `{}` and `{"list":[]}` are two documents a peer may send, so the two are
+/// written apart and not collapsed into one empty list.
+fn writeStringListObject(list: StringList, writer: *json.Writer) EncodeError!void {
+    if (list.list) |items| {
+        try writer.byte('{');
+        try writeMemberName(StringList, 0, writer);
+        try writeStringList(items, writer);
+        try writer.byte('}');
+        return;
+    }
+    try writer.slice("{}");
+}
+
+/// Write the `map<string, StringList>` a `SecurityRequirement` carries.
+fn writeRequirementEntries(
+    entries: []const SecurityRequirementEntry,
+    writer: *json.Writer,
+) EncodeError!void {
+    try writer.byte('{');
+    for (entries, 0..) |entry, index| {
+        if (index != 0) try writer.byte(',');
+        try writeMapKey(entry.name, writer);
+        try writeStringListObject(entry.list, writer);
+    }
+    try writer.byte('}');
+}
+
+/// Write a `SecurityRequirement`.
+fn writeSecurityRequirement(requirement: SecurityRequirement, writer: *json.Writer) EncodeError!void {
+    const schemes = requirement.schemes orelse {
+        try writer.slice("{}");
+        return;
+    };
+    try writer.byte('{');
+    try writeMemberName(SecurityRequirement, 0, writer);
+    try writeRequirementEntries(schemes, writer);
+    try writer.byte('}');
+}
+
+/// Write a `repeated SecurityRequirement` member.
+fn writeSecurityRequirements(
+    requirements: []const SecurityRequirement,
+    writer: *json.Writer,
+) EncodeError!void {
+    try writer.byte('[');
+    for (requirements, 0..) |requirement, index| {
+        if (index != 0) try writer.byte(',');
+        try writeSecurityRequirement(requirement, writer);
+    }
+    try writer.byte(']');
+}
+
+/// Write the `map<string, string>` an OAuth flow's `scopes` carries.
+fn writeOAuthScopes(scopes: []const OAuthScope, writer: *json.Writer) EncodeError!void {
+    try writer.byte('{');
+    for (scopes, 0..) |scope, index| {
+        if (index != 0) try writer.byte(',');
+        try writeMapKey(scope.name, writer);
+        try writer.string(scope.description);
+    }
+    try writer.byte('}');
+}
+
+/// Write an `AuthorizationCodeOAuthFlow`.
+fn writeAuthorizationCodeOAuthFlow(
+    flow: AuthorizationCodeOAuthFlow,
+    writer: *json.Writer,
+) EncodeError!void {
+    try writer.byte('{');
+    try writeMemberName(AuthorizationCodeOAuthFlow, 0, writer);
+    try writer.string(flow.authorization_url);
+    try writer.slice(",");
+    try writeMemberName(AuthorizationCodeOAuthFlow, 1, writer);
+    try writer.string(flow.token_url);
+    const separator: []const u8 = ",";
+    if (flow.refresh_url) |refresh_url| {
+        try writer.slice(separator);
+        try writeMemberName(AuthorizationCodeOAuthFlow, 2, writer);
+        try writer.string(refresh_url);
+    }
+    // `scopes` is REQUIRED, so it is always written even when the map is
+    // empty. An encoder that omitted it would answer a peer that sent
+    // `"scopes":{}` with a document that has no `scopes` member at all.
+    try writer.slice(separator);
+    try writeMemberName(AuthorizationCodeOAuthFlow, 3, writer);
+    try writeOAuthScopes(flow.scopes, writer);
+    if (flow.pkce_required) |pkce_required| {
+        try writer.slice(separator);
+        try writeMemberName(AuthorizationCodeOAuthFlow, 4, writer);
+        try writer.slice(if (pkce_required) "true" else "false");
+    }
+    try writer.byte('}');
+}
+
+/// Write a `ClientCredentialsOAuthFlow`.
+fn writeClientCredentialsOAuthFlow(
+    flow: ClientCredentialsOAuthFlow,
+    writer: *json.Writer,
+) EncodeError!void {
+    try writer.byte('{');
+    try writeMemberName(ClientCredentialsOAuthFlow, 0, writer);
+    try writer.string(flow.token_url);
+    if (flow.refresh_url) |refresh_url| {
+        try writer.slice(",");
+        try writeMemberName(ClientCredentialsOAuthFlow, 1, writer);
+        try writer.string(refresh_url);
+    }
+    try writer.slice(",");
+    try writeMemberName(ClientCredentialsOAuthFlow, 2, writer);
+    try writeOAuthScopes(flow.scopes, writer);
+    try writer.byte('}');
+}
+
+/// Write an `ImplicitOAuthFlow`.
+fn writeImplicitOAuthFlow(flow: ImplicitOAuthFlow, writer: *json.Writer) EncodeError!void {
+    try writer.byte('{');
+    var separator: []const u8 = "";
+    if (flow.authorization_url) |authorization_url| {
+        try writer.slice(separator);
+        try writeMemberName(ImplicitOAuthFlow, 0, writer);
+        try writer.string(authorization_url);
+        separator = ",";
+    }
+    if (flow.refresh_url) |refresh_url| {
+        try writer.slice(separator);
+        try writeMemberName(ImplicitOAuthFlow, 1, writer);
+        try writer.string(refresh_url);
+        separator = ",";
+    }
+    if (flow.scopes) |scopes| {
+        try writer.slice(separator);
+        try writeMemberName(ImplicitOAuthFlow, 2, writer);
+        try writeOAuthScopes(scopes, writer);
+    }
+    try writer.byte('}');
+}
+
+/// Write a `PasswordOAuthFlow`.
+fn writePasswordOAuthFlow(flow: PasswordOAuthFlow, writer: *json.Writer) EncodeError!void {
+    try writer.byte('{');
+    var separator: []const u8 = "";
+    if (flow.token_url) |token_url| {
+        try writer.slice(separator);
+        try writeMemberName(PasswordOAuthFlow, 0, writer);
+        try writer.string(token_url);
+        separator = ",";
+    }
+    if (flow.refresh_url) |refresh_url| {
+        try writer.slice(separator);
+        try writeMemberName(PasswordOAuthFlow, 1, writer);
+        try writer.string(refresh_url);
+        separator = ",";
+    }
+    if (flow.scopes) |scopes| {
+        try writer.slice(separator);
+        try writeMemberName(PasswordOAuthFlow, 2, writer);
+        try writeOAuthScopes(scopes, writer);
+    }
+    try writer.byte('}');
+}
+
+/// Write a `DeviceCodeOAuthFlow`.
+fn writeDeviceCodeOAuthFlow(
+    flow: DeviceCodeOAuthFlow,
+    writer: *json.Writer,
+) EncodeError!void {
+    try writer.byte('{');
+    try writeMemberName(DeviceCodeOAuthFlow, 0, writer);
+    try writer.string(flow.device_authorization_url);
+    try writer.slice(",");
+    try writeMemberName(DeviceCodeOAuthFlow, 1, writer);
+    try writer.string(flow.token_url);
+    const separator: []const u8 = ",";
+    if (flow.refresh_url) |refresh_url| {
+        try writer.slice(separator);
+        try writeMemberName(DeviceCodeOAuthFlow, 2, writer);
+        try writer.string(refresh_url);
+    }
+    try writer.slice(separator);
+    try writeMemberName(DeviceCodeOAuthFlow, 3, writer);
+    try writeOAuthScopes(flow.scopes, writer);
+    try writer.byte('}');
+}
+
+/// Write the `OAuthFlows` oneof, naming the arm from the union's own row.
+fn writeOAuthFlows(flows: OAuthFlows, writer: *json.Writer) EncodeError!void {
+    try writer.byte('{');
+    switch (flows) {
+        .authorization_code => |flow| {
+            try writeMemberName(OAuthFlows, 0, writer);
+            try writeAuthorizationCodeOAuthFlow(flow, writer);
+        },
+        .client_credentials => |flow| {
+            try writeMemberName(OAuthFlows, 1, writer);
+            try writeClientCredentialsOAuthFlow(flow, writer);
+        },
+        .implicit => |flow| {
+            try writeMemberName(OAuthFlows, 2, writer);
+            try writeImplicitOAuthFlow(flow, writer);
+        },
+        .password => |flow| {
+            try writeMemberName(OAuthFlows, 3, writer);
+            try writePasswordOAuthFlow(flow, writer);
+        },
+        .device_code => |flow| {
+            try writeMemberName(OAuthFlows, 4, writer);
+            try writeDeviceCodeOAuthFlow(flow, writer);
+        },
+    }
+    try writer.byte('}');
+}
+
+/// Write an `OAuth2SecurityScheme`.
+fn writeOAuth2SecurityScheme(
+    scheme: OAuth2SecurityScheme,
+    writer: *json.Writer,
+) EncodeError!void {
+    try writer.byte('{');
+    if (scheme.description) |description| {
+        try writeMemberName(OAuth2SecurityScheme, 0, writer);
+        try writer.string(description);
+        try writer.byte(',');
+    }
+    try writeMemberName(OAuth2SecurityScheme, 1, writer);
+    try writeOAuthFlows(scheme.flows, writer);
+    if (scheme.oauth2_metadata_url) |metadata_url| {
+        try writer.byte(',');
+        try writeMemberName(OAuth2SecurityScheme, 2, writer);
+        try writer.string(metadata_url);
+    }
+    try writer.byte('}');
+}
+
+/// Write the `SecurityScheme` oneof, naming the arm from the union's own row.
+///
+/// The five `zig_name` overrides live in that table and nowhere else, so the
+/// arm this writes under is `apiKeySecurityScheme` and not
+/// `api_key_security_scheme`, for the reason the module note gives.
+fn writeSecurityScheme(scheme: SecurityScheme, writer: *json.Writer) EncodeError!void {
+    try writer.byte('{');
+    switch (scheme) {
+        .api_key => |value| {
+            try writeMemberName(SecurityScheme, 0, writer);
+            try writeApiKeySecurityScheme(value, writer);
+        },
+        .http_auth => |value| {
+            try writeMemberName(SecurityScheme, 1, writer);
+            try writeHttpAuthSecurityScheme(value, writer);
+        },
+        .oauth2 => |value| {
+            try writeMemberName(SecurityScheme, 2, writer);
+            try writeOAuth2SecurityScheme(value, writer);
+        },
+        .open_id_connect => |value| {
+            try writeMemberName(SecurityScheme, 3, writer);
+            try writeOpenIdConnectSecurityScheme(value, writer);
+        },
+        .mtls => |value| {
+            try writeMemberName(SecurityScheme, 4, writer);
+            // The mTLS arm has nothing to refuse, so its public encoder is its
+            // writer and there is no private one to call.
+            try encodeMutualTlsSecurityScheme(value, writer);
+        },
+    }
+    try writer.byte('}');
+}
+
+/// Write the `map<string, SecurityScheme>` an `AgentCard` carries.
+fn writeSecuritySchemes(entries: []const SecuritySchemeEntry, writer: *json.Writer) EncodeError!void {
+    try writer.byte('{');
+    for (entries, 0..) |entry, index| {
+        if (index != 0) try writer.byte(',');
+        try writeMapKey(entry.name, writer);
+        try writeSecurityScheme(entry.scheme, writer);
+    }
+    try writer.byte('}');
+}
+
+/// Write an `AgentCapabilities`.
+fn writeAgentCapabilities(capabilities: AgentCapabilities, writer: *json.Writer) EncodeError!void {
+    try writer.byte('{');
+    var separator: []const u8 = "";
+    if (capabilities.streaming) |streaming| {
+        try writer.slice(separator);
+        try writeMemberName(AgentCapabilities, 0, writer);
+        try writer.slice(if (streaming) "true" else "false");
+        separator = ",";
+    }
+    if (capabilities.push_notifications) |push_notifications| {
+        try writer.slice(separator);
+        try writeMemberName(AgentCapabilities, 1, writer);
+        try writer.slice(if (push_notifications) "true" else "false");
+        separator = ",";
+    }
+    if (capabilities.extensions) |extensions| {
+        try writer.slice(separator);
+        try writeMemberName(AgentCapabilities, 2, writer);
+        try writer.byte('[');
+        for (extensions, 0..) |extension, index| {
+            if (index != 0) try writer.byte(',');
+            // An `AgentExtension` has nothing to refuse either, for the reason
+            // `writeSecurityScheme` gives.
+            try encodeAgentExtension(extension, writer);
+        }
+        try writer.byte(']');
+        separator = ",";
+    }
+    if (capabilities.extended_agent_card) |extended_agent_card| {
+        try writer.slice(separator);
+        try writeMemberName(AgentCapabilities, 3, writer);
+        try writer.slice(if (extended_agent_card) "true" else "false");
+    }
+    try writer.byte('}');
+}
+
+/// Write an `AgentSkill`.
+fn writeAgentSkill(skill: AgentSkill, writer: *json.Writer) EncodeError!void {
+    try writer.byte('{');
+    try writeMemberName(AgentSkill, 0, writer);
+    try writer.string(skill.id);
+    try writer.slice(",");
+    try writeMemberName(AgentSkill, 1, writer);
+    try writer.string(skill.name);
+    try writer.slice(",");
+    try writeMemberName(AgentSkill, 2, writer);
+    try writer.string(skill.description);
+    try writer.slice(",");
+    try writeMemberName(AgentSkill, 3, writer);
+    // `tags` is REQUIRED, so it is always written even when it is empty.
+    try writeStringList(skill.tags, writer);
+    const separator: []const u8 = ",";
+    if (skill.examples) |examples| {
+        try writer.slice(separator);
+        try writeMemberName(AgentSkill, 4, writer);
+        try writeStringList(examples, writer);
+    }
+    if (skill.input_modes) |input_modes| {
+        try writer.slice(separator);
+        try writeMemberName(AgentSkill, 5, writer);
+        try writeStringList(input_modes, writer);
+    }
+    if (skill.output_modes) |output_modes| {
+        try writer.slice(separator);
+        try writeMemberName(AgentSkill, 6, writer);
+        try writeStringList(output_modes, writer);
+    }
+    if (skill.security_requirements) |requirements| {
+        try writer.slice(separator);
+        try writeMemberName(AgentSkill, 7, writer);
+        try writeSecurityRequirements(requirements, writer);
+    }
+    try writer.byte('}');
+}
+
+/// Write an `AgentCard` without checking it first.
+fn writeAgentCard(card: AgentCard, writer: *json.Writer) EncodeError!void {
+    try writer.byte('{');
+    try writeMemberName(AgentCard, 0, writer);
+    try writer.string(card.name);
+    try writer.slice(",");
+    try writeMemberName(AgentCard, 1, writer);
+    try writer.string(card.description);
+    try writer.slice(",");
+    try writeMemberName(AgentCard, 2, writer);
+    try writer.byte('[');
+    for (card.supported_interfaces, 0..) |interface, index| {
+        if (index != 0) try writer.byte(',');
+        try writeAgentInterface(interface, writer);
+    }
+    try writer.byte(']');
+    // The separator is a constant from here down, because field 3 is REQUIRED
+    // and is always written, and every optional member that may follow one
+    // that was already written has a comma behind it.
+    const separator: []const u8 = ",";
+    if (card.provider) |provider| {
+        try writer.slice(separator);
+        try writeMemberName(AgentCard, 3, writer);
+        try writeAgentProvider(provider, writer);
+    }
+    try writer.slice(separator);
+    try writeMemberName(AgentCard, 4, writer);
+    try writer.string(card.version);
+    if (card.documentation_url) |documentation_url| {
+        try writer.slice(separator);
+        try writeMemberName(AgentCard, 5, writer);
+        try writer.string(documentation_url);
+    }
+    try writer.slice(separator);
+    try writeMemberName(AgentCard, 6, writer);
+    try writeAgentCapabilities(card.capabilities, writer);
+    if (card.security_schemes) |security_schemes| {
+        try writer.slice(separator);
+        try writeMemberName(AgentCard, 7, writer);
+        try writeSecuritySchemes(security_schemes, writer);
+    }
+    if (card.security_requirements) |security_requirements| {
+        try writer.slice(separator);
+        try writeMemberName(AgentCard, 8, writer);
+        try writeSecurityRequirements(security_requirements, writer);
+    }
+    try writer.slice(separator);
+    try writeMemberName(AgentCard, 9, writer);
+    try writeStringList(card.default_input_modes, writer);
+    try writer.slice(separator);
+    try writeMemberName(AgentCard, 10, writer);
+    try writeStringList(card.default_output_modes, writer);
+    try writer.slice(separator);
+    try writeMemberName(AgentCard, 11, writer);
+    try writer.byte('[');
+    for (card.skills, 0..) |skill, index| {
+        if (index != 0) try writer.byte(',');
+        try writeAgentSkill(skill, writer);
+    }
+    try writer.byte(']');
+    if (card.signatures) |signatures| {
+        try writer.slice(separator);
+        try writeMemberName(AgentCard, 12, writer);
+        try writer.byte('[');
+        for (signatures, 0..) |signature, index| {
+            if (index != 0) try writer.byte(',');
+            try writeAgentCardSignature(signature, writer);
+        }
+        try writer.byte(']');
+    }
+    if (card.icon_url) |icon_url| {
+        try writer.slice(separator);
+        try writeMemberName(AgentCard, 13, writer);
+        try writer.string(icon_url);
+    }
+    try writer.byte('}');
+}
+
+// The validation half
+//
+// Every encoder above checks its whole value before it writes its first byte,
+// for the reason the content half's validation note gives: a refusal halfway
+// through leaves `{"name":"W","description":"Fo` in the caller's buffer, which
+// is neither a card nor nothing. What is refused is a value the decoder could
+// not have returned — an empty REQUIRED string — and it is `error.InvalidField`.
+//
+// Four shapes in the card have nothing to refuse and so have no validator at
+// all: an `AgentExtension`, a `MutualTlsSecurityScheme`, an `AgentCapabilities`
+// and a `SecurityRequirement`. Every member of each of the four is optional, so
+// there is no value of any of them that `decodeAgentCard` would have refused
+// and `encodeAgentCard` has to refuse with it. A validator that returned
+// `void` unconditionally would be a function that cannot fail, and a reader of
+// `validateAgentCard` would have to work out which of its calls could.
+
+fn validateAuthorizationCodeOAuthFlow(flow: AuthorizationCodeOAuthFlow) EncodeError!void {
+    if (flow.authorization_url.len == 0 or flow.token_url.len == 0) return error.InvalidField;
+}
+
+fn validateClientCredentialsOAuthFlow(flow: ClientCredentialsOAuthFlow) EncodeError!void {
+    if (flow.token_url.len == 0) return error.InvalidField;
+}
+
+fn validateDeviceCodeOAuthFlow(flow: DeviceCodeOAuthFlow) EncodeError!void {
+    if (flow.device_authorization_url.len == 0 or flow.token_url.len == 0) {
+        return error.InvalidField;
+    }
+}
+
+fn validateOAuthFlows(flows: OAuthFlows) EncodeError!void {
+    switch (flows) {
+        .authorization_code => |flow| try validateAuthorizationCodeOAuthFlow(flow),
+        .client_credentials => |flow| try validateClientCredentialsOAuthFlow(flow),
+        // The two deprecated flows have no REQUIRED field, so there is nothing
+        // in either of them to refuse.
+        .implicit, .password => {},
+        .device_code => |flow| try validateDeviceCodeOAuthFlow(flow),
+    }
+}
+
+fn validateOAuth2SecurityScheme(scheme: OAuth2SecurityScheme) EncodeError!void {
+    try validateOAuthFlows(scheme.flows);
+}
+
+fn validateSecurityScheme(scheme: SecurityScheme) EncodeError!void {
+    switch (scheme) {
+        .api_key => |value| try validateApiKeySecurityScheme(value),
+        .http_auth => |value| try validateHttpAuthSecurityScheme(value),
+        .oauth2 => |value| try validateOAuth2SecurityScheme(value),
+        .open_id_connect => |value| try validateOpenIdConnectSecurityScheme(value),
+        // The mTLS arm has one optional member and so nothing to refuse.
+        .mtls => {},
+    }
+}
+
+fn validateAgentSkill(skill: AgentSkill) EncodeError!void {
+    if (skill.id.len == 0 or skill.name.len == 0 or skill.description.len == 0) {
+        return error.InvalidField;
+    }
+    // A `SecurityRequirement` reaches no scheme, so the walk ends here. The
+    // scopes under one are borrowed strings, and there is nothing in them to
+    // refuse either.
+}
+
+fn validateAgentCard(card: AgentCard) EncodeError!void {
+    if (card.name.len == 0 or card.description.len == 0 or card.version.len == 0) {
+        return error.InvalidField;
+    }
+    for (card.supported_interfaces) |interface| try validateAgentInterface(interface);
+    if (card.provider) |provider| try validateAgentProvider(provider);
+    if (card.security_schemes) |security_schemes| {
+        for (security_schemes) |entry| try validateSecurityScheme(entry.scheme);
+    }
+    for (card.skills) |skill| try validateAgentSkill(skill);
+    if (card.signatures) |signatures| {
+        for (signatures) |signature| try validateAgentCardSignature(signature);
+    }
+}
+
+/// Encode an `AgentCard`.
+///
+/// Members go out in field-number order, so a card that already reads in that
+/// order comes back unchanged and one that does not comes back with the same
+/// members in it. The whole card is checked before the first byte is written.
+pub fn encodeAgentCard(card: AgentCard, writer: *json.Writer) EncodeError!void {
+    try validateAgentCard(card);
+    try writeAgentCard(card, writer);
+}
+
+/// Encode an `AgentSkill`.
+pub fn encodeAgentSkill(skill: AgentSkill, writer: *json.Writer) EncodeError!void {
+    try validateAgentSkill(skill);
+    try writeAgentSkill(skill, writer);
+}
+
+/// Encode an `AgentCapabilities`.
+pub fn encodeAgentCapabilities(
+    capabilities: AgentCapabilities,
+    writer: *json.Writer,
+) EncodeError!void {
+    try writeAgentCapabilities(capabilities, writer);
+}
+
+/// Encode a `SecurityRequirement`.
+pub fn encodeSecurityRequirement(
+    requirement: SecurityRequirement,
+    writer: *json.Writer,
+) EncodeError!void {
+    try writeSecurityRequirement(requirement, writer);
+}
+
+/// Encode a `SecurityScheme`.
+pub fn encodeSecurityScheme(scheme: SecurityScheme, writer: *json.Writer) EncodeError!void {
+    try validateSecurityScheme(scheme);
+    try writeSecurityScheme(scheme, writer);
+}
+
+/// Encode an `OAuthFlows`.
+pub fn encodeOAuthFlows(flows: OAuthFlows, writer: *json.Writer) EncodeError!void {
+    try validateOAuthFlows(flows);
+    try writeOAuthFlows(flows, writer);
+}
+
+/// Encode an `OAuth2SecurityScheme`.
+pub fn encodeOAuth2SecurityScheme(
+    scheme: OAuth2SecurityScheme,
+    writer: *json.Writer,
+) EncodeError!void {
+    try validateOAuth2SecurityScheme(scheme);
+    try writeOAuth2SecurityScheme(scheme, writer);
+}
+
+/// Encode a `StringList`.
+pub fn encodeStringList(list: StringList, writer: *json.Writer) EncodeError!void {
+    try writeStringListObject(list, writer);
+}
+
+// --- Tests: the discovery half --------------------------------------------------
+
+/// The storage one discovery-half test runs against.
+///
+/// The arena is a set of slices into these arrays and nothing outlives the test
+/// that declared it, which is the same contract `CardArena` offers a real
+/// caller. A test that has to prove exhaustion builds its own smaller arrays,
+/// because that is the whole point of it.
+const CardTestStorage = struct {
+    interfaces: [4]AgentInterface = undefined,
+    skills: [4]AgentSkill = undefined,
+    extensions: [4]AgentExtension = undefined,
+    signatures: [2]AgentCardSignature = undefined,
+    security_schemes: [4]SecuritySchemeEntry = undefined,
+    security_requirements: [4]SecurityRequirement = undefined,
+    requirement_entries: [8]SecurityRequirementEntry = undefined,
+    scopes: [8]OAuthScope = undefined,
+    strings: [32][]const u8 = undefined,
+    out: [8192]u8 = undefined,
+    scratch: [1024]u8 = undefined,
+    arena: CardArena = undefined,
+
+    /// Point the arena at the arrays above. A method and not a field default,
+    /// because a slice of a field cannot be named until the struct exists.
+    fn init(self: *CardTestStorage) void {
+        self.arena = CardArena.init(
+            &self.interfaces,
+            &self.skills,
+            &self.extensions,
+            &self.signatures,
+            &self.security_schemes,
+            &self.security_requirements,
+            &self.requirement_entries,
+            &self.scopes,
+            &self.strings,
+        );
+    }
+};
+
+/// The smallest legal card, with two space-separated placeholders for the
+/// member under test.
+///
+/// The eight REQUIRED members are 1, 2, 3, 5, 7, 10, 11 and 12, so this is the
+/// whole required set and the six optional ones are absent. `{}` is a complete
+/// `AgentCapabilities` and `[]` satisfies each REQUIRED `repeated`, so a
+/// document built from this really is the smallest card the proto allows.
+const minimal_card =
+    "{\"name\":\"W\",\"description\":\"d\",\"supportedInterfaces\":[{" ++
+    "\"url\":\"https://a\",\"protocolBinding\":\"JSONRPC\",\"protocolVers" ++
+    "ion\":\"1.0\"}],\"version\":\"1.0\",\"capabilities\":{},\"defaultI" ++
+    "nputModes\":[],\"defaultOutputModes\":[],\"skills\":[]}";
+
+test "a map entry is walked over keys and not over member names" {
+    // This is the trap the discovery half is built around. A map entry is the
+    // synthetic message a compiler generates for one `map<K, V>` pair, and
+    // ProtoJSON renders it as the single member its key names, so neither half
+    // of the struct is a member of its own and `json` is null on both rows.
+    // `findField` therefore answers null for every input, and a decoder that
+    // dispatched on it would drop every security requirement in a card.
+    try testing.expectEqual(@as(?[]const u8, null), jsonName(SecurityRequirementEntry, 0));
+    try testing.expectEqual(@as(?[]const u8, null), jsonName(SecurityRequirementEntry, 1));
+    try testing.expectEqual(@as(?[]const u8, null), jsonName(SecuritySchemeEntry, 0));
+    try testing.expectEqual(@as(?[]const u8, null), jsonName(SecuritySchemeEntry, 1));
+    try testing.expectEqual(@as(?[]const u8, null), jsonName(OAuthScope, 0));
+    try testing.expectEqual(@as(?[]const u8, null), jsonName(OAuthScope, 1));
+
+    // And `findField` finds nothing in any of the three, for any name at all.
+    for ([_][]const u8{ "name", "list", "scheme", "description", "scopes", "skills" }) |name| {
+        try testing.expectEqual(@as(?usize, null), findField(SecurityRequirementEntry, name));
+        try testing.expectEqual(@as(?usize, null), findField(SecuritySchemeEntry, name));
+        try testing.expectEqual(@as(?usize, null), findField(OAuthScope, name));
+    }
+
+    // The three answer true to the question a reader has to be able to ask,
+    // and an ordinary message answers false, so the answer is about the shape
+    // and not about the three types that happen to be entries today.
+    try testing.expect(isMapEntry(SecurityRequirementEntry));
+    try testing.expect(isMapEntry(SecuritySchemeEntry));
+    try testing.expect(isMapEntry(OAuthScope));
+    try testing.expect(!isMapEntry(SecurityRequirement));
+    try testing.expect(!isMapEntry(StringList));
+    try testing.expect(!isMapEntry(AgentSkill));
+    try testing.expect(!isMapEntry(AgentCard));
+    // `AgentSkill` is the other way round: a `oneof` a struct holds as one
+    // field also carries `json = null`, and it is not a map entry. So is a
+    // message with no member name at all, which is `Empty`.
+    try testing.expect(!isMapEntry(Empty));
+
+    // The encoder writes the key, not a table row, and a key is escaped like
+    // any other string because a scope name is data a peer may spell with a
+    // quote in it.
+    var out: [64]u8 = undefined;
+    var writer = json.Writer.init(&out);
+    try writeMapKey("a\"b", &writer);
+    try testing.expectEqualStrings("\"a\\\"b\":", writer.written());
+}
+
+test "a card carrying two security requirements and three scopes round-trips both lists" {
+    var storage: CardTestStorage = .{};
+    storage.init();
+
+    const raw =
+        "{\"name\":\"W\",\"description\":\"d\",\"supportedInterfaces\":[{" ++
+        "\"url\":\"https://a\",\"protocolBinding\":\"JSONRPC\",\"protocolVers" ++
+        "ion\":\"1.0\"}],\"version\":\"1.0\",\"capabilities\":{},\"security" ++
+        "Schemes\":{\"oauth\":{\"oauth2SecurityScheme\":{\"flows\":{\"clien" ++
+        "tCredentials\":{\"tokenUrl\":\"https://auth/t\",\"scopes\":{\"a\":" ++
+        "\"one\",\"b\":\"two\",\"c\":\"three\"}}}}}},\"securityRequirements" ++
+        "\":[{\"schemes\":{\"oauth\":{\"list\":[\"a\",\"b\"]}}},{\"schemes" ++
+        "\":{\"basic\":{\"list\":[]},\"oauth\":{\"list\":[\"c\"]}}}],\"defa" ++
+        "ultInputModes\":[],\"defaultOutputModes\":[],\"skills\":[]}";
+
+    const card = try decodeAgentCard(raw, &storage.arena, &storage.scratch);
+
+    // Two requirements, and each of them holds the whole map rather than one
+    // entry of it. A decoder that stopped after the first entry of a map would
+    // come back with one requirement holding one entry and this would be 1.
+    try testing.expectEqual(@as(usize, 2), card.security_requirements.?.len);
+    try testing.expectEqual(@as(usize, 1), card.security_requirements.?[0].schemes.?.len);
+    try testing.expectEqualStrings("oauth", card.security_requirements.?[0].schemes.?[0].name);
+    try testing.expectEqual(@as(usize, 2), card.security_requirements.?[0].schemes.?[0].list.list.?.len);
+    try testing.expectEqualStrings("a", card.security_requirements.?[0].schemes.?[0].list.list.?[0]);
+    try testing.expectEqualStrings("b", card.security_requirements.?[0].schemes.?[0].list.list.?[1]);
+
+    // And the second requirement carries two entries of its own, so the second
+    // run of `requirement_entries` is a run and not a restart.
+    try testing.expectEqual(@as(usize, 2), card.security_requirements.?[1].schemes.?.len);
+    try testing.expectEqualStrings("basic", card.security_requirements.?[1].schemes.?[0].name);
+    // `"basic":{"list":[]}` is the empty list and not the absent one, and the
+    // two are different documents, so this is a zero-length slice rather than
+    // a null.
+    try testing.expectEqual(@as(usize, 0), card.security_requirements.?[1].schemes.?[0].list.list.?.len);
+    try testing.expectEqualStrings("oauth", card.security_requirements.?[1].schemes.?[1].name);
+    try testing.expectEqualStrings("c", card.security_requirements.?[1].schemes.?[1].list.list.?[0]);
+
+    // Three scopes, not one. This is the same trap with the same consequence:
+    // a decoder that kept the first entry of a map and dropped the rest would
+    // come back with one scope and a card that lost two of the three the agent
+    // published.
+    const schemes = card.security_schemes.?;
+    try testing.expectEqual(@as(usize, 1), schemes.len);
+    try testing.expectEqualStrings("oauth", schemes[0].name);
+    try testing.expect(schemes[0].scheme == .oauth2);
+    const flow = schemes[0].scheme.oauth2.flows.client_credentials;
+    try testing.expectEqual(@as(usize, 3), flow.scopes.len);
+    try testing.expectEqualStrings("a", flow.scopes[0].name);
+    try testing.expectEqualStrings("one", flow.scopes[0].description);
+    try testing.expectEqualStrings("c", flow.scopes[2].name);
+    try testing.expectEqualStrings("three", flow.scopes[2].description);
+
+    // The bytes come back exactly, and they are exactly the bytes that went in
+    // because this document already reads in field-number order.
+    var writer = json.Writer.init(&storage.out);
+    try encodeAgentCard(card, &writer);
+    try testing.expectEqualStrings(raw, writer.written());
+}
+
+test "an absent list and an empty list are two documents" {
+    var storage: CardTestStorage = .{};
+    storage.init();
+
+    const absent = try decodeAgentCard(minimal_card, &storage.arena, &storage.scratch);
+    try testing.expectEqual(@as(?[]const SecuritySchemeEntry, null), absent.security_schemes);
+    try testing.expectEqual(@as(?[]const SecurityRequirement, null), absent.security_requirements);
+    try testing.expectEqual(@as(?[]const AgentCardSignature, null), absent.signatures);
+    try testing.expectEqual(@as(?[]const AgentExtension, null), absent.capabilities.extensions);
+    try testing.expectEqual(@as(usize, 0), absent.skills.len);
+
+    // The same card with every one of those lists spelled as the empty one, in
+    // the order a peer writes them, which is the order the encoder writes them
+    // back in.
+    const empty_card =
+        "{\"name\":\"W\",\"description\":\"d\",\"supportedInterfaces\":[{" ++
+        "\"url\":\"https://a\",\"protocolBinding\":\"JSONRPC\",\"protocolVers" ++
+        "ion\":\"1.0\"}],\"version\":\"1.0\",\"capabilities\":{\"extensions" ++
+        "\":[]},\"securitySchemes\":{},\"securityRequirements\":[],\"defaul" ++
+        "tInputModes\":[],\"defaultOutputModes\":[],\"skills\":[{\"id\":\"s" ++
+        "\",\"name\":\"S\",\"description\":\"d\",\"tags\":[],\"examples\":[]," ++
+        "\"securityRequirements\":[]}],\"signatures\":[]}";
+    const empty = try decodeAgentCard(empty_card, &storage.arena, &storage.scratch);
+    try testing.expectEqual(@as(usize, 0), empty.security_schemes.?.len);
+    try testing.expectEqual(@as(usize, 0), empty.security_requirements.?.len);
+    try testing.expectEqual(@as(usize, 0), empty.signatures.?.len);
+    try testing.expectEqual(@as(usize, 0), empty.capabilities.extensions.?.len);
+    try testing.expectEqual(@as(usize, 0), empty.skills[0].examples.?.len);
+    try testing.expectEqual(@as(usize, 0), empty.skills[0].security_requirements.?.len);
+
+    // And each is written back as the member it arrived as, which is the whole
+    // of what the thirteen presence fixes bought. A `&.{}` default would have
+    // made these two cards one value and one of the two documents would have
+    // come back without the member the peer wrote.
+    var writer = json.Writer.init(&storage.out);
+    try encodeAgentCard(absent, &writer);
+    try testing.expectEqualStrings(minimal_card, writer.written());
+    writer = json.Writer.init(&storage.out);
+    try encodeAgentCard(empty, &writer);
+    try testing.expectEqualStrings(empty_card, writer.written());
+
+    // `pkceRequired` is the same defect in a different shape: a peer that wrote
+    // `false` and a peer that wrote nothing sent two documents, and the value
+    // is still `false` when the member is there. The three below are the three
+    // documents a peer may send, and each is written back as itself.
+    const flow_head =
+        "{\"name\":\"W\",\"description\":\"d\",\"supportedInterfaces\":[{" ++
+        "\"url\":\"https://a\",\"protocolBinding\":\"JSONRPC\",\"protocolVers" ++
+        "ion\":\"1.0\"}],\"version\":\"1.0\",\"capabilities\":{},\"security" ++
+        "Schemes\":{\"oauth\":{\"oauth2SecurityScheme\":{\"flows\":{";
+    const flow_mid =
+        "\"authorizationCode\":{\"authorizationUrl\":\"https://auth/a\",\"t" ++
+        "okenUrl\":\"https://auth/t\",\"scopes\":{}";
+    // Four braces close the flow, the scheme, the map entry and the scheme
+    // table, and the last one closes the card itself. The authorization-code
+    // object is closed by the `"}"` each document appends.
+    const flow_tail = "}}}},\"defaultInputModes\":[]," ++
+        "\"defaultOutputModes\":[],\"skills\":[]}";
+
+    const absent_pkce = try decodeAgentCard(
+        flow_head ++ flow_mid ++ "}" ++ flow_tail,
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(
+        @as(?bool, null),
+        absent_pkce.security_schemes.?[0].scheme.oauth2.flows.authorization_code.pkce_required,
+    );
+    var pkce = json.Writer.init(&storage.out);
+    try encodeAgentCard(absent_pkce, &pkce);
+    try testing.expectEqualStrings(flow_head ++ flow_mid ++ "}" ++ flow_tail, pkce.written());
+
+    const declined = try decodeAgentCard(
+        flow_head ++ flow_mid ++ ",\"pkceRequired\":false" ++ "}" ++ flow_tail,
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(
+        @as(?bool, false),
+        declined.security_schemes.?[0].scheme.oauth2.flows.authorization_code.pkce_required,
+    );
+    pkce = json.Writer.init(&storage.out);
+    try encodeAgentCard(declined, &pkce);
+    try testing.expectEqualStrings(
+        flow_head ++ flow_mid ++ ",\"pkceRequired\":false" ++ "}" ++ flow_tail,
+        pkce.written(),
+    );
+
+    const pinned = try decodeAgentCard(
+        flow_head ++ flow_mid ++ ",\"pkceRequired\":true" ++ "}" ++ flow_tail,
+        &storage.arena,
+        &storage.scratch,
+    );
+    pkce = json.Writer.init(&storage.out);
+    try encodeAgentCard(pinned, &pkce);
+    try testing.expectEqualStrings(
+        flow_head ++ flow_mid ++ ",\"pkceRequired\":true" ++ "}" ++ flow_tail,
+        pkce.written(),
+    );
+}
+
+test "a repeated key takes its first occurrence" {
+    var storage: CardTestStorage = .{};
+    storage.init();
+
+    // Two entries under one key is one entry, and it is the first one. The
+    // rule is the one every repeated member in this file takes its first
+    // occurrence under, and a map key is a member name like any other.
+    const duplicate =
+        "{\"name\":\"W\",\"description\":\"d\",\"supportedInterfaces\":[{" ++
+        "\"url\":\"https://a\",\"protocolBinding\":\"JSONRPC\",\"protocolVers" ++
+        "ion\":\"1.0\"}],\"version\":\"1.0\",\"capabilities\":{},\"security" ++
+        "Requirements\":[{\"schemes\":{\"oauth\":{\"list\":[\"a\"]},\"oauth" ++
+        "\":{\"list\":[\"b\"]}}}],\"defaultInputModes\":[],\"defaultOutputM" ++
+        "odes\":[],\"skills\":[]}";
+    const card = try decodeAgentCard(duplicate, &storage.arena, &storage.scratch);
+    const schemes = card.security_requirements.?[0].schemes.?;
+    try testing.expectEqual(@as(usize, 1), schemes.len);
+    try testing.expectEqualStrings("oauth", schemes[0].name);
+    try testing.expectEqualStrings("a", schemes[0].list.list.?[0]);
+
+    // The discarded copy is still read as a value rather than stepped over
+    // blindly, so a peer cannot hide a syntax error in the slot a key already
+    // used.
+    try testing.expectError(
+        error.MalformedJson,
+        decodeAgentCard(
+            "{\"name\":\"W\",\"description\":\"d\",\"supportedInterfaces\":" ++
+                "[{\"url\":\"https://a\",\"protocolBinding\":\"JSONRPC\"," ++
+                "\"protocolVersion\":\"1.0\"}],\"version\":\"1.0\",\"capabilities\":{}," ++
+                "\"securityRequirements\":[{\"schemes\":" ++
+                "{\"oauth\":{\"list\":[\"a\"]},\"oauth\":}}]," ++
+                "\"defaultInputModes\":[],\"defaultOutputModes\":[],\"skills\":[]}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+}
+
+test "a map value sent as null is an entry that is not there" {
+    var storage: CardTestStorage = .{};
+    storage.init();
+
+    // `{"basic":null}` names an entry and then declines to give it a value,
+    // which is what a message member sent as `null` is. The document is well
+    // formed, so it is not a syntax error, and the key does not become an
+    // entry, so the re-encode drops it.
+    const raw = "{\"name\":\"W\",\"description\":\"d\",\"supportedInterfaces\":" ++
+        "[{\"url\":\"https://a\",\"protocolBinding\":\"JSONRPC\",\"protocolVersion\":\"1.0\"}]," ++
+        "\"version\":\"1.0\",\"capabilities\":{}," ++
+        "\"securityRequirements\":[{\"schemes\":" ++
+        "{\"basic\":null,\"oauth\":{\"list\":[\"a\"]}}}]," ++
+        "\"defaultInputModes\":[],\"defaultOutputModes\":[],\"skills\":[]}";
+    const card = try decodeAgentCard(raw, &storage.arena, &storage.scratch);
+    const schemes = card.security_requirements.?[0].schemes.?;
+    try testing.expectEqual(@as(usize, 1), schemes.len);
+    try testing.expectEqualStrings("oauth", schemes[0].name);
+
+    var writer = json.Writer.init(&storage.out);
+    try encodeAgentCard(card, &writer);
+    try testing.expectEqualStrings(
+        "{\"name\":\"W\",\"description\":\"d\",\"supportedInterfaces\":" ++
+            "[{\"url\":\"https://a\",\"protocolBinding\":\"JSONRPC\"," ++
+            "\"protocolVersion\":\"1.0\"}],\"version\":\"1.0\",\"capabilities\":{}," ++
+            "\"securityRequirements\":[{\"schemes\":{\"oauth\":{\"list\":[\"a\"]}}}]," ++
+            "\"defaultInputModes\":[],\"defaultOutputModes\":[],\"skills\":[]}",
+        writer.written(),
+    );
+
+    // A `StringList` sent as `null` is the same case at the value half, and
+    // `{}` is the same document written the other way round: two spellings of
+    // "this requirement names no scope", so both are one value and both are
+    // written as the one the peer sent.
+    const nulled = try decodeSecurityRequirement(
+        "{\"schemes\":{\"oauth\":{\"list\":null}}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(
+        @as(?[]const []const u8, null),
+        nulled.schemes.?[0].list.list,
+    );
+    writer = json.Writer.init(&storage.out);
+    try encodeSecurityRequirement(nulled, &writer);
+    try testing.expectEqualStrings("{\"schemes\":{\"oauth\":{}}}", writer.written());
+    const bare = try decodeSecurityRequirement("{}", &storage.arena, &storage.scratch);
+    try testing.expectEqual(@as(?[]const SecurityRequirementEntry, null), bare.schemes);
+    writer = json.Writer.init(&storage.out);
+    try encodeSecurityRequirement(bare, &writer);
+    try testing.expectEqualStrings("{}", writer.written());
+}
+
+test "a SecurityScheme carries exactly one of its five arms" {
+    var storage: CardTestStorage = .{};
+    storage.init();
+
+    // The specification says a `SecurityScheme` MUST contain exactly one of the
+    // five, section 4.5.1 of the rendered specification as the normative table
+    // quotes it, so an object with none is a missing field.
+    try testing.expectError(
+        error.MissingField,
+        decodeSecurityScheme("{}", &storage.arena, &storage.scratch),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeSecurityScheme("{\"description\":\"d\"}", &storage.arena, &storage.scratch),
+    );
+
+    // The five arms, and the names ProtoJSON spells them under. The first is
+    // the one where the normative name and the derived Zig name disagree, and
+    // the `zig_name` override is what makes `api_key` the Zig arm; the name
+    // that goes on the wire is the table's `json` and not the override.
+    const api_key = try decodeSecurityScheme(
+        "{\"apiKeySecurityScheme\":{\"location\":\"header\",\"name\":\"X-Api-Key\"}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expect(api_key == .api_key);
+    try testing.expectEqual(ApiKeyLocation.header, api_key.api_key.location);
+    var writer = json.Writer.init(&storage.out);
+    try encodeSecurityScheme(api_key, &writer);
+    try testing.expectEqualStrings(
+        "{\"apiKeySecurityScheme\":{\"location\":\"header\",\"name\":\"X-Api-Key\"}}",
+        writer.written(),
+    );
+
+    const http = try decodeSecurityScheme(
+        "{\"httpAuthSecurityScheme\":{\"scheme\":\"bearer\",\"bearerFormat\":\"JWT\"}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expect(http == .http_auth);
+    writer = json.Writer.init(&storage.out);
+    try encodeSecurityScheme(http, &writer);
+    try testing.expectEqualStrings(
+        "{\"httpAuthSecurityScheme\":{\"scheme\":\"bearer\",\"bearerFormat\":\"JWT\"}}",
+        writer.written(),
+    );
+
+    const oidc = try decodeSecurityScheme(
+        "{\"openIdConnectSecurityScheme\":{\"openIdConnectUrl\":\"https://i\"}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expect(oidc == .open_id_connect);
+    writer = json.Writer.init(&storage.out);
+    try encodeSecurityScheme(oidc, &writer);
+    try testing.expectEqualStrings(
+        "{\"openIdConnectSecurityScheme\":{\"openIdConnectUrl\":\"https://i\"}}",
+        writer.written(),
+    );
+
+    const mtls = try decodeSecurityScheme("{\"mtlsSecurityScheme\":{}}", &storage.arena, &storage.scratch);
+    try testing.expect(mtls == .mtls);
+    writer = json.Writer.init(&storage.out);
+    try encodeSecurityScheme(mtls, &writer);
+    try testing.expectEqualStrings("{\"mtlsSecurityScheme\":{}}", writer.written());
+
+    const oauth2 = try decodeSecurityScheme(
+        "{\"oauth2SecurityScheme\":{\"flows\":{\"deviceCode\":" ++
+            "{\"deviceAuthorizationUrl\":\"https://auth/d\",\"tokenUrl\":\"https://auth/t\"," ++
+            "\"scopes\":{}}}}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expect(oauth2 == .oauth2);
+    try testing.expect(oauth2.oauth2.flows == .device_code);
+    writer = json.Writer.init(&storage.out);
+    try encodeSecurityScheme(oauth2, &writer);
+    try testing.expectEqualStrings(
+        "{\"oauth2SecurityScheme\":{\"flows\":{\"deviceCode\":" ++
+            "{\"deviceAuthorizationUrl\":\"https://auth/d\",\"tokenUrl\":\"https://auth/t\"," ++
+            "\"scopes\":{}}}}}",
+        writer.written(),
+    );
+
+    // Two arms is first-wins, the rule every repeated member in this file
+    // follows, and the discarded arm is still read as a value.
+    const two = try decodeSecurityScheme(
+        "{\"mtlsSecurityScheme\":{},\"apiKeySecurityScheme\":" ++
+            "{\"location\":\"cookie\",\"name\":\"sid\"}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expect(two == .mtls);
+    try testing.expectError(
+        error.MalformedJson,
+        decodeSecurityScheme(
+            "{\"mtlsSecurityScheme\":},{\"apiKeySecurityScheme\":{}}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    // An arm with no value is an arm that is not there, so a later arm that
+    // does carry one still decides the union.
+    const nulled = try decodeSecurityScheme(
+        "{\"mtlsSecurityScheme\":null,\"apiKeySecurityScheme\":" ++
+            "{\"location\":\"cookie\",\"name\":\"sid\"}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expect(nulled == .api_key);
+}
+
+test "an OAuthFlows carries exactly one of its five arms and two are deprecated" {
+    var storage: CardTestStorage = .{};
+    storage.init();
+
+    try testing.expectError(
+        error.MissingField,
+        decodeOAuthFlows("{}", &storage.arena, &storage.scratch),
+    );
+
+    // The two deprecated flows carry no REQUIRED field, so `{}` is a complete
+    // flow and the whole scope map is optional on them too.
+    const implicit = try decodeOAuthFlows("{\"implicit\":{}}", &storage.arena, &storage.scratch);
+    try testing.expect(implicit == .implicit);
+    try testing.expectEqual(@as(?[]const OAuthScope, null), implicit.implicit.scopes);
+    var writer = json.Writer.init(&storage.out);
+    try encodeOAuthFlows(implicit, &writer);
+    try testing.expectEqualStrings("{\"implicit\":{}}", writer.written());
+
+    const password = try decodeOAuthFlows(
+        "{\"password\":{\"tokenUrl\":\"https://auth/t\"}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expect(password == .password);
+    writer = json.Writer.init(&storage.out);
+    try encodeOAuthFlows(password, &writer);
+    try testing.expectEqualStrings(
+        "{\"password\":{\"tokenUrl\":\"https://auth/t\"}}",
+        writer.written(),
+    );
+
+    // `scopes` is REQUIRED on the three live flows and an empty map satisfies
+    // it, so the member is always written and `"scopes":{}` is a flow that
+    // authorizes nothing rather than a flow with no scope member.
+    const machine = try decodeOAuthFlows(
+        "{\"clientCredentials\":{\"tokenUrl\":\"https://auth/t\",\"scopes\":{}}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(usize, 0), machine.client_credentials.scopes.len);
+    writer = json.Writer.init(&storage.out);
+    try encodeOAuthFlows(machine, &writer);
+    try testing.expectEqualStrings(
+        "{\"clientCredentials\":{\"tokenUrl\":\"https://auth/t\",\"scopes\":{}}}",
+        writer.written(),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeOAuthFlows(
+            "{\"clientCredentials\":{\"tokenUrl\":\"https://auth/t\"}}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+
+    // Two arms is first-wins, and the first one named is the one that decides.
+    const two = try decodeOAuthFlows(
+        "{\"password\":{},\"implicit\":{}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expect(two == .password);
+}
+
+test "a card round-trips every member it declares" {
+    var storage: CardTestStorage = .{};
+    storage.init();
+
+    const raw =
+        "{\"name\":\"Weather\",\"description\":\"Forecasts and observations.\"," ++
+        "\"supportedInterfaces\":[" ++
+        "{\"url\":\"https://api.example.com/a2a/v1\",\"protocolBinding\":\"JSONRPC\"," ++
+        "\"protocolVersion\":\"1.0\"}," ++
+        "{\"url\":\"https://api.example.com/grpc\",\"protocolBinding\":\"GRPC\"," ++
+        "\"tenant\":\"acme\",\"protocolVersion\":\"1.0\"}]," ++
+        "\"provider\":{\"url\":\"https://example.com\",\"organization\":\"Example\"}," ++
+        "\"version\":\"1.0\",\"documentationUrl\":\"https://example.com/docs\"," ++
+        "\"capabilities\":{\"streaming\":true,\"pushNotifications\":false," ++
+        "\"extensions\":[{\"uri\":\"https://example.com/extensions/geolocation/v1\"," ++
+        "\"description\":\"Where you are\",\"required\":true," ++
+        "\"params\":{\"accuracy\":\"city\"}}],\"extendedAgentCard\":true}," ++
+        "\"securitySchemes\":{\"apiKey\":{\"apiKeySecurityScheme\":" ++
+        "{\"description\":\"A key\",\"location\":\"header\",\"name\":\"X-Api-Key\"}}}," ++
+        "\"securityRequirements\":[{\"schemes\":{\"apiKey\":{\"list\":[\"read\"]}}}]," ++
+        "\"defaultInputModes\":[\"text/plain\"]," ++
+        "\"defaultOutputModes\":[\"text/plain\",\"application/json\"]," ++
+        "\"skills\":[{\"id\":\"forecast\",\"name\":\"Forecast\"," ++
+        "\"description\":\"A seven-day forecast.\",\"tags\":[\"weather\",\"forecast\"]," ++
+        "\"examples\":[\"What is the weather?\"],\"inputModes\":[\"text/plain\"]," ++
+        "\"outputModes\":[\"text/plain\"]," ++
+        "\"securityRequirements\":[{\"schemes\":{\"apiKey\":{\"list\":[\"read\"]}}}]}]," ++
+        "\"signatures\":[{\"protected\":\"eyJhbGciOiJFUzI1NiJ9\"," ++
+        "\"signature\":\"c2ln\",\"header\":{\"kid\":\"k1\"}}]," ++
+        "\"iconUrl\":\"https://example.com/icon.png\"}";
+
+    const card = try decodeAgentCard(raw, &storage.arena, &storage.scratch);
+
+    // The two interfaces keep their order, because the first entry is the
+    // preferred one and the order is part of the contract.
+    try testing.expectEqual(@as(usize, 2), card.supported_interfaces.len);
+    try testing.expectEqualStrings("JSONRPC", card.supported_interfaces[0].protocol_binding);
+    try testing.expectEqualStrings("GRPC", card.supported_interfaces[1].protocol_binding);
+    try testing.expectEqualStrings("acme", card.supported_interfaces[1].tenant.?);
+
+    // `params` is a `google.protobuf.Struct` and is borrowed as the lexeme the
+    // peer wrote, so a setting this library does not model survives.
+    try testing.expectEqualStrings("{\"accuracy\":\"city\"}", card.capabilities.extensions.?[0].params.?);
+    try testing.expectEqual(@as(?bool, true), card.capabilities.extensions.?[0].required);
+    try testing.expectEqual(@as(?bool, false), card.capabilities.push_notifications);
+    try testing.expectEqual(@as(?bool, true), card.capabilities.streaming);
+
+    // A skill's four optional lists and its own requirements are presences,
+    // and its tags are REQUIRED.
+    const skill = card.skills[0];
+    try testing.expectEqual(@as(usize, 2), skill.tags.len);
+    try testing.expectEqualStrings("weather", skill.tags[0]);
+    try testing.expectEqualStrings("What is the weather?", skill.examples.?[0]);
+    try testing.expectEqualStrings("text/plain", skill.input_modes.?[0]);
+    try testing.expectEqualStrings("text/plain", skill.output_modes.?[0]);
+    try testing.expectEqualStrings(
+        "read",
+        skill.security_requirements.?[0].schemes.?[0].list.list.?[0],
+    );
+
+    // Both base64url members of a signature are spliced, and the borrowed
+    // header is a lexeme rather than a shape.
+    try testing.expectEqualStrings("eyJhbGciOiJFUzI1NiJ9", card.signatures.?[0].protected);
+    try testing.expectEqualStrings("c2ln", card.signatures.?[0].signature);
+    try testing.expectEqualStrings("{\"kid\":\"k1\"}", card.signatures.?[0].header.?);
+
+    // The card's own requirement and the skill's share one array as two runs,
+    // and the slices do not overlap.
+    try testing.expectEqual(@as(usize, 1), card.security_requirements.?.len);
+    try testing.expectEqual(@as(usize, 1), skill.security_requirements.?.len);
+
+    var writer = json.Writer.init(&storage.out);
+    try encodeAgentCard(card, &writer);
+    try testing.expectEqualStrings(raw, writer.written());
+}
+
+test "a card decode resets the arena and one decode serves one document" {
+    var storage: CardTestStorage = .{};
+    storage.init();
+
+    // One card with a skill in it, so the two fill levels are told apart.
+    const first = try decodeAgentCard(
+        "{\"name\":\"W\",\"description\":\"d\",\"supportedInterfaces\":[]," ++
+            "\"version\":\"1.0\",\"capabilities\":{},\"defaultInputModes\":[]," ++
+            "\"defaultOutputModes\":[],\"skills\":[{\"id\":\"s\",\"name\":\"S\"," ++
+            "\"description\":\"d\",\"tags\":[]}]}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(usize, 0), storage.arena.interfaces_used);
+    try testing.expectEqual(@as(usize, 1), storage.arena.skills_used);
+    try testing.expectEqualStrings("s", first.skills[0].id);
+
+    // The second decode starts from zero, so the first one's elements are not
+    // reachable from the second card and no run of one array is handed out
+    // twice. `minimal_card` is the other way round: an interface and no skill.
+    const second = try decodeAgentCard(minimal_card, &storage.arena, &storage.scratch);
+    try testing.expectEqual(@as(usize, 1), storage.arena.interfaces_used);
+    try testing.expectEqual(@as(usize, 0), storage.arena.skills_used);
+    try testing.expectEqual(@as(usize, 1), second.supported_interfaces.len);
+    try testing.expectEqual(@as(usize, 0), second.skills.len);
+    try testing.expectEqualStrings("s", first.skills[0].id);
+    try testing.expectEqualStrings("https://a", second.supported_interfaces[0].url);
+}
+
+test "a card out array that fills is an error and never a truncation" {
+    var storage: CardTestStorage = .{};
+    storage.init();
+
+    // One requirement, and an arena that holds one.
+    const one = "{\"name\":\"W\",\"description\":\"d\",\"supportedInterfaces\":" ++
+        "[{\"url\":\"https://a\",\"protocolBinding\":\"JSONRPC\",\"protocolVersion\":\"1.0\"}]," ++
+        "\"version\":\"1.0\",\"capabilities\":{}," ++
+        "\"securityRequirements\":[{\"schemes\":{\"oauth\":{\"list\":[\"a\"]}}}]," ++
+        "\"defaultInputModes\":[],\"defaultOutputModes\":[],\"skills\":[]}";
+    var one_requirement: [1]SecurityRequirement = undefined;
+    var small = CardArena.init(
+        &storage.interfaces,
+        &storage.skills,
+        &storage.extensions,
+        &storage.signatures,
+        &storage.security_schemes,
+        &one_requirement,
+        &storage.requirement_entries,
+        &storage.scopes,
+        &storage.strings,
+    );
+    const fits = try decodeAgentCard(one, &small, &storage.scratch);
+    try testing.expectEqual(@as(usize, 1), fits.security_requirements.?.len);
+
+    // Two requirements into the same array is `error.BufferTooSmall`, and not a
+    // card with one requirement and the second one dropped. A card whose
+    // eleventh scheme vanished is a card that says something the caller did
+    // not mean, and this is the same rule the content half applies.
+    const two = "{\"name\":\"W\",\"description\":\"d\",\"supportedInterfaces\":" ++
+        "[{\"url\":\"https://a\",\"protocolBinding\":\"JSONRPC\",\"protocolVersion\":\"1.0\"}]," ++
+        "\"version\":\"1.0\",\"capabilities\":{}," ++
+        "\"securityRequirements\":[{\"schemes\":{\"oauth\":{\"list\":[\"a\"]}}}," ++
+        "{\"schemes\":{\"oauth\":{\"list\":[\"b\"]}}}]," ++
+        "\"defaultInputModes\":[],\"defaultOutputModes\":[],\"skills\":[]}";
+    try testing.expectError(
+        error.BufferTooSmall,
+        decodeAgentCard(two, &small, &storage.scratch),
+    );
+
+    // And it is the room and not the shape: the same two requirements into an
+    // arena with room is the same document accepted. A check that could not
+    // tell the two apart would pass on a card the library refuses for a reason
+    // the caller has to act on.
+    const roomy = try decodeAgentCard(two, &storage.arena, &storage.scratch);
+    try testing.expectEqual(@as(usize, 2), roomy.security_requirements.?.len);
+
+    // Every other array is bounded the same way, and each is reached by a
+    // different member of the same document.
+    var one_scope: [1]OAuthScope = undefined;
+    small = CardArena.init(
+        &storage.interfaces,
+        &storage.skills,
+        &storage.extensions,
+        &storage.signatures,
+        &storage.security_schemes,
+        &storage.security_requirements,
+        &storage.requirement_entries,
+        &one_scope,
+        &storage.strings,
+    );
+    try testing.expectError(
+        error.BufferTooSmall,
+        decodeSecurityScheme(
+            "{\"oauth2SecurityScheme\":{\"flows\":{\"implicit\":{\"scopes\":" ++
+                "{\"a\":\"1\",\"b\":\"2\"}}}}}",
+            &small,
+            &storage.scratch,
+        ),
+    );
+
+    var one_entry: [1]SecurityRequirementEntry = undefined;
+    small = CardArena.init(
+        &storage.interfaces,
+        &storage.skills,
+        &storage.extensions,
+        &storage.signatures,
+        &storage.security_schemes,
+        &storage.security_requirements,
+        &one_entry,
+        &storage.scopes,
+        &storage.strings,
+    );
+    try testing.expectError(
+        error.BufferTooSmall,
+        decodeSecurityRequirement(
+            "{\"schemes\":{\"a\":{},\"b\":{}}}",
+            &small,
+            &storage.scratch,
+        ),
+    );
+
+    var one_string: [1][]const u8 = undefined;
+    small = CardArena.init(
+        &storage.interfaces,
+        &storage.skills,
+        &storage.extensions,
+        &storage.signatures,
+        &storage.security_schemes,
+        &storage.security_requirements,
+        &storage.requirement_entries,
+        &storage.scopes,
+        &one_string,
+    );
+    try testing.expectError(
+        error.BufferTooSmall,
+        decodeAgentSkill(
+            "{\"id\":\"s\",\"name\":\"S\",\"description\":\"d\"," ++
+                "\"tags\":[\"a\",\"b\"]}",
+            &small,
+            &storage.scratch,
+        ),
+    );
+    // And the same array bounded with a one-element list of extensions, which
+    // is a different member reaching the same storage.
+    var one_extension: [1]AgentExtension = undefined;
+    small = CardArena.init(
+        &storage.interfaces,
+        &storage.skills,
+        &one_extension,
+        &storage.signatures,
+        &storage.security_schemes,
+        &storage.security_requirements,
+        &storage.requirement_entries,
+        &storage.scopes,
+        &storage.strings,
+    );
+    try testing.expectError(
+        error.BufferTooSmall,
+        decodeAgentCapabilities(
+            "{\"extensions\":[{\"uri\":\"a\"},{\"uri\":\"b\"}]}",
+            &small,
+            &storage.scratch,
+        ),
+    );
+}
+
+test "a card is one JSON value and its own shape is checked" {
+    var storage: CardTestStorage = .{};
+    storage.init();
+
+    // The check is after the member loop, so a tail behind the closing brace
+    // is a second document rather than a member the walk had not reached.
+    try testing.expectError(
+        error.MalformedJson,
+        decodeAgentCard(minimal_card ++ " trailing", &storage.arena, &storage.scratch),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeAgentCard(minimal_card ++ " {}", &storage.arena, &storage.scratch),
+    );
+
+    // An empty object is not a card: seven of the eight REQUIRED members are
+    // missing and the eighth is a message with no fields of its own.
+    try testing.expectError(
+        error.MissingField,
+        decodeAgentCard("{}", &storage.arena, &storage.scratch),
+    );
+
+    // Each REQUIRED member is checked on its own, so a card missing one is
+    // `error.MissingField` and not a card the library quietly filled in. The
+    // document is the smallest legal card with one member left out, so the
+    // only thing that differs is which one the walk did not see.
+    for ([_][]const u8{
+        "{\"description\":\"d\",\"supportedInterfaces\":[]," ++
+            "\"version\":\"1.0\",\"capabilities\":{},\"defaultInputModes\":[]," ++
+            "\"defaultOutputModes\":[],\"skills\":[]}",
+        "{\"name\":\"W\",\"supportedInterfaces\":[]," ++
+            "\"version\":\"1.0\",\"capabilities\":{},\"defaultInputModes\":[]," ++
+            "\"defaultOutputModes\":[],\"skills\":[]}",
+        "{\"name\":\"W\",\"description\":\"d\"," ++
+            "\"version\":\"1.0\",\"capabilities\":{},\"defaultInputModes\":[]," ++
+            "\"defaultOutputModes\":[],\"skills\":[]}",
+        "{\"name\":\"W\",\"description\":\"d\"," ++
+            "\"version\":\"1.0\",\"capabilities\":{},\"defaultInputModes\":[]," ++
+            "\"defaultOutputModes\":[]}",
+        "{\"name\":\"W\",\"description\":\"d\",\"supportedInterfaces\":[]," ++
+            "\"capabilities\":{},\"defaultInputModes\":[]," ++
+            "\"defaultOutputModes\":[],\"skills\":[]}",
+        "{\"name\":\"W\",\"description\":\"d\",\"supportedInterfaces\":[]," ++
+            "\"version\":\"1.0\",\"defaultInputModes\":[]," ++
+            "\"defaultOutputModes\":[],\"skills\":[]}",
+        "{\"name\":\"W\",\"description\":\"d\",\"supportedInterfaces\":[]," ++
+            "\"version\":\"1.0\",\"capabilities\":{}, " ++
+            "\"defaultOutputModes\":[],\"skills\":[]}",
+        "{\"name\":\"W\",\"description\":\"d\",\"supportedInterfaces\":[]," ++
+            "\"version\":\"1.0\",\"capabilities\":{},\"defaultInputModes\":[]," ++
+            "\"skills\":[]}",
+    }) |incomplete| {
+        try testing.expectError(
+            error.MissingField,
+            decodeAgentCard(incomplete, &storage.arena, &storage.scratch),
+        );
+    }
+
+    // A `null` under a `repeated` or a message member is that member missing
+    // and wearing a key, so it is asked for and answered as an absent member
+    // rather than handed to the walk that would call it a syntax error. A
+    // `null` under a scalar is refused outright, for the reason
+    // `AgentExtension.required` gives: ProtoJSON spells it a `bool` and this
+    // library does not accept a value the type does not have.
+    try testing.expectError(
+        error.MissingField,
+        decodeAgentCard(
+            "{\"name\":\"W\",\"description\":\"d\",\"supportedInterfaces\":null," ++
+                "\"version\":\"1.0\",\"capabilities\":{},\"defaultInputModes\":[]," ++
+                "\"defaultOutputModes\":[],\"skills\":[]}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeAgentCard(
+            "{\"name\":null,\"description\":\"d\",\"supportedInterfaces\":[]," ++
+                "\"version\":\"1.0\",\"capabilities\":{},\"defaultInputModes\":[]," ++
+                "\"defaultOutputModes\":[],\"skills\":[]}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    const nulled_list = try decodeAgentCard(
+        "{\"name\":\"W\",\"description\":\"d\",\"supportedInterfaces\":[]," ++
+            "\"version\":\"1.0\",\"capabilities\":{},\"securitySchemes\":null," ++
+            "\"defaultInputModes\":[],\"defaultOutputModes\":[],\"skills\":[]}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(?[]const SecuritySchemeEntry, null), nulled_list.security_schemes);
+
+    // An empty REQUIRED string is `error.InvalidField`, for the reason
+    // `GetTaskRequest.id` gives: a card with no name is not a card. The encoder
+    // refuses the same value the same way, and it refuses before the first
+    // byte rather than after.
+    try testing.expectError(
+        error.InvalidField,
+        decodeAgentCard(
+            "{\"name\":\"\",\"description\":\"d\",\"supportedInterfaces\":[]," ++
+                "\"version\":\"1.0\",\"capabilities\":{},\"defaultInputModes\":[]," ++
+                "\"defaultOutputModes\":[],\"skills\":[]}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    var writer = json.Writer.init(&storage.out);
+    try testing.expectError(
+        error.InvalidField,
+        encodeAgentCard(.{
+            .name = "",
+            .description = "d",
+            .supported_interfaces = &.{},
+            .version = "1.0",
+            .capabilities = .{},
+            .default_input_modes = &.{},
+            .default_output_modes = &.{},
+            .skills = &.{},
+        }, &writer),
+    );
+    try testing.expectEqual(@as(usize, 0), writer.written().len);
+
+    // And the same for the one REQUIRED string nested three levels down, which
+    // is what makes the refusal-before-the-first-byte rule worth stating: a
+    // half-written card is a card whose `skills` member is truncated.
+    try testing.expectError(
+        error.InvalidField,
+        encodeAgentCard(.{
+            .name = "W",
+            .description = "d",
+            .supported_interfaces = &.{},
+            .version = "1.0",
+            .capabilities = .{},
+            .default_input_modes = &.{},
+            .default_output_modes = &.{},
+            .skills = &.{.{ .id = "", .name = "S", .description = "d", .tags = &.{} }},
+        }, &writer),
+    );
+    try testing.expectEqual(@as(usize, 0), writer.written().len);
+
+    // A skill's four REQUIRED members are checked the same way, and `tags` is
+    // one of them with no emptiness rule: `[]` is a skill tagged with nothing
+    // and only the absence of the member is missing.
+    try testing.expectError(
+        error.MissingField,
+        decodeAgentSkill(
+            "{\"id\":\"s\",\"name\":\"S\",\"description\":\"d\"}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    const untagged = try decodeAgentSkill(
+        "{\"id\":\"s\",\"name\":\"S\",\"description\":\"d\",\"tags\":[]}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(usize, 0), untagged.tags.len);
+    try testing.expectError(
+        error.InvalidField,
+        decodeAgentSkill(
+            "{\"id\":\"s\",\"name\":\"\",\"description\":\"d\",\"tags\":[]}",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+}
+
+test "a card leaf decodes and encodes on its own" {
+    var storage: CardTestStorage = .{};
+    storage.init();
+
+    // The four leaves a caller may hold without the card around them. Each
+    // takes the same arena the card does, because a caller decoding both
+    // should not have to size one set of arrays for the union of the two.
+    var writer = json.Writer.init(&storage.out);
+
+    const list = try decodeStringList("{\"list\":[\"openid\",\"a2a.tasks\"]}", &storage.arena, &storage.scratch);
+    try testing.expectEqual(@as(usize, 2), list.list.?.len);
+    try encodeStringList(list, &writer);
+    try testing.expectEqualStrings("{\"list\":[\"openid\",\"a2a.tasks\"]}", writer.written());
+
+    // `{}` is the other document, and it comes back as `{}` rather than as the
+    // empty list, because the two are not the same value.
+    const bare = try decodeStringList("{}", &storage.arena, &storage.scratch);
+    try testing.expectEqual(@as(?[]const []const u8, null), bare.list);
+    writer = json.Writer.init(&storage.out);
+    try encodeStringList(bare, &writer);
+    try testing.expectEqualStrings("{}", writer.written());
+
+    const capabilities = try decodeAgentCapabilities(
+        "{\"streaming\":true,\"extensions\":[{\"uri\":\"a\"}]}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(?bool, true), capabilities.streaming);
+    try testing.expectEqualStrings("a", capabilities.extensions.?[0].uri.?);
+    writer = json.Writer.init(&storage.out);
+    try encodeAgentCapabilities(capabilities, &writer);
+    try testing.expectEqualStrings(
+        "{\"streaming\":true,\"extensions\":[{\"uri\":\"a\"}]}",
+        writer.written(),
+    );
+
+    const skill = try decodeAgentSkill(
+        "{\"id\":\"s\",\"name\":\"S\",\"description\":\"d\",\"tags\":[\"t\"]," ++
+            "\"examples\":[]}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(usize, 0), skill.examples.?.len);
+    writer = json.Writer.init(&storage.out);
+    try encodeAgentSkill(skill, &writer);
+    try testing.expectEqualStrings(
+        "{\"id\":\"s\",\"name\":\"S\",\"description\":\"d\",\"tags\":[\"t\"]," ++
+            "\"examples\":[]}",
+        writer.written(),
+    );
+
+    const scheme = try decodeOAuth2SecurityScheme(
+        "{\"flows\":{\"clientCredentials\":{\"tokenUrl\":\"https://auth/t\"," ++
+            "\"scopes\":{\"a\":\"one\"}}}}",
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqualStrings("one", scheme.flows.client_credentials.scopes[0].description);
+    writer = json.Writer.init(&storage.out);
+    try encodeOAuth2SecurityScheme(scheme, &writer);
+    try testing.expectEqualStrings(
+        "{\"flows\":{\"clientCredentials\":{\"tokenUrl\":\"https://auth/t\"," ++
+            "\"scopes\":{\"a\":\"one\"}}}}",
+        writer.written(),
+    );
+
+    // A tail behind the closing brace is a second document, and each of the
+    // four refuses it for the reason `decodeAgentCard` does.
+    try testing.expectError(
+        error.MalformedJson,
+        decodeStringList("{\"list\":[]} tail", &storage.arena, &storage.scratch),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeAgentCapabilities("{} tail", &storage.arena, &storage.scratch),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeAgentSkill(
+            "{\"id\":\"s\",\"name\":\"S\",\"description\":\"d\",\"tags\":[]} tail",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeOAuth2SecurityScheme(
+            "{\"flows\":{\"implicit\":{}}} tail",
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeSecurityRequirement("{} tail", &storage.arena, &storage.scratch),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeSecurityScheme("{\"mtlsSecurityScheme\":{}} tail", &storage.arena, &storage.scratch),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeOAuthFlows("{\"implicit\":{}} tail", &storage.arena, &storage.scratch),
+    );
 }
