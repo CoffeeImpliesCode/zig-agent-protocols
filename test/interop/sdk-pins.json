@@ -1,0 +1,280 @@
+{
+  "schema": "zig-agent-proto/interop-sdk-pins/1",
+  "purpose": "Every version, byte and API fact an interoperability peer depends on, with the primary source each one came from. The peer scripts read this file and refuse to run against an environment that does not match it, so a pin that silently drifts is a failed run rather than a claim nobody checked.",
+  "compiled": "2026-10-01",
+  "declarative_only": "No pip, no uv, no system installation. Everything below is realised by devenv.nix against the nixpkgs revision devenv.lock already pins. test/interop/*.py are development tooling and are never imported by the library, which keeps its zero-dependency guarantee.",
+  "environment": {
+    "nixpkgs": {
+      "role": "the only source of Python packages here",
+      "repo": "NixOS/nixpkgs",
+      "channel": "nixpkgs-unstable",
+      "rev": "c7def046b9a883d46974757852106483d741586f",
+      "narHash": "sha256-6RSEDHIWQtesQKWSu5qRai8L2h4KgCgMEfJHstW99G4=",
+      "lastModified": 1789370336,
+      "provenance": "devenv.lock node nixpkgs-src, locked; verified by fetching files from this rev over HTTPS while preparing these pins"
+    },
+    "devenv": {
+      "repo": "cachix/devenv",
+      "rev": "fe20b5cba7ab5e93ae73f956a8d3efc50e1753f4",
+      "narHash": "sha256-0FpLHIRDYiyo3EMTnMQSobZQknZaa3JuWo6vmMCK76o=",
+      "dir": "src/modules",
+      "provenance": "devenv.lock node devenv"
+    },
+    "devenv_nixpkgs": {
+      "repo": "cachix/devenv-nixpkgs",
+      "ref": "rolling",
+      "rev": "c2f38fe7f9e04d9aadd354d380f2bd40531d9737",
+      "narHash": "sha256-vNkJbtmqyBfFhn/HnzQo4ROuoyYWuy/allqTfJb4kMY=",
+      "provenance": "devenv.lock node nixpkgs"
+    },
+    "python": {
+      "attribute": "pkgs.python3",
+      "version": "3.14",
+      "provenance": "pkgs/top-level/all-packages.nix line 4483 at the pinned rev: `python3 = python314;`",
+      "consequence": "a2a-sdk's `culsans>=0.11.0; python_full_version < '3.13'` requirement does not apply, so culsans is absent from the pinned nixpkgs python package set and is not needed here"
+    }
+  },
+  "sdks": {
+    "mcp": {
+      "distribution": "mcp",
+      "version": "1.29.0",
+      "role": "independent peer for the MCP 2025-11-25 stdio exchange; the Zig participant is the client",
+      "nix": {
+        "mechanism": "pinned nixpkgs package, no override",
+        "attribute": "python3Packages.mcp",
+        "expression": "pkgs/development/python-modules/mcp/default.nix at the pinned rev",
+        "upstream_tag": "v1.29.0",
+        "src": "fetchFromGitHub { owner = \"modelcontextprotocol\"; repo = \"python-sdk\"; tag = \"v1.29.0\"; hash = \"sha256-lRlj5RT/R5zrYL5XpdQR2l9t99G94WTsubN0gSQekMc=\"; }",
+        "nixpkgs_relaxations": ["pydantic-settings"],
+        "why_this_version": "1.29.0 is the newest mcp whose LATEST_PROTOCOL_VERSION is exactly 2025-11-25 and the newest revision nixpkgs pins at this rev. 1.30.0 also carries 2025-11-25 (src/mcp/types.py line 27 in the 1.30.0 sdist), so the nixpkgs pin is not protocol-stale, and the whole 1.x line is refused for nothing else: 1.9.4 and earlier stop at 2025-03-26."
+      },
+      "source_bytes": {
+        "pypi_sdist": {
+          "url": "https://files.pythonhosted.org/packages/06/f2/dc2450e566eeccf92d89a00c3e813234ad58e2ba1e31d11467a09ac4f3b9/mcp-1.9.4.tar.gz",
+          "note": "not the pin; kept only to record that 1.9.4 speaks 2025-03-26"
+        },
+        "pypi_sdist_pinned": {
+          "url": "https://files.pythonhosted.org/packages/30/d3/f9acc21dfc886e4f78e2add1a47db46ce16884346afde53f8a064c02c891/mcp-1.29.0.tar.gz",
+          "sha256_hex": "52d01f334de1868cc3bb2d6604931126a67631f99a6c5d3b82ba47290315ec36",
+          "sha256_sri": "sha256-UtAfM03hhozDuy1mBJMRJqZ2MfmabF07grpHKQMV7DY="
+        },
+        "pypi_wheel_pinned": {
+          "filename": "mcp-1.29.0-py3-none-any.whl",
+          "url": "https://files.pythonhosted.org/packages/01/c8/248b201f6d753d69fd5d6506011abbb35a946d9142b2ae311a948fd0be3d/mcp-1.29.0-py3-none-any.whl",
+          "sha256_hex": "f5a075bb611f23d6f4d080c6a1699fa62772eebc562ba9e66b306ddde1c755f7",
+          "sha256_sri": "sha256-9aB1u2EfI9b00IDGoWmfpidy7rxWK6nmazBt3eHHVfc="
+        },
+        "note": "the sdist above was downloaded and hashed from PyPI while preparing this file; the nixpkgs expression builds from the GitHub tag instead, whose hash is recorded above. Both identify the same release."
+      },
+      "upstream": {
+        "repo": "https://github.com/modelcontextprotocol/python-sdk",
+        "tag": "v1.29.0",
+        "tag_commit": "98b7159cb89274964055d2c016e3360a551280d0",
+        "provenance": "GitHub git-ref API for refs/tags/v1.29.0, retrieved 2026-10-01; the ref object is a commit, not an annotated tag"
+      },
+      "requires_python": ">=3.10",
+      "runtime_requirements": [
+        "anyio>=4.5",
+        "httpx<1.0.0,>=0.27.1",
+        "httpx-sse>=0.4",
+        "jsonschema>=4.20.0",
+        "pydantic<3.0.0,>=2.12.0; python_version >= \"3.14\"",
+        "pydantic-settings>=2.5.2",
+        "pyjwt[crypto]>=2.10.1",
+        "python-multipart>=0.0.9",
+        "sse-starlette>=1.6.1",
+        "starlette>=0.27; python_version < \"3.14\"",
+        "starlette>=0.48.0; python_version >= \"3.14\"",
+        "typing-extensions>=4.9.0",
+        "typing-inspection>=0.4.1",
+        "uvicorn>=0.31.1; sys_platform != \"emscripten\""
+      ],
+      "requirements_provenance": "requires_dist of https://pypi.org/pypi/mcp/1.29.0/json, retrieved 2026-10-01. The same set is what the nixpkgs expression declares as `dependencies`, so the environment satisfies the requirements without a resolver running at shell entry.",
+      "protocol": {
+        "LATEST_PROTOCOL_VERSION": "2025-11-25",
+        "DEFAULT_NEGOTIATED_VERSION": "2025-03-26",
+        "provenance": "src/mcp/types.py lines 27 and 35 of the 1.29.0 sdist",
+        "consequence": "the target revision is the SDK's own latest, so the handshake negotiates 2025-11-25 without either side forcing anything, and ServerSession echoes the client's requested version when it is supported (src/mcp/server/session.py lines 178-199)"
+      },
+      "api": {
+        "server_entry": "mcp.server.lowlevel.Server",
+        "server_decorators": ["Server.list_tools (line 440)", "Server.call_tool (line 498)"],
+        "server_run": "Server.run (line 646)",
+        "server_initialization_options": "Server.create_initialization_options (line 164)",
+        "stdio_transport": "mcp.server.stdio.stdio_server (line 34; accepts optional stdin/stdout, defaults to the process streams)",
+        "result_types": ["mcp.types.Tool", "mcp.types.CallToolResult", "mcp.types.TextContent", "mcp.types.ErrorData"],
+        "error_type": "mcp.shared.exceptions.McpError",
+        "peer_error_from_bad_params": "BaseSession._receive_loop validates every inbound request against ClientRequest and answers a failure with ErrorData(code=INVALID_PARAMS, message=\"Invalid request parameters\", data=\"\") (src/mcp/shared/session.py lines 351-395). A tools/call whose params omit the required name therefore produces a genuine JSON-RPC error member, produced by the SDK and not by the peer script.",
+        "is_error_result": "Server.call_tool's wrapper returns whatever the handler returns when it is already a CallToolResult (line 546), and _make_error_result (line 474) builds isError=true. A tool that returns CallToolResult(content=[...], isError=True) is answered with result.isError and no error member.",
+        "cancellation": "BaseSession._receive_loop intercepts notifications/cancelled, looks the requestId up in _in_flight and calls RequestResponder.cancel (src/mcp/shared/session.py lines 402-406), which cancels the handler's anyio scope and sends ErrorData(code=0, message=\"Request cancelled\") for that id (src/mcp/shared/session.py lines 138-150). Server._handle_request then suppresses the duplicate answer (src/mcp/server/lowlevel/server.py lines 769-780). The cancelled request is therefore answered with a peer error and never with the tool's result.",
+        "provenance": "all line numbers are from the 1.29.0 sdist extracted while preparing this file"
+      },
+      "runtime_assertions": [
+        "importlib.metadata.version('mcp') == '1.29.0'",
+        "mcp.types.LATEST_PROTOCOL_VERSION == '2025-11-25'"
+      ],
+      "alternatives_rejected": [
+        {
+          "what": "mcp 2.2.0 with the mcp-types 2.2.0 split",
+          "why": "genuine and supports 2025-11-25, but it is a rewrite: handlers are constructor-registered as (ctx, params) callables, the dispatcher gained a per-request cancel mode, and every deprecated 1.x symbol is gone. Nothing in the pinned nixpkgs provides it, so adopting it means a hand-written override of both distributions, and it buys no protocol coverage 1.29.0 lacks.",
+          "facts": "mcp 2.2.0 requires mcp-types==2.2.0; mcp_types/version.py KNOWN_PROTOCOL_VERSIONS lists 2024-11-05 through 2026-07-28, with 2026-07-28 served through server/discover rather than the initialize handshake"
+        },
+        {
+          "what": "mcp 1.9.4",
+          "why": "LATEST_PROTOCOL_VERSION is 2025-03-26 (src/mcp/types.py line 25 of the 1.9.4 sdist), so it cannot negotiate the required revision at all"
+        }
+      ]
+    },
+    "a2a-sdk": {
+      "distribution": "a2a-sdk",
+      "version": "1.2.1",
+      "role": "independent peer for A2A 1.0 JSON-RPC over HTTP, including Agent Card discovery",
+      "nix": {
+        "mechanism": "local buildPythonPackage over the exact PyPI release, because the pinned nixpkgs only carries 0.3.26",
+        "attribute": "a2aSdk in devenv.nix, added to python3.withPackages beside ps.mcp",
+        "why_this_derivation": "pkgs/development/python-modules/a2a-sdk/default.nix at the pinned rev declares version = \"0.3.26\"; the 0.3 line speaks protocol 0.3.0, whose method names (message/send, tasks/get) are not the 1.0 names (SendMessage, GetTask) this repository implements.",
+        "src": "fetchurl { url = \"https://files.pythonhosted.org/packages/32/13/b00cf93d0cb46010d2ea0e3132c33212bd27e44f775c98ee84ca1ba6382f/a2a_sdk-1.2.1.tar.gz\"; hash = \"sha256-BSMa3p4FmJo0RBRHREC/KrBJUDEt7VUZz3ef6h+5GNY=\"; }",
+        "src_hash_is_of": "the downloaded file as fetched (fetchurl flat hash), which is why the base64 SRI here is the SHA-256 of the sdist bytes and not a NAR hash",
+        "build_system": ["hatchling", "uv-dynamic-versioning"],
+        "version_source_fix": {
+          "what": "postPatch adds fallback-version = \"1.2.1\" to [tool.uv-dynamic-versioning]",
+          "why": "the sdist ships no .git, so the uv-dynamic-versioning hatch plugin has no VCS to read. The plugin's own documentation names this as the sandboxed-build workaround (uv_dynamic_versioning-0.14.1 docs/tips.md, \"Nix (and Other Sandboxed Build Environments)\"), and --replace-fail turns a pyproject that does not have the expected line into a build failure rather than a silently mis-versioned build.",
+          "verified_in": "the 1.2.1 sdist's [tool.uv-dynamic-versioning] block is exactly `vcs = \"git\"` and `style = \"pep440\"`, with no fallback-version"
+        }
+      },
+      "source_bytes": {
+        "pypi_sdist": {
+          "url": "https://files.pythonhosted.org/packages/32/13/b00cf93d0cb46010d2ea0e3132c33212bd27e44f775c98ee84ca1ba6382f/a2a_sdk-1.2.1.tar.gz",
+          "sha256_hex": "05231ade9e05989a344414474440bf2ab04950312ded5519cf779fea1fb918d6",
+          "sha256_sri": "sha256-BSMa3p4FmJo0RBRHREC/KrBJUDEt7VUZz3ef6h+5GNY=",
+          "verified": "downloaded from PyPI and hashed locally on 2026-10-01; the hex digest is what Nix will re-derive"
+        },
+        "pypi_wheel": {
+          "filename": "a2a_sdk-1.2.1-py3-none-any.whl",
+          "url": "https://files.pythonhosted.org/packages/cd/71/eca113a1bf8b8896389181d0cc68692011ccf0fba7b32c5746c32a04518d/a2a_sdk-1.2.1-py3-none-any.whl",
+          "sha256_hex": "5be3ed614f0dfb8f1e13c201dc603f7e01f364613951c1d492fddd1ffc010e29",
+          "sha256_sri": "sha256-W+PtYU8N+48eE8IB3GA/fgHzZGE5UcHUkv3dH/wBDik="
+        }
+      },
+      "upstream": {
+        "repo": "https://github.com/a2aproject/a2a-python",
+        "tag": "v1.2.1",
+        "tag_commit": "041c17bbe8d5ced7a8f6c48761152ce01ffbfc14",
+        "provenance": "GitHub git-ref API for refs/tags/v1.2.1, retrieved 2026-10-01"
+      },
+      "requires_python": ">=3.10",
+      "runtime_requirements": [
+        "google-api-core>=1.26.0",
+        "googleapis-common-protos>=1.70.0",
+        "httpx>=0.28.1",
+        "json-rpc>=1.15.0",
+        "packaging>=24.0",
+        "protobuf>=5.29.5",
+        "pydantic>=2.11.3",
+        "culsans>=0.11.0; python_full_version < '3.13'"
+      ],
+      "extras_used": {
+        "http-server": ["sse-starlette", "starlette"],
+        "why_not_fastapi": "create_jsonrpc_routes and create_agent_card_routes return plain starlette Routes and raise only on a missing starlette, so the peer serves them from a Starlette app and does not need the fastapi extra"
+      },
+      "requirements_provenance": "pyproject.toml [project].dependencies of the 1.2.1 sdist, retrieved 2026-10-01",
+      "protocol": {
+        "PROTOCOL_VERSION_1_0": "1.0",
+        "PROTOCOL_VERSION_0_3": "0.3",
+        "PROTOCOL_VERSION_CURRENT": "1.0",
+        "VERSION_HEADER": "A2A-Version",
+        "TransportProtocol_JSONRPC": "JSONRPC",
+        "AGENT_CARD_WELL_KNOWN_PATH": "/.well-known/agent-card.json",
+        "DEFAULT_RPC_URL": "/",
+        "A2A_JSON_MEDIA_TYPE": "application/a2a+json",
+        "provenance": "src/a2a/utils/constants.py of the 1.2.1 sdist",
+        "consequence": "the default RPC URL is the site root, so an advertised non-default path is a real test of a client that reads the card instead of guessing"
+      },
+      "api": {
+        "card_model": "a2a.types.AgentCard, a protobuf message (a2a.types.a2a_pb2). Fields: name, description, supported_interfaces[], provider, version, documentation_url, capabilities, security_schemes, security_requirements, default_input_modes, default_output_modes, skills, signatures, icon_url. There is no url field: the endpoints live in supported_interfaces[].",
+        "interface_model": "a2a.types.AgentInterface { url, protocol_binding, tenant, protocol_version }",
+        "server_routes": [
+          "a2a.server.routes.create_agent_card_routes(agent_card, card_url=...)",
+          "a2a.server.routes.create_jsonrpc_routes(request_handler, rpc_url=...)"
+        ],
+        "server_handler": "a2a.server.request_handlers.DefaultRequestHandler (an alias of DefaultRequestHandlerV2), constructed with (agent_executor, task_store, agent_card) and an InMemoryTaskStore",
+        "server_executor": "a2a.server.agent_execution.AgentExecutor, a class with async execute(context, event_queue)",
+        "client_card_resolver": "a2a.client.A2ACardResolver(httpx_client, base_url, agent_card_path=AGENT_CARD_WELL_KNOWN_PATH).get_agent_card()",
+        "client_factory": "a2a.client.ClientFactory(ClientConfig(...)); create_from_url(url) resolves the card and selects the transport",
+        "interface_selection": "ClientFactory._find_best_interface(card.supported_interfaces, protocol_bindings=[TransportProtocol.JSONRPC], url=url) picks the advertised interface and reads its protocol_version, falling back to PROTOCOL_VERSION_CURRENT only when the card advertises none",
+        "version_binding": "ClientFactory.__init__ does httpx_client.headers.setdefault(VERSION_HEADER, PROTOCOL_VERSION_CURRENT), and the server validates that header on every 1.0 method through @validate_version(constants.PROTOCOL_VERSION_1_0) (src/a2a/server/routes/jsonrpc_dispatcher.py line 349). A header that is absent is read as 0.3, and a mismatch raises VersionNotSupportedError.",
+        "jsonrpc_methods_1_0": [
+          "SendMessage",
+          "SendStreamingMessage",
+          "GetTask",
+          "ListTasks",
+          "CancelTask",
+          "CreateTaskPushNotificationConfig",
+          "GetTaskPushNotificationConfig",
+          "ListTaskPushNotificationConfigs",
+          "DeleteTaskPushNotificationConfig",
+          "SubscribeToTask",
+          "GetExtendedAgentCard"
+        ],
+        "method_table_provenance": "JsonRpcDispatcher.METHOD_TO_MODEL, src/a2a/server/routes/jsonrpc_dispatcher.py lines 115-127. The names are the gRPC service method names, which is why they are PascalCase in 1.0 where 0.3 used message/send and tasks/get.",
+        "send_message_result": "SendMessageResponse is a oneof of task and message (src/a2a/types/a2a_pb2.pyi), so a unary SendMessage answers with exactly one of the two; the dispatcher wraps whichever it got in MessageToDict(SendMessageResponse(...))",
+        "error_shape": "build_error_response maps an A2AError to a JSON-RPC error object (src/a2a/server/request_handlers/response_helpers.py line 116). Codes: MethodNotFoundError -32601, InvalidParamsError -32602, InvalidRequestError -32600, TaskNotFoundError -32001, TaskNotCancelableError -32002, UnsupportedOperationError -32004, VersionNotSupportedError -32009.",
+        "provenance": "all line numbers are from the 1.2.1 sdist extracted while preparing this file"
+      },
+      "runtime_assertions": [
+        "importlib.metadata.version('a2a-sdk') == '1.2.1'",
+        "a2a.utils.constants.PROTOCOL_VERSION_CURRENT == '1.0'"
+      ]
+    }
+  },
+  "harness": {
+    "zig_participants": {
+      "mcp": {
+        "file": "src/mcp_interop.zig",
+        "role": "MCP 2025-11-25 client over process stdio, using conn.Conn, stdio.Stdio and mcp_session.Client at Revision.previous",
+        "build": "zig build interop-mcp installs zig-agent-proto-mcp-interop; the step builds only, and the independent peer drives the exchange",
+        "flags": ["--slow-entered-file <path>", "--report-file <path>", "--cancel-timeout-ms <n>"],
+        "why_the_flag_exists": "the canceller task waits for the file the peer writes when its slow tool starts, so the cancellation cannot race the request; --cancel-timeout-ms bounds that marker wait"
+      },
+      "a2a": {
+        "file": "src/a2a_interop.zig",
+        "role": "A2A 1.0 unary JSON-RPC over std.http, through the public a2a_http module. The client role discovers the agent card, binds the first advertised JSONRPC 1.0 interface, checks it against the endpoint it was told to expect and sends two typed SendMessage calls, one answered as a Task and one as a Message. The server role serves the card at the well-known path and answers one typed SendMessage per request, in whichever arm of the result oneof the request's text asked for.",
+        "scope": "unary SendMessage only, in both roles. Nothing here claims REST, gRPC, SSE or streaming, push notification configuration, a remote task store or authentication, and the participant serves and calls no other shape than the one it claims.",
+        "build": "zig build interop-a2a installs zig-agent-proto-a2a-interop; the step builds only, and the independent peer drives the exchange",
+        "roles": {
+          "client": ["--role client", "--base-url <origin>", "--expect-endpoint <target>", "--report-file <path>"],
+          "server": ["--role server", "--port <n>", "--advertise-port <n>", "--rpc-target <target>", "--requests <n>", "--report-file <path>"]
+        },
+        "shared_flags": ["--role client|server", "--report-file <path>", "--help", "-h"],
+        "driven_as": "test/interop/a2a_peer.py --role zig-interop passes the client role --base-url and --expect-endpoint for the SDK's card, and the server role --port for a port it named itself, --advertise-port for the port its own relay is listening on, --rpc-target and --requests 6. Six is what the SDK client makes against that server: the probe's own card GET, the SDK resolver's card GET, two SendMessage calls and two calls it expects to be refused. A larger budget leaves the server waiting for a request that never comes.",
+        "outbound": "the server role prints one line of JSON on standard output naming the port it bound, the port its card advertises, its target, the card path, the protocol version and its request budget; the client role writes nothing to standard output",
+        "report": "one JSON object at --report-file per role. The client report carries the endpoint it expected, the one it selected, the selected binding and version, the index of the card interface it chose, whether they matched, both typed answers and a peer error kept beside them. The server report carries the bound and advertised ports, the target, the card path, the request budget, what it served and which arm each answer took.",
+        "both_roles_explain": "a refused command line is one message on standard error beside the usage and exit status 2; a run whose check failed writes its report, says which check on standard error and exits 1"
+      }
+    },
+    "peers": [
+      {
+        "file": "test/interop/mcp_peer.py",
+        "roles": ["supervise", "serve"],
+        "runs": "the genuine mcp SDK server as a child process over its own stdio, relayed byte for byte by the supervisor"
+      },
+      {
+        "file": "test/interop/a2a_peer.py",
+        "roles": ["supervise", "serve", "probe", "zig-interop"],
+        "runs": "the genuine a2a-sdk JSON-RPC server on loopback HTTP, the genuine a2a-sdk client against it as a baseline, and both directions of the exchange with the Zig participant, with the wire relayed through this process so every byte that crossed is captured",
+        "reads_pins": "schema, sdks, limits. The harness section records what the participants and the peer command lines are, for a reader checking them against the sources rather than for a runtime check."
+      }
+    ]
+  },
+  "limits": {
+    "capture_bytes_per_direction": 262144,
+    "capture_note": "the supervisor stops recording at the cap and fails the run; a truncated capture is never reported as a passing one",
+    "deadline_seconds_default": 60,
+    "readiness": "a child announces readiness on standard output and is waited for with whatever budget is left of the deadline; a child that starts and then says nothing is killed with its process group rather than waited on, so the deadline is enforced while waiting and not only between reads",
+    "cleanup": "every child is started in its own process group; a failure or a timeout kills the group and reaps it, so no run leaves an orphan or a blocked reader"
+  },
+  "not_claimed": [
+    "nothing here is a claim that a run passed: these pins record what the peers depend on, and the evidence that a run passed is that run's captured wire and reports, not this file",
+    "the A2A participant covers the unary JSON-RPC slice only: nothing here claims REST, gRPC, SSE or streaming, push notification configuration, a remote task store or authentication"
+  ]
+}
