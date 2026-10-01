@@ -717,7 +717,9 @@ pub const ReplayFrom = union(enum) {
     /// `{"type": "start"}`, carrying nothing but optional `_meta`.
     start,
     /// Any other `type`. The rest of the object belongs to the peer that sent
-    /// it and is not this library's to interpret.
+    /// it and is not this library's to interpret: neither arm carries it, so
+    /// a document with members beside `type` re-encodes without them.
+    /// [`encodeReplayFrom`] records that loss and what closing it would take.
     other: []const u8,
 };
 
@@ -730,10 +732,21 @@ pub fn decodeReplayFrom(raw: []const u8, scratch: []u8) DecodeError!ReplayFrom {
 
     while (try reader.nextKey(scratch)) |key| {
         if (std.mem.eql(u8, key, "type")) {
-            tag = try reader.string(scratch);
+            // The first occurrence of a repeated member wins, as in every
+            // other walk in this library. `start` and a vendor tag are
+            // different positions to resume at, so a peer that sends both must
+            // not be able to choose the one the session takes. The repeat is
+            // stepped over rather than read, so the first occurrence's text
+            // stays live in the caller's scratch.
+            if (tag != null) {
+                try reader.skipValue(scratch);
+            } else {
+                tag = try reader.string(scratch);
+            }
         } else {
             // `ReplayFromStart` carries only `_meta` and the `other` branch
             // sets `additionalProperties`, so no other member is required.
+            // None of them is carried, which `encodeReplayFrom` records.
             try reader.skipValue(scratch);
         }
     }
@@ -755,13 +768,16 @@ pub fn decodeReplayFrom(raw: []const u8, scratch: []u8) DecodeError!ReplayFrom {
 /// of them can reach, and a value this refuses is one the decoder could not
 /// have returned.
 ///
-/// One byte sequence the pair does not agree on, and it is the decoder's to
-/// answer for. `ReplayFromStart` carries an optional `_meta` that this module
-/// models nowhere, so a document with one decodes to a value that re-encodes
-/// without it. Refusing the value would not help, because the metadata is
-/// gone before any encoder sees the result; the member has to be carried by
-/// [`ReplayFrom`] itself, and that is a change to the shape rather than to
-/// this function.
+/// Two classes of byte sequence the pair does not agree on, and both are the
+/// decoder's to answer for. `ReplayFromStart` carries an optional `_meta` that
+/// this module models nowhere, and the `other` branch sets
+/// `additionalProperties`, so a document carrying members beside `type` of
+/// either kind decodes to a value that re-encodes to `{"type":"…"}`. Refusing
+/// the value would not help, because the members are gone before any encoder
+/// sees the result; they have to be carried by [`ReplayFrom`] itself, and that
+/// is a change to the shape rather than to this function. Carrying them means
+/// a borrowed lexeme beside the tag on both arms, and `src/acp_session.zig`
+/// and `src/testkit.zig` both match on and construct those arms.
 pub fn encodeReplayFrom(value: ReplayFrom, writer: *json.Writer) EncodeError!void {
     switch (value) {
         .start => try writer.slice("{\"type\":\"" ++ replay_from_type.start ++ "\"}"),
@@ -1004,14 +1020,7 @@ const CapabilityWalk = struct {
     }
 
     fn isKnown(self: *CapabilityWalk, path: []const u8) bool {
-        return switch (self.version) {
-            .stable => switch (self.side) {
-                .client => isKnownV1ClientCapability(path),
-                .agent => isKnownV1AgentCapability(path),
-                .protocol => false,
-            },
-            .draft => isKnownV2Capability(self.side, path),
-        };
+        return isKnownCapability(self.version, self.side, path);
     }
 
     /// Refuse a member whose form is not the one its version declares.
@@ -1039,6 +1048,26 @@ const CapabilityWalk = struct {
         }
     }
 };
+
+/// Whether this library names `path` as a capability of `side` at `version`.
+///
+/// The one place the answer is written. `CapabilityWalk.record` reads it on the
+/// way in and `validateCapabilityEntry` reads it on the way out, because a
+/// rule with a copy on each side that does not read the same table is a
+/// spelling that drifts. It did: the walk asked per `side` and the validator
+/// asked side-independently, so it form-checked a path the walk had already
+/// let through as an extension point and refused a value
+/// `decodeCapabilityObject` had returned.
+fn isKnownCapability(version: WireVersion, side: Side, path: []const u8) bool {
+    return switch (version) {
+        .stable => switch (side) {
+            .client => isKnownV1ClientCapability(path),
+            .agent => isKnownV1AgentCapability(path),
+            .protocol => false,
+        },
+        .draft => isKnownV2Capability(side, path),
+    };
+}
 
 /// The v1 object the session gates are nested under, in both spellings.
 ///
@@ -1152,13 +1181,19 @@ pub fn decodeCapabilityObject(
 
 /// Refuse a member whose form its version does not declare for its path.
 ///
-/// The rule `CapabilityWalk.checkForm` applies on the reading side, in one
-/// place rather than written twice. An encoder that did not apply it would
-/// advertise `terminal` as a `{}` at v1 or as a boolean at v2, and
-/// `decodeCapabilityObject` refuses both: at v1 the form is the schema's,
-/// and at v2 a boolean is a shape the draft does not define rather than a
-/// capability this library has not read.
-fn validateCapabilityEntry(version: WireVersion, entry: Capability) EncodeError!void {
+/// The rule `CapabilityWalk.checkForm` applies on the reading side, asked the
+/// same way: per `side`, through [`isKnownCapability`]. An encoder that did
+/// not apply it would advertise `terminal` as a `{}` at v1 or as a boolean at
+/// v2, and `decodeCapabilityObject` refuses both: at v1 the form is the
+/// schema's, and at v2 a boolean is a shape the draft does not define rather
+/// than a capability this library has not read. A validator that asked
+/// side-independently would go further than its decoder and refuse a value the
+/// decoder had returned.
+fn validateCapabilityEntry(
+    version: WireVersion,
+    side: Side,
+    entry: Capability,
+) EncodeError!void {
     // The value is the wire spelling of the form and carries nothing else. A
     // boolean with no value has to be written `null`, and the walk reads an
     // explicit `null` as the absent case and records no member at all. A
@@ -1168,10 +1203,13 @@ fn validateCapabilityEntry(version: WireVersion, entry: Capability) EncodeError!
     if (entry.form == .presence_object and entry.value != null) return error.InvalidField;
     switch (version) {
         .stable => {
-            // Only a path this library names is checked, because v1 has no
-            // closed capability set and an unknown path is an extension
-            // point that may take either form.
-            if (!isKnownV1Capability(entry.path)) return;
+            // Only a path this library names *for this side* is checked,
+            // because v1 has no closed capability set and an unknown path is
+            // an extension point that may take either form. The other side's
+            // table is not consulted: a client object carrying
+            // `promptCapabilities.image` names no client capability, and the
+            // walk recorded it as one that may take either form.
+            if (!isKnownCapability(.stable, side, entry.path)) return;
             if (entry.form != v1CapabilityForm(entry.path)) return error.InvalidField;
         },
         .draft => {
@@ -1195,7 +1233,7 @@ fn validateCapabilitySet(
     // Neither schema gives a capability object to a side-independent method,
     // and `decodeCapabilityObject` refuses that before it reads a byte.
     if (side == .protocol) return error.InvalidField;
-    for (set.entries) |entry| try validateCapabilityEntry(version, entry);
+    for (set.entries) |entry| try validateCapabilityEntry(version, side, entry);
 }
 
 /// The member name a top-level path takes inside the capability object.
@@ -1254,10 +1292,11 @@ fn isCapabilityAncestor(
 /// hand-built set whose paths are not a parent-then-child chain writes a
 /// shape the walk would never have produced.
 ///
-/// [`Capability.known`] is read from the path rather than written, because
-/// the decoder derives it from the path and the version and it is not a fact
-/// the wire carries. A caller that set it by hand gets the derived answer
-/// back, which is the one the gate tables are built from.
+/// [`Capability.known`] is neither read nor written. It is a fact about this
+/// library's tables rather than about the wire, so the decoder derives it with
+/// [`isKnownCapability`] and the encoder has nothing to say about it. A set
+/// built by hand keeps the flag its caller gave it, so a caller that wants the
+/// derived answer has to ask [`isKnownCapability`] itself.
 pub fn encodeCapabilityObject(
     version: WireVersion,
     side: Side,
@@ -1418,9 +1457,13 @@ pub fn encodeInitializeCapabilities(
         try writer.slice("{}");
         return;
     }
-    // Ahead of the member name rather than left to the nested call, so a
-    // refused set leaves the buffer untouched rather than holding
-    // `{"capabilities":`.
+    // Ahead of the member name rather than left to the nested call, so a set
+    // `validateCapabilitySet` refuses leaves the buffer untouched rather than
+    // holding `{"capabilities":`. A `BufferTooSmall` from the nested
+    // `encodeCapabilityObject` is the one error that still arrives after the
+    // brace and the member name are in the buffer: that call sizes nothing it
+    // can be asked about before it starts writing, so the guarantee is the
+    // validator's alone.
     try validateCapabilitySet(version, side, set);
     try writer.byte('{');
     try writer.string(member);
@@ -1479,6 +1522,13 @@ pub const PermissionOutcome = union(enum) {
 /// whole point: PROTOCOLS.md section 6.6 requires an agent receiving an
 /// unrecognised outcome to refuse to treat it as approval, and the only safe
 /// surface for that is an error the caller must handle.
+///
+/// A repeated member resolves first-wins, as in every other walk in this
+/// library. This is the decoder behind the library's central safety rule, so
+/// the case is the one `acp_session.readOutcome`'s own test names: a client
+/// that answers `cancelled` and then appends the option it wanted would have
+/// the grant read and the user shown the refusal. The repeat is stepped over
+/// rather than read, so the first occurrence's text stays live.
 pub fn decodePermissionOutcome(
     raw: []const u8,
     scratch: []u8,
@@ -1491,6 +1541,10 @@ pub fn decodePermissionOutcome(
 
     while (try reader.nextKey(scratch)) |key| {
         if (std.mem.eql(u8, key, "outcome")) {
+            if (branch != null) {
+                try reader.skipValue(scratch);
+                continue;
+            }
             const text = try reader.string(scratch);
             if (std.mem.eql(u8, text, "cancelled")) {
                 branch = .cancelled;
@@ -1503,7 +1557,13 @@ pub fn decodePermissionOutcome(
                 return error.UnknownTag;
             }
         } else if (std.mem.eql(u8, key, "optionId")) {
-            option_id = try reader.string(scratch);
+            // First-wins here too, or an outcome could name an option other
+            // than the one it was answered with.
+            if (option_id != null) {
+                try reader.skipValue(scratch);
+            } else {
+                option_id = try reader.string(scratch);
+            }
         } else {
             try reader.skipValue(scratch);
         }
@@ -1543,7 +1603,12 @@ pub const PermissionSubject = union(enum) {
     tool_call: []const u8,
     /// Carries a required `command` and a required **absolute** `cwd`.
     command: CommandSubject,
-    /// Any other `type` string. The other members of the object are opaque.
+    /// Any other `type` string. The other members of the object are the peer's
+    /// and this module reads none of them, so a subject read from a document
+    /// that had them re-encodes to `{"type":"…"}`. Carrying them would mean a
+    /// lexeme on this arm, and `acp_session` and `testkit` construct and match
+    /// on it; [`encodePermissionSubject`] records the loss and what closing it
+    /// would take.
     other: []const u8,
 };
 
@@ -1592,6 +1657,13 @@ fn nullableString(reader: *json.Reader, scratch: []u8) DecodeError!?[]const u8 {
 /// The `type` member is required and selects the arm. A missing or malformed
 /// required member of a known arm is a decode error; an unknown `type` is not,
 /// because the v2 schema defines the catch-all that receives it.
+///
+/// A repeated member resolves first-wins, as in every other walk in this
+/// library. `tool_call` and `command` are different requests to put in front of
+/// a user, and `command` is a line a user approves, so a peer that names either
+/// twice must not be able to choose which one the library shows. The repeat is
+/// stepped over rather than read, so the first occurrence's text stays live in
+/// the caller's scratch.
 pub fn decodePermissionSubject(
     raw: []const u8,
     scratch: []u8,
@@ -1602,24 +1674,55 @@ pub fn decodePermissionSubject(
     var subject: CommandSubject = .{ .command = "", .cwd = "" };
     var saw_command = false;
     var saw_cwd = false;
+    var saw_tool_call_id = false;
+    var saw_terminal_id = false;
 
     if (try reader.beginObject()) return error.MissingField;
 
     while (try reader.nextKey(scratch)) |key| {
         if (std.mem.eql(u8, key, "type")) {
-            tag = try reader.string(scratch);
+            if (tag != null) {
+                try reader.skipValue(scratch);
+            } else {
+                tag = try reader.string(scratch);
+            }
         } else if (std.mem.eql(u8, key, "toolCall")) {
-            tool_call = try reader.rawValue(scratch);
+            if (tool_call != null) {
+                try reader.skipValue(scratch);
+            } else {
+                tool_call = try reader.rawValue(scratch);
+            }
         } else if (std.mem.eql(u8, key, "command")) {
-            subject.command = try reader.string(scratch);
-            saw_command = true;
+            if (saw_command) {
+                try reader.skipValue(scratch);
+            } else {
+                subject.command = try reader.string(scratch);
+                saw_command = true;
+            }
         } else if (std.mem.eql(u8, key, "cwd")) {
-            subject.cwd = try reader.string(scratch);
-            saw_cwd = true;
+            if (saw_cwd) {
+                try reader.skipValue(scratch);
+            } else {
+                subject.cwd = try reader.string(scratch);
+                saw_cwd = true;
+            }
         } else if (std.mem.eql(u8, key, "toolCallId")) {
-            subject.tool_call_id = try nullableString(&reader, scratch);
+            // The flag rather than the value, because a first `null` reads the
+            // same as an absent member and would leave nothing to guard the
+            // second one with.
+            if (saw_tool_call_id) {
+                try reader.skipValue(scratch);
+            } else {
+                subject.tool_call_id = try nullableString(&reader, scratch);
+                saw_tool_call_id = true;
+            }
         } else if (std.mem.eql(u8, key, "terminalId")) {
-            subject.terminal_id = try nullableString(&reader, scratch);
+            if (saw_terminal_id) {
+                try reader.skipValue(scratch);
+            } else {
+                subject.terminal_id = try nullableString(&reader, scratch);
+                saw_terminal_id = true;
+            }
         } else {
             try reader.skipValue(scratch);
         }
@@ -1704,16 +1807,26 @@ fn validatePermissionSubject(subject: PermissionSubject) EncodeError!void {
 
 /// Encode a v2 `RequestPermissionSubject` object.
 ///
-/// The exact inverse of [`decodePermissionSubject`], and it refuses the three
-/// subjects its decoder refuses before it writes either.
+/// The inverse of [`decodePermissionSubject`] over every value one of them can
+/// reach, and it refuses the three subjects its decoder refuses before it
+/// writes either.
 ///
-/// The catch-all arm writes the `type` and nothing else, because the other
-/// members of such an object belong to the peer and this module models none
-/// of them. `acp_session.writePermissionSubject` takes the opposite line and
-/// refuses the arm outright, because there the missing members would be a
-/// request the agent never described. Here the caller holds a
-/// `PermissionSubject` and asked for a subject, so the discriminator is what
-/// it named and the round trip through it is exact.
+/// Two classes of byte sequence the pair does not agree on, and both are the
+/// decoder's to answer for. The catch-all arm carries the `type` and nothing
+/// else, so a subject read from a document with members of its own re-encodes
+/// to `{"type":"…"}`; and `nullableString` reads an explicit `null` on
+/// `toolCallId` or `terminalId` as the absent case, so a document that spelled
+/// one `null` re-encodes without the member. Refusing either value would not
+/// help, because what was lost is gone before any encoder sees the result;
+/// both have to be carried by [`PermissionSubject`] and [`CommandSubject`],
+/// which is a change to the shapes rather than to this function. Carrying them
+/// means a lexeme on the `.other` arm and a third state on the two optionals,
+/// and `src/acp_session.zig` and `src/testkit.zig` both construct and match on
+/// the arms that would move.
+///
+/// `acp_session.writePermissionSubject` takes the opposite line again and
+/// refuses the catch-all outright, because there the missing members would be a
+/// request the agent never described.
 pub fn encodePermissionSubject(
     subject: PermissionSubject,
     writer: *json.Writer,
@@ -1848,6 +1961,15 @@ pub const PermissionRequest = union(WireVersion) {
 /// reader's escape buffer. Nothing allocates, and a request with more options
 /// than the caller reserved is reported rather than truncated: a truncated
 /// choice list would hide the option the user wanted to pick.
+///
+/// A repeated member resolves first-wins, as in every other walk in this
+/// library. The tool call is what the agent shows the user and what
+/// `encodePermissionRequest` writes back, and the option ids are what an
+/// answer is matched against, so a peer that spells either twice must not be
+/// able to choose which one the library acts on. The repeat is stepped over
+/// rather than read, which also keeps a second `options` array from writing
+/// over the entries the first one left in the caller's array, and from
+/// replacing a count the first one set with one that satisfies `minItems`.
 pub fn decodePermissionRequest(
     version: WireVersion,
     raw: []const u8,
@@ -1858,6 +1980,9 @@ pub fn decodePermissionRequest(
     var session_id: ?[]const u8 = null;
     var title: ?[]const u8 = null;
     var description: ?[]const u8 = null;
+    // The flag rather than the value, because a first `null` reads the same as
+    // an absent member and would leave nothing to guard the second one with.
+    var saw_description = false;
     var tool_call: ?[]const u8 = null;
     var subject_text: ?[]const u8 = null;
     var option_count: usize = 0;
@@ -1867,19 +1992,49 @@ pub fn decodePermissionRequest(
 
     while (try reader.nextKey(scratch)) |key| {
         if (std.mem.eql(u8, key, "sessionId")) {
-            session_id = try reader.string(scratch);
+            if (session_id != null) {
+                try reader.skipValue(scratch);
+            } else {
+                session_id = try reader.string(scratch);
+            }
         } else if (std.mem.eql(u8, key, "title")) {
-            title = try reader.string(scratch);
+            if (title != null) {
+                try reader.skipValue(scratch);
+            } else {
+                title = try reader.string(scratch);
+            }
         } else if (std.mem.eql(u8, key, "description")) {
-            description = try nullableString(&reader, scratch);
+            if (saw_description) {
+                try reader.skipValue(scratch);
+            } else {
+                description = try nullableString(&reader, scratch);
+                saw_description = true;
+            }
         } else if (std.mem.eql(u8, key, "toolCall")) {
             // v1 only, and borrowed raw text, so it costs no scratch.
-            tool_call = try reader.rawValue(scratch);
+            if (tool_call != null) {
+                try reader.skipValue(scratch);
+            } else {
+                tool_call = try reader.rawValue(scratch);
+            }
         } else if (std.mem.eql(u8, key, "subject")) {
-            subject_text = try reader.rawValue(scratch);
+            if (subject_text != null) {
+                try reader.skipValue(scratch);
+            } else {
+                subject_text = try reader.rawValue(scratch);
+            }
         } else if (std.mem.eql(u8, key, "options")) {
-            option_count = try decodePermissionOptions(version, &reader, out_options, scratch);
-            saw_options = true;
+            if (saw_options) {
+                try reader.skipValue(scratch);
+            } else {
+                option_count = try decodePermissionOptions(
+                    version,
+                    &reader,
+                    out_options,
+                    scratch,
+                );
+                saw_options = true;
+            }
         } else {
             // A v2 request carries no `toolCall` and a v1 request no `title`,
             // so a peer that sends the other version's member is extending the
@@ -1954,9 +2109,21 @@ fn encodePermissionOption(option: PermissionOption, writer: *json.Writer) Encode
 
 /// Encode `session/request_permission` for the version the value's own tag names.
 ///
-/// The exact inverse of [`decodePermissionRequest`]: the two agree on every
-/// value one of them can reach, and every value this refuses is one the
-/// decoder could not have returned.
+/// The inverse of [`decodePermissionRequest`] over every value one of them can
+/// reach, and every value this refuses is one the decoder could not have
+/// returned.
+///
+/// Two classes of byte sequence the pair does not agree on, and both are the
+/// decoder's to answer for. An omitted member and an explicit `null` are read
+/// as one, so a `description` or a `subject` the peer spelled `null` re-encodes
+/// with the member absent; and the other version's member is stepped over
+/// rather than read, so a v1 request carrying `title`, `description` or
+/// `subject`, or a v2 one carrying `toolCall`, re-encodes without it. Refusing
+/// either would not help, because what was lost is gone before any encoder
+/// sees the result. The first has to be carried by
+/// [`PermissionRequestV2`], which would need a third state on two members, and
+/// the second by both arms; `src/acp_session.zig` and `src/testkit.zig` build
+/// and compare both, so the shape change is theirs to make with this one.
 ///
 /// The whole request is checked before the first byte is written. A refusal
 /// halfway through would leave `{"sessionId":"s1","title":"t` in the caller's
@@ -2060,15 +2227,33 @@ fn decodePermissionOption(
     if (try reader.beginObject()) return error.MissingField;
 
     while (try reader.nextKey(scratch)) |key| {
+        // First-wins for each member, as in every other walk in this library.
+        // The option id is what an answer is matched against and the kind is
+        // what decides whether it grants, so a peer that spells either twice
+        // must not be able to choose which one the caller acts on. The repeat
+        // is stepped over rather than read, so the first occurrence's text
+        // stays live in the caller's scratch.
         if (std.mem.eql(u8, key, "optionId")) {
-            option.option_id = try reader.string(scratch);
-            saw_id = true;
+            if (saw_id) {
+                try reader.skipValue(scratch);
+            } else {
+                option.option_id = try reader.string(scratch);
+                saw_id = true;
+            }
         } else if (std.mem.eql(u8, key, "name")) {
-            option.name = try reader.string(scratch);
-            saw_name = true;
+            if (saw_name) {
+                try reader.skipValue(scratch);
+            } else {
+                option.name = try reader.string(scratch);
+                saw_name = true;
+            }
         } else if (std.mem.eql(u8, key, "kind")) {
-            option.kind = try decodePermissionOptionKind(version, reader, scratch);
-            saw_kind = true;
+            if (saw_kind) {
+                try reader.skipValue(scratch);
+            } else {
+                option.kind = try decodePermissionOptionKind(version, reader, scratch);
+                saw_kind = true;
+            }
         } else {
             try reader.skipValue(scratch);
         }
@@ -2833,6 +3018,39 @@ test "a permission outcome with a second document behind it is refused" {
     try testing.expect(writer.written().len < tailed.len);
 }
 
+test "a repeated permission outcome member resolves first-wins" {
+    var scratch: [128]u8 = undefined;
+    // The threat the session layer's own test names: a client answers
+    // `cancelled` and then appends the option it wanted. The grant read would
+    // be the second one, and the user saw the first.
+    const hostile = "{\"outcome\":\"cancelled\",\"outcome\":\"selected\"," ++
+        "\"optionId\":\"allow-once\"}";
+    try testing.expectError(error.InvalidField, decodePermissionOutcome(hostile, &scratch));
+
+    // Read the other way round, the first branch is the one that stands and
+    // the pair agrees on the document that carried the repeat.
+    const branch = try decodePermissionOutcome(
+        "{\"outcome\":\"selected\",\"outcome\":\"cancelled\",\"optionId\":\"opt-1\"}",
+        &scratch,
+    );
+    try testing.expectEqualStrings("opt-1", branch.selected);
+    var buffer: [128]u8 = undefined;
+    var writer = json.Writer.init(&buffer);
+    try encodePermissionOutcome(branch, &writer);
+    try testing.expectEqualStrings(
+        "{\"outcome\":\"selected\",\"optionId\":\"opt-1\"}",
+        writer.written(),
+    );
+
+    // The option id resolves the same way, so an outcome cannot name an option
+    // other than the one it was answered with.
+    const chosen = try decodePermissionOutcome(
+        "{\"outcome\":\"selected\",\"optionId\":\"opt-1\",\"optionId\":\"opt-2\"}",
+        &scratch,
+    );
+    try testing.expectEqualStrings("opt-1", chosen.selected);
+}
+
 test "an absolute path starts at the root" {
     try testing.expect(isAbsolutePath("/"));
     try testing.expect(isAbsolutePath("/srv/work"));
@@ -2934,6 +3152,35 @@ test "a permission subject with a second document behind it is refused" {
     try testing.expectError(error.MalformedJson, decodePermissionSubject(
         \\{"type":"review"} trailing
     , &scratch));
+}
+
+test "a repeated subject member resolves first-wins" {
+    var scratch: [256]u8 = undefined;
+    // `tool_call` and `command` are different requests to put in front of a
+    // user, and a peer that names both must not be able to choose which one
+    // the library shows. The arm is the one the first member named.
+    const hostile = "{\"type\":\"tool_call\",\"type\":\"command\"," ++
+        "\"command\":\"rm -rf /\",\"cwd\":\"/\"," ++
+        "\"toolCall\":{\"kind\":\"read\"}}";
+    const first = try decodePermissionSubject(hostile, &scratch);
+    try testing.expect(first == .tool_call);
+    try testing.expectEqualStrings("{\"kind\":\"read\"}", first.tool_call);
+
+    // The first command line is the one the user reads, and a later one cannot
+    // replace it. The repeat is stepped over rather than read, so the first
+    // occurrence's text stays live in the scratch the caller owns.
+    const command = "{\"type\":\"command\",\"command\":\"ls\",\"cwd\":\"/tmp\"," ++
+        "\"command\":\"rm -rf /\",\"cwd\":\"/\"}";
+    const shown = try decodePermissionSubject(command, &scratch);
+    try testing.expectEqualStrings("ls", shown.command.command);
+    try testing.expectEqualStrings("/tmp", shown.command.cwd);
+
+    // An optional is resolved the same way, so a repeat cannot move the tool
+    // call a command is attributed to.
+    const ids = "{\"type\":\"command\",\"command\":\"ls\",\"cwd\":\"/tmp\"," ++
+        "\"toolCallId\":\"first\",\"toolCallId\":\"second\"}";
+    const named = try decodePermissionSubject(ids, &scratch);
+    try testing.expectEqualStrings("first", named.command.tool_call_id.?);
 }
 
 test "elicitation modes and actions are the stated sets" {
@@ -3116,6 +3363,31 @@ test "an option needs its optionId, its name and its kind" {
     , &options, &scratch));
 }
 
+test "a repeated option member resolves first-wins" {
+    var scratch: [256]u8 = undefined;
+    var options: [1]PermissionOption = undefined;
+    // The option id is what `acp_session.readOutcome` matches the grant
+    // against, so a peer that names it twice must not be able to choose which
+    // one the caller compares.
+    const hostile = "{\"sessionId\":\"s\",\"toolCall\":{},\"options\":[" ++
+        "{\"optionId\":\"a\",\"name\":\"No\",\"kind\":\"reject_once\"," ++
+        "\"optionId\":\"allow-once\",\"name\":\"Yes\",\"kind\":\"allow_once\"}]}";
+    const request = try decodePermissionRequest(.stable, hostile, &options, &scratch);
+    const option = request.stable.options[0];
+    try testing.expectEqualStrings("a", option.option_id);
+    try testing.expectEqualStrings("No", option.name);
+    try testing.expectEqual(PermissionOptionKind.reject_once, option.kind.known);
+    try testing.expectEqual(@as(?bool, false), option.grants());
+
+    // A repeated `kind` resolves the same way, so a grant cannot be moved from
+    // a rejection to an approval behind the user's back.
+    const moved = "{\"sessionId\":\"s\",\"toolCall\":{},\"options\":[" ++
+        "{\"optionId\":\"a\",\"name\":\"No\",\"kind\":\"reject_once\"," ++
+        "\"kind\":\"allow_once\"}]}";
+    const again = try decodePermissionRequest(.stable, moved, &options, &scratch);
+    try testing.expectEqual(@as(?bool, false), again.stable.options[0].grants());
+}
+
 test "more options than the caller reserved is BufferTooSmall" {
     var scratch: [256]u8 = undefined;
     var one: [1]PermissionOption = undefined;
@@ -3127,6 +3399,59 @@ test "more options than the caller reserved is BufferTooSmall" {
         error.BufferTooSmall,
         decodePermissionRequest(.stable, source, &one, &scratch),
     );
+}
+
+test "a repeated permission request member resolves first-wins" {
+    var scratch: [512]u8 = undefined;
+    var options: [2]PermissionOption = undefined;
+    // The tool call is what the agent shows the user and what
+    // `encodePermissionRequest` writes back, so a second one must not be able
+    // to replace the first.
+    const hostile = "{\"sessionId\":\"s1\",\"title\":\"Read\"," ++
+        "\"toolCall\":{\"kind\":\"read\"},\"options\":[" ++
+        "{\"optionId\":\"a\",\"name\":\"Allow\",\"kind\":\"allow_once\"}]," ++
+        "\"toolCall\":{\"kind\":\"execute\",\"command\":\"rm -rf /\"}}";
+    const request = try decodePermissionRequest(.stable, hostile, &options, &scratch);
+    try testing.expectEqualStrings("{\"kind\":\"read\"}", request.stable.tool_call);
+    var buffer: [512]u8 = undefined;
+    var writer = json.Writer.init(&buffer);
+    try encodePermissionRequest(request, &writer);
+    try testing.expect(std.mem.startsWith(
+        u8,
+        writer.written(),
+        "{\"sessionId\":\"s1\",\"toolCall\":{\"kind\":\"read\"}",
+    ));
+
+    // The second array is stepped over rather than read, so it cannot fill the
+    // caller's array and it cannot replace a count the first one set with one
+    // that satisfies `minItems`.
+    const counted = "{\"sessionId\":\"s1\",\"title\":\"t\",\"options\":[]," ++
+        "\"options\":[{\"optionId\":\"a\",\"name\":\"A\",\"kind\":\"allow_once\"}]}";
+    try testing.expectError(
+        error.InvalidField,
+        decodePermissionRequest(.draft, counted, &options, &scratch),
+    );
+    var one: [1]PermissionOption = undefined;
+    const roomy = "{\"sessionId\":\"s\",\"toolCall\":{},\"options\":[" ++
+        "{\"optionId\":\"a\",\"name\":\"A\",\"kind\":\"allow_once\"}]," ++
+        "\"options\":[{\"optionId\":\"b\",\"name\":\"B\",\"kind\":\"allow_once\"}," ++
+        "{\"optionId\":\"c\",\"name\":\"C\",\"kind\":\"reject_once\"}]}";
+    const kept = try decodePermissionRequest(.stable, roomy, &one, &scratch);
+    try testing.expectEqual(@as(usize, 1), kept.stable.options.len);
+    try testing.expectEqualStrings("a", kept.stable.options[0].option_id);
+
+    // The session id resolves the same way, so the request the caller acts on
+    // is the one the first member named.
+    var named_options: [1]PermissionOption = undefined;
+    const named = "{\"sessionId\":\"s1\",\"sessionId\":\"s2\",\"toolCall\":{}," ++
+        "\"options\":[]}";
+    const named_request = try decodePermissionRequest(
+        .stable,
+        named,
+        &named_options,
+        &scratch,
+    );
+    try testing.expectEqualStrings("s1", named_request.stable.session_id);
 }
 
 test "a v2 permission request requires a title and one option at least" {
@@ -3319,6 +3644,20 @@ test "a second document behind a replayFrom is refused" {
     try testing.expectError(error.MalformedJson, decodeReplayFrom(
         \\{"type":"checkpoint","cursor":42} trailing
     , &scratch));
+}
+
+test "a repeated replayFrom type resolves first-wins" {
+    var scratch: [64]u8 = undefined;
+    // `start` and a vendor tag are different positions to resume at, so a peer
+    // that sends both must not be able to choose which one the session takes.
+    const start = try decodeReplayFrom("{\"type\":\"start\",\"type\":\"checkpoint\"}", &scratch);
+    try testing.expect(start == .start);
+
+    // The other way round the first tag is the catch-all, and the catch-all is
+    // what stays carried.
+    const other = try decodeReplayFrom("{\"type\":\"checkpoint\",\"type\":\"start\"}", &scratch);
+    try testing.expect(other == .other);
+    try testing.expectEqualStrings("checkpoint", other.other);
 }
 
 test "a paths buffer sized to the recorded paths is enough" {
@@ -3923,6 +4262,74 @@ test "a capability member the decoder would refuse is not written" {
     );
     try testing.expectEqual(@as(usize, 1), flat_set.entries.len);
     try testing.expectEqualStrings("vendor.flag", flat_set.entries[0].path);
+}
+
+test "a capability the decoder let through is written for the side that let it" {
+    var scratch: [256]u8 = undefined;
+    var paths: [256]u8 = undefined;
+    var out: [8]Capability = undefined;
+    var buffer: [256]u8 = undefined;
+    // `promptCapabilities.image` is an agent gate, so a *client* object that
+    // carries it holds a path this library does not name for that side. v1 has
+    // no closed capability set, so an unknown path is the extension point and
+    // either form is legal. The validator has to ask the same per-side question
+    // the walk asked on the way in, or it refuses a value the decoder returned
+    // and `decode(encode(x)) == x` fails on the decoder's own output.
+    const source = "{\"promptCapabilities\":{\"image\":{}}}";
+    const set = try decodeCapabilityObject(.stable, .client, source, &out, &paths, &scratch);
+    const entry = findCapability(set, "promptCapabilities.image").?;
+    try testing.expect(!entry.known);
+    try testing.expectEqual(CapabilityForm.presence_object, entry.form);
+
+    var writer = json.Writer.init(&buffer);
+    try encodeCapabilityObject(.stable, .client, set, &writer);
+    try testing.expectEqualStrings(source, writer.written());
+
+    // The other spelling of the same drift: `session.close` is a presence
+    // object on an agent object and no client capability at all, so a client
+    // object may carry the boolean the walk read.
+    // Its own array and paths, because `set` above borrows the ones the first
+    // decode filled and a second walk into them would land on top of it.
+    var other_out: [8]Capability = undefined;
+    var other_paths: [128]u8 = undefined;
+    const boolean_side = try decodeCapabilityObject(
+        .stable,
+        .client,
+        "{\"session\":{\"close\":true}}",
+        &other_out,
+        &other_paths,
+        &scratch,
+    );
+    var boolean_writer = json.Writer.init(&buffer);
+    try encodeCapabilityObject(.stable, .client, boolean_side, &boolean_writer);
+    try testing.expectEqualStrings(
+        "{\"session\":{\"close\":true}}",
+        boolean_writer.written(),
+    );
+
+    // The same set through the `initialize` member, which is the call
+    // `acp_session` makes with a decoded set.
+    var init_writer = json.Writer.init(&buffer);
+    try encodeInitializeCapabilities(.stable, .client, set, &init_writer);
+    try testing.expectEqualStrings(
+        "{\"" ++ v2_renames.client_capabilities_v1 ++
+            "\":{\"promptCapabilities\":{\"image\":{}}}}",
+        init_writer.written(),
+    );
+
+    // The check is not gone, only asked per side: the same path on the agent
+    // side is a boolean the schema types, and the presence object is refused.
+    var refuser = json.Writer.init(&buffer);
+    try testing.expectError(error.InvalidField, encodeCapabilityObject(.stable, .agent, .{
+        .entries = &.{.{
+            .path = "promptCapabilities.image",
+            .known = true,
+            .form = .presence_object,
+            .value = null,
+        }},
+        .present = true,
+    }, &refuser));
+    try testing.expectEqual(@as(usize, 0), refuser.written().len);
 }
 
 test "the initialize capability member round-trips through the encoder" {

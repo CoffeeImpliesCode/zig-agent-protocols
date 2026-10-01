@@ -342,13 +342,19 @@ pub fn checkCall(
 /// uses, and a session stores the path list rather than the entries: the entries
 /// come out of caller buffers of three different sizes, and keeping all of them
 /// alive to answer a gate is a cost no gate needs.
+///
+/// This is [`acp.advertisedPaths`] under the name the session layer uses, and
+/// deliberately not a second walk over the entries. What decides whether a
+/// decoded member is support is [`acp.Capability.advertised`], and the part of
+/// it that is easy to lose is the v1 boolean: the member is on the wire either
+/// way, so a walk that copied every path would hand the gate a capability the
+/// peer answered `false` on, and `session/load` would go to an agent that said
+/// in its own `initialize` that it does not serve it. One walk, one predicate.
 pub fn capabilityPaths(
     set: acp.CapabilitySet,
     out: [][]const u8,
-) Error![]const []const u8 {
-    if (set.entries.len > out.len) return error.BufferTooSmall;
-    for (set.entries, 0..) |entry, index| out[index] = entry.path;
-    return out[0..set.entries.len];
+) root.DecodeError![]const []const u8 {
+    return acp.advertisedPaths(set, out);
 }
 
 // --- The client side ----------------------------------------------------------
@@ -693,6 +699,13 @@ pub const Agent = struct {
     /// never chose, so the call stops here rather than sending a request whose
     /// answer it may not be able to read.
     ///
+    /// `params` is the third region and is written while `permission` is still
+    /// borrowed from `request_scratch`: the body quotes the option ids the
+    /// answer is then checked against, so one buffer for both builds a request
+    /// out of the ids it is about to compare, and the answer may match a
+    /// mangled entry. All three pairs are refused for the reason the first one
+    /// is, and refused before a byte goes out.
+    ///
     /// An outcome this library cannot parse is [`PermissionDecision.unreadable`]
     /// and not a Zig error, so the two-arm `switch` PROTOCOLS.md 6.6 requires
     /// still fails to compile without an `unreadable` arm. A client that
@@ -707,9 +720,15 @@ pub const Agent = struct {
         request_scratch: []u8,
         outcome_scratch: []u8,
     ) Error!PermissionDecision {
-        if (conn.overlaps(request_scratch, outcome_scratch)) {
-            return .{ .unreadable = error.InvalidField };
-        }
+        // `params` joins the pair above rather than sitting beside it: it is
+        // written by `permissionParams` while `permission` is still borrowed
+        // from `request_scratch`, and it is `findOption` that compares the two
+        // afterwards. One buffer for a scratch and for `params` is the same
+        // fault one buffer for both scratches is, one step earlier.
+        const shared = conn.overlaps(request_scratch, outcome_scratch) or
+            conn.overlaps(params, request_scratch) or
+            conn.overlaps(params, outcome_scratch);
+        if (shared) return .{ .unreadable = error.InvalidField };
         const body = try permissionParams(permission, params);
         const answer = try self.request("session/request_permission", body, result, out);
         return readOutcome(answer.body, permission, request_scratch, outcome_scratch);
@@ -847,6 +866,18 @@ pub const PermissionDecision = union(enum) {
 /// borrowed from that buffer, `findOption` matches one id against itself, and
 /// `grants` is true for an option the client never chose. The id is
 /// peer-controlled, so that is a grant no user made.
+///
+/// A repeated member inside the outcome object resolves first-wins, which is
+/// what the `json.memberText` call above does with the outer `outcome` and
+/// what `jsonrpc.decode` does with every member it reads, so one rule settles
+/// the whole answer and every reader of this body reaches the same decision.
+/// The repeat cannot carry a grant past a refusal either, because
+/// `acp.decodePermissionOutcome` returns `error.InvalidField` for a cancelled
+/// outcome that names an option: a cancellation with an option on it
+/// contradicts itself. So a client that answered `cancelled` and appended the
+/// option it wanted hands the agent a cancellation rather than that option,
+/// and a client that answered `selected` and appended `cancelled` is read as
+/// the grant its own first member authorised.
 pub fn readOutcome(
     body: []const u8,
     request: *const acp.PermissionRequest,
@@ -1200,20 +1231,37 @@ fn readHandshake(client: *Client, answer: conn.Response, scratch: []u8) Error!Ha
     };
 }
 
+/// Read the `protocolVersion` the agent answered with.
+///
+/// First-wins, as every other walk in the tree is: RFC 8259 section 4 says the
+/// names in an object should be unique, and a peer that sends `2` and then `1`
+/// gets the session pinned to the version it named first rather than to the one
+/// it named last. Nothing here is inferred from the second occurrence, and the
+/// value is not re-read once one has been taken, so a repeat cannot rewrite a
+/// version a reader has already resolved.
 fn readProtocolVersion(body: []const u8, scratch: []u8) root.DecodeError!u16 {
     var reader = json.Reader.init(body);
     var number: ?u16 = null;
     if (try reader.beginObject()) return error.MissingField;
     while (try reader.nextKey(scratch)) |key| {
         if (std.mem.eql(u8, key, "protocolVersion")) {
-            const lexeme = try reader.number();
-            // A float, an exponent or an out-of-range integer is a shape the
-            // schema does not declare for this member, not a version.
-            number = std.fmt.parseInt(u16, lexeme, 10) catch return error.InvalidField;
+            if (number == null) {
+                const lexeme = try reader.number();
+                // A float, an exponent or an out-of-range integer is a shape
+                // the schema does not declare for this member, not a version.
+                number = std.fmt.parseInt(u16, lexeme, 10) catch return error.InvalidField;
+            } else {
+                try reader.skipValue(scratch);
+            }
         } else {
             try reader.skipValue(scratch);
         }
     }
+    // An answer is one JSON value. Bytes behind the closing brace are not part
+    // of the version, and `jsonrpc.decode` refuses the same document for the
+    // same reason, so a body that reached here with a tail is refused here too
+    // rather than read as the head of a longer document.
+    if (!reader.atEnd()) return error.MalformedJson;
     return number orelse error.MissingField;
 }
 
@@ -1500,6 +1548,95 @@ test "the outcome that is read is the first one the client sent" {
     try testing.expect(twice == .cancelled);
 }
 
+test "a repeated member in the outcome object is read first-wins" {
+    // One rule for the whole tree: `json.memberText` peels the outer `outcome`
+    // first-wins, `jsonrpc.decode` does the same, and
+    // `acp.decodePermissionOutcome` settles the members inside. A body that
+    // names its decision twice therefore has one decision, and every reader of
+    // it reaches that one.
+    var options: [2]acp.PermissionOption = undefined;
+    var request_scratch: [512]u8 = undefined;
+    const request = try decodeRequest(
+        .stable,
+        "{\"sessionId\":\"s1\",\"toolCall\":{},\"options\":[" ++
+            "{\"optionId\":\"yes\",\"name\":\"Yes\",\"kind\":\"allow_once\"}," ++
+            "{\"optionId\":\"no\",\"name\":\"No\",\"kind\":\"reject_once\"}]}",
+        &options,
+        &request_scratch,
+    );
+    var outcome_scratch: [256]u8 = undefined;
+    const reason: root.DecodeError = error.InvalidField;
+
+    // A refusal the client sent first is the refusal that stands. The option
+    // appended behind it refuses the answer rather than granting it, and it
+    // refuses it under the codec's own rule: a cancelled outcome that names an
+    // option contradicts itself. This is the direction that matters, because
+    // last-wins reads the appended `selected` and hands the agent an option the
+    // user declined, and nothing has to notice this document for that to
+    // happen.
+    const contradicted = readOutcome(
+        \\{"outcome":{"outcome":"cancelled","outcome":"selected","optionId":"yes"}}
+    , &request, &request_scratch, &outcome_scratch);
+    switch (contradicted) {
+        .unreadable => |err| try testing.expectEqual(reason, err),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(?ReadableOutcome, null), contradicted.readable());
+
+    // A cancellation with nothing contradicting it is still a cancellation,
+    // rather than the refusal a repeat used to earn.
+    const cancelled = readOutcome(
+        \\{"outcome":{"outcome":"cancelled","outcome":"selected"}}
+    , &request, &request_scratch, &outcome_scratch);
+    try testing.expect(cancelled == .cancelled);
+    try testing.expectEqual(ReadableOutcome{ .cancelled = {} }, cancelled.readable().?);
+
+    // The same append under an escaped name, which is the one spelling this
+    // walk can see: `json.Reader.nextKey` unescapes before it compares, so an
+    // escaped `outcome` in front of a plain one is the repeat that decides the
+    // answer and not a key to step over on the way to a later `selected`.
+    const escaped = readOutcome(
+        \\{"outcome":{"\u006futcome":"cancelled","outcome":"selected","optionId":"yes"}}
+    , &request, &request_scratch, &outcome_scratch);
+    switch (escaped) {
+        .unreadable => |err| try testing.expectEqual(reason, err),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(?ReadableOutcome, null), escaped.readable());
+
+    // And the other direction: a grant the client sent first stays the grant,
+    // with the cancellation behind it stepped over. Last-wins refused this
+    // answer, so it is the case to be careful about, and what makes it sound is
+    // that the id the client named first is an option this request offered,
+    // which is the check every grant passes, and that refusing it would put
+    // this layer at odds with the `memberText` call it delegates to.
+    const granted = readOutcome(
+        \\{"outcome":{"outcome":"selected","optionId":"yes","outcome":"cancelled"}}
+    , &request, &request_scratch, &outcome_scratch);
+    try testing.expectEqual(true, granted.grants);
+    try testing.expectEqual(ReadableOutcome{ .grants = true }, granted.readable().?);
+
+    // The option named twice is first-wins for the same reason, so the id
+    // checked against the request is the one the client named first and not
+    // whatever it appended behind it.
+    const id_twice = readOutcome(
+        \\{"outcome":{"outcome":"selected","optionId":"yes","optionId":"other"}}
+    , &request, &request_scratch, &outcome_scratch);
+    try testing.expectEqual(true, id_twice.grants);
+
+    // And an id this request never offered is still consent to nothing, which
+    // is what bounds this: a repeat decides which occurrence stands, it never
+    // widens the set of options a grant may name.
+    const appended = readOutcome(
+        \\{"outcome":{"outcome":"selected","\u006futcome":"cancelled","optionId":"other"}}
+    , &request, &request_scratch, &outcome_scratch);
+    switch (appended) {
+        .unreadable => |err| try testing.expectEqual(reason, err),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(?ReadableOutcome, null), appended.readable());
+}
+
 test "an outcome naming an option the request never offered is consent to nothing" {
     var options: [1]acp.PermissionOption = undefined;
     var request_scratch: [512]u8 = undefined;
@@ -1603,6 +1740,71 @@ test "one buffer for both scratches is refused before a byte is sent" {
         else => return error.TestUnexpectedResult,
     }
     try testing.expectEqual(@as(?ReadableOutcome, null), decision.readable());
+}
+
+test "one buffer for params and a scratch is refused before a byte is sent" {
+    // `params` is the region `permissionParams` writes while the option ids it
+    // quotes are still borrowed from `request_scratch`, so a caller that hands
+    // over one buffer for both builds the request over the very ids the answer
+    // is checked against. The connection is `undefined` for the same reason as
+    // in the test above: the refusal happens before the agent reaches it, so a
+    // caller that got past it faults here rather than reading an answer nobody
+    // can vouch for.
+    var agent: Agent = .{ .connection = undefined, .version = .stable };
+    var options: [1]acp.PermissionOption = undefined;
+    var request_scratch: [512]u8 = undefined;
+    // The option id carries an escape, so it is borrowed from the scratch rather
+    // than from the fixture, and the two regions really do hold the same value.
+    const request = try decodeRequest(
+        .stable,
+        "{\"sessionId\":\"s1\",\"toolCall\":{},\"options\":[" ++
+            "{\"optionId\":\"\\u0079es\",\"name\":\"Yes\",\"kind\":\"allow_once\"}]}",
+        &options,
+        &request_scratch,
+    );
+    var result: [128]u8 = undefined;
+    var out: [128]u8 = undefined;
+    var outcome_scratch: [256]u8 = undefined;
+
+    const reason: root.DecodeError = error.InvalidField;
+    const into_params = try agent.requestPermission(
+        &request,
+        &result,
+        &out,
+        &request_scratch,
+        &request_scratch,
+        &outcome_scratch,
+    );
+    switch (into_params) {
+        .unreadable => |err| try testing.expectEqual(reason, err),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // And the same buffer handed over as the outcome region rather than as the
+    // request's, which is the other pair `params` joins. The request is decoded
+    // a second time into its own region so the two scratches here are not the
+    // pair the call above already covers.
+    var other_options: [1]acp.PermissionOption = undefined;
+    var other_scratch: [512]u8 = undefined;
+    const other_request = try decodeRequest(
+        .stable,
+        "{\"sessionId\":\"s1\",\"toolCall\":{},\"options\":[" ++
+            "{\"optionId\":\"\\u0079es\",\"name\":\"Yes\",\"kind\":\"allow_once\"}]}",
+        &other_options,
+        &other_scratch,
+    );
+    const into_outcome = try agent.requestPermission(
+        &other_request,
+        &result,
+        &out,
+        &other_scratch,
+        &request_scratch,
+        &other_scratch,
+    );
+    switch (into_outcome) {
+        .unreadable => |err| try testing.expectEqual(reason, err),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "a v2 catch-all option kind is unreadable, not a grant and not a refusal" {
@@ -2025,6 +2227,37 @@ test "a downgrade is read in the version the agent answered with" {
     try testing.expect(bare.capabilities == null);
 }
 
+test "the version read is the first one the agent sent" {
+    // RFC 8259 section 4 says the names in an object should be unique, and a
+    // peer that sends `2` and then `1` is a document the grammar permits. The
+    // first occurrence is the answer every other walk in the tree gives, and a
+    // session pinned to the version the agent named last is pinned to a
+    // registry the agent may not have answered for.
+    var scratch: [128]u8 = undefined;
+    try testing.expectEqual(
+        @as(u16, 2),
+        try readProtocolVersion("{\"protocolVersion\":2,\"protocolVersion\":1}", &scratch),
+    );
+    try testing.expectEqual(
+        @as(u16, 1),
+        try readProtocolVersion("{\"agentInfo\":{\"name\":\"a\"},\"protocolVersion\":1}", &scratch),
+    );
+    // A body that carries no version member is a missing one, whatever else it
+    // does carry.
+    try testing.expectError(
+        error.MissingField,
+        readProtocolVersion("{\"info\":{\"name\":\"a\"}}", &scratch),
+    );
+    // Bytes behind the closing brace are not part of the version. Nothing in
+    // this library can put one here today — `jsonrpc.decode` proved the result a
+    // peer answers with is one value before this reads it — and the check is
+    // here because the rule is about this function and not about one caller.
+    try testing.expectError(
+        error.MalformedJson,
+        readProtocolVersion("{\"protocolVersion\":1} {\"protocolVersion\":1}", &scratch),
+    );
+}
+
 test "a short scratch is the caller's fault and not a verdict on the peer" {
     // An answer that carries a version, and a key the caller's scratch cannot
     // unescape. The peer did nothing wrong, and `NotAResult` would say it sent
@@ -2239,6 +2472,57 @@ test "capability paths are collected in the spelling a gate uses" {
     // report a gate the peer advertised as one it did not.
     var one: [1][]const u8 = undefined;
     try testing.expectError(error.BufferTooSmall, capabilityPaths(set, &one));
+}
+
+test "a v1 capability answered false is not support" {
+    // PROTOCOLS.md 6.5 makes omission mean unsupported, and a v1 boolean has a
+    // third spelling: `false`. The member is on the wire either way, so a walk
+    // that copied every path would hand the gate a capability the agent
+    // explicitly refused, and `session/load` would go to an agent that said in
+    // its own `initialize` that it does not serve it.
+    var entries: [4]acp.Capability = undefined;
+    var paths_buffer: [192]u8 = undefined;
+    var scratch: [256]u8 = undefined;
+    const refused = try acp.decodeCapabilityObject(
+        .stable,
+        .agent,
+        "{\"loadSession\":false,\"mcpCapabilities\":{\"http\":false}}",
+        &entries,
+        &paths_buffer,
+        &scratch,
+    );
+    // Both booleans were decoded, so the peer is taken at its word about them:
+    // the member is on the wire and its value is `false`. The object around
+    // `http` is itself an entry and advertises by existing, which is what a
+    // presence object is, and it is the only path left in the list.
+    try testing.expectEqual(@as(usize, 3), refused.entries.len);
+    var list: [4][]const u8 = undefined;
+    const paths = try capabilityPaths(refused, &list);
+    try testing.expectEqual(@as(usize, 1), paths.len);
+    try testing.expectEqualStrings("mcpCapabilities", paths[0]);
+
+    var client: Client = .{ .connection = undefined, .version = .stable };
+    client.setAgentCapabilities(paths);
+    try testing.expectError(error.NotPermitted, client.gate("session/load", .request));
+
+    // The same object with the values flipped opens the gate, so the refusal
+    // above is about the value and not about the spelling of the set. Its
+    // buffers are its own, because the first set's paths borrow the first ones.
+    var other_entries: [4]acp.Capability = undefined;
+    var other_paths: [192]u8 = undefined;
+    var other_scratch: [256]u8 = undefined;
+    const offered = try acp.decodeCapabilityObject(
+        .stable,
+        .agent,
+        "{\"loadSession\":true,\"mcpCapabilities\":{\"http\":true}}",
+        &other_entries,
+        &other_paths,
+        &other_scratch,
+    );
+    var other_list: [4][]const u8 = undefined;
+    const advertised = try capabilityPaths(offered, &other_list);
+    client.setAgentCapabilities(advertised);
+    _ = try client.gate("session/load", .request);
 }
 
 /// A policy with no decision, for the auto-decide test.
