@@ -9,15 +9,21 @@
 //! normative examples themselves the regression net, so a change to a tag, a
 //! spelling or a required member moves one of them.
 //!
-//! Two of them go back out as well. The `bridge` encoders are the pair this
-//! library exists to keep honest: a member a decoder accepted and then did not
-//! write back re-encodes to a document that still decodes cleanly, so nothing
+//! Three of them go back out as well — both `bridge` encoders and the MCP
+//! interim-result encoder. A member a decoder accepted and then did not write
+//! back re-encodes to a document that still decodes cleanly, so nothing
 //! downstream ever reports the loss. No fixture under `test/golden/` carries
 //! the ACP carrier `_meta` that loss is about, and the step did not call
-//! either encoder at all, so the two tests below wrap the normative payloads
-//! in the carrier the RFD names and compare the written bytes against them
-//! literally. That is the only coverage those two encoders have in the
+//! either `bridge` encoder at all, so the two tests below wrap the normative
+//! payloads in the carrier the RFD names and compare the written bytes against
+//! them literally. That is the only coverage those two encoders have in the
 //! default step, and it is the coverage the binding's own loss class needs.
+//!
+//! The same class reaches the MCP result objects, and the one open-set vector
+//! there carries what it needs to carry: `mcp_mrtr_result.json` holds a `_meta`
+//! and a vendor key the `InputRequiredResult` shape does not model, so the
+//! round trip below compares every byte the encoder wrote against a literal
+//! rather than against a second decode of the same fixture.
 //!
 //! ## Provenance
 //!
@@ -43,15 +49,23 @@
 //!
 //! | Fixture | Source |
 //! | --- | --- |
-//! | `mcp_mrtr_result.json` | `mcp-2026-07-28.md` 10, the `InputRequiredResult` interface |
+//! | `mcp_mrtr_result.json` | `mcp-2026-07-28.md` 10, the `InputRequiredResult`
+//!   interface, and section 2 for the two members that interface does not
+//!   model: the reserved `io.modelcontextprotocol/serverInfo` key every result
+//!   `_meta` carries, and the key grammar a vendor key is spelled with |
+//! | `mcp_mrtr_result_bare.json` | `mcp-2026-07-28.md` 10, the *"At least one of
+//!   `inputRequests` or `requestState` MUST be present"* sentence — the one
+//!   document here a receiver must refuse, so it is a vector too |
 //! | `acp_session_new_request.json` | `acp-v1-v2.md` 3a and 10e, the v1 `session/new`
 //!   required list and the server declaration |
 //! | `acp_permission_outcome_selected.json` | `acp-v1-v2.md` 5b, the `selected` branch of `RequestPermissionOutcome` |
 //! | `acp_permission_outcome_cancelled.json` | `acp-v1-v2.md` 5b, the `cancelled` branch |
 //! | `acp_permission_request_v1.json` | `acp-v1-v2.md` 5a and 5c, the v1 required lists |
-//! | `jsonrpc_request.json`, `jsonrpc_notification.json` | `mcp-2026-07-28.md` section 1, the JSON-RPC message table |
+//! | `jsonrpc_request.json`, `jsonrpc_notification.json` | `mcp-2026-07-28.md` section 1, the JSON-RPC message table. The `progressToken` the notification carries is the one member whose placement the sources answer differently; see the note at that test |
 //! | `bridge_outcome_error.json` | `acp-v1-v2.md` 10d, `-32022` inside the outcome carrier |
-//! | `bridge_outcome_result.json` | `mcp-2026-07-28.md` 5, a `complete` result |
+//! | `bridge_outcome_result.json` | `mcp-2026-07-28-schema.md` 4, the
+//!   `CallToolResult` declaration, whose required `content` is the member this
+//!   fixture exists to carry |
 
 const std = @import("std");
 const proto = @import("zig-agent-proto");
@@ -88,10 +102,31 @@ const Fixture = struct {
     mcp_client_capabilities_meta: []const u8 = @embedFile("golden/mcp_client_capabilities_meta.json"),
     mcp_message_request: []const u8 = @embedFile("golden/mcp_message_request.json"),
     mcp_mrtr_result: []const u8 = @embedFile("golden/mcp_mrtr_result.json"),
+    mcp_mrtr_result_bare: []const u8 = @embedFile("golden/mcp_mrtr_result_bare.json"),
     mcp_server_capabilities: []const u8 = @embedFile("golden/mcp_server_capabilities.json"),
 };
 
 const fixture: Fixture = .{};
+
+/// Every fixture, with the file name it is embedded under.
+///
+/// Walking `Fixture` rather than restating its eighteen lines here means a
+/// fixture added there is reached by the well-formedness test without a second
+/// edit, and a failure there names the file rather than a line number.
+const every_fixture = blk: {
+    var list: [std.meta.fields(Fixture).len]struct { name: []const u8, bytes: []const u8 } = undefined;
+    for (std.meta.fields(Fixture), 0..) |field, at| {
+        list[at] = .{ .name = field.name, .bytes = @field(fixture, field.name) };
+    }
+    break :blk list;
+};
+
+/// Scratch wide enough to read any fixture whole, for the same reason.
+const widest_fixture = blk: {
+    var widest: usize = 0;
+    for (every_fixture) |entry| widest = @max(widest, entry.bytes.len);
+    break :blk widest;
+};
 
 // --- Borrow-reader helpers ----------------------------------------------------
 //
@@ -99,6 +134,11 @@ const fixture: Fixture = .{};
 // regions by bumping a high-water mark that starts at zero. Two readers sharing
 // one buffer would therefore overwrite each other's results, so every helper
 // takes a distinct region from this pool.
+//
+// A helper returns the moment it finds its member, so on that path it cannot
+// see a second value after the closing brace. Every path that does walk to the
+// end ends in `atEnd()`, and the test below reads all eighteen documents whole,
+// which is what covers the ones that return early.
 
 /// Scratch regions handed out one at a time, so two live results never share
 /// one. A helper that runs out reports the same `BufferTooSmall` the library
@@ -129,6 +169,7 @@ fn rawMember(input: []const u8, key: []const u8, scratch: []u8) DecodeError!?[]c
         if (std.mem.eql(u8, name, key)) return try reader.rawValue(scratch);
         try reader.skipValue(scratch);
     }
+    if (!reader.atEnd()) return error.MalformedJson;
     return null;
 }
 
@@ -140,6 +181,7 @@ fn stringMember(input: []const u8, key: []const u8, scratch: []u8) DecodeError!?
         if (std.mem.eql(u8, name, key)) return try reader.string(scratch);
         try reader.skipValue(scratch);
     }
+    if (!reader.atEnd()) return error.MalformedJson;
     return null;
 }
 
@@ -154,6 +196,7 @@ fn numberMember(input: []const u8, key: []const u8, scratch: []u8) DecodeError!?
         if (std.mem.eql(u8, name, key)) return try reader.number();
         try reader.skipValue(scratch);
     }
+    if (!reader.atEnd()) return error.MalformedJson;
     return null;
 }
 
@@ -164,6 +207,7 @@ fn booleanMember(input: []const u8, key: []const u8, scratch: []u8) DecodeError!
         if (std.mem.eql(u8, name, key)) return try reader.boolean();
         try reader.skipValue(scratch);
     }
+    if (!reader.atEnd()) return error.MalformedJson;
     return null;
 }
 
@@ -194,6 +238,7 @@ fn memberKeys(input: []const u8, out: [][]const u8, scratch: []u8) DecodeError!u
         count += 1;
         try reader.skipValue(scratch);
     }
+    if (!reader.atEnd()) return error.MalformedJson;
     return count;
 }
 
@@ -223,6 +268,28 @@ fn knownKind(option: acp.PermissionOption) ?acp.PermissionOptionKind {
         .known => |kind| kind,
         .other => null,
     };
+}
+
+test "every fixture is one JSON value, as a decoder of any of them would require" {
+    var scratch: [widest_fixture]u8 = undefined;
+
+    // "A JSON document is exactly one value" is what every decoder this
+    // library owns ends on — `decodeResultType`, `decodeInputRequiredResult`
+    // and `decodeToolCallResult` each refuse a tail — so a library decoder is
+    // already told when a fixture is malformed. The borrow-reader helpers
+    // above are not: they stop at the member they were asked for, and the
+    // three that only ever read the first one stop there by construction. This
+    // reads each fixture whole, which is the only statement that reaches the
+    // nine that are read through those helpers, and it is the difference
+    // between "well-formed" being asserted and being true by inspection.
+    for (every_fixture) |entry| {
+        var reader = json.Reader.init(entry.bytes);
+        try reader.skipValue(&scratch);
+        if (!reader.atEnd()) {
+            std.debug.print("not one JSON value: {s}.json\n", .{entry.name});
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 // --- The mcp-over-acp worked example ------------------------------------------
@@ -352,6 +419,41 @@ test "a request and a notification classify apart, and a notification re-encodes
     try testing.expect(notification.id == null);
     try testing.expectEqualStrings("notifications/progress", notification.method.?.text);
 
+    // `params` is borrowed whole, so the notification's own document is read
+    // here rather than carried past the test. `progressToken` is the one
+    // member in this file whose placement the sources answer differently, so
+    // it is pinned rather than passed over: PROTOCOLS.md 4.3 lists it as a
+    // bare `_meta` key, and every other document this repository holds puts it
+    // under `params._meta` — the request fixtures in `src/http.zig` and the
+    // retry in `src/mcp_session.zig` — while the section 1b table this fixture
+    // is copied from gives `ProgressNotificationParams` a top-level
+    // `progressToken`. Nothing offline settles which one a
+    // `notifications/progress` params object follows, so the fixture stays
+    // where the section it is copied from puts it and the assertions make the
+    // placement visible rather than leaving it to inspection.
+    const notification_params = "{\n" ++
+        "    \"progressToken\": \"progress-1\",\n" ++
+        "    \"progress\": 0.5,\n" ++
+        "    \"total\": 1\n" ++
+        "  }";
+    try testing.expectEqualStrings(notification_params, notification.params.value);
+    try testing.expectEqualStrings(
+        "progress-1",
+        (try stringMember(
+            notification.params.value,
+            "progressToken",
+            try pool.next(),
+        )).?,
+    );
+    try testing.expectEqualStrings(
+        "0.5",
+        (try numberMember(notification.params.value, "progress", try pool.next())).?,
+    );
+    try testing.expectEqualStrings(
+        "1",
+        (try numberMember(notification.params.value, "total", try pool.next())).?,
+    );
+
     // A notification omits the member that would make it a request, so the
     // re-encoded bytes must not carry an `id` the decoder would then reject.
     var buffer: [512]u8 = undefined;
@@ -365,10 +467,27 @@ test "a request and a notification classify apart, and a notification re-encodes
 
 // --- MCP -----------------------------------------------------------------------
 
-test "an input_required result carries both members and its discriminator" {
-    var pool = ScratchPool{};
+/// The MRTR decoder, through the one place this file calls it.
+///
+/// It takes the caller's regions in the order the ten 4.10.3 decoders take
+/// them — `raw`, the store for the members this shape does not model, the
+/// scratch — and `encodeInputRequiredResult` takes the value alone. Both tests
+/// below are the only call sites this file has of either, so a change to that
+/// pair is a change here rather than in the middle of assertions about the
+/// wire.
+fn decodeMrtr(
+    raw: []const u8,
+    store: []mcp.VerbatimMember,
+    scratch: []u8,
+) DecodeError!mcp.InputRequiredResult {
+    return mcp.decodeInputRequiredResult(raw, store, scratch);
+}
 
-    const result = try mcp.decodeInputRequiredResult(fixture.mcp_mrtr_result, try pool.next());
+test "an input_required result carries both members and every member it does not" {
+    var pool = ScratchPool{};
+    var store: [4]mcp.VerbatimMember = undefined;
+
+    const result = try decodeMrtr(fixture.mcp_mrtr_result, &store, try pool.next());
     try testing.expectEqualStrings("input_required", result.result_type.value.?);
     try testing.expect(result.result_type.known() == .input_required);
     try testing.expect(!result.result_type.isComplete());
@@ -390,6 +509,74 @@ test "an input_required result carries both members and its discriminator" {
     try testing.expect(mcp.permitsMrtr("tools/call"));
     try testing.expect(mcp.permitsMrtr("prompts/get"));
     try testing.expect(!mcp.permitsMrtr("tools/list"));
+
+    // A result object is an open set: 4.10.6's first row, and the decision
+    // SPEC-DECISIONS.md 5 records, put a member the shape does not model in
+    // the decoder as the borrowed lexeme it arrived as and in the encoder as
+    // the same bytes back. The fixture carries one of each kind — the `_meta`
+    // every result may have and a vendor key no interface names — so what the
+    // round trip below states is that rule, and not only the three members the
+    // type models. Asserted here first, so a vector that quietly loses its
+    // open-set members cannot make the comparison below vacuous.
+    var keys: [8][]const u8 = undefined;
+    try testing.expectEqual(
+        @as(usize, 5),
+        try memberKeys(fixture.mcp_mrtr_result, &keys, try pool.next()),
+    );
+    try testing.expectEqualStrings("resultType", keys[0]);
+    try testing.expectEqualStrings("inputRequests", keys[1]);
+    try testing.expectEqualStrings("requestState", keys[2]);
+    try testing.expectEqualStrings("_meta", keys[3]);
+    try testing.expectEqualStrings("vendor.example.com/audit", keys[4]);
+
+    // The comparison is against a literal, not against a second decode of the
+    // same fixture: the member names, the braces and the two scalars are the
+    // literals, and the three carried values — the map and the two open-set
+    // members — come back as the fixture's own bytes, its indentation
+    // included. An encoder that dropped a member the decoder accepted, rebuilt
+    // one from the shape rather than carrying the lexeme, or reordered them,
+    // writes different bytes and fails here. That is the loss a result object
+    // this library re-encodes would otherwise carry out to the peer with no
+    // error anywhere.
+    var out: [1024]u8 = undefined;
+    var writer = json.Writer.init(&out);
+    try mcp.encodeInputRequiredResult(result, &writer);
+    try testing.expectEqualStrings(
+        "{\"resultType\":\"input_required\",\"inputRequests\":{\n" ++
+            "    \"e1\": {\n" ++
+            "      \"method\": \"elicitation/create\",\n" ++
+            "      \"params\": {\n" ++
+            "        \"message\": \"Which environment should the migration target?\"\n" ++
+            "      }\n" ++
+            "    }\n" ++
+            "  },\"requestState\":\"eyJzdWIiOiJ1MSJ9\",\"_meta\":{\n" ++
+            "    \"io.modelcontextprotocol/serverInfo\": {\n" ++
+            "      \"name\": \"example-server\",\n" ++
+            "      \"version\": \"1.2.3\"\n" ++
+            "    }\n" ++
+            "  },\"vendor.example.com/audit\":{\n" ++
+            "    \"decision\": \"pending\",\n" ++
+            "    \"attempts\": [1, 2]\n" ++
+            "  }}",
+        writer.written(),
+    );
+}
+
+test "an input_required result carrying neither optional member is refused" {
+    var pool = ScratchPool{};
+    var store: [2]mcp.VerbatimMember = undefined;
+
+    // The rule is the schema's own doc comment on the interface — "At least
+    // one of `inputRequests` or `requestState` MUST be present" — so the
+    // document it forbids belongs in this set beside the one it permits. The
+    // fixture above carries both members, which the rule allows, so without
+    // this vector nothing in the golden step would notice the refusal going
+    // away. `src/mcp.zig` states the same rule in its own unit test; what this
+    // one adds is the document, which is what the step pins everywhere else.
+    try testing.expectError(
+        error.MissingField,
+        decodeMrtr(fixture.mcp_mrtr_result_bare, &store, try pool.next()),
+    );
 }
 
 test "the capability objects walk to every member the schema names" {
@@ -755,6 +942,21 @@ test "a version mismatch inside the outcome carrier is not a binding failure" {
     const result_type = try mcp.decodeResultType(result_text, try pool.next());
     try testing.expectEqualStrings("complete", result_type.value.?);
     try testing.expect(result_type.isComplete());
+
+    // `content` is the member this fixture was selected for — it is what makes
+    // a `CallToolResult` that document rather than any other result — and the
+    // provenance row above names the declaration it is copied from, so it is
+    // read here rather than carried through the carrier unread.
+    const content = (try rawMember(result_text, "content", try pool.next())).?;
+    const block = (try firstArrayElement(content, try pool.next())).?;
+    try testing.expectEqualStrings(
+        "text",
+        (try stringMember(block, "type", try pool.next())).?,
+    );
+    try testing.expectEqualStrings(
+        "hello",
+        (try stringMember(block, "text", try pool.next())).?,
+    );
 
     // The encoder, over the same normative outcome, and byte for byte. Neither
     // fixture under `test/golden/` carries a carrier `_meta`, and

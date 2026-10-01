@@ -8,5 +8,15 @@
       }
     }
   },
-  "requestState": "eyJzdWIiOiJ1MSJ9"
+  "requestState": "eyJzdWIiOiJ1MSJ9",
+  "_meta": {
+    "io.modelcontextprotocol/serverInfo": {
+      "name": "example-server",
+      "version": "1.2.3"
+    }
+  },
+  "vendor.example.com/audit": {
+    "decision": "pending",
+    "attempts": [1, 2]
+  }
 }
