@@ -68,6 +68,36 @@
 //!   disagrees is excused only by the one difference that table records, the
 //!   leading zero [`hasLeadingZero`] names, and only in the direction the
 //!   table gives it.
+//! - **The A2A vocabulary comes from the A2A tables.** The twenty `a2a`
+//!   codecs are table driven: every message carries a `fields` table of
+//!   `{number, json, zig_name}` that `a2a.assertFieldTable` checks against the
+//!   struct at comptime, and those tables are where the member names those
+//!   decoders compare are written down. [`a2a_member_names`] reads them out of
+//!   the tables instead of listing them again here, because a transcribed
+//!   second copy is a second thing to keep correct and the codec is what the
+//!   generator has to reach. A new A2A member is then a row in its own table
+//!   and one seed document, and a renamed one changes neither file.
+//! - **Base64 is a codec, and it is total too.** `json.base64` is not a JSON
+//!   decoder, so no document reaches it and it cannot have a trailing-byte
+//!   case. What it can take is bytes, and the corpus's own bytes are the most
+//!   hostile input this harness owns: invalid UTF-8, a NUL and a `0xff` reach
+//!   it on every run, at every length from zero to the document bound, in both
+//!   RFC 4648 alphabets rather than only the standard one.
+//! - **A decoder nobody reached is a decoder nobody checked.** Being in the
+//!   battery is not coverage: a decoder that accepts nothing has a
+//!   trailing-byte assertion that never fires and a round trip that never
+//!   runs, and both are green. [`new_codec_names`] lists the decoders this
+//!   wave added and [`expectEveryNewCodecReached`] fails a run that fed none of
+//!   them a document it takes, so "the corpus reaches it" is something the
+//!   harness proves rather than something this file claims. A decoder that
+//!   cannot be reached that way is named in [`tail_rule.unasserted`] instead of
+//!   being left out quietly.
+//! - **A name the current revision removed still resolves at the previous
+//!   one.** `mcp.lookupMethod` takes the revision, and the three `2026-07-28`
+//!   removed were ordinary client-to-server requests at `2025-11-25`. The
+//!   corpus feeds the registry a name cut out of the document, which reaches
+//!   `.previous` and never reaches those three, so the rule carries a test of
+//!   its own rather than resting on the registry feed.
 //!
 //! ## Running it
 //!
@@ -88,6 +118,7 @@ const build_options = @import("build_options");
 const json = proto.json;
 const jsonrpc = proto.jsonrpc;
 const mcp = proto.mcp;
+const a2a = proto.a2a;
 const acp = proto.acp;
 const bridge = proto.bridge;
 
@@ -234,9 +265,16 @@ const string_forms = [_][]const u8{
 /// key: `acp.decodeCapabilityObject` turns whatever it reads into a path, so
 /// `terminal` and `loadSession` are reached when a document nests them rather
 /// than spelled on their own, and a dotted path fragment in a table of string
-/// bodies is weight. `test "every member name is in a seed or listed as
-/// grammar-only"` is what keeps this list, the seeds and
-/// [`grammar_only_names`] in step.
+/// bodies is weight.
+///
+/// This is the hand-written half and it is not where a decoder's own table
+/// goes. The twenty `a2a` codecs publish the members they compare as a `fields`
+/// table beside every message, and [`a2a_member_names`] derives the rest of the
+/// vocabulary from those rather than copying them here, where a rename would
+/// have to be made twice and one of the two copies would be the one nobody
+/// reads. The two halves meet in [`vocabulary_member_names`], and `test "every
+/// member name is in a seed or listed as grammar-only"` walks that rather than
+/// this table alone.
 const member_names = [_][]const u8{
     // `jsonrpc.decode` and the error object it carries.
     "jsonrpc",
@@ -278,6 +316,119 @@ const member_names = [_][]const u8{
     "requestId",
 };
 
+/// The messages whose members the twenty A2A codecs compare.
+///
+/// One entry per message that has both a decoder and an encoder, and the list
+/// is what makes the derivation below a statement about the codecs rather than
+/// about every message `a2a.zig` declares: a message with no codec compares no
+/// member, so its table would widen the vocabulary with names no rule reads.
+/// Every `json` name in each of these twenty tables is compared by the decoder
+/// for that message, which is why the derivation can be the whole of it.
+const a2a_codec_messages = [_]type{
+    a2a.Empty,
+    a2a.GetTaskRequest,
+    a2a.CancelTaskRequest,
+    a2a.SubscribeToTaskRequest,
+    a2a.GetTaskPushNotificationConfigRequest,
+    a2a.DeleteTaskPushNotificationConfigRequest,
+    a2a.ListTaskPushNotificationConfigsRequest,
+    a2a.GetExtendedAgentCardRequest,
+    a2a.ListTasksRequest,
+    a2a.AuthenticationInfo,
+    a2a.TaskPushNotificationConfig,
+    a2a.SendMessageConfiguration,
+    a2a.AgentInterface,
+    a2a.AgentProvider,
+    a2a.AgentCardSignature,
+    a2a.AgentExtension,
+    a2a.ApiKeySecurityScheme,
+    a2a.HttpAuthSecurityScheme,
+    a2a.OpenIdConnectSecurityScheme,
+    a2a.MutualTlsSecurityScheme,
+};
+
+/// How many ProtoJSON rows those twenty tables hold before a repeat is dropped.
+///
+/// `tenant` is a member of nine of them and `id` of six, so this counts rows
+/// rather than names. It sizes the one scratch array [`collectA2aMemberNames`]
+/// needs to remember what it has already emitted.
+const a2a_field_row_count = blk: {
+    var rows: usize = 0;
+    for (a2a_codec_messages) |T| {
+        for (T.fields) |entry| {
+            if (entry.json != null) rows += 1;
+        }
+    }
+    break :blk rows;
+};
+
+/// Write the ProtoJSON names the twenty A2A codecs compare into `out` and
+/// return how many there are.
+///
+/// The names come from the `fields` tables `a2a.zig` derives every Zig field
+/// name from, so they cannot drift: a renamed member is a new row in that
+/// table and nothing to change here. A name two tables carry contributes it
+/// once, and a name [`member_names`] already carries is not repeated, so the
+/// vocabulary stays a set rather than a tally of how many decoders branch on
+/// each name.
+fn collectA2aMemberNames(out: [][]const u8) usize {
+    // The quota, for the same reason the reachability test below has one: this
+    // runs at comptime because the two tables above are built from it, and it
+    // compares every row of twenty tables against the whole hand-written table
+    // and against everything it has already emitted.
+    @setEvalBranchQuota(100_000);
+    var seen: [member_names.len + a2a_field_row_count][]const u8 = undefined;
+    var count: usize = 0;
+    for (a2a_codec_messages) |T| {
+        for (T.fields) |entry| {
+            const name = entry.json orelse continue;
+            var known = false;
+            for (member_names) |existing| {
+                if (std.mem.eql(u8, existing, name)) known = true;
+            }
+            for (seen[0..count]) |existing| {
+                if (std.mem.eql(u8, existing, name)) known = true;
+            }
+            if (known) continue;
+            seen[count] = name;
+            out[count] = name;
+            count += 1;
+        }
+    }
+    return count;
+}
+
+/// How many names [`a2a_member_names`] holds, counted before it is built.
+const a2a_member_name_count = blk: {
+    var scratch: [member_names.len + a2a_field_row_count][]const u8 = undefined;
+    break :blk collectA2aMemberNames(scratch[0..]);
+};
+
+/// The member names the twenty A2A codecs branch on, read out of their tables.
+///
+/// Derived rather than transcribed, for the reason in the module comment: the
+/// table a decoder branches on and the table it is written from are then one
+/// thing. Every name here is spelled by a seed in [`seed_documents`], which is
+/// what lets a mutation move an A2A member as readily as it moves `id`; a name
+/// only the grammar generator could produce would be reached by chance and a
+/// rule about it would be asserted over a handful of documents in the whole
+/// run. `test "every member name is in a seed or listed as grammar-only"` is
+/// what keeps that promise honest, and it walks the derived table too.
+const a2a_member_names: [a2a_member_name_count][]const u8 = blk: {
+    var list: [a2a_member_name_count][]const u8 = undefined;
+    const written = collectA2aMemberNames(list[0..]);
+    if (written != a2a_member_name_count) @compileError("the two A2A name counts disagree");
+    break :blk list;
+};
+
+/// Every member name the corpus can write as a key.
+///
+/// [`member_names`] is the hand-written half and [`a2a_member_names`] the
+/// derived one, and the generator draws from both. A rename is only a rename if
+/// its name is in here, so a decoder that branches on a member the rename shape
+/// can never move is one whose key rules the corpus cannot reach.
+const vocabulary_member_names = member_names ++ a2a_member_names;
+
 /// Member names the grammar generator spells but no seed document carries.
 ///
 /// `renameMember` moves a name a seed already contains, so a name here widens
@@ -304,7 +455,7 @@ const grammar_only_names = [_][]const u8{
 ///
 /// `writeObject` draws a member name from here too, so a key is not a special
 /// case: the same table feeds both halves of a document.
-const string_vocabulary = string_forms ++ member_names;
+const string_vocabulary = string_forms ++ vocabulary_member_names;
 
 /// Number lexemes the generator writes.
 ///
@@ -346,7 +497,7 @@ const hostile_alphabet = [_]u8{
 /// the protocols actually carry, so a mutation is a change to a real document
 /// rather than a change to noise.
 ///
-/// Two of them carry members no other seed spells, and they are here for the
+/// Three of them carry members no other seed spells, and they are here for the
 /// decoder arms nothing else reaches: an MRTR interim result is the only
 /// document `mcp.decodeInputRequiredResult` accepts, and a permission request
 /// with a `toolCall` is the only document the stable arm of
@@ -354,6 +505,18 @@ const hostile_alphabet = [_]u8{
 /// revisions, so a mutation of either is a change to a real document. The
 /// three after them carry a carrier `_meta`, and the comment among the seeds
 /// says why that needed one.
+///
+/// The last fourteen are the A2A half, and they are the reason the twenty
+/// `a2a` codecs are in the battery at all. A decoder the corpus only ever sees
+/// through random keys is a decoder whose required-member rules are asserted
+/// over a handful of documents in the whole run, and whose arms nothing else
+/// reaches: `id` and `location` together are one draw in ten thousand, so
+/// `decodeAgentProvider` and `decodeApiKeySecurityScheme` were never going to
+/// accept anything at all. One real request per codec is both the coverage and
+/// the reason every ProtoJSON name the twenty `fields` tables carry is spelled
+/// here, which is what lets `a2a_member_names` be derived rather than listed as
+/// grammar-only. Member sets come from `research/normative/a2a-1.0.0.md`; the
+/// values are the ones a tenant-prefixed deployment sends.
 const seed_documents = [_][]const u8{
     "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
         "\"params\":{\"name\":\"echo\"}}",
@@ -389,6 +552,50 @@ const seed_documents = [_][]const u8{
         "\"_meta\":{\"trace\":\"t\"}}",
     "{\"error\":{\"code\":-32602,\"message\":\"bad\"}," ++
         "\"_meta\":{\"trace\":\"t\"}}",
+    // A2A. `GetTaskRequest`, `SubscribeToTaskRequest` and
+    // `GetExtendedAgentCardRequest` all accept the first of these, and the
+    // push-notification configuration is the only seed carrying both `taskId`
+    // and `id`, so the get and delete config requests accept it too.
+    "{\"tenant\":\"acme\",\"id\":\"task-1\",\"historyLength\":10}",
+    "{\"tenant\":\"acme\",\"id\":\"task-1\",\"metadata\":{\"reason\":\"user\"}}",
+    "{\"taskId\":\"task-1\",\"pageSize\":50,\"pageToken\":\"tok\"," ++
+        "\"tenant\":\"acme\"}",
+    "{\"tenant\":\"acme\",\"contextId\":\"ctx-1\"," ++
+        "\"status\":\"TASK_STATE_WORKING\",\"pageSize\":10," ++
+        "\"pageToken\":\"tok\",\"historyLength\":5," ++
+        "\"statusTimestampAfter\":\"2026-01-01T00:00:00Z\"," ++
+        "\"includeArtifacts\":true}",
+    "{\"scheme\":\"Bearer\",\"credentials\":\"secret\"}",
+    "{\"tenant\":\"acme\",\"id\":\"cfg-1\",\"taskId\":\"task-1\"," ++
+        "\"url\":\"https://example.com/hook\",\"token\":\"tok\"," ++
+        "\"authentication\":{\"scheme\":\"Bearer\"," ++
+        "\"credentials\":\"secret\"}}",
+    "{\"acceptedOutputModes\":[\"text/plain\",\"application/json\"]," ++
+        "\"taskPushNotificationConfig\":" ++
+        "{\"url\":\"https://example.com/hook\"}," ++
+        "\"historyLength\":3,\"returnImmediately\":false}",
+    "{\"url\":\"https://example.com/agent\",\"protocolBinding\":\"JSONRPC\"," ++
+        "\"tenant\":\"acme\",\"protocolVersion\":\"1.0\"}",
+    "{\"url\":\"https://example.com\",\"organization\":\"Example Inc\"}",
+    "{\"protected\":\"eyJhbGciOiJFUzI1NiJ9\"," ++
+        "\"signature\":\"QFdk-_8\",\"header\":{\"kid\":\"key-1\"}}",
+    "{\"uri\":\"https://example.com/ext\",\"description\":\"ext\"," ++
+        "\"required\":true,\"params\":{\"k\":1}}",
+    "{\"description\":\"d\",\"location\":\"header\",\"name\":\"X-Api-Key\"}",
+    "{\"description\":\"d\",\"scheme\":\"bearer\",\"bearerFormat\":\"JWT\"}",
+    "{\"description\":\"d\",\"openIdConnectUrl\":" ++
+        "\"https://example.com/.well-known/openid-configuration\"}",
+    "{\"description\":\"d\"}",
+    // The two ACP objects the trailing-byte work could name but not reach. Both
+    // select their shape from a top-level `type` member, and no seed above
+    // carries one, so `acp.decodeReplayFrom` and `acp.decodePermissionSubject`
+    // saw a document they accept only when the grammar generator happened to
+    // draw that key. These are the objects themselves: the `replayFrom` member
+    // of a v2 `session/new` request, and the two `subject` arms the v2
+    // permission request carries beside its options.
+    "{\"type\":\"start\"}",
+    "{\"type\":\"command\",\"command\":\"ls\",\"cwd\":\"/tmp\"}",
+    "{\"type\":\"tool_call\",\"toolCall\":{\"toolCallId\":\"tc\"}}",
 };
 
 fn hostileByte(rng: std.Random) u8 {
@@ -570,8 +777,12 @@ fn isGrammarOnly(comptime name: []const u8) bool {
 /// renamed it is a refusal.
 fn writeMemberRenamed(rng: std.Random, doc: *Doc) void {
     const source = seed_documents[rng.intRangeLessThan(usize, 0, seed_documents.len)];
-    const from = member_names[rng.intRangeLessThan(usize, 0, member_names.len)];
-    const to = member_names[rng.intRangeLessThan(usize, 0, member_names.len)];
+    // The whole vocabulary and not [`member_names`] alone: a rename of an A2A
+    // member is the only mutation that turns a required member of one of the
+    // twenty into a missing-field refusal, and drawing from the hand-written
+    // half alone would never produce one.
+    const from = vocabulary_member_names[rng.intRangeLessThan(usize, 0, vocabulary_member_names.len)];
+    const to = vocabulary_member_names[rng.intRangeLessThan(usize, 0, vocabulary_member_names.len)];
     if (renameMember(source, from, to, doc)) return;
     // A seed that spells neither name, or a rename that would overflow the
     // document, is not a rename. The seed itself still reaches every decoder,
@@ -985,7 +1196,7 @@ fn expectSameDocumentBytes(
     return error.RoundTripBytesDiffer;
 }
 
-/// The two sets a trailing-byte assertion splits into, and why they differ.
+/// The two ways a decoder can be named here, and why the split moved.
 ///
 /// Ten decoders in the tree accepted a byte sequence that is one JSON value
 /// and then more, and dropped the tail without saying so. Measured by running
@@ -1004,22 +1215,36 @@ fn expectSameDocumentBytes(
 ///
 /// `jsonrpc.decode` (jsonrpc.zig:274), its error object (jsonrpc.zig:552) and
 /// the two session readers (acp_session.zig:235, mcp_session.zig:637) refuse
-/// one, and `bridge` now does too (bridge.zig:184, bridge.zig:303).
+/// one, and `bridge` now does too (bridge.zig:184, bridge.zig:303). The twenty
+/// `a2a` codecs never accepted one: each closes with a `reader.atEnd()` check
+/// after its member loop, and the property run is what says so rather than the
+/// reading.
 ///
-/// Five of the ten are not in this harness's decoder battery at all, so the
-/// corpus feeds them nothing and no assertion here would ever fire:
-/// `acp.decodeReplayFrom`, `acp.decodeInitializeCapabilities`,
-/// `acp.decodePermissionSubject`, `mcp.decodeCacheable` and
-/// `mcp.decodeCacheLeg`. They are named here so a reader knows they are
-/// unasserted rather than clean. A check that is green because it never ran is
-/// the thing this harness exists to prevent, so they are left out rather than
-/// written decoratively.
+/// This table used to have three halves' worth of meaning and now has two. The
+/// five `acp` decoders that were fed nothing have been fed: `encodeReplayFrom`,
+/// `encodeCapabilityObject`, `encodeInitializeCapabilities`,
+/// `encodePermissionSubject` and `encodePermissionRequest` all landed, so
+/// every one of the ten is in [`tail_rule.round_trip`] and the set of decoders
+/// this harness re-encodes no longer has a member outside it. Two of the ten
+/// are still not in the battery and are named in [`tail_rule.unasserted`]
+/// rather than quietly left out, because a check that is green because it never
+/// ran is the thing this harness exists to prevent.
+///
+/// "Fed" is the operative word and it is not a claim about the code. A decoder
+/// in the battery that accepts nothing has a trailing-byte assertion that never
+/// fires and a round trip that never runs, and both are green, so
+/// [`new_codec_names`] is the list of the ones added in this wave and
+/// [`expectEveryNewCodecReached`] fails the run if the corpus never fed one of
+/// them a document it takes. A decoder that cannot be reached that way belongs
+/// in [`tail_rule.unasserted`] and not in the battery, which is what that field
+/// is for.
 const tail_rule = struct {
     /// Decoders this harness re-encodes, so a tail they accept is a lost
     /// `encode(decode(b))`: `mcp.decodeResultType` and
     /// `mcp.decodeInputRequiredResult` through the writers in
-    /// [`roundTripResultType`] and [`roundTripInputRequiredResult`], and
-    /// `acp.decodePermissionOutcome` through `acp.encodePermissionOutcome`.
+    /// [`roundTripResultType`] and [`roundTripInputRequiredResult`], the six
+    /// `acp` ones through their own encoders, and the twenty `a2a` ones
+    /// through the twenty `roundTripA2a*` writers.
     ///
     /// The byte comparison cannot see the loss even here, and that is worth
     /// being blunt about rather than dressing up: an encoder has nowhere
@@ -1027,25 +1252,55 @@ const tail_rule = struct {
     /// agree on a document neither can reproduce. The decoder is the thing
     /// that is wrong, and the assertion is a refusal because a round trip
     /// cannot express what was thrown away.
+    ///
+    /// The twenty A2A names are the same twenty as
+    /// [`a2a_codec_messages`] paired with their `decode` function, which is
+    /// why none of them is in the round-trip half for a different reason than
+    /// the rest: each has an encoder, and each encoder is called.
     round_trip: []const []const u8 = &.{
         "mcp.decodeResultType",
         "mcp.decodeInputRequiredResult",
+        "acp.decodeReplayFrom",
         "acp.decodePermissionOutcome",
-    },
-
-    /// Decoders this harness never re-encodes, so the tail has nothing to be
-    /// lost by: `acp.decodePermissionRequest` in both wire versions and
-    /// `acp.decodeCapabilityObject`. For these the defect is only that a byte
-    /// sequence which is not a document was accepted, which is a framing
-    /// question rather than a round-trip one.
-    ///
-    /// The distinction is not cosmetic. A reader who adds an encoder to one of
-    /// these moves that one name to [`tail_rule.round_trip`] and nothing else
-    /// changes, because the two sets differ in what the loss costs and not in
-    /// what the decoder has to do about it.
-    unmodelled: []const []const u8 = &.{
+        "acp.decodePermissionSubject",
         "acp.decodePermissionRequest",
         "acp.decodeCapabilityObject",
+        "acp.decodeInitializeCapabilities",
+        "a2a.decodeEmpty",
+        "a2a.decodeGetTaskRequest",
+        "a2a.decodeCancelTaskRequest",
+        "a2a.decodeSubscribeToTaskRequest",
+        "a2a.decodeGetTaskPushNotificationConfigRequest",
+        "a2a.decodeDeleteTaskPushNotificationConfigRequest",
+        "a2a.decodeListTaskPushNotificationConfigsRequest",
+        "a2a.decodeGetExtendedAgentCardRequest",
+        "a2a.decodeListTasksRequest",
+        "a2a.decodeAuthenticationInfo",
+        "a2a.decodeTaskPushNotificationConfig",
+        "a2a.decodeSendMessageConfiguration",
+        "a2a.decodeAgentInterface",
+        "a2a.decodeAgentProvider",
+        "a2a.decodeAgentCardSignature",
+        "a2a.decodeAgentExtension",
+        "a2a.decodeApiKeySecurityScheme",
+        "a2a.decodeHttpAuthSecurityScheme",
+        "a2a.decodeOpenIdConnectSecurityScheme",
+        "a2a.decodeMutualTlsSecurityScheme",
+    },
+
+    /// Decoders this harness does not feed at all, so no assertion above would
+    /// ever fire for them.
+    ///
+    /// These are named rather than left out, which is the whole reason this
+    /// field exists. Both were already decoders that accepted a tailed
+    /// document before the checks landed; what they are missing is a corpus,
+    /// not a fix. Adding one is a decoder and a call in
+    /// [`exerciseEveryDecoder`], and until that happens a reader has to be able
+    /// to see that their coverage is absent rather than infer it from a name
+    /// that is missing from the half above.
+    unasserted: []const []const u8 = &.{
+        "mcp.decodeCacheable",
+        "mcp.decodeCacheLeg",
     },
 };
 
@@ -1054,25 +1309,6 @@ const tail_rule = struct {
 /// See [`tail_rule.round_trip`] for the set and for why a refusal is the only
 /// shape this can take.
 fn expectRoundTripHasNoTail(
-    comptime what: []const u8,
-    input: []const u8,
-    tail: bool,
-) !void {
-    return reportTailedDocument(what, input, tail);
-}
-
-/// Fail unless a decoder this harness never re-encodes refused a tailed input.
-///
-/// See [`tail_rule.unmodelled`] for the set.
-fn expectRefusalHasNoTail(
-    comptime what: []const u8,
-    input: []const u8,
-    tail: bool,
-) !void {
-    return reportTailedDocument(what, input, tail);
-}
-
-fn reportTailedDocument(
     comptime what: []const u8,
     input: []const u8,
     tail: bool,
@@ -1086,6 +1322,67 @@ fn reportTailedDocument(
     return error.DocumentHasTail;
 }
 
+/// The decoders this wave added to the battery, in the order
+/// [`Stats.reached_new_codecs`] indexes them.
+///
+/// Three `acp` decoders that the trailing-byte work named rather than asserted
+/// because they had no encoder, then the twenty `a2a` codecs. The list is
+/// here so a run can name the one the corpus never reached: an assertion that
+/// is green because nothing fed it is the failure this harness exists to
+/// prevent, and it is invisible unless something says so.
+const new_codec_names = [_][]const u8{
+    "acp.decodeReplayFrom",
+    "acp.decodePermissionSubject",
+    "acp.decodeInitializeCapabilities",
+    "a2a.decodeEmpty",
+    "a2a.decodeGetTaskRequest",
+    "a2a.decodeCancelTaskRequest",
+    "a2a.decodeSubscribeToTaskRequest",
+    "a2a.decodeGetTaskPushNotificationConfigRequest",
+    "a2a.decodeDeleteTaskPushNotificationConfigRequest",
+    "a2a.decodeListTaskPushNotificationConfigsRequest",
+    "a2a.decodeGetExtendedAgentCardRequest",
+    "a2a.decodeListTasksRequest",
+    "a2a.decodeAuthenticationInfo",
+    "a2a.decodeTaskPushNotificationConfig",
+    "a2a.decodeSendMessageConfiguration",
+    "a2a.decodeAgentInterface",
+    "a2a.decodeAgentProvider",
+    "a2a.decodeAgentCardSignature",
+    "a2a.decodeAgentExtension",
+    "a2a.decodeApiKeySecurityScheme",
+    "a2a.decodeHttpAuthSecurityScheme",
+    "a2a.decodeOpenIdConnectSecurityScheme",
+    "a2a.decodeMutualTlsSecurityScheme",
+};
+
+/// Record that one of the decoders in [`new_codec_names`] accepted a document.
+///
+/// The index is a comptime constant rather than a lookup by name, because a
+/// lookup is a second place for the two lists to disagree and this table
+/// exists to say a decoder was reached rather than to say a call happened.
+fn reachedNewCodec(stats: *Stats, comptime index: usize) void {
+    stats.reached_new_codecs[index] = true;
+}
+
+/// Fail unless the corpus reached every decoder [`new_codec_names`] names.
+///
+/// A short run says nothing either way, so it asserts nothing, for the same
+/// reason the trailing-byte guard above is behind a length check.
+fn expectEveryNewCodecReached(stats: *const Stats) !void {
+    var unreached: ?[]const u8 = null;
+    for (new_codec_names, stats.reached_new_codecs) |name, reached| {
+        if (!reached and unreached == null) unreached = name;
+    }
+    if (unreached) |name| {
+        std.debug.print(
+            "\ncoverage: the corpus fed '{s}' nothing it accepts\n",
+            .{name},
+        );
+        return error.CodecNeverReached;
+    }
+}
+
 // --- Round trips ---------------------------------------------------------------
 
 const Stats = struct {
@@ -1097,6 +1394,14 @@ const Stats = struct {
     /// because CI and the gate parse this block and this number is a
     /// liveness check for the assertion above rather than a result.
     tails: usize = 0,
+    /// Which of [`new_codec_names`] the corpus fed a document it accepts.
+    ///
+    /// A boolean and not a count, because the failure this exists to catch is
+    /// a decoder that accepted nothing at all: its trailing-byte assertion and
+    /// its round trip would both be green on every run without ever having
+    /// run. One bit per decoder rather than one count for all of them, because
+    /// a single total cannot say which one went missing.
+    reached_new_codecs: [new_codec_names.len]bool = .{false} ** new_codec_names.len,
 };
 
 fn roundTripJsonRpc(
@@ -1280,6 +1585,686 @@ fn roundTripInputRequiredResult(
     try expectSameString(result.result_type.value, again.result_type.value);
     try expectSameString(result.input_requests, again.input_requests);
     try expectSameString(result.request_state, again.request_state);
+    stats.round_trips += 1;
+}
+
+// --- The ACP encoders that arrived after the battery -----------------------------
+//
+// Five `acp` decoders had no encoder when the trailing-byte work named them, so
+// they were named rather than asserted. Each has one now, and each is
+// re-encoded below. The pair that takes `(version, side)` ahead of the value
+// takes them here too: the version is what picks the member name and the
+// boolean-versus-presence-object split, so it is an input to the encoding and
+// not a detail of it.
+
+/// Compare a decoded capability set with the one its encoder was given.
+///
+/// The entries are compared one at a time and not as a slice: `Capability` has
+/// a slice in it, so no single equality would say what this says, and a
+/// whole-set comparison would pass on two sets differing in one path.
+fn expectCapabilityEntries(
+    first: []const acp.Capability,
+    second: []const acp.Capability,
+) !void {
+    const testing = std.testing;
+    try testing.expectEqual(first.len, second.len);
+    for (first, second) |one, other| {
+        try expectSameString(one.path, other.path);
+        try testing.expectEqual(one.form, other.form);
+        // `known` is derived from the path and the version rather than carried
+        // on the wire, and `encodeCapabilityObject` reads it back off the path
+        // rather than writing it, so a decoder that derived it differently from
+        // the encoder shows here and nowhere else.
+        try testing.expectEqual(one.known, other.known);
+        // `value` is read through `advertised` rather than compared directly,
+        // because the two forms carry it differently: a presence object has
+        // none and a boolean has one, and the pair is only comparable once
+        // each has been reduced to what it advertises.
+        try testing.expectEqual(one.advertised(), other.advertised());
+    }
+}
+
+fn roundTripCapabilityObject(
+    version: acp.WireVersion,
+    side: acp.Side,
+    set: acp.CapabilitySet,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    const testing = std.testing;
+    var writer = json.Writer.init(out);
+    try acp.encodeCapabilityObject(version, side, set, &writer);
+
+    // The paths are built in the caller's buffer and the encoder only reads
+    // them, so the re-decode takes a second pair: sharing one would overwrite
+    // the entries being compared and make the comparison a copy of itself.
+    var entries: [32]acp.Capability = undefined;
+    var paths: [512]u8 = undefined;
+    const again = try acp.decodeCapabilityObject(
+        version,
+        side,
+        writer.written(),
+        &entries,
+        &paths,
+        replay,
+    );
+    // An empty object is a peer that advertised nothing, which is a fact and
+    // not an error, so the encoder has to have kept the member present rather
+    // than dropped it for `{}`.
+    try testing.expect(again.present);
+    try expectCapabilityEntries(set.entries, again.entries);
+    stats.round_trips += 1;
+}
+
+fn roundTripInitializeCapabilities(
+    version: acp.WireVersion,
+    side: acp.Side,
+    set: acp.CapabilitySet,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    const testing = std.testing;
+    var writer = json.Writer.init(out);
+    try acp.encodeInitializeCapabilities(version, side, set, &writer);
+
+    var entries: [32]acp.Capability = undefined;
+    var paths: [512]u8 = undefined;
+    const again = try acp.decodeInitializeCapabilities(
+        version,
+        side,
+        writer.written(),
+        &entries,
+        &paths,
+        replay,
+    );
+    // Presence is the half of the value this has to pin. Omission and an empty
+    // member are different documents, and the decoder reads them back as
+    // `present = false` and `present = true` respectively, so an encoder that
+    // swapped them would pass a comparison of the entries alone.
+    try testing.expectEqual(set.present, again.present);
+    try expectCapabilityEntries(set.entries, again.entries);
+    stats.round_trips += 1;
+}
+
+fn roundTripReplayFrom(
+    value: acp.ReplayFrom,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    const testing = std.testing;
+    var writer = json.Writer.init(out);
+    try acp.encodeReplayFrom(value, &writer);
+    const again = try acp.decodeReplayFrom(writer.written(), replay);
+    switch (value) {
+        // The one named tag is the `.start` arm, and the catch-all refuses to
+        // spell it, so a `.start` can only come back as a `.start`.
+        .start => try testing.expect(again == .start),
+        .other => |tag| switch (again) {
+            .other => |other| try testing.expectEqualStrings(tag, other),
+            .start => return error.TestUnexpectedResult,
+        },
+    }
+    stats.round_trips += 1;
+}
+
+/// Compare two decoded permission subjects, arm by arm.
+fn expectPermissionSubject(
+    first: acp.PermissionSubject,
+    second: acp.PermissionSubject,
+) !void {
+    switch (first) {
+        .tool_call => |call| switch (second) {
+            .tool_call => |other| try expectSameString(call, other),
+            .command, .other => return error.TestUnexpectedResult,
+        },
+        .command => |command| {
+            const other = switch (second) {
+                .command => |arm| arm,
+                .tool_call, .other => return error.TestUnexpectedResult,
+            };
+            try expectSameString(command.command, other.command);
+            try expectSameString(command.cwd, other.cwd);
+            // Both are nullable and each is written only when the peer sent it,
+            // so the absent cases have to agree rather than one standing in for
+            // the other.
+            try expectSameString(command.tool_call_id, other.tool_call_id);
+            try expectSameString(command.terminal_id, other.terminal_id);
+        },
+        .other => |tag| switch (second) {
+            .other => |other| try expectSameString(tag, other),
+            .tool_call, .command => return error.TestUnexpectedResult,
+        },
+    }
+}
+
+fn roundTripPermissionSubject(
+    value: acp.PermissionSubject,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    const testing = std.testing;
+    var writer = json.Writer.init(out);
+    try acp.encodePermissionSubject(value, &writer);
+    const again = try acp.decodePermissionSubject(writer.written(), replay);
+    try expectPermissionSubject(value, again);
+    // The `toolCall` member is spliced rather than rebuilt, so it has to be a
+    // complete value to a reader that has not seen the document it was cut out
+    // of. This comes last because it borrows `replay`, which is where the
+    // comparison above keeps its own escaped strings.
+    switch (again) {
+        .tool_call => |call| try testing.expect(borrowAccepts(call, replay)),
+        .command, .other => {},
+    }
+    stats.round_trips += 1;
+}
+
+/// Compare two decoded option lists.
+///
+/// No version parameter, because every member of an option is written whatever
+/// the version is: the two versions differ in whether an unknown kind is a
+/// value at all, and that difference is settled before a decoder could have
+/// returned one.
+fn expectPermissionOptions(
+    first: []const acp.PermissionOption,
+    second: []const acp.PermissionOption,
+) !void {
+    const testing = std.testing;
+    try testing.expectEqual(first.len, second.len);
+    for (first, second) |one, other| {
+        try expectSameString(one.option_id, other.option_id);
+        try expectSameString(one.name, other.name);
+        // A switch and not an `==`, for the reason the capability entries are
+        // compared member by member: a tagged union with a payload in it has no
+        // equality that would say which arm the two disagree on, and naming
+        // the arm is what a failure report needs.
+        switch (one.kind) {
+            .known => |kind| switch (other.kind) {
+                .known => |other_kind| try testing.expectEqual(kind, other_kind),
+                .other => return error.TestUnexpectedResult,
+            },
+            .other => |text| switch (other.kind) {
+                .other => |other_text| try testing.expectEqualStrings(text, other_text),
+                .known => return error.TestUnexpectedResult,
+            },
+        }
+    }
+}
+
+fn roundTripPermissionRequest(
+    value: acp.PermissionRequest,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    const testing = std.testing;
+    // The version is not an argument here because it is not an argument to the
+    // encoder either: `PermissionRequest` is a `union(WireVersion)`, so the
+    // value carries the revision it was decoded at and passing it separately
+    // would give the two a way to disagree.
+    const version: acp.WireVersion = switch (value) {
+        .stable => .stable,
+        .draft => .draft,
+    };
+    var writer = json.Writer.init(out);
+    try acp.encodePermissionRequest(value, &writer);
+
+    // The options live in a caller's array and the decoder fills that array
+    // rather than borrowing the document, so the re-decode takes a second one:
+    // sharing it would overwrite the entries being compared.
+    var options: [16]acp.PermissionOption = undefined;
+    const again = try acp.decodePermissionRequest(version, writer.written(), &options, replay);
+    try testing.expect(std.meta.activeTag(again) == std.meta.activeTag(value));
+    switch (value) {
+        .stable => |first| {
+            const other = switch (again) {
+                .stable => |arm| arm,
+                .draft => return error.TestUnexpectedResult,
+            };
+            try expectSameString(first.session_id, other.session_id);
+            // Spliced verbatim, because a `ToolCallUpdate` is not modelled here
+            // and this is the one member an agent cannot afford to have
+            // re-shaped.
+            try expectSameString(first.tool_call, other.tool_call);
+            try expectPermissionOptions(first.options, other.options);
+        },
+        .draft => |first| {
+            const other = switch (again) {
+                .draft => |arm| arm,
+                .stable => return error.TestUnexpectedResult,
+            };
+            try expectSameString(first.session_id, other.session_id);
+            try expectSameString(first.title, other.title);
+            // Omitted and `null` mean the same in both schemas, so the encoder
+            // writes the member only when the peer sent it and the absent
+            // cases have to agree.
+            try expectSameString(first.description, other.description);
+            try expectPermissionOptions(first.options, other.options);
+            if (first.subject == null or other.subject == null) {
+                try testing.expect((first.subject == null) == (other.subject == null));
+            } else {
+                try expectPermissionSubject(first.subject.?, other.subject.?);
+            }
+        },
+    }
+    stats.round_trips += 1;
+}
+
+// --- The twenty A2A codecs ------------------------------------------------------
+//
+// One writer per pair, and none of them compares bytes. A member a peer sent
+// and the shape does not model is dropped by the encoder on purpose, which is
+// the stated consequence every decoder in this library records, so a byte
+// comparison would be asserting a document the protocol does not define. What
+// is asserted is the property that does hold: every member the codec models
+// comes back, an optional member comes back as the same optional rather than
+// as a default, and a member carried as a borrowed lexeme is still a complete
+// value once it has been written out.
+
+fn expectAuthenticationInfo(
+    first: ?a2a.AuthenticationInfo,
+    second: ?a2a.AuthenticationInfo,
+) !void {
+    const value = first orelse {
+        // The encoder omits an absent member rather than writing `null`, so the
+        // re-decode has to agree there was nothing to read.
+        try std.testing.expect(second == null);
+        return;
+    };
+    const again = second orelse return error.TestUnexpectedResult;
+    try expectSameString(value.scheme, again.scheme);
+    try expectSameString(value.credentials, again.credentials);
+}
+
+fn roundTripA2aEmpty(
+    input: []const u8,
+    value: a2a.Empty,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    // The message declares no field, so a member comparison would be a
+    // tautology and the bytes are the whole of the value. `{}` is the canonical
+    // form of every document the decoder accepts, decoration and all, which is
+    // the consequence a decoder that steps over unknown members documents.
+    var writer = json.Writer.init(out);
+    try a2a.encodeEmpty(value, &writer);
+    try expectSameDocumentBytes("a2a.encodeEmpty", input, "{}", writer.written());
+    _ = try a2a.decodeEmpty(writer.written(), replay);
+    stats.round_trips += 1;
+}
+
+fn roundTripA2aGetTaskRequest(
+    value: a2a.GetTaskRequest,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    var writer = json.Writer.init(out);
+    try a2a.encodeGetTaskRequest(value, &writer);
+    const again = try a2a.decodeGetTaskRequest(writer.written(), replay);
+    try expectSameString(value.tenant, again.tenant);
+    try expectSameString(value.id, again.id);
+    // `historyLength` is an `optional int32`, so `"historyLength":0` and no
+    // member are two requests and the encoder has to tell them apart.
+    try std.testing.expectEqual(value.history_length, again.history_length);
+    stats.round_trips += 1;
+}
+
+fn roundTripA2aCancelTaskRequest(
+    value: a2a.CancelTaskRequest,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    const testing = std.testing;
+    var writer = json.Writer.init(out);
+    try a2a.encodeCancelTaskRequest(value, &writer);
+    const again = try a2a.decodeCancelTaskRequest(writer.written(), replay);
+    try expectSameString(value.tenant, again.tenant);
+    try expectSameString(value.id, again.id);
+    try expectSameString(value.metadata, again.metadata);
+    // `metadata` is a `Struct` borrowed as the lexeme it arrived as, so it has
+    // to be a complete value to a reader that has not seen the document it was
+    // cut out of.
+    if (again.metadata) |text| try testing.expect(borrowAccepts(text, replay));
+    stats.round_trips += 1;
+}
+
+fn roundTripA2aSubscribeToTaskRequest(
+    value: a2a.SubscribeToTaskRequest,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    var writer = json.Writer.init(out);
+    try a2a.encodeSubscribeToTaskRequest(value, &writer);
+    const again = try a2a.decodeSubscribeToTaskRequest(writer.written(), replay);
+    try expectSameString(value.tenant, again.tenant);
+    try expectSameString(value.id, again.id);
+    stats.round_trips += 1;
+}
+
+fn roundTripA2aGetTaskPushNotificationConfigRequest(
+    value: a2a.GetTaskPushNotificationConfigRequest,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    var writer = json.Writer.init(out);
+    try a2a.encodeGetTaskPushNotificationConfigRequest(value, &writer);
+    const again = try a2a.decodeGetTaskPushNotificationConfigRequest(
+        writer.written(),
+        replay,
+    );
+    try expectSameString(value.tenant, again.tenant);
+    try expectSameString(value.task_id, again.task_id);
+    try expectSameString(value.id, again.id);
+    stats.round_trips += 1;
+}
+
+fn roundTripA2aDeleteTaskPushNotificationConfigRequest(
+    value: a2a.DeleteTaskPushNotificationConfigRequest,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    var writer = json.Writer.init(out);
+    try a2a.encodeDeleteTaskPushNotificationConfigRequest(value, &writer);
+    const again = try a2a.decodeDeleteTaskPushNotificationConfigRequest(
+        writer.written(),
+        replay,
+    );
+    try expectSameString(value.tenant, again.tenant);
+    try expectSameString(value.task_id, again.task_id);
+    try expectSameString(value.id, again.id);
+    stats.round_trips += 1;
+}
+
+fn roundTripA2aListTaskPushNotificationConfigsRequest(
+    value: a2a.ListTaskPushNotificationConfigsRequest,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    const testing = std.testing;
+    var writer = json.Writer.init(out);
+    try a2a.encodeListTaskPushNotificationConfigsRequest(value, &writer);
+    const again = try a2a.decodeListTaskPushNotificationConfigsRequest(
+        writer.written(),
+        replay,
+    );
+    try expectSameString(value.task_id, again.task_id);
+    // A plain `int32` is still carried as presence here, for the reason
+    // `historyLength` is: `"pageSize":0` and no member are the same page and
+    // two different documents.
+    try testing.expectEqual(value.page_size, again.page_size);
+    try expectSameString(value.page_token, again.page_token);
+    // `tenant` is field 4 in the proto although the source lists it first, so
+    // it is written last and has to come back as itself rather than as the
+    // token that precedes it on the wire.
+    try expectSameString(value.tenant, again.tenant);
+    stats.round_trips += 1;
+}
+
+fn roundTripA2aGetExtendedAgentCardRequest(
+    value: a2a.GetExtendedAgentCardRequest,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    var writer = json.Writer.init(out);
+    try a2a.encodeGetExtendedAgentCardRequest(value, &writer);
+    const again = try a2a.decodeGetExtendedAgentCardRequest(writer.written(), replay);
+    try expectSameString(value.tenant, again.tenant);
+    stats.round_trips += 1;
+}
+
+fn roundTripA2aListTasksRequest(
+    value: a2a.ListTasksRequest,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    const testing = std.testing;
+    var writer = json.Writer.init(out);
+    try a2a.encodeListTasksRequest(value, &writer);
+    const again = try a2a.decodeListTasksRequest(writer.written(), replay);
+    try expectSameString(value.tenant, again.tenant);
+    try expectSameString(value.context_id, again.context_id);
+    // `status` is presence even though the proto declares it singular, and it
+    // goes out under the full proto name, so an encoder that wrote the Zig tag
+    // would fail to decode at all and one that dropped an unspecified filter
+    // would pass an equality on the value alone.
+    try testing.expectEqual(value.status, again.status);
+    try testing.expectEqual(value.page_size, again.page_size);
+    try expectSameString(value.page_token, again.page_token);
+    try testing.expectEqual(value.history_length, again.history_length);
+    try expectSameString(value.status_timestamp_after, again.status_timestamp_after);
+    try testing.expectEqual(value.include_artifacts, again.include_artifacts);
+    stats.round_trips += 1;
+}
+
+fn roundTripA2aAuthenticationInfo(
+    value: a2a.AuthenticationInfo,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    var writer = json.Writer.init(out);
+    try a2a.encodeAuthenticationInfo(value, &writer);
+    const again = try a2a.decodeAuthenticationInfo(writer.written(), replay);
+    try expectSameString(value.scheme, again.scheme);
+    try expectSameString(value.credentials, again.credentials);
+    stats.round_trips += 1;
+}
+
+fn roundTripA2aTaskPushNotificationConfig(
+    value: a2a.TaskPushNotificationConfig,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    var writer = json.Writer.init(out);
+    try a2a.encodeTaskPushNotificationConfig(value, &writer);
+    const again = try a2a.decodeTaskPushNotificationConfig(writer.written(), replay);
+    try expectAuthenticationInfo(value.authentication, again.authentication);
+    try expectSameString(value.tenant, again.tenant);
+    try expectSameString(value.id, again.id);
+    try expectSameString(value.task_id, again.task_id);
+    try expectSameString(value.url, again.url);
+    try expectSameString(value.token, again.token);
+    stats.round_trips += 1;
+}
+
+fn roundTripA2aSendMessageConfiguration(
+    value: a2a.SendMessageConfiguration,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    const testing = std.testing;
+    var writer = json.Writer.init(out);
+    try a2a.encodeSendMessageConfiguration(value, &writer);
+
+    // The accepted modes are filled into a caller's array rather than borrowed
+    // from the document, so the re-decode takes a second array: sharing one
+    // would overwrite the elements being compared and make the comparison a
+    // copy of itself.
+    var modes: [16][]const u8 = undefined;
+    const again = try a2a.decodeSendMessageConfiguration(writer.written(), &modes, replay);
+    try testing.expectEqual(value.history_length, again.history_length);
+    try testing.expectEqual(value.return_immediately, again.return_immediately);
+
+    const first = value.accepted_output_modes;
+    const second = again.accepted_output_modes;
+    if (first == null or second == null) {
+        // An absent list and an empty one are different documents, so exactly
+        // one of the two being absent is already a disagreement.
+        try testing.expect((first == null) == (second == null));
+    } else {
+        try testing.expectEqual(first.?.len, second.?.len);
+        for (first.?, second.?) |one, other| {
+            try testing.expectEqualStrings(one, other);
+        }
+    }
+
+    // The nested configuration is an ordinary optional struct rather than the
+    // `AuthenticationInfo` above, so it gets its own comparison rather than
+    // sharing one with it.
+    const pushed = value.task_push_notification_config;
+    const pushed_again = again.task_push_notification_config;
+    if (pushed == null or pushed_again == null) {
+        try testing.expect((pushed == null) == (pushed_again == null));
+    } else {
+        try expectSameString(pushed.?.tenant, pushed_again.?.tenant);
+        try expectSameString(pushed.?.id, pushed_again.?.id);
+        try expectSameString(pushed.?.task_id, pushed_again.?.task_id);
+        try expectSameString(pushed.?.url, pushed_again.?.url);
+        try expectSameString(pushed.?.token, pushed_again.?.token);
+        try expectAuthenticationInfo(
+            pushed.?.authentication,
+            pushed_again.?.authentication,
+        );
+    }
+    stats.round_trips += 1;
+}
+
+fn roundTripA2aAgentInterface(
+    value: a2a.AgentInterface,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    var writer = json.Writer.init(out);
+    try a2a.encodeAgentInterface(value, &writer);
+    const again = try a2a.decodeAgentInterface(writer.written(), replay);
+    try expectSameString(value.url, again.url);
+    try expectSameString(value.protocol_binding, again.protocol_binding);
+    try expectSameString(value.tenant, again.tenant);
+    // Kept as the declared text rather than a parsed `Major.Minor`, because a
+    // normalised spelling of the same version is not the bytes the agent
+    // published.
+    try expectSameString(value.protocol_version, again.protocol_version);
+    stats.round_trips += 1;
+}
+
+fn roundTripA2aAgentProvider(
+    value: a2a.AgentProvider,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    var writer = json.Writer.init(out);
+    try a2a.encodeAgentProvider(value, &writer);
+    const again = try a2a.decodeAgentProvider(writer.written(), replay);
+    try expectSameString(value.url, again.url);
+    try expectSameString(value.organization, again.organization);
+    stats.round_trips += 1;
+}
+
+fn roundTripA2aAgentCardSignature(
+    value: a2a.AgentCardSignature,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    const testing = std.testing;
+    var writer = json.Writer.init(out);
+    try a2a.encodeAgentCardSignature(value, &writer);
+    const again = try a2a.decodeAgentCardSignature(writer.written(), replay);
+    // Both are base64url text and neither is a `bytes` field, so there is
+    // nothing to convert and the bytes the agent published are the bytes that
+    // have to come back.
+    try expectSameString(value.protected, again.protected);
+    try expectSameString(value.signature, again.signature);
+    // `header` is a JSON object rather than base64url and it is carried as the
+    // borrowed lexeme, so it is spliced and has to survive whole.
+    try expectSameString(value.header, again.header);
+    if (again.header) |text| try testing.expect(borrowAccepts(text, replay));
+    stats.round_trips += 1;
+}
+
+fn roundTripA2aAgentExtension(
+    value: a2a.AgentExtension,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    const testing = std.testing;
+    var writer = json.Writer.init(out);
+    try a2a.encodeAgentExtension(value, &writer);
+    const again = try a2a.decodeAgentExtension(writer.written(), replay);
+    try expectSameString(value.uri, again.uri);
+    try expectSameString(value.description, again.description);
+    // `"required":false` and no `required` are two documents, so the boolean
+    // has to come back as present-or-absent rather than as a plain false.
+    try testing.expectEqual(value.required, again.required);
+    try expectSameString(value.params, again.params);
+    if (again.params) |text| try testing.expect(borrowAccepts(text, replay));
+    stats.round_trips += 1;
+}
+
+fn roundTripA2aApiKeySecurityScheme(
+    value: a2a.ApiKeySecurityScheme,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    var writer = json.Writer.init(out);
+    try a2a.encodeApiKeySecurityScheme(value, &writer);
+    const again = try a2a.decodeApiKeySecurityScheme(writer.written(), replay);
+    try expectSameString(value.description, again.description);
+    // The location is an enum and goes out under the spelling the parser takes,
+    // so a value that came back as a different tag would be a peer told to
+    // read a credential from somewhere it was never written.
+    try std.testing.expectEqual(value.location, again.location);
+    try expectSameString(value.name, again.name);
+    stats.round_trips += 1;
+}
+
+fn roundTripA2aHttpAuthSecurityScheme(
+    value: a2a.HttpAuthSecurityScheme,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    var writer = json.Writer.init(out);
+    try a2a.encodeHttpAuthSecurityScheme(value, &writer);
+    const again = try a2a.decodeHttpAuthSecurityScheme(writer.written(), replay);
+    try expectSameString(value.description, again.description);
+    try expectSameString(value.scheme, again.scheme);
+    try expectSameString(value.bearer_format, again.bearer_format);
+    stats.round_trips += 1;
+}
+
+fn roundTripA2aOpenIdConnectSecurityScheme(
+    value: a2a.OpenIdConnectSecurityScheme,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    var writer = json.Writer.init(out);
+    try a2a.encodeOpenIdConnectSecurityScheme(value, &writer);
+    const again = try a2a.decodeOpenIdConnectSecurityScheme(writer.written(), replay);
+    try expectSameString(value.description, again.description);
+    try expectSameString(value.open_id_connect_url, again.open_id_connect_url);
+    stats.round_trips += 1;
+}
+
+fn roundTripA2aMutualTlsSecurityScheme(
+    value: a2a.MutualTlsSecurityScheme,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    var writer = json.Writer.init(out);
+    try a2a.encodeMutualTlsSecurityScheme(value, &writer);
+    const again = try a2a.decodeMutualTlsSecurityScheme(writer.written(), replay);
+    try expectSameString(value.description, again.description);
     stats.round_trips += 1;
 }
 
@@ -1508,6 +2493,53 @@ test "an encoder that drops the carrier _meta does not reproduce the document" {
     );
 }
 
+// --- Base64, which takes bytes rather than a document ---------------------------
+
+/// The buffer one base64 encoding of a whole document needs.
+///
+/// `encodedLen` is the documented bound and the codec writes exactly it, so a
+/// buffer sized from the number and handed to the function is the tight one:
+/// one byte shorter is `BufferTooSmall`, which is what
+/// `test "base64 refuses the alphabet it was not given and every buffer it was
+/// told about"` asserts from the other side.
+const base64_encoded_len = json.base64.encodedLen(max_doc_len);
+
+/// The buffer the documented decode bound needs, which is one byte more than
+/// the document at the lengths this harness builds: three input bytes make four
+/// characters, and four characters decode to at most three, so the bound
+/// overstates by the whole of the final partial group.
+const base64_decoded_len = json.base64.decodedLen(base64_encoded_len).?;
+
+/// Encode the corpus's own bytes in both alphabets and read them back.
+///
+/// `json.base64` is the one public codec in the tree that takes no document, so
+/// it cannot have a trailing-byte case and it is not in [`tail_rule`]. What it
+/// can take is bytes, and this harness owns twenty thousand documents' worth of
+/// the most hostile bytes there are: invalid UTF-8, a NUL and a `0xff` reach
+/// it on every run, at every length from zero to the document bound, which
+/// exercises the one-byte, two-byte and three-byte final groups the padding
+/// rules turn on. Both alphabets, because a codec that took the alphabet as
+/// decoration would agree with itself on every one of them.
+fn exerciseBase64(input: []const u8, stats: *Stats) !void {
+    const testing = std.testing;
+    var encoded: [base64_encoded_len]u8 = undefined;
+    var decoded: [base64_decoded_len]u8 = undefined;
+
+    for ([_]json.base64.Alphabet{ .standard, .url }) |alphabet| {
+        const text = try json.base64.encode(input, encoded[0..], alphabet);
+        try testing.expectEqual(json.base64.encodedLen(input.len), text.len);
+        // The bound the documentation tells a caller to size from, measured
+        // from this run's own text rather than from the input: a decode that
+        // needed more would be a caller's `BufferTooSmall` on a buffer sized
+        // correctly from the number the documentation gives.
+        const bound = json.base64.decodedLen(text.len) orelse
+            return error.Base64BoundMissing;
+        try testing.expect(decoded.len >= bound);
+        try testing.expectEqualSlices(u8, input, try json.base64.decode(text, decoded[0..], alphabet));
+        stats.round_trips += 1;
+    }
+}
+
 // --- The decoder battery --------------------------------------------------------
 
 /// Feed one document to every public decoder and check the properties.
@@ -1590,26 +2622,47 @@ fn exerciseEveryDecoder(
         stats.refused += 1;
     }
 
+    if (acp.decodeReplayFrom(input, scratch)) |value| {
+        stats.accepted += 1;
+        reachedNewCodec(stats, 0);
+        try expectRoundTripHasNoTail("acp.decodeReplayFrom", input, tail);
+        try roundTripReplayFrom(value, replay, out, stats);
+    } else |_| {
+        stats.refused += 1;
+    }
+
+    if (acp.decodePermissionSubject(input, scratch)) |value| {
+        stats.accepted += 1;
+        reachedNewCodec(stats, 1);
+        try expectRoundTripHasNoTail("acp.decodePermissionSubject", input, tail);
+        try roundTripPermissionSubject(value, replay, out, stats);
+    } else |_| {
+        stats.refused += 1;
+    }
+
     // The option array every permission-request decode writes into. A document
     // with more options than this is a `BufferTooSmall`, which a caller sees as
     // a decode error rather than a truncated list of choices.
     var permission_options: [16]acp.PermissionOption = undefined;
     if (acp.decodePermissionRequest(.stable, input, &permission_options, scratch)) |request| {
         stats.accepted += 1;
-        try expectRefusalHasNoTail("acp.decodePermissionRequest stable", input, tail);
+        try expectRoundTripHasNoTail("acp.decodePermissionRequest stable", input, tail);
         const v1 = switch (request) {
             .stable => |value| value,
             .draft => return error.TestUnexpectedResult,
         };
         try testing.expect(borrowAccepts(v1.tool_call, replay));
-        stats.round_trips += 1;
+        // The round trip takes `replay` back, so it runs after the borrow check
+        // above rather than before it: the two would otherwise be reading one
+        // buffer at the same time.
+        try roundTripPermissionRequest(request, replay, out, stats);
     } else |_| {
         stats.refused += 1;
     }
 
     if (acp.decodePermissionRequest(.draft, input, &permission_options, scratch)) |request| {
         stats.accepted += 1;
-        try expectRefusalHasNoTail("acp.decodePermissionRequest draft", input, tail);
+        try expectRoundTripHasNoTail("acp.decodePermissionRequest draft", input, tail);
         const v2 = switch (request) {
             .draft => |value| value,
             .stable => return error.TestUnexpectedResult,
@@ -1622,7 +2675,7 @@ fn exerciseEveryDecoder(
                 .command, .other => {},
             }
         }
-        stats.round_trips += 1;
+        try roundTripPermissionRequest(request, replay, out, stats);
     } else |_| {
         stats.refused += 1;
     }
@@ -1652,6 +2705,215 @@ fn exerciseEveryDecoder(
         stats.refused += 1;
     }
 
+    // --- The twenty A2A codecs ------------------------------------------------
+    //
+    // One block per pair, and the shape is the one every other decoder here
+    // has: accept or refuse, count it, refuse a tailed document if it accepted,
+    // and put the value back through its own encoder. Fourteen seeds in
+    // [`seed_documents`] exist so these twenty are reached by a real document
+    // rather than by a lucky draw; every block below runs on the whole corpus.
+
+    if (a2a.decodeEmpty(input, scratch)) |value| {
+        stats.accepted += 1;
+        reachedNewCodec(stats, 3);
+        try expectRoundTripHasNoTail("a2a.decodeEmpty", input, tail);
+        try roundTripA2aEmpty(input, value, replay, out, stats);
+    } else |_| {
+        stats.refused += 1;
+    }
+
+    if (a2a.decodeGetTaskRequest(input, scratch)) |value| {
+        stats.accepted += 1;
+        reachedNewCodec(stats, 4);
+        try expectRoundTripHasNoTail("a2a.decodeGetTaskRequest", input, tail);
+        try roundTripA2aGetTaskRequest(value, replay, out, stats);
+    } else |_| {
+        stats.refused += 1;
+    }
+
+    if (a2a.decodeCancelTaskRequest(input, scratch)) |value| {
+        stats.accepted += 1;
+        reachedNewCodec(stats, 5);
+        try expectRoundTripHasNoTail("a2a.decodeCancelTaskRequest", input, tail);
+        try roundTripA2aCancelTaskRequest(value, replay, out, stats);
+    } else |_| {
+        stats.refused += 1;
+    }
+
+    if (a2a.decodeSubscribeToTaskRequest(input, scratch)) |value| {
+        stats.accepted += 1;
+        reachedNewCodec(stats, 6);
+        try expectRoundTripHasNoTail("a2a.decodeSubscribeToTaskRequest", input, tail);
+        try roundTripA2aSubscribeToTaskRequest(value, replay, out, stats);
+    } else |_| {
+        stats.refused += 1;
+    }
+
+    if (a2a.decodeGetTaskPushNotificationConfigRequest(input, scratch)) |value| {
+        stats.accepted += 1;
+        reachedNewCodec(stats, 7);
+        try expectRoundTripHasNoTail(
+            "a2a.decodeGetTaskPushNotificationConfigRequest",
+            input,
+            tail,
+        );
+        try roundTripA2aGetTaskPushNotificationConfigRequest(value, replay, out, stats);
+    } else |_| {
+        stats.refused += 1;
+    }
+
+    if (a2a.decodeDeleteTaskPushNotificationConfigRequest(input, scratch)) |value| {
+        stats.accepted += 1;
+        reachedNewCodec(stats, 8);
+        try expectRoundTripHasNoTail(
+            "a2a.decodeDeleteTaskPushNotificationConfigRequest",
+            input,
+            tail,
+        );
+        try roundTripA2aDeleteTaskPushNotificationConfigRequest(value, replay, out, stats);
+    } else |_| {
+        stats.refused += 1;
+    }
+
+    if (a2a.decodeListTaskPushNotificationConfigsRequest(input, scratch)) |value| {
+        stats.accepted += 1;
+        reachedNewCodec(stats, 9);
+        try expectRoundTripHasNoTail(
+            "a2a.decodeListTaskPushNotificationConfigsRequest",
+            input,
+            tail,
+        );
+        try roundTripA2aListTaskPushNotificationConfigsRequest(value, replay, out, stats);
+    } else |_| {
+        stats.refused += 1;
+    }
+
+    if (a2a.decodeGetExtendedAgentCardRequest(input, scratch)) |value| {
+        stats.accepted += 1;
+        reachedNewCodec(stats, 10);
+        try expectRoundTripHasNoTail("a2a.decodeGetExtendedAgentCardRequest", input, tail);
+        try roundTripA2aGetExtendedAgentCardRequest(value, replay, out, stats);
+    } else |_| {
+        stats.refused += 1;
+    }
+
+    if (a2a.decodeListTasksRequest(input, scratch)) |value| {
+        stats.accepted += 1;
+        reachedNewCodec(stats, 11);
+        try expectRoundTripHasNoTail("a2a.decodeListTasksRequest", input, tail);
+        try roundTripA2aListTasksRequest(value, replay, out, stats);
+    } else |_| {
+        stats.refused += 1;
+    }
+
+    if (a2a.decodeAuthenticationInfo(input, scratch)) |value| {
+        stats.accepted += 1;
+        reachedNewCodec(stats, 12);
+        try expectRoundTripHasNoTail("a2a.decodeAuthenticationInfo", input, tail);
+        try roundTripA2aAuthenticationInfo(value, replay, out, stats);
+    } else |_| {
+        stats.refused += 1;
+    }
+
+    if (a2a.decodeTaskPushNotificationConfig(input, scratch)) |value| {
+        stats.accepted += 1;
+        reachedNewCodec(stats, 13);
+        try expectRoundTripHasNoTail("a2a.decodeTaskPushNotificationConfig", input, tail);
+        try roundTripA2aTaskPushNotificationConfig(value, replay, out, stats);
+    } else |_| {
+        stats.refused += 1;
+    }
+
+    // The accepted-mode array the configuration decoder fills. A document with
+    // more modes than this is a `BufferTooSmall`, which a caller reads as a
+    // decode error rather than as a truncated list of what it will accept.
+    var output_modes: [16][]const u8 = undefined;
+    if (a2a.decodeSendMessageConfiguration(input, &output_modes, scratch)) |value| {
+        stats.accepted += 1;
+        reachedNewCodec(stats, 14);
+        try expectRoundTripHasNoTail("a2a.decodeSendMessageConfiguration", input, tail);
+        try roundTripA2aSendMessageConfiguration(value, replay, out, stats);
+    } else |_| {
+        stats.refused += 1;
+    }
+
+    if (a2a.decodeAgentInterface(input, scratch)) |value| {
+        stats.accepted += 1;
+        reachedNewCodec(stats, 15);
+        try expectRoundTripHasNoTail("a2a.decodeAgentInterface", input, tail);
+        try roundTripA2aAgentInterface(value, replay, out, stats);
+    } else |_| {
+        stats.refused += 1;
+    }
+
+    if (a2a.decodeAgentProvider(input, scratch)) |value| {
+        stats.accepted += 1;
+        reachedNewCodec(stats, 16);
+        try expectRoundTripHasNoTail("a2a.decodeAgentProvider", input, tail);
+        try roundTripA2aAgentProvider(value, replay, out, stats);
+    } else |_| {
+        stats.refused += 1;
+    }
+
+    if (a2a.decodeAgentCardSignature(input, scratch)) |value| {
+        stats.accepted += 1;
+        reachedNewCodec(stats, 17);
+        try expectRoundTripHasNoTail("a2a.decodeAgentCardSignature", input, tail);
+        try roundTripA2aAgentCardSignature(value, replay, out, stats);
+    } else |_| {
+        stats.refused += 1;
+    }
+
+    if (a2a.decodeAgentExtension(input, scratch)) |value| {
+        stats.accepted += 1;
+        reachedNewCodec(stats, 18);
+        try expectRoundTripHasNoTail("a2a.decodeAgentExtension", input, tail);
+        try roundTripA2aAgentExtension(value, replay, out, stats);
+    } else |_| {
+        stats.refused += 1;
+    }
+
+    if (a2a.decodeApiKeySecurityScheme(input, scratch)) |value| {
+        stats.accepted += 1;
+        reachedNewCodec(stats, 19);
+        try expectRoundTripHasNoTail("a2a.decodeApiKeySecurityScheme", input, tail);
+        try roundTripA2aApiKeySecurityScheme(value, replay, out, stats);
+    } else |_| {
+        stats.refused += 1;
+    }
+
+    if (a2a.decodeHttpAuthSecurityScheme(input, scratch)) |value| {
+        stats.accepted += 1;
+        reachedNewCodec(stats, 20);
+        try expectRoundTripHasNoTail("a2a.decodeHttpAuthSecurityScheme", input, tail);
+        try roundTripA2aHttpAuthSecurityScheme(value, replay, out, stats);
+    } else |_| {
+        stats.refused += 1;
+    }
+
+    if (a2a.decodeOpenIdConnectSecurityScheme(input, scratch)) |value| {
+        stats.accepted += 1;
+        reachedNewCodec(stats, 21);
+        try expectRoundTripHasNoTail("a2a.decodeOpenIdConnectSecurityScheme", input, tail);
+        try roundTripA2aOpenIdConnectSecurityScheme(value, replay, out, stats);
+    } else |_| {
+        stats.refused += 1;
+    }
+
+    if (a2a.decodeMutualTlsSecurityScheme(input, scratch)) |value| {
+        stats.accepted += 1;
+        reachedNewCodec(stats, 22);
+        try expectRoundTripHasNoTail("a2a.decodeMutualTlsSecurityScheme", input, tail);
+        try roundTripA2aMutualTlsSecurityScheme(value, replay, out, stats);
+    } else |_| {
+        stats.refused += 1;
+    }
+
+    // The one public codec that takes no document. It has no trailing-byte case
+    // for that reason and is not in [`tail_rule`]; what it does have is the
+    // whole corpus of hostile bytes, in both alphabets.
+    try exerciseBase64(input, stats);
+
     var capabilities: [32]acp.Capability = undefined;
     var paths: [512]u8 = undefined;
     for ([_]acp.WireVersion{ .stable, .draft }) |version| {
@@ -1665,14 +2927,42 @@ fn exerciseEveryDecoder(
                 scratch,
             )) |set| {
                 stats.accepted += 1;
-                try expectRefusalHasNoTail("acp.decodeCapabilityObject", input, tail);
+                try expectRoundTripHasNoTail("acp.decodeCapabilityObject", input, tail);
                 // An empty object is a peer that advertises nothing, which is a
                 // fact rather than an error, so every success is present.
                 try testing.expect(set.present);
                 try expectDisjointPaths(set.entries, paths[0..]);
+                try roundTripCapabilityObject(version, side, set, replay, out, stats);
             } else |_| {
                 // Arbitrary input is usually not a capability object. Any
                 // DecodeError is a valid refusal; only a trap violates totality.
+                stats.refused += 1;
+            }
+        }
+    }
+
+    // The capability member of an `initialize` body, which is the same walk
+    // behind a member name the version and the side choose. It was named rather
+    // than asserted while it had no encoder, so it gets its own loop here
+    // rather than being folded into the one above: the two agree on what a set
+    // contains and differ on what an absent member means, and the encoder is
+    // what tells them apart.
+    for ([_]acp.WireVersion{ .stable, .draft }) |version| {
+        for ([_]acp.Side{ .client, .agent }) |side| {
+            if (acp.decodeInitializeCapabilities(
+                version,
+                side,
+                input,
+                &capabilities,
+                &paths,
+                scratch,
+            )) |set| {
+                stats.accepted += 1;
+                reachedNewCodec(stats, 2);
+                try expectRoundTripHasNoTail("acp.decodeInitializeCapabilities", input, tail);
+                try expectDisjointPaths(set.entries, paths[0..]);
+                try roundTripInitializeCapabilities(version, side, set, replay, out, stats);
+            } else |_| {
                 stats.refused += 1;
             }
         }
@@ -1740,6 +3030,11 @@ fn runPropertyHarness(run_seed: u64, count: usize) !Stats {
     // case. The same guard the differential run uses: a short run says
     // nothing either way, so it asserts nothing.
     if (count >= 1000) try testing.expect(stats.tails != 0);
+    // Every decoder this wave added has to have accepted a document, or its
+    // trailing-byte assertion and its round trip are both green on a run that
+    // never called them. This is the same guard as the line above and for the
+    // same reason: a short run says nothing either way, so it asserts nothing.
+    if (count >= 1000) try expectEveryNewCodecReached(&stats);
     std.debug.print(
         "  documents={d} accepted={d} refused={d} round-trips={d}\n",
         .{ stats.documents, stats.accepted, stats.refused, stats.round_trips },
@@ -1790,18 +3085,23 @@ test "every member name is in a seed or listed as grammar-only" {
     // every seed, so the work is names times seeds times a substring search
     // that preprocesses its own skip table. That is more backwards branches
     // than the default thousand allows by a wide margin, and 20 000 was not
-    // enough either: the compiler reported the same overflow at that figure,
-    // so the number is two orders above the limit rather than one. Deleting
-    // the keyword does not make the check cheaper, it makes the test fail to
-    // compile, so raise the number rather than drop a name.
-    @setEvalBranchQuota(200_000);
+    // enough either: the compiler reported the same overflow at that figure.
+    // The A2A half made it worse in both factors at once — twenty-nine more
+    // names and nineteen more seeds — so the number is three orders above the
+    // limit rather than one. Deleting the keyword does not make the check
+    // cheaper, it makes the test fail to compile, so raise the number rather
+    // than drop a name.
+    @setEvalBranchQuota(2_000_000);
 
-    // The table of member names and the two ways the corpus can use one have to
+    // The whole vocabulary and the two ways the corpus can use one have to
     // cover each other exactly. A name a seed spells is one a mutation can move;
     // a name no seed spells is one the grammar generator can emit as a key and
     // nothing more, and it has to be listed as such or it is corpus weight. A
     // name in neither place widens every mutation in the corpus and reaches no
-    // rule, so this fails rather than growing.
+    // rule, so this fails rather than growing. This is what holds the derived
+    // half to the same promise as the hand-written one: a member an A2A
+    // message's table carries has to be spelled by a seed, and the fourteen at
+    // the end of [`seed_documents`] are what make that true.
     //
     // `inline for` and not `for`, and the body carries no `continue`, no
     // `break` and no `return`. The loop unrolls, so a `continue` inside it is
@@ -1814,7 +3114,7 @@ test "every member name is in a seed or listed as grammar-only" {
     // up, and the property is what the loop is for.
     var stale: ?[]const u8 = null;
     var unexplained: ?[]const u8 = null;
-    inline for (member_names) |name| {
+    inline for (vocabulary_member_names) |name| {
         // `comptime` for the same reason as the count in the scratch test: a
         // `const` bound to a call is a runtime value, and these two answers are
         // the whole assertion.
@@ -1834,6 +3134,183 @@ test "every member name is in a seed or listed as grammar-only" {
         std.debug.print("\ncorpus: '{s}' is in no seed and not listed\n", .{name});
         return error.UnreachableMemberName;
     }
+}
+
+test "the previous revision resolves the three names the current one refuses" {
+    const testing = std.testing;
+    // `lookupMethod` takes the revision, and what `2026-07-28` removed from the
+    // top level is a request `2025-11-25` still defines. The corpus feeds the
+    // registry a name cut out of a document, so it reaches `.previous` and
+    // reaches it with names no table below matches; nothing else in this file
+    // would notice a registry that answered the current revision's table for
+    // both and refused three requests an older peer is entitled to send.
+    //
+    // Three and not four, because the count is itself part of the claim: a
+    // fourth name added to the table would be a fourth thing to check.
+    try testing.expectEqual(@as(usize, 3), mcp.previous_top_level_requests.len);
+    for (mcp.previous_top_level_requests) |info| {
+        const there = try mcp.lookupMethod(.previous, info.name);
+        try testing.expectEqualStrings(info.name, there.name);
+        // The top-level direction rather than the one `input_requests` carries:
+        // a row that reused the carried direction would resolve the name here
+        // and then be refused as `NotARequest` by the session gate, so a
+        // previous-revision server would refuse to answer it as well.
+        try testing.expect(there.direction == .client_to_server);
+        try testing.expect(!there.present_at_current);
+
+        try testing.expectError(
+            error.UnknownMethod,
+            mcp.lookupMethod(.current, info.name),
+        );
+
+        // The same three survive as values inside an MRTR answer at every
+        // revision the library decodes, so the second table has to resolve them
+        // too and in the other direction.
+        const carried = try mcp.lookupInputRequest(info.name);
+        try testing.expectEqualStrings(info.name, carried.name);
+        try testing.expect(carried.direction == .server_to_client_mrtr_only);
+        try testing.expect(carried.present_at_current);
+    }
+}
+
+test "base64 refuses the alphabet it was not given and every buffer it was told about" {
+    const testing = std.testing;
+    var encoded: [16]u8 = undefined;
+    var decoded: [16]u8 = undefined;
+
+    // The two alphabets differ in exactly two characters, so a codec that took
+    // the alphabet as decoration would accept what the other spelling refuses
+    // and produce the same bytes from both. This input reaches all four of the
+    // differing positions: 0xfb 0xff 0xbf is 62 63 62 63 in six-bit groups,
+    // which is `+/+/` in one spelling and `-_-_` in the other and nothing
+    // else, so a decoder reading the wrong alphabet has no character to fall
+    // back on.
+    const digits = [_]u8{ 0xfb, 0xff, 0xbf };
+    try testing.expectEqualStrings(
+        "+/+/",
+        try json.base64.encode(&digits, encoded[0..], .standard),
+    );
+    try testing.expectEqualStrings(
+        "-_-_",
+        try json.base64.encode(&digits, encoded[0..], .url),
+    );
+    try testing.expectError(
+        error.InvalidField,
+        json.base64.decode("+/+/", decoded[0..], .url),
+    );
+    try testing.expectError(
+        error.InvalidField,
+        json.base64.decode("-_-_", decoded[0..], .standard),
+    );
+    // Each spelling reads its own back to the bytes it came from.
+    try testing.expectEqualSlices(
+        u8,
+        &digits,
+        try json.base64.decode("+/+/", decoded[0..], .standard),
+    );
+    try testing.expectEqualSlices(
+        u8,
+        &digits,
+        try json.base64.decode("-_-_", decoded[0..], .url),
+    );
+
+    // Padding is a property of the codec rather than of the alphabet: RFC 4648
+    // section 5 defines the URL-safe alphabet with the same pad characters, so
+    // both spellings emit pads and both require them.
+    try testing.expectEqualStrings("QQ==", try json.base64.encode("A", encoded[0..], .standard));
+    try testing.expectEqualStrings("QQ==", try json.base64.encode("A", encoded[0..], .url));
+    try testing.expectEqualStrings("QUI=", try json.base64.encode("AB", encoded[0..], .standard));
+    try testing.expectEqualStrings("QUJD", try json.base64.encode("ABC", encoded[0..], .url));
+    try testing.expectEqualStrings("", try json.base64.encode("", encoded[0..], .url));
+
+    // Totality. Every byte of an encoded value is peer input, so a group that
+    // is not four characters, a group opening with a pad, a group carrying one
+    // digit and a character outside the alphabet are all `error.InvalidField`
+    // and never a trap.
+    try testing.expectError(error.InvalidField, json.base64.decode("QQ=", decoded[0..], .standard));
+    try testing.expectError(error.InvalidField, json.base64.decode("====", decoded[0..], .standard));
+    try testing.expectError(error.InvalidField, json.base64.decode("=QQQ", decoded[0..], .standard));
+    try testing.expectError(error.InvalidField, json.base64.decode("Q=QQ", decoded[0..], .standard));
+    try testing.expectError(error.InvalidField, json.base64.decode("QQ!Q", decoded[0..], .standard));
+    try testing.expectError(error.InvalidField, json.base64.decode("+/+/", decoded[0..], .url));
+
+    // The two bounds, from both sides. `decodedLen` is null for a length that
+    // is not a whole number of groups, so a caller that checks it cannot go on
+    // to divide a partial group, and `encodedLen` is the buffer an input of
+    // every length from zero to three needs.
+    try testing.expect(json.base64.decodedLen(0) != null);
+    try testing.expect(json.base64.decodedLen(3) == null);
+    try testing.expectEqual(@as(usize, 0), json.base64.encodedLen(0));
+    try testing.expectEqual(@as(usize, 4), json.base64.encodedLen(1));
+    try testing.expectEqual(@as(usize, 4), json.base64.encodedLen(2));
+    try testing.expectEqual(@as(usize, 4), json.base64.encodedLen(3));
+    try testing.expectEqual(@as(usize, 8), json.base64.encodedLen(4));
+    // The documented decode bound overstates rather than understates, so a
+    // buffer sized from it is never short. That is the direction that matters:
+    // one sized from the padded length would report the peer's bytes as the
+    // caller's own mistake.
+    try testing.expectEqual(@as(usize, 3), json.base64.decodedLen(4).?);
+    try testing.expectEqual(@as(usize, 6), json.base64.decodedLen(8).?);
+
+    // A buffer one byte short is `BufferTooSmall` rather than a truncated
+    // value. That is the caller's own sizing mistake and it is kept apart from
+    // `InvalidField` because the two have different repairs.
+    var short_out: [3]u8 = undefined;
+    var short_in: [2]u8 = undefined;
+    try testing.expectError(
+        error.BufferTooSmall,
+        json.base64.encode("ABC", short_out[0..], .standard),
+    );
+    try testing.expectError(
+        error.BufferTooSmall,
+        json.base64.decode("QUJD", short_in[0..], .standard),
+    );
+}
+
+test "the derived A2A vocabulary is the tables the codecs are written from" {
+    const testing = std.testing;
+    // The point of deriving [`a2a_member_names`] rather than transcribing it is
+    // that there is nothing left to keep in step. This is what says so from the
+    // other side: every name the harness can write as an A2A key is one a
+    // decoder in [`a2a_codec_messages`] really compares, and `findField` finds
+    // it on that message and on no other of the twenty.
+    //
+    // "On no other" is the half that matters. A name several of the twenty
+    // carry is fine — `tenant` is nine — and the assertion below is that the
+    // set the generator uses and the set the tables carry are the same set,
+    // checked from the tables rather than from a list.
+    var missing_from_a_table: ?[]const u8 = null;
+    for (a2a_member_names) |name| {
+        var found = false;
+        inline for (a2a_codec_messages) |T| {
+            if (a2a.findField(T, name) != null) found = true;
+        }
+        if (!found) missing_from_a_table = name;
+    }
+    if (missing_from_a_table) |name| {
+        std.debug.print("\ncorpus: '{s}' is in no A2A field table\n", .{name});
+        return error.A2aMemberNameNotInATable;
+    }
+
+    // And the other direction: a table row that the vocabulary dropped is a
+    // member the corpus cannot spell, which is the drift the derivation was
+    // supposed to remove rather than introduce.
+    var dropped: ?[]const u8 = null;
+    inline for (a2a_codec_messages) |T| {
+        for (T.fields) |entry| {
+            const name = entry.json orelse continue;
+            var known = false;
+            for (vocabulary_member_names) |existing| {
+                if (std.mem.eql(u8, existing, name)) known = true;
+            }
+            if (!known and dropped == null) dropped = name;
+        }
+    }
+    if (dropped) |name| {
+        std.debug.print("\ncorpus: the A2A table carries '{s}' and the vocabulary does not\n", .{name});
+        return error.A2aMemberNameMissing;
+    }
+    try testing.expect(a2a_member_names.len != 0);
 }
 
 test "a renamed member reaches the acp and bridge decoders too" {

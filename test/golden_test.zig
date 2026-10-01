@@ -847,3 +847,48 @@ test "the AgentCard signature shape decodes, and its protected header is the one
         signature,
     );
 }
+
+test "the AgentCard signature fixture decodes through the codec and re-encodes to its canonical form" {
+    var pool = ScratchPool{};
+
+    // The fixture is pretty-printed, so it is not the bytes the encoder writes.
+    // The two differ in whitespace and in nothing else, which is the whole of
+    // what this pins. Reading two members out by hand, as the test above does,
+    // says nothing about whether the decoder takes the document as a whole.
+    const signature = try a2a.decodeAgentCardSignature(
+        fixture.a2a_agent_card_signature,
+        try pool.next(),
+    );
+    try testing.expectEqualStrings(
+        "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpPU0UiLCJraWQiOiJrZXktMSIsImpr" ++
+            "dSI6Imh0dHBzOi8vZXhhbXBsZS5jb20vYWdlbnQvandrcy5qc29uIn0",
+        signature.protected,
+    );
+    try testing.expectEqualStrings(
+        "QFdkNLNszlGj3z3u0YQGt_T9LixY3qtdQpZmsTdDHDe3fXV9y9-B3m2-XgC" ++
+            "pzuhiLt8E0tV6HXoZKHv4GtHgKQ",
+        signature.signature,
+    );
+    // The shape declares two required members and one optional, and the
+    // published example carries neither `header` nor a patch component in the
+    // version it does carry. A decoder that invented a member would be reading
+    // something the fixture does not have.
+    try testing.expect(signature.header == null);
+
+    var out: [512]u8 = undefined;
+    var writer = json.Writer.init(&out);
+    try a2a.encodeAgentCardSignature(signature, &writer);
+    try testing.expectEqualStrings(
+        "{\"protected\":\"eyJhbGciOiJFUzI1NiIsInR5cCI6IkpPU0UiLCJraWQiOiJr" ++
+            "ZXktMSIsImprdSI6Imh0dHBzOi8vZXhhbXBsZS5jb20vYWdlbnQvandrcy5" ++
+            "qc29uIn0\",\"signature\":\"QFdkNLNszlGj3z3u0YQGt_T9LixY3qtdQp" ++
+            "ZmsTdDHDe3fXV9y9-B3m2-XgCpzuhiLt8E0tV6HXoZKHv4GtHgKQ\"}",
+        writer.written(),
+    );
+
+    // And the canonical form decodes back to the same two members, so what is
+    // pinned above is the pair agreeing rather than one of them alone.
+    const again = try a2a.decodeAgentCardSignature(writer.written(), try pool.next());
+    try testing.expectEqualStrings(signature.protected, again.protected);
+    try testing.expectEqualStrings(signature.signature, again.signature);
+}
