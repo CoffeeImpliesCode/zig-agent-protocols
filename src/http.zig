@@ -2343,6 +2343,12 @@ const Side = struct {
     /// once: the first message is still readable when the second arrives, and
     /// a caller reads both of them afterwards.
     next_out: [message_size]u8 = undefined,
+    /// The message read after that one.
+    ///
+    /// A third field for the same reason as `next_out`: a caller reads the
+    /// messages after the exchange is done, so a message it wants to read
+    /// needs a region of its own to have landed in.
+    third_out: [message_size]u8 = undefined,
     decode: [1024]u8 = undefined,
 };
 
@@ -2585,6 +2591,9 @@ const Listen = struct {
     first_len: usize = 0,
     /// The length of the second, for a stream that carries more than a result.
     second_len: usize = 0,
+    /// The length of the third, for a stream that carries two notifications
+    /// on top of a result.
+    third_len: usize = 0,
     /// How many messages the reply held, and the count at the read that
     /// reported the reply over.
     messages: usize = 0,
@@ -2619,14 +2628,22 @@ const Listen = struct {
             self.content_type_len = n;
         }
 
-        // A region of its own per read, because both messages stay live: the
-        // lengths below go back to a test that reads the first message's bytes
-        // again after the second one has arrived.
+        // The reply is read to its end rather than to a count, because a
+        // reader that stops early is what breaks an exchange rather than what
+        // observes one: releasing the exchange closes the connection, and the
+        // write the peer had left to make then fails on a peer that has done
+        // nothing wrong. A region of its own per read, because the messages
+        // stay live: the lengths below go back to a test that reads their
+        // bytes again after the exchange has ended.
         while (true) {
-            const out: []u8 = if (self.messages == 0)
-                &self.side.out
-            else
-                &self.side.next_out;
+            const out: []u8 = switch (self.messages) {
+                0 => &self.side.out,
+                1 => &self.side.next_out,
+                // The newest message lands in the last region, so a reply
+                // longer than this does not overwrite one a test reads
+                // afterwards.
+                else => &self.side.third_out,
+            };
             const message = exchange.nextMessage(out) catch |err| {
                 self.failed.* = true;
                 self.failure = switch (err) {
@@ -2642,8 +2659,8 @@ const Listen = struct {
             };
             if (self.messages == 0) self.first_len = message.len;
             if (self.messages == 1) self.second_len = message.len;
+            if (self.messages == 2) self.third_len = message.len;
             self.messages += 1;
-            if (self.messages == 2) break;
         }
         self.got.* = true;
     }
@@ -3394,11 +3411,17 @@ test "a stream keeps delivering after the result, which is what a subscription i
     if (listen.failure) |step| return step;
     try testing.expect(!failed);
     try testing.expect(got);
-    // Three messages went out and three came back, in order. A server that
-    // answered once and closed would have delivered the result and nothing
-    // else, which is the whole reason the stream exists.
+    // Three messages went out and all three came back, in order, and the
+    // reply then ended. A server that answered once and closed would have
+    // delivered the result and nothing else, which is the whole reason the
+    // stream exists, and a server that kept one notification coming would
+    // have delivered the first one twice.
     try testing.expectEqual(@as(usize, 3), sent);
-    try testing.expectEqual(@as(usize, 2), listen.messages);
+    try testing.expectEqual(@as(usize, 3), listen.messages);
+    // The count at the read that reported the reply over, so the third
+    // message arrived on a stream that was ended and not on one the client
+    // stopped reading.
+    try testing.expectEqual(@as(usize, 3), listen.ended);
     try testing.expectEqualStrings(
         "{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{\"resultType\":\"complete\"}}",
         client_side.out[0..listen.first_len],
@@ -3406,6 +3429,10 @@ test "a stream keeps delivering after the result, which is what a subscription i
     try testing.expectEqualStrings(
         notifications[0],
         client_side.next_out[0..listen.second_len],
+    );
+    try testing.expectEqualStrings(
+        notifications[1],
+        client_side.third_out[0..listen.third_len],
     );
 }
 
