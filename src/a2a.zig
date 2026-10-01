@@ -62,19 +62,18 @@
 //! three, and the answer decides whether it reads member names or keys.
 //!
 //! **What this file encodes, and what it does not.** The tables below say
-//! which name and which number a field has, and the last three sections turn
-//! them into codecs. Every message in the flat half and every message in the
+//! which name and which number a field has, and the codec sections turn them
+//! into codecs. Every message in the flat half and every message in the
 //! content half has a decoder and an encoder: `PartContent`, `Part`,
 //! `Message`, `Artifact`, `TaskStatus`, `Task`, `TaskStatusUpdateEvent`,
 //! `TaskArtifactUpdateEvent`, `SendMessageRequest`, `SendMessageResponse` and
 //! `StreamResponse` joined the twenty the flat half already had, and the
 //! discovery half then gave `AgentCard` and everything it reaches one: both
 //! `oneof` unions, `AgentCapabilities`, `AgentSkill`, `StringList`,
-//! `SecurityRequirement` and the three map entries between them. What is left
-//! without a codec is `ListTasksResponse` and
-//! `ListTaskPushNotificationConfigsResponse`, which are the two list
-//! *responses*; both hold a `repeated` message and so need a codec for their
-//! own halves, and neither is reached from a card.
+//! `SecurityRequirement` and the three map entries between them. The two list
+//! *responses* joined those last, and what is different about them is where
+//! their elements live: both hold a `repeated` message, neither is reached
+//! from a card, and each hands the caller an array the caller sized itself.
 //!
 //! Three encodings an earlier revision of this note named as missing are not
 //! encodings. `TaskStatus.timestamp` and
@@ -112,7 +111,7 @@
 const std = @import("std");
 const root = @import("root.zig");
 const json = @import("json.zig");
-const protocol = @This();
+const Protocol = @This();
 
 const DecodeError = root.DecodeError;
 const EncodeError = root.EncodeError;
@@ -493,16 +492,15 @@ fn assertTable(comptime T: type, comptime members: anytype) void {
             }
         }
         // A row with neither a member name nor a Zig name cannot name its field,
-        // and that is a transcription error rather than a wire fact. This is an
-        // `if` and not an `orelse` because `@compileError` is only legal in a
-        // comptime branch, and an `orelse` operand is a runtime position.
-        if (entry.json == null and entry.zig_name == null) {
-            @compileError(std.fmt.comptimePrint(
+        // and that is a transcription error rather than a wire fact. It is
+        // stated where the name is produced rather than in an `if` beside it,
+        // because the `orelse` fires on exactly the same condition and one fact
+        // is better checked once.
+        const expected_name: []const u8 = entry.zig_name orelse
+            (derived orelse @compileError(std.fmt.comptimePrint(
                 "{s} field {d} has neither a ProtoJSON name nor a Zig name",
                 .{ @typeName(T), index },
-            ));
-        }
-        const expected_name: []const u8 = entry.zig_name orelse derived.?;
+            )));
         if (comptime !std.mem.eql(u8, member.name, expected_name)) {
             @compileError(std.fmt.comptimePrint(
                 "{s} field {d} is named '{s}', but its table row says '{s}'",
@@ -531,6 +529,26 @@ fn assertTable(comptime T: type, comptime members: anytype) void {
 /// name is the map's key, and a key is data rather than a name.
 pub fn jsonName(comptime T: type, comptime index: usize) ?[]const u8 {
     return T.fields[index].json;
+}
+
+/// The ProtoJSON member name of message `T`'s field `index`, which a decoder
+/// and an encoder both have to be able to spell.
+///
+/// [`jsonName`] is optional because two kinds of row have no member name of
+/// their own: a synthetic map entry, whose name is the key the value arrived
+/// under, and a `oneof` a struct holds as a single field, whose name belongs to
+/// the union's arm. Neither is a field a walk compares a key against, so every
+/// arm that does compare one is naming an ordinary message field, and a row
+/// with no name there is the transcription error [`writeMemberName`] reports
+/// for an encoder and [`assertFieldTable`] for the table itself. Stating it
+/// once here is what keeps those arms free of a `.?` that could only ever be a
+/// panic, and both parameters are comptime, so a call costs nothing per member
+/// compared.
+fn fieldName(comptime T: type, comptime index: usize) []const u8 {
+    return comptime (jsonName(T, index) orelse @compileError(std.fmt.comptimePrint(
+        "{s} field {d} has no ProtoJSON name to spell",
+        .{ @typeName(T), index },
+    )));
 }
 
 /// The field number of message `T`'s field `index`.
@@ -1203,7 +1221,8 @@ comptime {
 
 pub const ListTaskPushNotificationConfigsResponse = struct {
     /// 1. Not REQUIRED, so it is a presence: an empty list and no list are two
-    /// documents, and the codec that lands next needs to tell them apart.
+    /// documents, and this field being null is what tells the second from the
+    /// first.
     configs: ?[]const TaskPushNotificationConfig = null,
     /// 2. Unlike `ListTasksResponse.next_page_token`, this is not required, so
     /// an empty string and no member are two documents here as well. A `""`
@@ -1239,7 +1258,7 @@ comptime {
 pub const Empty = struct {
     /// The message declares no field, so the table is empty and a codec writes
     /// an empty object.
-    pub const fields = [_]Field{};
+    pub const fields: [0]Field = .{};
 };
 
 comptime {
@@ -1265,19 +1284,19 @@ pub const Rpc = struct {
     streaming: bool = false,
 
     /// Resolve the RPC's declared protobuf request to its Zig payload type.
-    pub fn requestType(comptime self: Rpc) type {
-        return messageType(self.request);
+    pub fn RequestType(comptime self: Rpc) type {
+        return MessageType(self.request);
     }
 
     /// Resolve the RPC's declared protobuf response to its Zig payload type.
-    pub fn responseType(comptime self: Rpc) type {
-        return messageType(self.response);
+    pub fn ResponseType(comptime self: Rpc) type {
+        return MessageType(self.response);
     }
 
-    fn messageType(comptime name: []const u8) type {
+    fn MessageType(comptime name: []const u8) type {
         if (std.mem.eql(u8, name, "google.protobuf.Empty")) return Empty;
-        if (!@hasDecl(protocol, name)) @compileError("A2A RPC references an undeclared message: " ++ name);
-        return @field(protocol, name);
+        if (!@hasDecl(Protocol, name)) @compileError("A2A RPC references an undeclared message: " ++ name);
+        return @field(Protocol, name);
     }
 };
 
@@ -1365,8 +1384,8 @@ pub const rpcs = [_]Rpc{
 
 comptime {
     for (rpcs) |rpc| {
-        _ = rpc.requestType();
-        _ = rpc.responseType();
+        _ = rpc.RequestType();
+        _ = rpc.ResponseType();
     }
 }
 
@@ -4365,16 +4384,13 @@ pub const ContentArena = struct {
 /// with it rather than leaving a literal behind.
 fn oneofMemberName(comptime U: type, comptime index: usize) []const u8 {
     const info = @typeInfo(U).@"union";
-    // An `if` and not an `orelse`, for the reason `assertTable` records: a
-    // `@compileError` is only legal in a comptime branch, and an `orelse`
-    // operand is a runtime position.
-    if (comptime info.tag_type == null) {
-        @compileError(std.fmt.comptimePrint(
-            "{s} is not a tagged union, so it has no oneof member names",
-            .{@typeName(U)},
-        ));
-    }
-    const tag_type = info.tag_type.?;
+    // An untagged union has no member names to give, and that is a compile error
+    // stated where the tag type is produced rather than in an `if` beside it, so
+    // one fact is checked once.
+    const tag_type = info.tag_type orelse @compileError(std.fmt.comptimePrint(
+        "{s} is not a tagged union, so it has no oneof member names",
+        .{@typeName(U)},
+    ));
     const ordinal = @intFromEnum(@field(tag_type, info.fields[index].name));
     if (comptime ordinal != index) {
         @compileError(std.fmt.comptimePrint(
@@ -4389,37 +4405,24 @@ fn oneofMemberName(comptime U: type, comptime index: usize) []const u8 {
             .{ @typeName(U), index, U.fields[index].number, ordinal },
         ));
     }
-    // An `if` and not an `orelse`, for the reason `assertTable` records: a
-    // `@compileError` is only legal in a comptime branch, and an `orelse`
-    // operand is a runtime position.
-    if (comptime U.fields[index].json == null) {
-        @compileError(std.fmt.comptimePrint(
-            "{s} member {d} has no ProtoJSON name, and a oneof member always has one",
-            .{ @typeName(U), index },
-        ));
-    }
-    return U.fields[index].json.?;
+    return U.fields[index].json orelse @compileError(std.fmt.comptimePrint(
+        "{s} member {d} has no ProtoJSON name, and a oneof member always has one",
+        .{ @typeName(U), index },
+    ));
 }
 
 /// Write `"name":` for member `index` of message `T`.
 ///
 /// The name comes from the table rather than from a literal in the body, so the
 /// one place a member name is transcribed stays the one place an encoder reads
-/// it. A row with `json = null` is a compile error here rather than a `null`
-/// that would slice, and the rows that carry one are the two kinds a member
-/// name cannot describe: a synthetic map entry, whose name is its key, and a
-/// `oneof` a struct holds as one field, which goes through `oneofMemberName`
-/// instead because the name that goes on the wire belongs to the union's arm.
+/// it. A row with `json = null` is a compile error from [`fieldName`] rather
+/// than a `null` that would slice, and the rows that carry one are the two kinds
+/// a member name cannot describe: a synthetic map entry, whose name is its key,
+/// and a `oneof` a struct holds as one field, which goes through
+/// `oneofMemberName` instead because the name on the wire is the union arm's.
 fn writeMemberName(comptime T: type, comptime index: usize, writer: *json.Writer) EncodeError!void {
-    // An `if` and not an `orelse`, for the reason `assertTable` records.
-    if (comptime jsonName(T, index) == null) {
-        @compileError(std.fmt.comptimePrint(
-            "{s} field {d} has no ProtoJSON name, so an encoder cannot spell it",
-            .{ @typeName(T), index },
-        ));
-    }
     try writer.byte('"');
-    try writer.slice(jsonName(T, index).?);
+    try writer.slice(fieldName(T, index));
     try writer.slice("\":");
 }
 
@@ -6374,7 +6377,7 @@ test "every RPC has a tenant-prefixed secondary binding" {
     // A name that is not an RPC has no binding.
     try testing.expectEqual(@as(?[]const u8, null), tenantBindingPath("MessageSend"));
     for (rpcs) |rpc| {
-        const tenant_path = tenantBindingPath(rpc.name).?;
+        const tenant_path = tenantBindingPath(rpc.name) orelse return error.TestUnexpectedResult;
         try testing.expect(std.mem.startsWith(u8, tenant_path, tenant_binding_prefix));
         // The prefix is added, not moved: the primary binding still stands.
         try testing.expectEqualStrings(
@@ -6621,7 +6624,7 @@ test "StringList is field 1 and keeps the singular JSON name" {
     try testing.expectEqualStrings("a2a.tasks", scopes.list.?[1]);
     // `{}` is a list a peer may send as a map value, so the absent list and
     // the empty one are told apart rather than collapsed into one `&.{}`.
-    try testing.expectEqual(?[]const []const u8, fieldType(StringList, "list"));
+    try testing.expectEqual(?[]const []const u8, FieldType(StringList, "list"));
     try testing.expectEqual(@as(?[]const []const u8, null), (StringList{}).list);
 }
 
@@ -6634,9 +6637,9 @@ test "a security requirement maps a scheme name to the scopes it needs" {
     try testing.expectEqual(@as(usize, 1), requirement.schemes.?.len);
     try testing.expectEqualStrings("oauth", requirement.schemes.?[0].name);
     try testing.expectEqualStrings("a2a.tasks", requirement.schemes.?[0].list.list.?[0]);
-    // The map itself is a presence too, and `fieldType` is what a `&.{}` default
+    // The map itself is a presence too, and `FieldType` is what a `&.{}` default
     // on it would have hidden.
-    try testing.expectEqual(?[]const SecurityRequirementEntry, fieldType(SecurityRequirement, "schemes"));
+    try testing.expectEqual(?[]const SecurityRequirementEntry, FieldType(SecurityRequirement, "schemes"));
     try testing.expectEqual(@as(?[]const SecurityRequirementEntry, null), (SecurityRequirement{}).schemes);
 }
 
@@ -6723,7 +6726,7 @@ test "AgentSkill numbers four required fields ahead of four optional ones" {
     try testing.expectEqual(@as(?[]const SecurityRequirement, null), skill.security_requirements);
     // `tags` is REQUIRED, so it keeps no default and an empty array is a
     // skill that is tagged with nothing rather than one that is untagged.
-    try testing.expectEqual([]const []const u8, fieldType(AgentSkill, "tags"));
+    try testing.expectEqual([]const []const u8, FieldType(AgentSkill, "tags"));
     try testing.expectEqual(@as(u32, 8), fieldNumber(AgentSkill, 7));
 }
 
@@ -6818,32 +6821,32 @@ test "a REQUIRED field carries no default and an optional one is a presence" {
     // this asserts, and the behaviour it protects is checked where it is
     // observable — an absent context decodes, in the `Message` and `Task`
     // tests below.
-    try testing.expectEqual(?[]const u8, fieldType(Task, "context_id"));
-    try testing.expectEqual(?[]const u8, fieldType(Message, "context_id"));
-    try testing.expectEqual(?[]const u8, fieldType(Message, "task_id"));
+    try testing.expectEqual(?[]const u8, FieldType(Task, "context_id"));
+    try testing.expectEqual(?[]const u8, FieldType(Message, "context_id"));
+    try testing.expectEqual(?[]const u8, FieldType(Message, "task_id"));
 
     // The same six fields, and the ones with a default that no member name can
     // reach: an empty list and an absent list are different requests.
-    try testing.expectEqual(?[]const Artifact, fieldType(Task, "artifacts"));
-    try testing.expectEqual(?[]const Message, fieldType(Task, "history"));
-    try testing.expectEqual(?[]const []const u8, fieldType(Message, "extensions"));
-    try testing.expectEqual(?[]const []const u8, fieldType(Message, "reference_task_ids"));
-    try testing.expectEqual(?[]const []const u8, fieldType(Artifact, "extensions"));
-    try testing.expectEqual(?[]const u8, fieldType(SendMessageRequest, "tenant"));
+    try testing.expectEqual(?[]const Artifact, FieldType(Task, "artifacts"));
+    try testing.expectEqual(?[]const Message, FieldType(Task, "history"));
+    try testing.expectEqual(?[]const []const u8, FieldType(Message, "extensions"));
+    try testing.expectEqual(?[]const []const u8, FieldType(Message, "reference_task_ids"));
+    try testing.expectEqual(?[]const []const u8, FieldType(Artifact, "extensions"));
+    try testing.expectEqual(?[]const u8, FieldType(SendMessageRequest, "tenant"));
 
     // The two REQUIRED `repeated` fields are the other side of the rule. An
     // empty array satisfies a REQUIRED `repeated` field, so these carry no
     // default and no emptiness check: only the absence of the member is a
     // missing field, and `[]` is a message with no parts.
-    try testing.expectEqual([]const Part, fieldType(Message, "parts"));
-    try testing.expectEqual([]const Part, fieldType(Artifact, "parts"));
+    try testing.expectEqual([]const Part, FieldType(Message, "parts"));
+    try testing.expectEqual([]const Part, FieldType(Artifact, "parts"));
 }
 
 /// The declared type of message `T`'s field `field`.
 ///
 /// A name `T` does not carry is a compile error rather than a false, for the
 /// reason `hasDefault` gives: a renamed field cannot pass as an absent one.
-fn fieldType(comptime T: type, comptime field: []const u8) type {
+fn FieldType(comptime T: type, comptime field: []const u8) type {
     return comptime blk: {
         for (@typeInfo(T).@"struct".fields) |candidate| {
             if (std.mem.eql(u8, candidate.name, field)) break :blk candidate.type;
@@ -6907,7 +6910,7 @@ test "the two live OAuth flows require their URLs and their scopes" {
     // And the type is what pins it, because `hasDefault` answers true for a
     // `?bool = null` just as it does for the `false` default that was the
     // defect, so it could not have told the two apart.
-    try testing.expectEqual(?bool, fieldType(AuthorizationCodeOAuthFlow, "pkce_required"));
+    try testing.expectEqual(?bool, FieldType(AuthorizationCodeOAuthFlow, "pkce_required"));
 }
 
 test "the two deprecated OAuth flows have no required field" {
@@ -6924,7 +6927,7 @@ test "the two deprecated OAuth flows have no required field" {
     // The three live flows keep their REQUIRED scope maps, so an encoder
     // always writes one and `"scopes":{}` is a flow that authorizes nothing
     // rather than a flow with no scope member.
-    try testing.expectEqual([]const OAuthScope, fieldType(ClientCredentialsOAuthFlow, "scopes"));
+    try testing.expectEqual([]const OAuthScope, FieldType(ClientCredentialsOAuthFlow, "scopes"));
     // They are variants 3 and 4, either side of device code at 5.
     try testing.expectEqual(@as(u32, 3), fieldNumber(OAuthFlows, 2));
     try testing.expectEqual(@as(u32, 4), fieldNumber(OAuthFlows, 3));
@@ -7239,30 +7242,6 @@ test "ListTaskPushNotificationConfigsRequest keeps an explicit zero page size" {
         error.MalformedJson,
         decodeListTaskPushNotificationConfigsRequest("{\"taskId\":\"t\"} x", &scratch),
     );
-}
-
-test "ListTaskPushNotificationConfigsResponse carries two presences and not two defaults" {
-    // Neither member is REQUIRED in the proto, so an empty list and no list
-    // are two documents and an empty token and no member are two documents. A
-    // struct that holds one empty slice and one empty string for both cannot
-    // write either of them back, and a `""` default on the token reads as
-    // "no more pages" for a response that never said so.
-    const bare: ListTaskPushNotificationConfigsResponse = .{};
-    try testing.expect(@TypeOf(bare.configs) == ?[]const TaskPushNotificationConfig);
-    try testing.expect(@TypeOf(bare.next_page_token) == ?[]const u8);
-    try testing.expectEqual(@as(?[]const TaskPushNotificationConfig, null), bare.configs);
-    try testing.expectEqual(@as(?[]const u8, null), bare.next_page_token);
-
-    // The two empty documents are two of the four, and the optional is what
-    // tells them apart: `[]` is a member that arrived and no member is one
-    // that did not.
-    const empty_list: ListTaskPushNotificationConfigsResponse = .{ .configs = &.{} };
-    const empty_token: ListTaskPushNotificationConfigsResponse = .{ .next_page_token = "" };
-    try testing.expectEqual(
-        @as(?[]const TaskPushNotificationConfig, &.{}),
-        empty_list.configs,
-    );
-    try testing.expectEqual(@as(?[]const u8, ""), empty_token.next_page_token);
 }
 
 test "ListTasksRequest keeps an explicit unspecified status" {
@@ -7709,7 +7688,8 @@ test "an OpenIdConnectSecurityScheme round-trips its url" {
     var scratch: [64]u8 = undefined;
     var out: [128]u8 = undefined;
 
-    const body = "{\"description\":\"OIDC\",\"openIdConnectUrl\":\"https://idp.example.com/.well-known/openid-configuration\"}";
+    const body = "{\"description\":\"OIDC\",\"openIdConnectUrl\":" ++
+        "\"https://idp.example.com/.well-known/openid-configuration\"}";
     const scheme = try decodeOpenIdConnectSecurityScheme(body, &scratch);
     try testing.expectEqualStrings(
         "https://idp.example.com/.well-known/openid-configuration",
@@ -7766,14 +7746,23 @@ test "a MutualTlsSecurityScheme is an empty object" {
 /// caller. A test that has to prove exhaustion builds its own smaller arrays,
 /// because that is the whole point of it.
 const TestStorage = struct {
+    // SAFETY: `readParts` assigns `parts[start + count]` before `parts_used` grows past it.
     parts: [16]Part = undefined,
+    // SAFETY: `readArtifacts` assigns its slot before `artifacts_used` grows past it.
     artifacts: [4]Artifact = undefined,
+    // SAFETY: `readMessages` assigns its slot before `messages_used` grows past it.
     messages: [4]Message = undefined,
+    // SAFETY: `readStringList` writes `out[count]` before it returns the count it counted.
     strings: [8][]const u8 = undefined,
+    // SAFETY: `readRawPart` decodes into `bytes[start..]` and hands back that run only.
     bytes: [256]u8 = undefined,
+    // SAFETY: `json.Writer.init` starts the run at 0; only `written()` slices it out.
     out: [4096]u8 = undefined,
+    // SAFETY: `json.base64.encode` fills the caller's array before the text goes out.
     base64: [512]u8 = undefined,
+    // SAFETY: the reader copies each token into scratch and slices only what it wrote.
     scratch: [512]u8 = undefined,
+    // SAFETY: `init` assigns it before a test reads a member; every count starts at 0.
     arena: ContentArena = undefined,
 
     /// Point the arena at the arrays above. A method and not a field default,
@@ -9253,6 +9242,972 @@ test "an out array that fills is an error and never a truncation" {
     try testing.expectEqualStrings("{\"raw\":\"AAECAwQ=\"}", fits.written());
 }
 
+// --- Codec: the two list responses ----------------------------------------------
+
+// What this section carries
+//
+// `ListTasksResponse` and `ListTaskPushNotificationConfigsResponse`. Both hold a
+// `repeated` message, and both are the one shape the rest of the module has no
+// answer for: the element array is the caller's rather than the arena's, so a
+// page is decoded into storage the caller names and bounded by it.
+//
+// One array beside the arena, and the arena beside nothing
+//
+// `decodeListTasksResponse` takes the caller's array of `Task` and the
+// `ContentArena` every nested part, artifact, message and `Part.raw` comes out
+// of. `decodeListTaskPushNotificationConfigsResponse` takes the caller's array
+// of `TaskPushNotificationConfig` and no arena at all, and the absence is the
+// shape rather than an omission: a configuration names a webhook and carries
+// strings, so nothing under one is a `Part` and nothing is a `bytes` field.
+//
+// The outer array is bounded the way `acp.decodePermissionRequest` bounds an
+// option array, so a page with more tasks than the caller reserved is
+// `error.BufferTooSmall` rather than a page that lost its last task: a page
+// that says something the caller did not mean is not a page. The arrays the
+// nested tasks reach keep the content half's rule, which is the same refusal
+// under the arena's own bounds.
+//
+// One reader across the whole page
+//
+// A page is one document read by one `json.Reader`, and every nested value is
+// read through `readTask` or `readTaskPushNotificationConfig` with that same
+// reader. The escape regions of a `json.Reader` are handed out one after
+// another and never reused, so two tasks in one page cannot be handed the same
+// run of `scratch`. A decoder that opened a second reader over a nested value
+// would restart that bump at zero and every task would read the same bytes,
+// which is why these two functions call the private walks rather than the
+// public `decodeTask` and `decodeTaskPushNotificationConfig`.
+//
+// The arena is reset once, at the public boundary, for the reason every public
+// decoder in the content half resets it there: one decode serves one document,
+// and a caller that reused one arena for a second page would otherwise read
+// the second page on top of the values the first one is still holding.
+//
+// The required page and the optional page
+//
+// `ListTasksResponse` marks all four of its members REQUIRED, so none of them
+// may be invented: `tasks` may be empty but its absence is
+// `error.MissingField`, `nextPageToken` may be `""` because that is the last
+// page, and `pageSize` and `totalSize` are plain `int32`s read at the width
+// ProtoJSON spells them and at no other. All four are recorded beside their
+// destinations rather than in them, because `""` and `0` are values a page may
+// carry and neither can stand for "not seen".
+//
+// `ListTaskPushNotificationConfigsResponse` marks neither of its two members
+// REQUIRED, and the two are the shape the flat half already has: `configs` is
+// null for a page that never mentioned the list and a zero-length slice for
+// `[]`, and `nextPageToken` is null for a page that never mentioned the token
+// and `""` for the last page. A `""` default would read as "no further pages"
+// for a response that never said so.
+//
+// The first occurrence of a name decides it, `null` included
+//
+// `tasks` and `configs` are `repeated`, so they are read through `claimMember`:
+// a `null` occurrence is the member missing and wearing a key, and a later list
+// does not become it. `nextPageToken` on both pages is an optional string, and
+// a destination that a string read always fills answers the same question.
+//
+// An encoder walks the page before its first byte
+//
+// `encodeListTasksResponse` validates every task through `validateTask` — which
+// is the walk that reaches a status message, an artifact and a history message,
+// and so every `Part.raw` that does not fit `base64` — before the writer is
+// touched. `encodeListTaskPushNotificationConfigsResponse` does the same
+// through `validateTaskPushNotificationConfig`. A page refused halfway is
+// neither a page nor nothing, so the refusal comes first and neither encoder
+// validates anything once it has started writing.
+
+/// Decode a `ListTasksResponse` page.
+///
+/// All four members are REQUIRED and none of them may be invented, so a page
+/// missing one is `error.MissingField` rather than a page answered with a
+/// default. `tasks` may be empty, because an empty page is a page.
+pub fn decodeListTasksResponse(
+    raw: []const u8,
+    tasks: []Task,
+    arena: *ContentArena,
+    scratch: []u8,
+) DecodeError!ListTasksResponse {
+    arena.reset();
+    var reader = json.Reader.init(raw);
+    var page: []const Task = tasks[0..0];
+    var next_page_token: []const u8 = "";
+    var page_size: i32 = 0;
+    var total_size: i32 = 0;
+    var saw_tasks = false;
+    var saw_next_page_token = false;
+    var saw_page_size = false;
+    var saw_total_size = false;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, "tasks")) {
+                // `[]` and `null` are both the empty page, and `null` is the
+                // occurrence that decides the member: a later list is dropped.
+                if (try claimMember(&saw_tasks, &reader, scratch)) {
+                    page = try readTasks(&reader, tasks, arena, scratch);
+                }
+            } else if (std.mem.eql(u8, key, "nextPageToken")) {
+                if (saw_next_page_token) {
+                    try reader.skipValue(scratch);
+                } else {
+                    next_page_token = try reader.string(scratch);
+                    saw_next_page_token = true;
+                }
+            } else if (std.mem.eql(u8, key, "pageSize")) {
+                if (saw_page_size) {
+                    try reader.skipValue(scratch);
+                } else {
+                    page_size = try readInt32(&reader);
+                    saw_page_size = true;
+                }
+            } else if (std.mem.eql(u8, key, "totalSize")) {
+                if (saw_total_size) {
+                    try reader.skipValue(scratch);
+                } else {
+                    total_size = try readInt32(&reader);
+                    saw_total_size = true;
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    if (!saw_tasks or !saw_next_page_token or !saw_page_size or !saw_total_size) {
+        return error.MissingField;
+    }
+    // The body is one JSON value, and the walk above stopped at the closing
+    // brace of the page rather than at the end of the document.
+    if (!reader.atEnd()) return error.MalformedJson;
+
+    return .{
+        .tasks = page,
+        .next_page_token = next_page_token,
+        .page_size = page_size,
+        .total_size = total_size,
+    };
+}
+
+/// Read a `repeated Task` member into the caller's own array.
+///
+/// The one element list in this module that is not the arena's, so the
+/// exhaustion rule is `readStringList`'s rather than `readArtifacts`': a page
+/// with more tasks than the array holds is `error.BufferTooSmall` and never a
+/// truncated page. Each task reaches the arena through `readTask` on this same
+/// reader, so the parts, artifacts, messages and bytes of a whole page share the
+/// one arena the caller sized.
+fn readTasks(
+    reader: *json.Reader,
+    out: []Task,
+    arena: *ContentArena,
+    scratch: []u8,
+) DecodeError![]const Task {
+    if (try reader.beginArray()) return out[0..0];
+    var count: usize = 0;
+    while (try reader.nextArrayElement()) {
+        if (count == out.len) return error.BufferTooSmall;
+        out[count] = try readTask(reader, arena, scratch);
+        count += 1;
+    }
+    return out[0..count];
+}
+
+/// Encode a `ListTasksResponse` page.
+///
+/// Every task is validated first, for the reason the section above gives: the
+/// walk reaches a status message, an artifact and a history message, and so
+/// every `Part.raw` that does not fit `base64`, and a page refused halfway is
+/// neither a page nor nothing.
+pub fn encodeListTasksResponse(
+    response: ListTasksResponse,
+    writer: *json.Writer,
+    base64: []u8,
+) EncodeError!void {
+    for (response.tasks) |task| try validateTask(task, base64);
+
+    try writer.byte('{');
+    try writeMemberName(ListTasksResponse, 0, writer);
+    try writer.byte('[');
+    for (response.tasks, 0..) |task, index| {
+        if (index != 0) try writer.byte(',');
+        try writeTask(task, writer, base64);
+    }
+    try writer.byte(']');
+    try writer.byte(',');
+    try writeMemberName(ListTasksResponse, 1, writer);
+    try writer.string(response.next_page_token);
+    try writer.byte(',');
+    try writeMemberName(ListTasksResponse, 2, writer);
+    try writeInt32(writer, response.page_size);
+    try writer.byte(',');
+    try writeMemberName(ListTasksResponse, 3, writer);
+    try writeInt32(writer, response.total_size);
+    try writer.byte('}');
+}
+
+/// Decode a `ListTaskPushNotificationConfigsResponse` page.
+///
+/// Neither member is REQUIRED, so `{}` is a page that mentioned neither of
+/// them, and each is a presence the encoder can write back as itself. There is
+/// no arena and no reset, because nothing under a configuration is arena
+/// storage; the caller's array and the reader's scratch are the whole of it.
+pub fn decodeListTaskPushNotificationConfigsResponse(
+    raw: []const u8,
+    configs: []TaskPushNotificationConfig,
+    scratch: []u8,
+) DecodeError!ListTaskPushNotificationConfigsResponse {
+    var reader = json.Reader.init(raw);
+    var response: ListTaskPushNotificationConfigsResponse = .{};
+    var saw_configs = false;
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, "configs")) {
+                // `null` and an absent member agree, for the reason
+                // `authentication` agrees with an absent member in
+                // `readTaskPushNotificationConfig`: the list is repeated, so a
+                // `null` is the empty one, and the occurrence still decides.
+                if (try claimMember(&saw_configs, &reader, scratch)) {
+                    response.configs = try readPushNotificationConfigs(&reader, configs, scratch);
+                }
+            } else if (std.mem.eql(u8, key, "nextPageToken")) {
+                if (response.next_page_token != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    response.next_page_token = try reader.string(scratch);
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    // The body is one JSON value, and the walk above stopped at the closing
+    // brace of the page rather than at the end of the document.
+    if (!reader.atEnd()) return error.MalformedJson;
+    return response;
+}
+
+/// Read a `repeated TaskPushNotificationConfig` member into the caller's array.
+///
+/// The bounded-read rule of `readTasks` under a different element type, and
+/// each element goes through `readTaskPushNotificationConfig` on this same
+/// reader, so a page of configurations shares one scratch and no two of them
+/// are handed the same region of it.
+fn readPushNotificationConfigs(
+    reader: *json.Reader,
+    out: []TaskPushNotificationConfig,
+    scratch: []u8,
+) DecodeError![]const TaskPushNotificationConfig {
+    if (try reader.beginArray()) return out[0..0];
+    var count: usize = 0;
+    while (try reader.nextArrayElement()) {
+        if (count == out.len) return error.BufferTooSmall;
+        out[count] = try readTaskPushNotificationConfig(reader, scratch);
+        count += 1;
+    }
+    return out[0..count];
+}
+
+/// Encode a `ListTaskPushNotificationConfigsResponse` page.
+///
+/// Both members are written or both are left out, because both are presences:
+/// a page holding no configuration and a page that never said are two
+/// documents, and only the first of them is `{"configs":[]}`. Every
+/// configuration is validated first, for the reason
+/// `encodeListTasksResponse` gives.
+pub fn encodeListTaskPushNotificationConfigsResponse(
+    response: ListTaskPushNotificationConfigsResponse,
+    writer: *json.Writer,
+) EncodeError!void {
+    if (response.configs) |configs| {
+        for (configs) |config| try validateTaskPushNotificationConfig(config);
+    }
+
+    try writer.byte('{');
+    var separator: []const u8 = "";
+    if (response.configs) |configs| {
+        try writer.slice(separator);
+        try writeMemberName(ListTaskPushNotificationConfigsResponse, 0, writer);
+        try writer.byte('[');
+        for (configs, 0..) |config, index| {
+            if (index != 0) try writer.byte(',');
+            try writeTaskPushNotificationConfig(config, writer);
+        }
+        try writer.byte(']');
+        separator = ",";
+    }
+    if (response.next_page_token) |next_page_token| {
+        try writer.slice(separator);
+        try writeMemberName(ListTaskPushNotificationConfigsResponse, 1, writer);
+        try writer.string(next_page_token);
+    }
+    try writer.byte('}');
+}
+
+// --- Tests: the two list responses ----------------------------------------------
+
+// The two list *responses* hand the caller an array the caller sized: a page of
+// tasks reaches the content half through `readTask` and the arena it shares with
+// every nested message, and a page of configurations reaches
+// `readTaskPushNotificationConfig` beside its own members. What the two change in
+// the rules above is where the storage comes from, so what these tests pin is
+// that the outer array and the arena are both bounded, that one decode serves one
+// document, that one reader serves a whole page, and that an encoder walks the
+// whole page before its first byte.
+
+test "a ListTasksResponse round-trips its four REQUIRED members over two tasks" {
+    var storage: TestStorage = .{};
+    storage.init();
+    var tasks: [2]Task = undefined;
+
+    const body = "{\"tasks\":[" ++
+        "{\"id\":\"t-1\",\"contextId\":\"c-1\",\"status\":{\"state\":\"TASK_STATE_WORKING\"," ++
+        "\"message\":{\"messageId\":\"m-0\",\"role\":\"ROLE_AGENT\"," ++
+        "\"parts\":[{\"text\":\"one\"}]}}," ++
+        "\"artifacts\":[{\"artifactId\":\"a-1\",\"parts\":[{\"text\":\"two\"}]}]," ++
+        "\"history\":[{\"messageId\":\"m-1\",\"role\":\"ROLE_USER\"," ++
+        "\"parts\":[{\"text\":\"three\"}]}]}," ++
+        "{\"id\":\"t-2\",\"status\":{\"state\":\"TASK_STATE_COMPLETED\"," ++
+        "\"message\":{\"messageId\":\"m-2\",\"role\":\"ROLE_AGENT\"," ++
+        "\"parts\":[{\"text\":\"four\"}]}}}]," ++
+        "\"nextPageToken\":\"page-2\",\"pageSize\":2,\"totalSize\":7}";
+
+    const response = try decodeListTasksResponse(body, &tasks, &storage.arena, &storage.scratch);
+    try testing.expectEqual(@as(usize, 2), response.tasks.len);
+    try testing.expectEqualStrings("t-1", response.tasks[0].id);
+    try testing.expectEqualStrings("c-1", response.tasks[0].context_id.?);
+    try testing.expectEqualStrings("four", response.tasks[1].status.message.?.parts[0].content.text);
+    try testing.expectEqualStrings("page-2", response.next_page_token);
+    try testing.expectEqual(@as(i32, 2), response.page_size);
+    try testing.expectEqual(@as(i32, 7), response.total_size);
+    // Every `Part` in both tasks, and both nested lists, sit in the one arena
+    // the caller sized: four parts, one artifact and the one history message.
+    try testing.expectEqual(@as(usize, 4), storage.arena.parts_used);
+    try testing.expectEqual(@as(usize, 1), storage.arena.artifacts_used);
+    try testing.expectEqual(@as(usize, 1), storage.arena.messages_used);
+
+    var writer = json.Writer.init(&storage.out);
+    try encodeListTasksResponse(response, &writer, &storage.base64);
+    try testing.expectEqualStrings(body, writer.written());
+
+    // `tasks` is REQUIRED but may be empty: the empty page is a page, and one
+    // decode serves one document, so the second call reset the arena instead of
+    // adding to the first call's fill.
+    const empty = try decodeListTasksResponse(
+        "{\"tasks\":[],\"nextPageToken\":\"\",\"pageSize\":0,\"totalSize\":0}",
+        &tasks,
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(usize, 0), empty.tasks.len);
+    try testing.expectEqualStrings("", empty.next_page_token);
+    try testing.expectEqual(@as(usize, 0), storage.arena.parts_used);
+    writer = json.Writer.init(&storage.out);
+    try encodeListTasksResponse(empty, &writer, &storage.base64);
+    try testing.expectEqualStrings(
+        "{\"tasks\":[],\"nextPageToken\":\"\",\"pageSize\":0,\"totalSize\":0}",
+        writer.written(),
+    );
+
+    // Each of the four members is REQUIRED, so the page is refused when one is
+    // absent rather than answered with a default.
+    try testing.expectError(
+        error.MissingField,
+        decodeListTasksResponse(
+            "{\"nextPageToken\":\"\",\"pageSize\":0,\"totalSize\":0}",
+            &tasks,
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeListTasksResponse(
+            "{\"tasks\":[],\"pageSize\":0,\"totalSize\":0}",
+            &tasks,
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeListTasksResponse(
+            "{\"tasks\":[],\"nextPageToken\":\"\",\"totalSize\":0}",
+            &tasks,
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeListTasksResponse(
+            "{\"tasks\":[],\"nextPageToken\":\"\",\"pageSize\":0}",
+            &tasks,
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+
+    // The body is one JSON value.
+    try testing.expectError(
+        error.MalformedJson,
+        decodeListTasksResponse(body ++ " x", &tasks, &storage.arena, &storage.scratch),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeListTasksResponse(body ++ "{}", &tasks, &storage.arena, &storage.scratch),
+    );
+}
+
+test "a ListTasksResponse reads pageSize and totalSize as int32 and nothing else" {
+    var storage: TestStorage = .{};
+    storage.init();
+    var tasks: [2]Task = undefined;
+
+    // The widest values an `int32` holds are page sizes, and they go back out
+    // as the digits they came in as.
+    const widest = try decodeListTasksResponse(
+        "{\"tasks\":[],\"nextPageToken\":\"\",\"pageSize\":2147483647," ++
+            "\"totalSize\":-2147483648}",
+        &tasks,
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(i32, 2147483647), widest.page_size);
+    try testing.expectEqual(@as(i32, -2147483648), widest.total_size);
+    var writer = json.Writer.init(&storage.out);
+    try encodeListTasksResponse(widest, &writer, &storage.base64);
+    try testing.expectEqualStrings(
+        "{\"tasks\":[],\"nextPageToken\":\"\",\"pageSize\":2147483647," ++
+            "\"totalSize\":-2147483648}",
+        writer.written(),
+    );
+
+    // One past either end, a fraction and an exponent are numbers JSON carries
+    // and an `int32` field does not. None of them may truncate to a page size.
+    try testing.expectError(
+        error.InvalidField,
+        decodeListTasksResponse(
+            "{\"tasks\":[],\"nextPageToken\":\"\",\"pageSize\":2147483648,\"totalSize\":0}",
+            &tasks,
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.InvalidField,
+        decodeListTasksResponse(
+            "{\"tasks\":[],\"nextPageToken\":\"\",\"pageSize\":-2147483649,\"totalSize\":0}",
+            &tasks,
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.InvalidField,
+        decodeListTasksResponse(
+            "{\"tasks\":[],\"nextPageToken\":\"\",\"pageSize\":1.5,\"totalSize\":0}",
+            &tasks,
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.InvalidField,
+        decodeListTasksResponse(
+            "{\"tasks\":[],\"nextPageToken\":\"\",\"pageSize\":1e3,\"totalSize\":0}",
+            &tasks,
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.InvalidField,
+        decodeListTasksResponse(
+            "{\"tasks\":[],\"nextPageToken\":\"\",\"pageSize\":0,\"totalSize\":2147483648}",
+            &tasks,
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+
+    // A quoted number and a boolean are the wrong JSON type, which is a
+    // different fault from a number the field cannot carry.
+    try testing.expectError(
+        error.MalformedJson,
+        decodeListTasksResponse(
+            "{\"tasks\":[],\"nextPageToken\":\"\",\"pageSize\":\"3\",\"totalSize\":0}",
+            &tasks,
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeListTasksResponse(
+            "{\"tasks\":[],\"nextPageToken\":\"\",\"pageSize\":true,\"totalSize\":0}",
+            &tasks,
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+}
+
+test "two tasks in one page keep their escaped strings in their own runs" {
+    var storage: TestStorage = .{};
+    storage.init();
+    var tasks: [2]Task = undefined;
+
+    // Every string below carries an escape, so every one of them is copied into
+    // the reader's scratch. The scratch bump is per reader, and the whole page
+    // is read on one reader, so two tasks must not be handed the same run.
+    const body = "{\"tasks\":[" ++
+        "{\"id\":\"t\\u002d1\",\"contextId\":\"c\\n1\"," ++
+        "\"status\":{\"state\":\"TASK_STATE_WORKING\"," ++
+        "\"message\":{\"messageId\":\"m\\t1\",\"role\":\"ROLE_AGENT\"," ++
+        "\"parts\":[{\"text\":\"one\\\\one\"}]}}," ++
+        "\"artifacts\":[{\"artifactId\":\"a-1\",\"name\":\"n\\na\",\"parts\":[]}]," ++
+        "\"history\":[{\"messageId\":\"h\\n1\",\"role\":\"ROLE_USER\",\"parts\":[]}]}," ++
+        "{\"id\":\"t\\u002d2\",\"contextId\":\"c\\n2\"," ++
+        "\"status\":{\"state\":\"TASK_STATE_COMPLETED\"," ++
+        "\"message\":{\"messageId\":\"m\\t2\",\"role\":\"ROLE_AGENT\"," ++
+        "\"parts\":[{\"text\":\"two\\\\two\"}]}}," ++
+        "\"artifacts\":[{\"artifactId\":\"a-2\",\"name\":\"n\\na\",\"parts\":[]}]," ++
+        "\"history\":[{\"messageId\":\"h\\n2\",\"role\":\"ROLE_USER\",\"parts\":[]}]}]," ++
+        "\"nextPageToken\":\"p\\n1\",\"pageSize\":2,\"totalSize\":2}";
+
+    const response = try decodeListTasksResponse(body, &tasks, &storage.arena, &storage.scratch);
+    try testing.expectEqual(@as(usize, 2), response.tasks.len);
+    try testing.expectEqualStrings("t-1", response.tasks[0].id);
+    try testing.expectEqualStrings("t-2", response.tasks[1].id);
+    try testing.expectEqualStrings("c\n1", response.tasks[0].context_id.?);
+    try testing.expectEqualStrings("c\n2", response.tasks[1].context_id.?);
+    try testing.expectEqualStrings("m\t1", response.tasks[0].status.message.?.message_id);
+    try testing.expectEqualStrings("one\\one", response.tasks[0].status.message.?.parts[0].content.text);
+    try testing.expectEqualStrings("n\na", response.tasks[0].artifacts.?[0].name.?);
+    try testing.expectEqualStrings("h\n2", response.tasks[1].history.?[0].message_id);
+    try testing.expectEqualStrings("p\n1", response.next_page_token);
+
+    const context = response.tasks[0].context_id orelse return error.TestUnexpectedResult;
+    const first_context = context.ptr;
+    try testing.expect(first_context != response.tasks[1].context_id.?.ptr);
+    try testing.expect(first_context != response.tasks[0].status.message.?.message_id.ptr);
+    try testing.expect(
+        first_context != response.tasks[0].status.message.?.parts[0].content.text.ptr,
+    );
+    // The status message, the artifact and the history message are three
+    // different arrays of the one arena, and the two tasks are two more runs.
+    try testing.expect(
+        response.tasks[0].status.message.?.parts[0].content.text.ptr !=
+            response.tasks[1].status.message.?.parts[0].content.text.ptr,
+    );
+    try testing.expect(
+        response.tasks[0].artifacts.?[0].name.?.ptr != response.tasks[0].history.?[0].message_id.ptr,
+    );
+    try testing.expect(
+        response.tasks[0].history.?[0].message_id.ptr != response.tasks[1].history.?[0].message_id.ptr,
+    );
+    try testing.expect(first_context != response.next_page_token.ptr);
+}
+
+test "a task page that outgrows the caller's array is an error and never a truncation" {
+    var storage: TestStorage = .{};
+    storage.init();
+    var scratch: [256]u8 = undefined;
+
+    const two_tasks = "{\"tasks\":[" ++
+        "{\"id\":\"t-1\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}," ++
+        "{\"id\":\"t-2\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}]," ++
+        "\"nextPageToken\":\"\",\"pageSize\":2,\"totalSize\":2}";
+
+    // One slot and a page of two tasks: a page that lost its second task is a
+    // page that says something the caller did not mean.
+    var one_task: [1]Task = undefined;
+    try testing.expectError(
+        error.BufferTooSmall,
+        decodeListTasksResponse(two_tasks, &one_task, &storage.arena, &scratch),
+    );
+    // One slot is enough for the same page with one task, so the refusal is the
+    // second element and not the shape.
+    const single = try decodeListTasksResponse(
+        "{\"tasks\":[{\"id\":\"t-1\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}]," ++
+            "\"nextPageToken\":\"\",\"pageSize\":1,\"totalSize\":1}",
+        &one_task,
+        &storage.arena,
+        &scratch,
+    );
+    try testing.expectEqual(@as(usize, 1), single.tasks.len);
+
+    // The arrays the nested tasks reach are the arena's, and a page that fills
+    // one of them is refused the same way rather than dropping an artifact.
+    var parts: [8]Part = undefined;
+    var one_artifact: [1]Artifact = undefined;
+    var messages: [8]Message = undefined;
+    var strings: [4][]const u8 = undefined;
+    var bytes: [64]u8 = undefined;
+    var two_slots: [2]Task = undefined;
+
+    var artifact_arena = ContentArena.init(&parts, &one_artifact, &messages, &strings, &bytes);
+    try testing.expectError(
+        error.BufferTooSmall,
+        decodeListTasksResponse(
+            "{\"tasks\":[" ++
+                "{\"id\":\"t-1\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}," ++
+                "\"artifacts\":[{\"artifactId\":\"a-1\",\"parts\":[]}]}," ++
+                "{\"id\":\"t-2\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}," ++
+                "\"artifacts\":[{\"artifactId\":\"a-2\",\"parts\":[]}]}]," ++
+                "\"nextPageToken\":\"\",\"pageSize\":2,\"totalSize\":2}",
+            &two_slots,
+            &artifact_arena,
+            &scratch,
+        ),
+    );
+
+    // And for the history array, which is a different array again.
+    var one_message: [1]Message = undefined;
+    var message_arena = ContentArena.init(&parts, &one_artifact, &one_message, &strings, &bytes);
+    try testing.expectError(
+        error.BufferTooSmall,
+        decodeListTasksResponse(
+            "{\"tasks\":[" ++
+                "{\"id\":\"t-1\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}," ++
+                "\"history\":[{\"messageId\":\"m-1\",\"role\":\"ROLE_USER\",\"parts\":[]}]}," ++
+                "{\"id\":\"t-2\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}," ++
+                "\"history\":[{\"messageId\":\"m-2\",\"role\":\"ROLE_AGENT\",\"parts\":[]}]}]," ++
+                "\"nextPageToken\":\"\",\"pageSize\":2,\"totalSize\":2}",
+            &two_slots,
+            &message_arena,
+            &scratch,
+        ),
+    );
+}
+
+test "a repeated ListTasksResponse member takes its first occurrence" {
+    var storage: TestStorage = .{};
+    storage.init();
+    var tasks: [2]Task = undefined;
+
+    // The first occurrence of a name decides it, so every member below keeps
+    // the value it arrived with first and the later copy is dropped.
+    const first_wins = try decodeListTasksResponse(
+        "{\"tasks\":[{\"id\":\"t-1\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}]," ++
+            "\"nextPageToken\":\"a\",\"nextPageToken\":\"b\"," ++
+            "\"pageSize\":1,\"pageSize\":2,\"totalSize\":1,\"totalSize\":9," ++
+            "\"tasks\":[{\"id\":\"t-2\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}]}",
+        &tasks,
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(usize, 1), first_wins.tasks.len);
+    try testing.expectEqualStrings("t-1", first_wins.tasks[0].id);
+    try testing.expectEqualStrings("a", first_wins.next_page_token);
+    try testing.expectEqual(@as(i32, 1), first_wins.page_size);
+    try testing.expectEqual(@as(i32, 1), first_wins.total_size);
+
+    // An empty first list is still the occurrence that decides the member.
+    const empty_first = try decodeListTasksResponse(
+        "{\"tasks\":[],\"tasks\":[{\"id\":\"t-2\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}]," ++
+            "\"nextPageToken\":\"\",\"pageSize\":0,\"totalSize\":0}",
+        &tasks,
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(usize, 0), empty_first.tasks.len);
+
+    // A `null` occurrence is the member missing and wearing a key, so it is
+    // still the occurrence that decided: the page is the empty one and the
+    // later list does not become it.
+    const null_first = try decodeListTasksResponse(
+        "{\"tasks\":null,\"tasks\":[{\"id\":\"t-2\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}]," ++
+            "\"nextPageToken\":\"\",\"pageSize\":0,\"totalSize\":0}",
+        &tasks,
+        &storage.arena,
+        &storage.scratch,
+    );
+    try testing.expectEqual(@as(usize, 0), null_first.tasks.len);
+
+    // The discarded occurrence is still read as a value, so a peer cannot hide
+    // a syntax error in the second slot of a name the first slot already used.
+    try testing.expectError(
+        error.MalformedJson,
+        decodeListTasksResponse(
+            "{\"tasks\":[],\"tasks\":,\"nextPageToken\":\"\",\"pageSize\":0,\"totalSize\":0}",
+            &tasks,
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeListTasksResponse(
+            "{\"nextPageToken\":\"\",\"pageSize\":0,\"pageSize\":,\"totalSize\":0}",
+            &tasks,
+            &storage.arena,
+            &storage.scratch,
+        ),
+    );
+}
+
+test "a ListTasksResponse encoder validates every task before it writes a byte" {
+    var storage: TestStorage = .{};
+    storage.init();
+    var out: [512]u8 = undefined;
+
+    // The second task cannot be written, and the refusal has to arrive before
+    // the first one is: a half-written page is neither a page nor nothing.
+    const tasks = [_]Task{
+        .{ .id = "t-1", .status = .{ .state = .working } },
+        .{ .id = "", .status = .{ .state = .working } },
+    };
+    var writer = json.Writer.init(&out);
+    try testing.expectError(
+        error.InvalidField,
+        encodeListTasksResponse(
+            .{ .tasks = &tasks, .next_page_token = "", .page_size = 2, .total_size = 2 },
+            &writer,
+            &storage.base64,
+        ),
+    );
+    try testing.expectEqual(@as(usize, 0), writer.written().len);
+
+    // One member deeper: a status message carries a REQUIRED id of its own, and
+    // it is the same walk that reaches it.
+    const deeper = [_]Task{
+        .{ .id = "t-1", .status = .{ .state = .working } },
+        .{ .id = "t-2", .status = .{
+            .state = .working,
+            .message = .{ .message_id = "", .role = .agent, .parts = &.{} },
+        } },
+    };
+    writer = json.Writer.init(&out);
+    try testing.expectError(
+        error.InvalidField,
+        encodeListTasksResponse(
+            .{ .tasks = &deeper, .next_page_token = "", .page_size = 2, .total_size = 2 },
+            &writer,
+            &storage.base64,
+        ),
+    );
+    try testing.expectEqual(@as(usize, 0), writer.written().len);
+}
+
+test "a config page tells an absent list from an empty one and an absent token from an empty one" {
+    var scratch: [256]u8 = undefined;
+    var preset: [2]TaskPushNotificationConfig = undefined;
+    var out: [1024]u8 = undefined;
+
+    // Neither member is REQUIRED, so `{}` is a response that never mentioned
+    // either of them, and it goes back out as the same document.
+    const bare = try decodeListTaskPushNotificationConfigsResponse("{}", &preset, &scratch);
+    try testing.expectEqual(@as(?[]const TaskPushNotificationConfig, null), bare.configs);
+    try testing.expectEqual(@as(?[]const u8, null), bare.next_page_token);
+    var writer = json.Writer.init(&out);
+    try encodeListTaskPushNotificationConfigsResponse(bare, &writer);
+    try testing.expectEqualStrings("{}", writer.written());
+
+    // `[]` says the agent holds no configuration, which is not the same
+    // document as one that never said.
+    const empty_list = try decodeListTaskPushNotificationConfigsResponse(
+        "{\"configs\":[]}",
+        &preset,
+        &scratch,
+    );
+    try testing.expectEqual(@as(usize, 0), empty_list.configs.?.len);
+    writer = json.Writer.init(&out);
+    try encodeListTaskPushNotificationConfigsResponse(empty_list, &writer);
+    try testing.expectEqualStrings("{\"configs\":[]}", writer.written());
+
+    // And `""` is the last page rather than an absent token.
+    const empty_token = try decodeListTaskPushNotificationConfigsResponse(
+        "{\"configs\":[],\"nextPageToken\":\"\"}",
+        &preset,
+        &scratch,
+    );
+    writer = json.Writer.init(&out);
+    try encodeListTaskPushNotificationConfigsResponse(empty_token, &writer);
+    try testing.expectEqualStrings(
+        "{\"configs\":[],\"nextPageToken\":\"\"}",
+        writer.written(),
+    );
+
+    // A page carrying two configurations with every member one can have.
+    const body = "{\"configs\":[" ++
+        "{\"tenant\":\"acme\",\"id\":\"cfg-1\",\"taskId\":\"task-1\"," ++
+        "\"url\":\"https://c.example.com/hook\",\"token\":\"tok\"," ++
+        "\"authentication\":{\"scheme\":\"Bearer\",\"credentials\":\"s3cret\"}}," ++
+        "{\"url\":\"https://d.example.com/hook\"}]," ++
+        "\"nextPageToken\":\"page-2\"}";
+    const page = try decodeListTaskPushNotificationConfigsResponse(body, &preset, &scratch);
+    try testing.expectEqual(@as(usize, 2), page.configs.?.len);
+    try testing.expectEqualStrings("task-1", page.configs.?[0].task_id.?);
+    try testing.expectEqualStrings("s3cret", page.configs.?[0].authentication.?.credentials.?);
+    try testing.expectEqual(@as(?AuthenticationInfo, null), page.configs.?[1].authentication);
+    writer = json.Writer.init(&out);
+    try encodeListTaskPushNotificationConfigsResponse(page, &writer);
+    try testing.expectEqualStrings(body, writer.written());
+
+    // A `null` member and an absent one agree; a configuration still has to
+    // carry its `url` and the url may not be empty.
+    const nulled = try decodeListTaskPushNotificationConfigsResponse(
+        "{\"configs\":null}",
+        &preset,
+        &scratch,
+    );
+    try testing.expectEqual(@as(?[]const TaskPushNotificationConfig, null), nulled.configs);
+    try testing.expectError(
+        error.MissingField,
+        decodeListTaskPushNotificationConfigsResponse("{\"configs\":[{}]}", &preset, &scratch),
+    );
+    try testing.expectError(
+        error.InvalidField,
+        decodeListTaskPushNotificationConfigsResponse(
+            "{\"configs\":[{\"url\":\"\"}]}",
+            &preset,
+            &scratch,
+        ),
+    );
+}
+
+test "two configurations in one page keep their escaped strings in their own runs" {
+    var scratch: [512]u8 = undefined;
+    var configs: [2]TaskPushNotificationConfig = undefined;
+
+    // Every string carries an escape, and the two configurations and their
+    // nested authentication all come off the one reader's scratch.
+    const body = "{\"configs\":[" ++
+        "{\"tenant\":\"a\\ncme\",\"id\":\"cfg\\n1\",\"taskId\":\"task\\n1\"," ++
+        "\"url\":\"https://c.example.com/h\\nook\",\"token\":\"to\\tk\"," ++
+        "\"authentication\":{\"scheme\":\"Bearer\",\"credentials\":\"s3c\\nret\"}}," ++
+        "{\"tenant\":\"a\\ncme2\",\"id\":\"cfg\\n2\",\"taskId\":\"task\\n2\"," ++
+        "\"url\":\"https://d.example.com/h\\nook\",\"token\":\"to\\tk2\"," ++
+        "\"authentication\":{\"scheme\":\"Basic\",\"credentials\":\"p\\na55\"}}]," ++
+        "\"nextPageToken\":\"pa\\n2\"}";
+
+    const page = try decodeListTaskPushNotificationConfigsResponse(body, &configs, &scratch);
+    try testing.expectEqual(@as(usize, 2), page.configs.?.len);
+    try testing.expectEqualStrings("a\ncme", page.configs.?[0].tenant.?);
+    try testing.expectEqualStrings("a\ncme2", page.configs.?[1].tenant.?);
+    try testing.expectEqualStrings("https://c.example.com/h\nook", page.configs.?[0].url);
+    try testing.expectEqualStrings("https://d.example.com/h\nook", page.configs.?[1].url);
+    try testing.expectEqualStrings("to\tk", page.configs.?[0].token.?);
+    try testing.expectEqualStrings("s3c\nret", page.configs.?[0].authentication.?.credentials.?);
+    try testing.expectEqualStrings("p\na55", page.configs.?[1].authentication.?.credentials.?);
+    try testing.expectEqualStrings("pa\n2", page.next_page_token.?);
+
+    const first_url = page.configs.?[0].url.ptr;
+    try testing.expect(first_url != page.configs.?[1].url.ptr);
+    try testing.expect(first_url != page.configs.?[0].token.?.ptr);
+    try testing.expect(first_url != page.configs.?[0].tenant.?.ptr);
+    try testing.expect(
+        first_url != page.configs.?[0].authentication.?.credentials.?.ptr,
+    );
+    try testing.expect(
+        page.configs.?[0].authentication.?.credentials.?.ptr !=
+            page.configs.?[1].authentication.?.credentials.?.ptr,
+    );
+    try testing.expect(first_url != page.next_page_token.?.ptr);
+}
+
+test "a config page that outgrows the caller's array is an error and a repeat is first-wins" {
+    var scratch: [256]u8 = undefined;
+
+    // One slot and a page of two configurations.
+    var one: [1]TaskPushNotificationConfig = undefined;
+    try testing.expectError(
+        error.BufferTooSmall,
+        decodeListTaskPushNotificationConfigsResponse(
+            "{\"configs\":[{\"url\":\"https://a.example.com/hook\"}," ++
+                "{\"url\":\"https://b.example.com/hook\"}]}",
+            &one,
+            &scratch,
+        ),
+    );
+    // One slot takes the same document with one configuration.
+    const single = try decodeListTaskPushNotificationConfigsResponse(
+        "{\"configs\":[{\"url\":\"https://a.example.com/hook\"}]}",
+        &one,
+        &scratch,
+    );
+    try testing.expectEqual(@as(usize, 1), single.configs.?.len);
+
+    // The first occurrence of a name decides it, in this message as in every
+    // other.
+    var configs: [2]TaskPushNotificationConfig = undefined;
+    const first_wins = try decodeListTaskPushNotificationConfigsResponse(
+        "{\"configs\":[{\"url\":\"https://a.example.com/hook\"}]," ++
+            "\"configs\":[{\"url\":\"https://b.example.com/hook\"}]," ++
+            "\"nextPageToken\":\"a\",\"nextPageToken\":\"b\"}",
+        &configs,
+        &scratch,
+    );
+    try testing.expectEqual(@as(usize, 1), first_wins.configs.?.len);
+    try testing.expectEqualStrings("https://a.example.com/hook", first_wins.configs.?[0].url);
+    try testing.expectEqualStrings("a", first_wins.next_page_token.?);
+
+    // A `null` occurrence is still the occurrence that decided: the list is
+    // absent and a later list does not become it.
+    const null_first = try decodeListTaskPushNotificationConfigsResponse(
+        "{\"configs\":null,\"configs\":[{\"url\":\"https://a.example.com/hook\"}]}",
+        &configs,
+        &scratch,
+    );
+    try testing.expectEqual(@as(?[]const TaskPushNotificationConfig, null), null_first.configs);
+
+    // The discarded occurrence is still read as a value.
+    try testing.expectError(
+        error.MalformedJson,
+        decodeListTaskPushNotificationConfigsResponse(
+            "{\"configs\":[],\"configs\":}",
+            &configs,
+            &scratch,
+        ),
+    );
+    // And the body is one JSON value.
+    try testing.expectError(
+        error.MalformedJson,
+        decodeListTaskPushNotificationConfigsResponse("{\"configs\":[]} x", &configs, &scratch),
+    );
+}
+
+test "a config list encoder validates every configuration before it writes a byte" {
+    var out: [256]u8 = undefined;
+
+    // The second configuration has no url, and the refusal arrives before the
+    // first one is written.
+    const configs = [_]TaskPushNotificationConfig{
+        .{ .url = "https://a.example.com/hook" },
+        .{ .url = "" },
+    };
+    var writer = json.Writer.init(&out);
+    try testing.expectError(
+        error.InvalidField,
+        encodeListTaskPushNotificationConfigsResponse(
+            .{ .configs = &configs, .next_page_token = "page-2" },
+            &writer,
+        ),
+    );
+    try testing.expectEqual(@as(usize, 0), writer.written().len);
+
+    // One member deeper: authentication carries a REQUIRED scheme of its own.
+    const deeper = [_]TaskPushNotificationConfig{.{
+        .url = "https://a.example.com/hook",
+        .authentication = .{ .scheme = "" },
+    }};
+    writer = json.Writer.init(&out);
+    try testing.expectError(
+        error.InvalidField,
+        encodeListTaskPushNotificationConfigsResponse(
+            .{ .configs = &deeper, .next_page_token = "page-2" },
+            &writer,
+        ),
+    );
+    try testing.expectEqual(@as(usize, 0), writer.written().len);
+}
+
 // --- Codec: the discovery half --------------------------------------------------
 
 // What this section carries
@@ -9530,13 +10485,13 @@ comptime {
     // any of the three a `json` name and the table is describing an ordinary
     // message, so the walk beside it is reading the wrong thing and the build
     // stops saying so.
-    for ([_]type{ SecurityRequirementEntry, SecuritySchemeEntry, OAuthScope }) |T| {
-        if (!isMapEntry(T)) {
+    for ([_]type{ SecurityRequirementEntry, SecuritySchemeEntry, OAuthScope }) |entry_type| {
+        if (!isMapEntry(entry_type)) {
             @compileError(std.fmt.comptimePrint(
                 "{s} is walked over keys, so both of its rows must carry json = null" ++
                     " and a zig_name. A json name here would make findField find it," ++
                     " and a decoder that trusted findField would read nothing.",
-                .{@typeName(T)},
+                .{@typeName(entry_type)},
             ));
         }
     }
@@ -9692,7 +10647,7 @@ fn readStringListObject(
             // The name is singular because the proto disables the
             // pluralisation lint on this message, so a decoder that pluralised
             // it would read nothing.
-            if (std.mem.eql(u8, key, jsonName(StringList, 0).?)) {
+            if (std.mem.eql(u8, key, fieldName(StringList, 0))) {
                 // `null` and an absent member agree, and the encoder writes
                 // none of the two, so the key the entry was named under comes
                 // back as `"oauth":{}`.
@@ -9762,7 +10717,7 @@ fn readSecurityRequirement(
     const is_empty = try reader.beginObject();
     if (!is_empty) {
         while (try reader.nextKey(scratch)) |key| {
-            if (std.mem.eql(u8, key, jsonName(SecurityRequirement, 0).?)) {
+            if (std.mem.eql(u8, key, fieldName(SecurityRequirement, 0))) {
                 if (try claimMember(&saw_schemes, reader, scratch)) {
                     schemes = try readRequirementEntries(reader, arena, scratch);
                 }
@@ -9850,31 +10805,31 @@ fn readAuthorizationCodeOAuthFlow(
     const is_empty = try reader.beginObject();
     if (!is_empty) {
         while (try reader.nextKey(scratch)) |key| {
-            if (std.mem.eql(u8, key, jsonName(AuthorizationCodeOAuthFlow, 0).?)) {
+            if (std.mem.eql(u8, key, fieldName(AuthorizationCodeOAuthFlow, 0))) {
                 if (saw_authorization_url) {
                     try reader.skipValue(scratch);
                 } else {
                     authorization_url = try reader.string(scratch);
                     saw_authorization_url = true;
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AuthorizationCodeOAuthFlow, 1).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AuthorizationCodeOAuthFlow, 1))) {
                 if (saw_token_url) {
                     try reader.skipValue(scratch);
                 } else {
                     token_url = try reader.string(scratch);
                     saw_token_url = true;
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AuthorizationCodeOAuthFlow, 2).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AuthorizationCodeOAuthFlow, 2))) {
                 if (refresh_url != null) {
                     try reader.skipValue(scratch);
                 } else {
                     refresh_url = try reader.string(scratch);
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AuthorizationCodeOAuthFlow, 3).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AuthorizationCodeOAuthFlow, 3))) {
                 if (try claimMember(&saw_scopes, reader, scratch)) {
                     scopes = try readOAuthScopes(reader, arena, scratch);
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AuthorizationCodeOAuthFlow, 4).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AuthorizationCodeOAuthFlow, 4))) {
                 if (pkce_required != null) {
                     try reader.skipValue(scratch);
                 } else {
@@ -9924,20 +10879,20 @@ fn readClientCredentialsOAuthFlow(
     const is_empty = try reader.beginObject();
     if (!is_empty) {
         while (try reader.nextKey(scratch)) |key| {
-            if (std.mem.eql(u8, key, jsonName(ClientCredentialsOAuthFlow, 0).?)) {
+            if (std.mem.eql(u8, key, fieldName(ClientCredentialsOAuthFlow, 0))) {
                 if (saw_token_url) {
                     try reader.skipValue(scratch);
                 } else {
                     token_url = try reader.string(scratch);
                     saw_token_url = true;
                 }
-            } else if (std.mem.eql(u8, key, jsonName(ClientCredentialsOAuthFlow, 1).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(ClientCredentialsOAuthFlow, 1))) {
                 if (refresh_url != null) {
                     try reader.skipValue(scratch);
                 } else {
                     refresh_url = try reader.string(scratch);
                 }
-            } else if (std.mem.eql(u8, key, jsonName(ClientCredentialsOAuthFlow, 2).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(ClientCredentialsOAuthFlow, 2))) {
                 if (try claimMember(&saw_scopes, reader, scratch)) {
                     scopes = try readOAuthScopes(reader, arena, scratch);
                 }
@@ -9973,19 +10928,19 @@ fn readImplicitOAuthFlow(
     const is_empty = try reader.beginObject();
     if (!is_empty) {
         while (try reader.nextKey(scratch)) |key| {
-            if (std.mem.eql(u8, key, jsonName(ImplicitOAuthFlow, 0).?)) {
+            if (std.mem.eql(u8, key, fieldName(ImplicitOAuthFlow, 0))) {
                 if (authorization_url != null) {
                     try reader.skipValue(scratch);
                 } else {
                     authorization_url = try reader.string(scratch);
                 }
-            } else if (std.mem.eql(u8, key, jsonName(ImplicitOAuthFlow, 1).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(ImplicitOAuthFlow, 1))) {
                 if (refresh_url != null) {
                     try reader.skipValue(scratch);
                 } else {
                     refresh_url = try reader.string(scratch);
                 }
-            } else if (std.mem.eql(u8, key, jsonName(ImplicitOAuthFlow, 2).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(ImplicitOAuthFlow, 2))) {
                 if (try claimMember(&saw_scopes, reader, scratch)) {
                     scopes = try readOAuthScopes(reader, arena, scratch);
                 }
@@ -10016,19 +10971,19 @@ fn readPasswordOAuthFlow(
     const is_empty = try reader.beginObject();
     if (!is_empty) {
         while (try reader.nextKey(scratch)) |key| {
-            if (std.mem.eql(u8, key, jsonName(PasswordOAuthFlow, 0).?)) {
+            if (std.mem.eql(u8, key, fieldName(PasswordOAuthFlow, 0))) {
                 if (token_url != null) {
                     try reader.skipValue(scratch);
                 } else {
                     token_url = try reader.string(scratch);
                 }
-            } else if (std.mem.eql(u8, key, jsonName(PasswordOAuthFlow, 1).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(PasswordOAuthFlow, 1))) {
                 if (refresh_url != null) {
                     try reader.skipValue(scratch);
                 } else {
                     refresh_url = try reader.string(scratch);
                 }
-            } else if (std.mem.eql(u8, key, jsonName(PasswordOAuthFlow, 2).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(PasswordOAuthFlow, 2))) {
                 if (try claimMember(&saw_scopes, reader, scratch)) {
                     scopes = try readOAuthScopes(reader, arena, scratch);
                 }
@@ -10058,27 +11013,27 @@ fn readDeviceCodeOAuthFlow(
     const is_empty = try reader.beginObject();
     if (!is_empty) {
         while (try reader.nextKey(scratch)) |key| {
-            if (std.mem.eql(u8, key, jsonName(DeviceCodeOAuthFlow, 0).?)) {
+            if (std.mem.eql(u8, key, fieldName(DeviceCodeOAuthFlow, 0))) {
                 if (saw_device_authorization_url) {
                     try reader.skipValue(scratch);
                 } else {
                     device_authorization_url = try reader.string(scratch);
                     saw_device_authorization_url = true;
                 }
-            } else if (std.mem.eql(u8, key, jsonName(DeviceCodeOAuthFlow, 1).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(DeviceCodeOAuthFlow, 1))) {
                 if (saw_token_url) {
                     try reader.skipValue(scratch);
                 } else {
                     token_url = try reader.string(scratch);
                     saw_token_url = true;
                 }
-            } else if (std.mem.eql(u8, key, jsonName(DeviceCodeOAuthFlow, 2).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(DeviceCodeOAuthFlow, 2))) {
                 if (refresh_url != null) {
                     try reader.skipValue(scratch);
                 } else {
                     refresh_url = try reader.string(scratch);
                 }
-            } else if (std.mem.eql(u8, key, jsonName(DeviceCodeOAuthFlow, 3).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(DeviceCodeOAuthFlow, 3))) {
                 if (try claimMember(&saw_scopes, reader, scratch)) {
                     scopes = try readOAuthScopes(reader, arena, scratch);
                 }
@@ -10176,17 +11131,17 @@ fn readOAuth2SecurityScheme(
     const is_empty = try reader.beginObject();
     if (!is_empty) {
         while (try reader.nextKey(scratch)) |key| {
-            if (std.mem.eql(u8, key, jsonName(OAuth2SecurityScheme, 0).?)) {
+            if (std.mem.eql(u8, key, fieldName(OAuth2SecurityScheme, 0))) {
                 if (description != null) {
                     try reader.skipValue(scratch);
                 } else {
                     description = try reader.string(scratch);
                 }
-            } else if (std.mem.eql(u8, key, jsonName(OAuth2SecurityScheme, 1).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(OAuth2SecurityScheme, 1))) {
                 if (try claimMember(&saw_flows, reader, scratch)) {
                     flows = try readOAuthFlows(reader, arena, scratch);
                 }
-            } else if (std.mem.eql(u8, key, jsonName(OAuth2SecurityScheme, 2).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(OAuth2SecurityScheme, 2))) {
                 if (oauth2_metadata_url != null) {
                     try reader.skipValue(scratch);
                 } else {
@@ -10348,23 +11303,23 @@ fn readAgentCapabilities(
     const is_empty = try reader.beginObject();
     if (!is_empty) {
         while (try reader.nextKey(scratch)) |key| {
-            if (std.mem.eql(u8, key, jsonName(AgentCapabilities, 0).?)) {
+            if (std.mem.eql(u8, key, fieldName(AgentCapabilities, 0))) {
                 if (streaming != null) {
                     try reader.skipValue(scratch);
                 } else {
                     streaming = try reader.boolean();
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AgentCapabilities, 1).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AgentCapabilities, 1))) {
                 if (push_notifications != null) {
                     try reader.skipValue(scratch);
                 } else {
                     push_notifications = try reader.boolean();
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AgentCapabilities, 2).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AgentCapabilities, 2))) {
                 if (try claimMember(&saw_extensions, reader, scratch)) {
                     extensions = try readExtensions(reader, arena, scratch);
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AgentCapabilities, 3).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AgentCapabilities, 3))) {
                 if (extended_agent_card != null) {
                     try reader.skipValue(scratch);
                 } else {
@@ -10415,44 +11370,44 @@ fn readAgentSkill(
     const is_empty = try reader.beginObject();
     if (!is_empty) {
         while (try reader.nextKey(scratch)) |key| {
-            if (std.mem.eql(u8, key, jsonName(AgentSkill, 0).?)) {
+            if (std.mem.eql(u8, key, fieldName(AgentSkill, 0))) {
                 if (saw_id) {
                     try reader.skipValue(scratch);
                 } else {
                     id = try reader.string(scratch);
                     saw_id = true;
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AgentSkill, 1).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AgentSkill, 1))) {
                 if (saw_name) {
                     try reader.skipValue(scratch);
                 } else {
                     name = try reader.string(scratch);
                     saw_name = true;
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AgentSkill, 2).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AgentSkill, 2))) {
                 if (saw_description) {
                     try reader.skipValue(scratch);
                 } else {
                     description = try reader.string(scratch);
                     saw_description = true;
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AgentSkill, 3).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AgentSkill, 3))) {
                 if (try claimMember(&saw_tags, reader, scratch)) {
                     tags = try readCardStrings(reader, arena, scratch);
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AgentSkill, 4).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AgentSkill, 4))) {
                 if (try claimMember(&saw_examples, reader, scratch)) {
                     examples = try readCardStrings(reader, arena, scratch);
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AgentSkill, 5).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AgentSkill, 5))) {
                 if (try claimMember(&saw_input_modes, reader, scratch)) {
                     input_modes = try readCardStrings(reader, arena, scratch);
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AgentSkill, 6).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AgentSkill, 6))) {
                 if (try claimMember(&saw_output_modes, reader, scratch)) {
                     output_modes = try readCardStrings(reader, arena, scratch);
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AgentSkill, 7).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AgentSkill, 7))) {
                 if (try claimMember(&saw_security_requirements, reader, scratch)) {
                     security_requirements = try readSecurityRequirements(reader, arena, scratch);
                 }
@@ -10566,70 +11521,70 @@ fn readAgentCard(reader: *json.Reader, arena: *CardArena, scratch: []u8) DecodeE
     const is_empty = try reader.beginObject();
     if (!is_empty) {
         while (try reader.nextKey(scratch)) |key| {
-            if (std.mem.eql(u8, key, jsonName(AgentCard, 0).?)) {
+            if (std.mem.eql(u8, key, fieldName(AgentCard, 0))) {
                 if (saw_name) {
                     try reader.skipValue(scratch);
                 } else {
                     name = try reader.string(scratch);
                     saw_name = true;
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 1).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AgentCard, 1))) {
                 if (saw_description) {
                     try reader.skipValue(scratch);
                 } else {
                     description = try reader.string(scratch);
                     saw_description = true;
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 2).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AgentCard, 2))) {
                 if (try claimMember(&saw_supported_interfaces, reader, scratch)) {
                     supported_interfaces = try readInterfaces(reader, arena, scratch);
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 3).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AgentCard, 3))) {
                 if (try claimMember(&saw_provider, reader, scratch)) {
                     provider = try readAgentProvider(reader, scratch);
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 4).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AgentCard, 4))) {
                 if (saw_version) {
                     try reader.skipValue(scratch);
                 } else {
                     version = try reader.string(scratch);
                     saw_version = true;
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 5).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AgentCard, 5))) {
                 if (documentation_url != null) {
                     try reader.skipValue(scratch);
                 } else {
                     documentation_url = try reader.string(scratch);
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 6).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AgentCard, 6))) {
                 if (try claimMember(&saw_capabilities, reader, scratch)) {
                     capabilities = try readAgentCapabilities(reader, arena, scratch);
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 7).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AgentCard, 7))) {
                 if (try claimMember(&saw_security_schemes, reader, scratch)) {
                     security_schemes = try readSecuritySchemes(reader, arena, scratch);
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 8).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AgentCard, 8))) {
                 if (try claimMember(&saw_security_requirements, reader, scratch)) {
                     security_requirements = try readSecurityRequirements(reader, arena, scratch);
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 9).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AgentCard, 9))) {
                 if (try claimMember(&saw_default_input_modes, reader, scratch)) {
                     default_input_modes = try readCardStrings(reader, arena, scratch);
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 10).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AgentCard, 10))) {
                 if (try claimMember(&saw_default_output_modes, reader, scratch)) {
                     default_output_modes = try readCardStrings(reader, arena, scratch);
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 11).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AgentCard, 11))) {
                 if (try claimMember(&saw_skills, reader, scratch)) {
                     skills = try readSkills(reader, arena, scratch);
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 12).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AgentCard, 12))) {
                 if (try claimMember(&saw_signatures, reader, scratch)) {
                     signatures = try readSignatures(reader, arena, scratch);
                 }
-            } else if (std.mem.eql(u8, key, jsonName(AgentCard, 13).?)) {
+            } else if (std.mem.eql(u8, key, fieldName(AgentCard, 13))) {
                 if (icon_url != null) {
                     try reader.skipValue(scratch);
                 } else {
@@ -11392,17 +12347,29 @@ pub fn encodeStringList(list: StringList, writer: *json.Writer) EncodeError!void
 /// caller. A test that has to prove exhaustion builds its own smaller arrays,
 /// because that is the whole point of it.
 const CardTestStorage = struct {
+    // SAFETY: `readInterfaces` assigns its slot before `interfaces_used` grows past it.
     interfaces: [4]AgentInterface = undefined,
+    // SAFETY: `readSkills` assigns its slot before `skills_used` grows past it.
     skills: [4]AgentSkill = undefined,
+    // SAFETY: `readExtensions` assigns its slot before `extensions_used` grows past it.
     extensions: [4]AgentExtension = undefined,
+    // SAFETY: `readSignatures` assigns its slot before `signatures_used` grows past it.
     signatures: [2]AgentCardSignature = undefined,
+    // SAFETY: `readSecuritySchemes` assigns its slot before `security_schemes_used` grows.
     security_schemes: [4]SecuritySchemeEntry = undefined,
+    // SAFETY: `readSecurityRequirements` assigns its slot before `security_requirements_used` grows.
     security_requirements: [4]SecurityRequirement = undefined,
+    // SAFETY: `readRequirementEntries` assigns its slot before `requirement_entries_used` grows.
     requirement_entries: [8]SecurityRequirementEntry = undefined,
+    // SAFETY: `readOAuthScopes` assigns its slot before `scopes_used` grows past it.
     scopes: [8]OAuthScope = undefined,
+    // SAFETY: `readStringList` writes `out[count]` before it returns the count it counted.
     strings: [32][]const u8 = undefined,
+    // SAFETY: `json.Writer.init` starts the run at 0; only `written()` slices it out.
     out: [8192]u8 = undefined,
+    // SAFETY: the reader copies each token into scratch and slices only what it wrote.
     scratch: [1024]u8 = undefined,
+    // SAFETY: `init` assigns it before a test reads a member; every count starts at 0.
     arena: CardArena = undefined,
 
     /// Point the arena at the arrays above. A method and not a field default,
@@ -11522,7 +12489,7 @@ test "a card carrying two security requirements and three scopes round-trips bot
     // a decoder that kept the first entry of a map and dropped the rest would
     // come back with one scope and a card that lost two of the three the agent
     // published.
-    const schemes = card.security_schemes.?;
+    const schemes = card.security_schemes orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(usize, 1), schemes.len);
     try testing.expectEqualStrings("oauth", schemes[0].name);
     try testing.expect(schemes[0].scheme == .oauth2);
@@ -11656,7 +12623,8 @@ test "a repeated key takes its first occurrence" {
         "\":{\"list\":[\"b\"]}}}],\"defaultInputModes\":[],\"defaultOutputM" ++
         "odes\":[],\"skills\":[]}";
     const card = try decodeAgentCard(duplicate, &storage.arena, &storage.scratch);
-    const schemes = card.security_requirements.?[0].schemes.?;
+    const requirements = card.security_requirements orelse return error.TestUnexpectedResult;
+    const schemes = requirements[0].schemes orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(usize, 1), schemes.len);
     try testing.expectEqualStrings("oauth", schemes[0].name);
     try testing.expectEqualStrings("a", schemes[0].list.list.?[0]);
@@ -11866,7 +12834,8 @@ test "a map value sent as null is an entry that is not there" {
         "{\"basic\":null,\"oauth\":{\"list\":[\"a\"]}}}]," ++
         "\"defaultInputModes\":[],\"defaultOutputModes\":[],\"skills\":[]}";
     const card = try decodeAgentCard(raw, &storage.arena, &storage.scratch);
-    const schemes = card.security_requirements.?[0].schemes.?;
+    const requirements = card.security_requirements orelse return error.TestUnexpectedResult;
+    const schemes = requirements[0].schemes orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(usize, 1), schemes.len);
     try testing.expectEqualStrings("oauth", schemes[0].name);
 
