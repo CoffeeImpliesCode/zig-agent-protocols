@@ -9,6 +9,16 @@
 //! normative examples themselves the regression net, so a change to a tag, a
 //! spelling or a required member moves one of them.
 //!
+//! Two of them go back out as well. The `bridge` encoders are the pair this
+//! library exists to keep honest: a member a decoder accepted and then did not
+//! write back re-encodes to a document that still decodes cleanly, so nothing
+//! downstream ever reports the loss. No fixture under `test/golden/` carries
+//! the ACP carrier `_meta` that loss is about, and the step did not call
+//! either encoder at all, so the two tests below wrap the normative payloads
+//! in the carrier the RFD names and compare the written bytes against them
+//! literally. That is the only coverage those two encoders have in the
+//! default step, and it is the coverage the binding's own loss class needs.
+//!
 //! ## Provenance
 //!
 //! Verbatim JSON blocks, copied without reformatting, or a verbatim member
@@ -253,6 +263,52 @@ test "the RFD worked example decodes as a request carrying one envelope" {
     // The only three methods that may return an input_required result.
     try testing.expect(info.mrtr);
     try testing.expect(mcp.permitsMrtr(envelope.inner_method));
+
+    // The encoder, over the same normative envelope, and byte for byte. The
+    // three member names and their order are written out here and the `params`
+    // lexeme is the example's own bytes, so an encoder that rebuilt the member
+    // from a shape would disagree here on the indentation it would have to
+    // drop. `zig build test` had no coverage of `bridge.encodeEnvelope` at
+    // all, and the one loss this binding exists to prevent is a member that
+    // decodes and is then not written back.
+    var out: [1024]u8 = undefined;
+    var owed: [2048]u8 = undefined;
+    var writer = json.Writer.init(&out);
+    try bridge.encodeEnvelope(envelope, &writer);
+    // The expected bytes are assembled with a writer rather than a `++`,
+    // because the one member that is not a literal is the example's own
+    // `params` lexeme and that is a runtime slice.
+    var canonical = json.Writer.init(&owed);
+    try canonical.slice("{\"serverId\":\"project-tools:7a72\",");
+    try canonical.slice("\"requestId\":\"mcp-request:a11f\",");
+    try canonical.slice("\"method\":\"tools/call\",\"params\":");
+    try canonical.slice(envelope.inner_params.?);
+    try canonical.byte('}');
+    try testing.expectEqualStrings(canonical.written(), writer.written());
+    // And those bytes decode back to the same envelope, so what is pinned
+    // above is a round trip rather than one half of one.
+    const again = try bridge.decodeEnvelope(writer.written(), try pool.next(), message.id);
+    try testing.expectEqualStrings(envelope.server_id, again.server_id);
+    try testing.expectEqualStrings(envelope.request_id, again.request_id);
+    try testing.expectEqualStrings(envelope.inner_method, again.inner_method);
+    try testing.expectEqualStrings(envelope.inner_params.?, again.inner_params.?);
+
+    // The same envelope with the ACP envelope `_meta` the RFD names beside
+    // `serverId`. The three members are the example's own spellings and the
+    // carrier is a member this binding does not model, so the only way to
+    // reproduce these bytes is to carry the lexeme and write it back.
+    var carrier = json.Writer.init(&owed);
+    try carrier.slice("{\"serverId\":\"project-tools:7a72\",");
+    try carrier.slice("\"requestId\":\"mcp-request:a11f\",");
+    try carrier.slice("\"method\":\"tools/call\",\"params\":");
+    try carrier.slice(envelope.inner_params.?);
+    try carrier.slice(",\"_meta\":{\"trace\":\"abc\"}}");
+    const carried = carrier.written();
+    const carried_envelope = try bridge.decodeEnvelope(carried, try pool.next(), message.id);
+    try testing.expectEqualStrings("{\"trace\":\"abc\"}", carried_envelope.meta.?);
+    var carried_writer = json.Writer.init(&out);
+    try bridge.encodeEnvelope(carried_envelope, &carried_writer);
+    try testing.expectEqualStrings(carried, carried_writer.written());
 
     // The `_meta` the example carries names the one revision the binding
     // supports, so a version the library does not implement would show up here
@@ -699,6 +755,57 @@ test "a version mismatch inside the outcome carrier is not a binding failure" {
     const result_type = try mcp.decodeResultType(result_text, try pool.next());
     try testing.expectEqualStrings("complete", result_type.value.?);
     try testing.expect(result_type.isComplete());
+
+    // The encoder, over the same normative outcome, and byte for byte. Neither
+    // fixture under `test/golden/` carries a carrier `_meta`, and
+    // `bridge.encodeOutcome` was not called by this step at all, so the default
+    // test run had no coverage of the exact loss the outcome encoder exists to
+    // prevent: a carrier accepted by the decoder and then not written back.
+    //
+    // The frame around the payload is written with a writer because the
+    // payload itself is the fixture's own lexeme, indentation and all, and an
+    // encoder that rebuilt it from a shape would have to produce different
+    // bytes to pass. The member name and the brace are the literals, and they
+    // are what pins the frame.
+    var out: [1024]u8 = undefined;
+    var owed: [2048]u8 = undefined;
+    var writer = json.Writer.init(&out);
+    try bridge.encodeOutcome(success, &writer);
+    var canonical = json.Writer.init(&owed);
+    try canonical.slice("{\"result\":");
+    try canonical.slice(result_text);
+    try canonical.byte('}');
+    try testing.expectEqualStrings(canonical.written(), writer.written());
+
+    // And the carrier, which is the member the whole comparison is for. The
+    // object under `_meta` names keys this binding does not model, which is
+    // the reason it is carried as text at all.
+    var carrier = json.Writer.init(&owed);
+    try carrier.slice("{\"result\":");
+    try carrier.slice(result_text);
+    try carrier.slice(",\"_meta\":{\"trace\":\"t\",\"vendor\":[1]}}");
+    const carried_result = carrier.written();
+    const result_arm = try bridge.decodeOutcome(carried_result, try pool.next());
+    try testing.expectEqualStrings(
+        "{\"trace\":\"t\",\"vendor\":[1]}",
+        result_arm.result.meta.?,
+    );
+    var carried = json.Writer.init(&out);
+    try bridge.encodeOutcome(result_arm, &carried);
+    try testing.expectEqualStrings(carried_result, carried.written());
+
+    // The same on the error arm, so a rejection cannot reach the peer stripped
+    // of the metadata the caller put beside it.
+    var error_carrier = json.Writer.init(&owed);
+    try error_carrier.slice("{\"error\":");
+    try error_carrier.slice(error_text);
+    try error_carrier.slice(",\"_meta\":{\"trace\":\"t\"}}");
+    const carried_error = error_carrier.written();
+    const error_arm = try bridge.decodeOutcome(carried_error, try pool.next());
+    try testing.expectEqualStrings("{\"trace\":\"t\"}", error_arm.@"error".meta.?);
+    var carried_error_writer = json.Writer.init(&out);
+    try bridge.encodeOutcome(error_arm, &carried_error_writer);
+    try testing.expectEqualStrings(carried_error, carried_error_writer.written());
 }
 
 // --- A2A -----------------------------------------------------------------------

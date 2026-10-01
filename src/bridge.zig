@@ -121,6 +121,15 @@ pub const Envelope = struct {
 /// member. `_meta` is the one the RFD defines, so it is carried rather than
 /// skipped; the RFD names no other member of this object.
 ///
+/// A member the input spells more than once resolves first-wins, which is the
+/// rule [`json.memberText`] and [`jsonrpc.decode`] apply and the reason they
+/// apply it: a later member must not be able to make a failed comparison
+/// pass. So the first `serverId` is the server the envelope names, and a
+/// second one appended beside it cannot repair an empty identifier or
+/// redirect the call to another tenant than the one a first-wins intermediary
+/// read. The repeat is stepped over rather than refused; `http` is the one
+/// decoder in this library that refuses one outright, and this is not it.
+///
 /// The walk is ordered, so a document wrong in more than one way reports the
 /// first fault the walk reaches. A `params` shape fault is detected inside
 /// the member loop and is therefore reported ahead of a trailing tail, which
@@ -143,21 +152,39 @@ pub fn decodeEnvelope(
     var saw_server = false;
     var saw_request = false;
     var saw_method = false;
+    var saw_params = false;
+    var saw_meta = false;
     // A request carries an inner method; a notification carries the MCP
     // notification belonging to the operation, which also has a method.
 
     if (try reader.beginObject()) return error.MissingField;
 
     while (try reader.nextKey(scratch)) |key| {
+        // Each member is taken from its first occurrence and the second is
+        // stepped over, for the reason the doc above gives. The guards are
+        // read before the value rather than after it, so a repeat is spent by
+        // `skipValue` and never overwrites what the first one decoded.
         if (std.mem.eql(u8, key, "serverId")) {
-            envelope.server_id = try reader.string(scratch);
-            saw_server = true;
+            if (saw_server) {
+                try reader.skipValue(scratch);
+            } else {
+                envelope.server_id = try reader.string(scratch);
+                saw_server = true;
+            }
         } else if (std.mem.eql(u8, key, "requestId")) {
-            envelope.request_id = try reader.string(scratch);
-            saw_request = true;
+            if (saw_request) {
+                try reader.skipValue(scratch);
+            } else {
+                envelope.request_id = try reader.string(scratch);
+                saw_request = true;
+            }
         } else if (std.mem.eql(u8, key, "method")) {
-            envelope.inner_method = try reader.string(scratch);
-            saw_method = true;
+            if (saw_method) {
+                try reader.skipValue(scratch);
+            } else {
+                envelope.inner_method = try reader.string(scratch);
+                saw_method = true;
+            }
         } else if (std.mem.eql(u8, key, "params")) {
             // `research/normative/acp-v1-v2.md` table 10b types this member
             // "object | `null`" and says "positional arrays are invalid", which
@@ -170,14 +197,26 @@ pub fn decodeEnvelope(
             // required to refuse. The shape is checked before the lexeme is
             // taken; `n` is the `null` the same row allows, and `skipValue`
             // is what rejects a malformed literal under it.
+            //
+            // The shape is checked on a repeat too. The first occurrence is
+            // the one that is carried, and a document whose second `params`
+            // is an array is malformed whatever the first one said.
             reader.skipWhitespace();
             const byte = reader.peek() orelse return error.Truncated;
             if (byte != '{' and byte != 'n') return error.InvalidField;
-            envelope.inner_params = try reader.rawValue(scratch);
+            const value = try reader.rawValue(scratch);
+            if (!saw_params) {
+                envelope.inner_params = value;
+                saw_params = true;
+            }
         } else if (std.mem.eql(u8, key, "_meta")) {
             // Carried verbatim so `encodeEnvelope` can put it back. See
             // [`Envelope.meta`] for why it is borrowed text and not a shape.
-            envelope.meta = try reader.rawValue(scratch);
+            const value = try reader.rawValue(scratch);
+            if (!saw_meta) {
+                envelope.meta = value;
+                saw_meta = true;
+            }
         } else {
             try reader.skipValue(scratch);
         }
@@ -264,6 +303,14 @@ pub const Outcome = union(enum) {
 /// therefore drops it — the same stated consequence [`jsonrpc.decode`]
 /// records, and it remains open for an *unrecognised* member. The carrier
 /// `_meta` is the one table 10c defines, so it is carried rather than skipped.
+///
+/// A member the input spells more than once resolves first-wins, as in
+/// [`decodeEnvelope`] and as [`jsonrpc.decode`] applies it. A repeat is not a
+/// second outcome, so `{"result":1,"result":2}` is the first result rather
+/// than a document to refuse, and a carrier `_meta` appended twice carries the
+/// first one. What is still refused is the *pair*: an object carrying both
+/// `result` and `error` has two outcomes whichever order they arrived in, and
+/// the specification allows one.
 pub fn decodeOutcome(raw: []const u8, scratch: []u8) DecodeError!Outcome {
     var reader = json.Reader.init(raw);
     // The outcome member and the carrier metadata are collected apart and
@@ -273,31 +320,55 @@ pub fn decodeOutcome(raw: []const u8, scratch: []u8) DecodeError!Outcome {
     var text: ?[]const u8 = null;
     var is_error = false;
     var carrier_meta: ?[]const u8 = null;
+    var saw_result = false;
+    var saw_error = false;
+    var saw_meta = false;
 
     if (try reader.beginObject()) return error.MissingField;
 
     while (try reader.nextKey(scratch)) |key| {
+        // Each member is taken from its first occurrence and the second is
+        // stepped over, for the reason the doc above gives. The guard is read
+        // before the value, so a repeat never overwrites what the first one
+        // decoded.
         if (std.mem.eql(u8, key, "result")) {
-            // A payload is borrowed text and is never null, so a non-null
-            // `text` is the "an outcome is already present" test the flag was.
-            if (text != null) return error.InvalidField;
-            // Deliberately not checked. A result carries whatever the MCP
-            // operation returned, and an explicit `null` is a result.
-            text = try reader.rawValue(scratch);
+            if (saw_result) {
+                try reader.skipValue(scratch);
+            } else {
+                // The two members are mutually exclusive whichever came
+                // first, so the *other* outcome beside this one is the
+                // refusal. It is the pair that is illegal, not the repetition.
+                if (saw_error) return error.InvalidField;
+                saw_result = true;
+                // Deliberately not checked. A result carries whatever the MCP
+                // operation returned, and an explicit `null` is a result.
+                text = try reader.rawValue(scratch);
+            }
         } else if (std.mem.eql(u8, key, "error")) {
-            if (text != null) return error.InvalidField;
-            // The lexeme is taken around the check rather than by `rawValue`,
-            // which consumes the value before anything can look at it.
-            reader.skipWhitespace();
-            const start = reader.pos;
-            try checkInnerError(&reader, scratch);
-            text = reader.input[start..reader.pos];
-            is_error = true;
+            if (saw_error) {
+                try reader.skipValue(scratch);
+            } else {
+                // And in the other order, for the same reason.
+                if (saw_result) return error.InvalidField;
+                saw_error = true;
+                // The lexeme is taken around the check rather than by
+                // `rawValue`, which consumes the value before anything can
+                // look at it.
+                reader.skipWhitespace();
+                const start = reader.pos;
+                try checkInnerError(&reader, scratch);
+                text = reader.input[start..reader.pos];
+                is_error = true;
+            }
         } else if (std.mem.eql(u8, key, "_meta")) {
-            // Carried verbatim so `encodeOutcome` can put it back. See
-            // [`OutcomePayload.meta`] for why it is borrowed text and not a
-            // shape.
-            carrier_meta = try reader.rawValue(scratch);
+            const value = try reader.rawValue(scratch);
+            if (!saw_meta) {
+                saw_meta = true;
+                // Carried verbatim so `encodeOutcome` can put it back. See
+                // [`OutcomePayload.meta`] for why it is borrowed text and not
+                // a shape.
+                carrier_meta = value;
+            }
         } else {
             try reader.skipValue(scratch);
         }
@@ -340,7 +411,14 @@ fn checkInnerError(reader: *json.Reader, scratch: []u8) DecodeError!void {
     var saw_code = false;
     var saw_message = false;
     while (try reader.nextKey(scratch)) |key| {
+        // First-wins here as in every other member walk in this library, so a
+        // second `code` cannot supply the integer the first one was refused
+        // for.
         if (std.mem.eql(u8, key, "code")) {
+            if (saw_code) {
+                try reader.skipValue(scratch);
+                continue;
+            }
             // A JSON-RPC code is an integer: not a quoted number, and not a
             // fraction, so `-32602.0` is not the code the binding allocates.
             reader.skipWhitespace();
@@ -354,6 +432,10 @@ fn checkInnerError(reader: *json.Reader, scratch: []u8) DecodeError!void {
             }
             saw_code = true;
         } else if (std.mem.eql(u8, key, "message")) {
+            if (saw_message) {
+                try reader.skipValue(scratch);
+                continue;
+            }
             reader.skipWhitespace();
             if ((reader.peek() orelse return error.Truncated) != '"') {
                 return error.InvalidField;
@@ -666,6 +748,126 @@ test "an envelope round-trips its outer _meta byte for byte" {
     var second = json.Writer.init(&buffer);
     try encodeEnvelope(both, &second);
     try testing.expectEqualStrings(with_params, second.written());
+}
+
+test "an envelope member the input spells twice resolves first-wins" {
+    var scratch: [256]u8 = undefined;
+    var buffer: [256]u8 = undefined;
+
+    // `AGENTS.md` pins first-wins for a repeated member, and names the harm
+    // it prevents: a later member must not be able to make a failed
+    // comparison pass. This walk took the last occurrence of every member it
+    // compared, so a peer could name one tenant and then, on the same line,
+    // name another, and a proxy reading the document with `json.memberText`
+    // beside it would forward the call somewhere the first reader did not.
+    const redirected =
+        \\{"serverId":"tenant-a","requestId":"r","method":"tools/call","serverId":"tenant-b"}
+    ;
+    const envelope = try decodeEnvelope(redirected, &scratch, .{ .integer = 7 });
+    try testing.expectEqualStrings("tenant-a", envelope.server_id);
+
+    // The repeat is stepped over rather than refused, and the encoder writes
+    // the member once, from the occurrence the decoder kept.
+    var writer = json.Writer.init(&buffer);
+    try encodeEnvelope(envelope, &writer);
+    try testing.expectEqualStrings(
+        \\{"serverId":"tenant-a","requestId":"r","method":"tools/call"}
+    , writer.written());
+
+    // Every member the walk compares, not only the one the harm is named
+    // against: a repeat of `requestId`, `method` or `params` is the same
+    // question and the same answer.
+    const repeated = try decodeEnvelope(
+        \\{"serverId":"s","requestId":"first","requestId":"second","method":"first","method":"second","params":{"a":1},"params":{"b":2}}
+    , &scratch, null);
+    try testing.expectEqualStrings("first", repeated.request_id);
+    try testing.expectEqualStrings("first", repeated.inner_method);
+    try testing.expectEqualStrings("{\"a\":1}", repeated.inner_params.?);
+
+    // The carrier `_meta` is carried the same way, because it is carried
+    // rather than modelled, so a second one is a second document a peer did
+    // not mean to write.
+    const twice_meta = try decodeEnvelope(
+        \\{"serverId":"s","requestId":"r","method":"m","_meta":{"a":1},"_meta":{"b":2}}
+    , &scratch, null);
+    try testing.expectEqualStrings("{\"a\":1}", twice_meta.meta.?);
+}
+
+test "a later envelope member cannot repair an empty one" {
+    var scratch: [256]u8 = undefined;
+
+    // The check below the member loop refuses an empty identifier, and a walk
+    // that resolved last-wins let a peer append a usable one and be accepted
+    // anyway: the document the encoder was handed was not the document the
+    // first reader saw. Under first-wins the empty `serverId` is the one that
+    // is read, so the refusal stands.
+    try testing.expectError(error.InvalidField, decodeEnvelope(
+        \\{"serverId":"","requestId":"r","method":"m","serverId":"s"}
+    , &scratch, null));
+    try testing.expectError(error.InvalidField, decodeEnvelope(
+        \\{"serverId":"s","requestId":"","requestId":"r","method":"m"}
+    , &scratch, null));
+    try testing.expectError(error.InvalidField, decodeEnvelope(
+        \\{"serverId":"s","requestId":"r","method":"","method":"m"}
+    , &scratch, null));
+
+    // A member that is absent stays absent. A repeat is not a way to supply
+    // one the document never carried.
+    try testing.expectError(error.MissingField, decodeEnvelope(
+        \\{"requestId":"r","method":"m","requestId":"r"}
+    , &scratch, null));
+}
+
+test "a repeated params member is shape-checked even though it is skipped" {
+    var scratch: [256]u8 = undefined;
+
+    // The first occurrence is the lexeme the envelope carries, and a document
+    // whose second `params` is an array is malformed whatever the first one
+    // said: table 10b types the member "object | `null`" and says positional
+    // arrays are invalid, and the member is named in the document however
+    // often it is spelled.
+    try testing.expectError(error.InvalidField, decodeEnvelope(
+        \\{"serverId":"s","requestId":"r","method":"m","params":{},"params":[1,2]}
+    , &scratch, null));
+    // And the first one is still checked, so a second valid member cannot
+    // stand in for a malformed first.
+    try testing.expectError(error.InvalidField, decodeEnvelope(
+        \\{"serverId":"s","requestId":"r","method":"m","params":[1,2],"params":{}}
+    , &scratch, null));
+}
+
+test "an outcome member the input spells twice resolves first-wins" {
+    var scratch: [256]u8 = undefined;
+    var buffer: [256]u8 = undefined;
+
+    // The same rule as the envelope. The pair is still refused — that is a
+    // document with two outcomes — and the repetition is not.
+    try testing.expectError(error.InvalidField, decodeOutcome(
+        \\{"result":1,"error":{"code":-1,"message":"m"}}
+    , &scratch));
+    try testing.expectError(error.InvalidField, decodeOutcome(
+        \\{"error":{"code":-1,"message":"m"},"result":1}
+    , &scratch));
+
+    const first = try decodeOutcome(
+        \\{"result":{"a":1},"result":{"b":2}}
+    , &scratch);
+    try testing.expect(first == .result);
+    try testing.expectEqualStrings("{\"a\":1}", first.result.text);
+    var writer = json.Writer.init(&buffer);
+    try encodeOutcome(first, &writer);
+    try testing.expectEqualStrings("{\"result\":{\"a\":1}}", writer.written());
+
+    // The carrier `_meta` rides the same rule, and an `error` pair does too:
+    // the second `code` is not the code the caller is told about.
+    const repeated_error = try decodeOutcome(
+        \\{"error":{"code":-1,"message":"first","code":-32022,"message":"second"},"_meta":{"a":1},"_meta":{"b":2}}
+    , &scratch);
+    try testing.expect(repeated_error == .@"error");
+    try testing.expectEqualStrings(
+        \\{"code":-1,"message":"first","code":-32022,"message":"second"}
+    , repeated_error.@"error".text);
+    try testing.expectEqualStrings("{\"a\":1}", repeated_error.@"error".meta.?);
 }
 
 test "an envelope carries the outer _meta as the lexeme that arrived" {
