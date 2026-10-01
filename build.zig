@@ -4,6 +4,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const testio_mod = b.createModule(.{
+        .root_source_file = b.path("src/testio.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // The library is a module first: a protocol contract is consumed by
     // importers, not linked as a binary. The static artifact exists so that
     // `zig build` produces a checkable proof of compilation and so that a
@@ -13,6 +19,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    lib_mod.addImport("testio", testio_mod);
 
     const lib = b.addLibrary(.{
         .linkage = .static,
@@ -48,6 +55,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     runtime_mod.addImport("zig-agent-proto", lib_mod);
+    runtime_mod.addImport("testio", testio_mod);
 
     const runtime_demo = b.addExecutable(.{
         .name = "zig-agent-proto-runtime",
@@ -66,6 +74,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     sessions_mod.addImport("zig-agent-proto", lib_mod);
+    sessions_mod.addImport("testio", testio_mod);
 
     const sessions_demo = b.addExecutable(.{
         .name = "zig-agent-proto-sessions",
@@ -97,6 +106,103 @@ pub fn build(b: *std.Build) void {
     const run_http_cmd = b.addRunArtifact(http_demo);
     const run_http_step = b.step("run-http", "Run the Streamable HTTP transport over a socket");
     run_http_step.dependOn(&run_http_cmd.step);
+
+    // The A2A example drives the fourth protocol over a real socket: a card
+    // discovered from an origin, one unary JSON-RPC call answered with a task,
+    // one with a message, and one refused. It is an installed demonstration
+    // with a `run-a2a` step for the same reason the other three are — the A2A
+    // codec has never been driven by anything but literals until a transport
+    // carries it, and a refusal is only refused correctly when a peer sent it.
+    const a2a_mod = b.createModule(.{
+        .root_source_file = b.path("src/a2a_demo.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    a2a_mod.addImport("zig-agent-proto", lib_mod);
+    const a2a_demo = b.addExecutable(.{
+        .name = "zig-agent-proto-a2a",
+        .root_module = a2a_mod,
+    });
+    b.installArtifact(a2a_demo);
+    const run_a2a_cmd = b.addRunArtifact(a2a_demo);
+    b.step("run-a2a", "Run A2A discovery and unary JSON-RPC over a socket").dependOn(&run_a2a_cmd.step);
+
+    // The benchmarks are three modules because they answer three different
+    // questions. The driver only sizes a run and prints it, and refusing a
+    // mistyped count before any work starts is its whole job; the codec module
+    // measures literals in buffers; the runtime module opens sockets and
+    // measures a round trip. `b.args` reaches the driver rather than the build,
+    // so `zig build run-bench -- --mode codec` sizes the run and the driver
+    // decides what is in range.
+    const bench_codec_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench_codec.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_codec_mod.addImport("zig-agent-proto", lib_mod);
+    const bench_runtime_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench_runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_runtime_mod.addImport("zig-agent-proto", lib_mod);
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_mod.addImport("bench_codec", bench_codec_mod);
+    bench_mod.addImport("bench_runtime", bench_runtime_mod);
+    const bench = b.addExecutable(.{
+        .name = "zig-agent-proto-bench",
+        .root_module = bench_mod,
+    });
+    b.installArtifact(bench);
+    const run_bench_cmd = b.addRunArtifact(bench);
+    if (b.args) |args| run_bench_cmd.addArgs(args);
+    b.step("run-bench", "Run bounded codec and live runtime benchmarks").dependOn(&run_bench_cmd.step);
+
+    // The interoperability participants are peers, not examples. Each one is
+    // started as a child process by the Python supervisor in `test/interop/`
+    // and answers an independent upstream SDK, so the build cannot run them:
+    // with no peer on the other end of their pipes, a run proves nothing. They
+    // are installed rather than only built because the supervisor starts them
+    // by the installed path, and the `interop-*` steps build exactly that
+    // artifact — `zig build interop-mcp` compiles the participant, and the
+    // `interop-mcp` script in `devenv.nix` is what drives the exchange.
+    const mcp_interop_mod = b.createModule(.{
+        .root_source_file = b.path("src/mcp_interop.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    mcp_interop_mod.addImport("zig-agent-proto", lib_mod);
+    const mcp_interop = b.addExecutable(.{
+        .name = "zig-agent-proto-mcp-interop",
+        .root_module = mcp_interop_mod,
+    });
+    const install_mcp_interop = b.addInstallArtifact(mcp_interop, .{});
+    b.getInstallStep().dependOn(&install_mcp_interop.step);
+    b.step(
+        "interop-mcp",
+        "Build the participant for the independent MCP SDK exchange",
+    ).dependOn(&install_mcp_interop.step);
+
+    const a2a_interop_mod = b.createModule(.{
+        .root_source_file = b.path("src/a2a_interop.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    a2a_interop_mod.addImport("zig-agent-proto", lib_mod);
+    const a2a_interop = b.addExecutable(.{
+        .name = "zig-agent-proto-a2a-interop",
+        .root_module = a2a_interop_mod,
+    });
+    const install_a2a_interop = b.addInstallArtifact(a2a_interop, .{});
+    b.getInstallStep().dependOn(&install_a2a_interop.step);
+    b.step(
+        "interop-a2a",
+        "Build the participant for the independent A2A SDK exchange",
+    ).dependOn(&install_a2a_interop.step);
 
     // running
 
@@ -148,19 +254,20 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     loopback_mod.addImport("zig-agent-proto", lib_mod);
+    loopback_mod.addImport("testio", testio_mod);
 
     const loopback_tests = b.addTest(.{
         .root_module = loopback_mod,
     });
     const run_loopback_tests = b.addRunArtifact(loopback_tests);
 
-    // The examples carry test blocks of their own: the runtime, the sessions
-    // and the HTTP examples assert the failure paths their printed output
-    // cannot show, such as a handler answering a string id and an error member
-    // landing beside `result` rather than inside it. Zig only runs the tests in
-    // a root the build reaches, so without these binaries those blocks are
-    // source that no compiler ever looks at, which is the dormancy this
-    // repository has already been bitten by once.
+    // The examples carry test blocks of their own: the runtime, the sessions,
+    // the HTTP and the A2A examples assert the failure paths their printed
+    // output cannot show, such as a handler answering a string id and an error
+    // member landing beside `result` rather than inside it. Zig only runs the
+    // tests in a root the build reaches, so without these binaries those
+    // blocks are source that no compiler ever looks at, which is the dormancy
+    // this repository has already been bitten by once.
     const runtime_example_tests = b.addTest(.{
         .root_module = runtime_mod,
     });
@@ -176,13 +283,83 @@ pub fn build(b: *std.Build) void {
     });
     const run_http_example_tests = b.addRunArtifact(http_example_tests);
 
-    const test_step = b.step("test", "Run unit tests, the golden vectors and the example tests");
-    test_step.dependOn(&run_lib_unit_tests.step);
-    test_step.dependOn(&run_golden_tests.step);
-    test_step.dependOn(&run_loopback_tests.step);
-    test_step.dependOn(&run_runtime_example_tests.step);
-    test_step.dependOn(&run_http_example_tests.step);
-    test_step.dependOn(&run_sessions_example_tests.step);
+    // The benchmarks are three roots for the same reason they are three
+    // modules: a driver test cannot see the corpus a codec run decodes, and a
+    // statistics test that had to open a socket to reach its numbers would be
+    // testing the machine as much as the arithmetic. `testio` is a root of its
+    // own because the library reaches it as a named import; the shared module
+    // is one instance here and one instance inside the library, so a type the
+    // harness and the runtime exchange is one type rather than two that only
+    // happen to have the same name.
+    const bench_tests = b.addTest(.{ .root_module = bench_mod });
+    const run_bench_tests = b.addRunArtifact(bench_tests);
+    const bench_codec_tests = b.addTest(.{ .root_module = bench_codec_mod });
+    const run_bench_codec_tests = b.addRunArtifact(bench_codec_tests);
+    const bench_runtime_tests = b.addTest(.{ .root_module = bench_runtime_mod });
+    const run_bench_runtime_tests = b.addRunArtifact(bench_runtime_tests);
+    const testio_tests = b.addTest(.{ .root_module = testio_mod });
+    const run_testio_tests = b.addRunArtifact(testio_tests);
+
+    const a2a_example_tests = b.addTest(.{ .root_module = a2a_mod });
+    const run_a2a_example_tests = b.addRunArtifact(a2a_example_tests);
+
+    // The interoperability participants carry test blocks of their own, for
+    // the same reason the examples do: the decoding each one owns outside the
+    // library — the MCP participant's protocol version member and its
+    // `tools/list` name view, the A2A participant's command line — is the code
+    // that decides whether a run against a real SDK reaches its handshake at
+    // all, and a defect in it is a failed exchange rather than a reported
+    // difference. Each root reuses the module the installed executable is
+    // built from, so the participant a test covers and the participant the
+    // supervisor starts are one module instance rather than two copies.
+    const a2a_interop_tests = b.addTest(.{ .root_module = a2a_interop_mod });
+    const run_a2a_interop_tests = b.addRunArtifact(a2a_interop_tests);
+    const mcp_interop_tests = b.addTest(.{ .root_module = mcp_interop_mod });
+    const run_mcp_interop_tests = b.addRunArtifact(mcp_interop_tests);
+
+    const test_step = b.step(
+        "test",
+        "Run unit tests, the golden vectors, the example tests and the interop participants",
+    );
+    // Guest runners use the same binaries as `test`, not a codec-only subset.
+    // The manifest is generated from this one registry so adding a root cannot
+    // leave the exported suite or its guest runner behind.
+    const artifacts_step = b.step(
+        "test-artifacts",
+        "Install every test binary for a guest runner without executing it",
+    );
+    const suites = [_]struct {
+        name: []const u8,
+        binary: *std.Build.Step.Compile,
+        run: *std.Build.Step.Run,
+    }{
+        .{ .name = "library", .binary = lib_unit_tests, .run = run_lib_unit_tests },
+        .{ .name = "golden", .binary = golden_tests, .run = run_golden_tests },
+        .{ .name = "loopback", .binary = loopback_tests, .run = run_loopback_tests },
+        .{ .name = "runtime", .binary = runtime_example_tests, .run = run_runtime_example_tests },
+        .{ .name = "http", .binary = http_example_tests, .run = run_http_example_tests },
+        .{ .name = "sessions", .binary = sessions_example_tests, .run = run_sessions_example_tests },
+        .{ .name = "bench", .binary = bench_tests, .run = run_bench_tests },
+        .{ .name = "bench-codec", .binary = bench_codec_tests, .run = run_bench_codec_tests },
+        .{ .name = "bench-runtime", .binary = bench_runtime_tests, .run = run_bench_runtime_tests },
+        .{ .name = "testio", .binary = testio_tests, .run = run_testio_tests },
+        .{ .name = "a2a", .binary = a2a_example_tests, .run = run_a2a_example_tests },
+        .{ .name = "a2a-interop", .binary = a2a_interop_tests, .run = run_a2a_interop_tests },
+        .{ .name = "mcp-interop", .binary = mcp_interop_tests, .run = run_mcp_interop_tests },
+    };
+    var manifest = std.ArrayList(u8).empty;
+    for (suites) |suite| {
+        test_step.dependOn(&suite.run.step);
+        const install = b.addInstallArtifact(suite.binary, .{
+            .dest_dir = .{ .override = .prefix },
+            .dest_sub_path = b.fmt("tests/{s}", .{suite.name}),
+        });
+        artifacts_step.dependOn(&install.step);
+        manifest.appendSlice(b.allocator, suite.name) catch @panic("OOM");
+        manifest.append(b.allocator, '\n') catch @panic("OOM");
+    }
+    const manifest_file = b.addWriteFiles().add("manifest", manifest.items);
+    artifacts_step.dependOn(&b.addInstallFileWithDir(manifest_file, .prefix, "tests/manifest").step);
 
     // The property and differential harness. It is a separate step because it
     // generates tens of thousands of documents, and because the interesting
