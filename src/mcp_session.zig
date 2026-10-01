@@ -45,11 +45,13 @@
 //! [`Server.methodNotFound`] instead of a guess. What the client sends, the
 //! server reads, so [`Server.observe`] returns the method and the capabilities
 //! one request carried from a single decode. What the server sends, the
-//! server checks, so [`checkResult`] refuses a result that leaves out a
-//! member PROTOCOLS.md 4.6 requires, and [`inputRequired`] refuses an
-//! interim result on a method 4.7 does not let answer with one. [`Server.gate`]
-//! refuses the arities the client half does, so a handler is not entered for a
-//! message that expects no answer or for one travelling the other way.
+//! server checks — but the checks are not here, because a result is a
+//! document and what may be sent in one is not a fact about a connection:
+//! `mcp.checkResult` refuses a result that leaves out a member PROTOCOLS.md
+//! 4.6 requires, and `mcp.inputRequired` refuses an interim result on a
+//! method 4.7 does not let answer with one. [`Server.gate`] refuses the
+//! arities the client half does, so a handler is not entered for a message
+//! that expects no answer or for one travelling the other way.
 //!
 //! The server half sends nothing at the top level, and there is no
 //! `Server.notify` for it to send it with. PROTOCOLS.md 4.4 puts
@@ -80,7 +82,20 @@ const mcp = @import("mcp.zig");
 const root = @import("root.zig");
 const Io = std.Io;
 
-pub const Error = error{
+/// What this layer reports, and what it borrows rather than re-declares.
+///
+/// `mcp.ResultError` is here because this layer calls [`mcp.classifyResult`]
+/// and nothing else. The three result rules read a document rather than a
+/// connection, so they moved down to the codec, and the faults they can
+/// refuse arrive here from there. Naming one of those three again alongside
+/// this would be two declarations of one value, and leaving one out would
+/// leave a `try` across that call with no error to raise.
+///
+/// `NotAnObject` is the one result-shaped fault that stays, and it stays
+/// because it is not about a result: it is a `params` the caller passed that
+/// cannot carry a `_meta` wrapper, which is a fault of the call rather than of
+/// anything a decoder read.
+pub const Error = mcp.ResultError || error{
     /// The method is not part of the pinned revision, so it was not sent.
     ///
     /// Reported before the wire rather than as a peer's `-32601`, because the
@@ -123,22 +138,8 @@ pub const Error = error{
     /// be wrapped, not the buffer, so a caller that doubles the buffer and
     /// tries again gets this again.
     NotAnObject,
-    /// A body is not a result this layer can pass on.
-    ///
-    /// A peer's body that does not decode as one, or one this revision does
-    /// not define for the method that must carry it. PROTOCOLS.md 4.6 makes
-    /// `resultType` required on every result and adds `ttlMs` and `cacheScope`
-    /// to one the method table marks cacheable, so a body missing one of those
-    /// three is refused whichever side wrote it.
-    NotAResult,
-    /// An interim result arrived where none could be answered: the method is
-    /// one PROTOCOLS.md 4.7 does not let return one, or the caller supplied
-    /// no answer to the one it did.
-    InputRequiredUnexpected,
     /// The result carried a `resultType` this library does not define.
     UnknownResultType,
-    /// A caller-supplied buffer was too small.
-    BufferTooSmall,
 } || conn.Error;
 
 /// A client bound to one revision.
@@ -268,7 +269,7 @@ pub const Client = struct {
     /// by sending one. [`mcp.permitsMrtr`] is the only list of those methods.
     ///
     /// `params_out` does two jobs. `request` builds the `_meta` wrapper into
-    /// it, and [`classifyResult`] then reads the answer with it as its
+    /// it, and [`mcp.classifyResult`] then reads the answer with it as its
     /// scratch. That is safe because the wrapper is on the wire by then and the
     /// answer sits in the caller's `result` buffer.
     ///
@@ -288,7 +289,7 @@ pub const Client = struct {
         // An error answer ends the exchange rather than being classified.
         if (first.failed()) return first;
 
-        const kind = try classifyResult(first.body, params_out);
+        const kind = try mcp.classifyResult(first.body, params_out);
         if (kind.isComplete()) return first;
         // The value first, then the method. A `resultType` this library does
         // not define is a fault of its own whatever the method sent it, and
@@ -306,7 +307,7 @@ pub const Client = struct {
         // back as the final one. A second `input_required` is not answered here:
         // another round is the caller's to drive, with input this layer has no
         // business inventing.
-        const retried = try classifyResult(retry.body, params_out);
+        const retried = try mcp.classifyResult(retry.body, params_out);
         if (retried.isComplete()) return retry;
         // The value first, on this leg as on the first. A `resultType` the
         // revision does not define is a fault of the answer whichever leg it
@@ -462,8 +463,8 @@ pub const Server = struct {
     /// own, and nothing is invented for a caller that has none.
     ///
     /// A session with no caching values is refused rather than handed a body
-    /// [`checkResult`] would refuse. A caller holding a body will send
-    /// it, and a body refused on arrival has already travelled; refusing here
+    /// [`mcp.checkResult`] would refuse. A caller holding a body will send it,
+    /// and a body refused on arrival has already travelled; refusing here
     /// leaves no frame to be wrong about.
     ///
     /// A session with no capabilities writes the literal `null`, which is the
@@ -496,113 +497,6 @@ pub const Server = struct {
         return writer.written();
     }
 };
-
-/// Classify a result body without consuming it.
-///
-/// A result from a peer on an earlier revision omits `resultType`, and the
-/// specification requires that to be treated as `complete`.
-///
-/// No session, because a body says nothing about the revision that sent it:
-/// the same reader serves an answer from `2026-07-28` and one from
-/// `2025-11-25`, and the revision is what [`checkResult`] reads on the other
-/// side of the wire. A consumer holding the bytes and no session still has to
-/// be able to ask, and a reader that needed a session to be read would refuse
-/// the very answer PROTOCOLS.md 4.6 tells it to accept.
-pub fn classifyResult(body: []const u8, scratch: []u8) Error!mcp.ResultType {
-    return mcp.decodeResultType(body, scratch) catch |err| switch (err) {
-        error.BufferTooSmall => error.BufferTooSmall,
-        else => error.NotAResult,
-    };
-}
-
-/// Refuse a result that breaks the rule `info` carries, and accept the rest.
-///
-/// PROTOCOLS.md 4.6 makes `resultType` required on every result and adds
-/// `ttlMs` and `cacheScope` to one the method table marks cacheable, so a
-/// handler calls this on the body it built and learns from a return value
-/// whether the body may be sent, rather than from a review of whether it
-/// remembered the three members.
-///
-/// `resultType` is required here and absent-tolerant on the reading side,
-/// which is not an inconsistency: 4.6's "a result from a peer on an earlier
-/// revision omits `resultType`" is about what this library receives, and a
-/// body a server built is not that. [`classifyResult`] is where such a peer
-/// is answered for. A value outside the two the revision defines is not
-/// refused either: what to do with one an extension contributed is the
-/// client's decision, and this is the sending side.
-///
-/// No session, because the rule does not depend on one. PROTOCOLS.md 4.6
-/// binds the two caching fields to the method, and [`mcp.lookupMethod`]
-/// returns the same entry at both revisions for every method it resolves,
-/// so re-deriving `info` from a session could not change one outcome. A
-/// caller already holding `info` from [`Server.gate`] passes it on
-/// unchanged.
-pub fn checkResult(info: mcp.MethodInfo, result: []const u8, scratch: []u8) Error!void {
-    const kind = mcp.decodeResultType(result, scratch) catch |err| switch (err) {
-        error.BufferTooSmall => return error.BufferTooSmall,
-        else => return error.NotAResult,
-    };
-    // The member is required on a result, so its absence is refused here
-    // even though a peer on an earlier revision may omit one. A body that
-    // is not an object was already reported by the decode above.
-    if (kind.value == null) return error.NotAResult;
-    if (!info.cacheable) return;
-    // `mcp.decodeCacheable` is the one implementation of the caching rule,
-    // and this is where it becomes reachable.
-    _ = mcp.decodeCacheable(result, scratch) catch |err| switch (err) {
-        error.BufferTooSmall => return error.BufferTooSmall,
-        // Both fields are required, so an absent one and a value of the
-        // wrong type are one fault to a server: the body it built is not a
-        // result this method may answer with.
-        else => return error.NotAResult,
-    };
-}
-
-/// Write the interim result body for `method`, or refuse the method.
-///
-/// PROTOCOLS.md 4.7 lets `tools/call`, `resources/read` and `prompts/get`
-/// answer with an interim result, and [`mcp.permitsMrtr`] is that list. A
-/// server that wants one on any other method is refused here rather than
-/// on the wire, because a peer has to treat such a result as invalid.
-///
-/// What comes back is the body and not the frame. The caller wraps it with
-/// [`conn.respond`], so the id the answer echoes is the one the
-/// connection decoded rather than one written here.
-///
-/// `requests` is spliced as written, because it is a JSON object the
-/// caller built and keyed by the server-assigned ids. `request_state` is
-/// a string and not an object, so it is written as a JSON string literal
-/// with the escapes JSON requires, and what the peer reads back decodes
-/// to the characters that were passed in. Splicing it would have ended
-/// the member at the first quote in it and handed the peer a different
-/// state. It is opaque and attacker controlled besides, and PROTOCOLS.md
-/// 4.7 requires a server to integrity-protect it wherever it influences
-/// authorization.
-///
-/// No session, because [`mcp.permitsMrtr`] reads a name and no revision:
-/// the 4.7 list is the same at both revisions, so a session would have
-/// nothing to add to the decision.
-pub fn inputRequired(
-    method: []const u8,
-    requests: []const u8,
-    request_state: []const u8,
-    out: []u8,
-) Error![]const u8 {
-    if (!mcp.permitsMrtr(method)) return error.InputRequiredUnexpected;
-    var writer = json.Writer.init(out);
-    // `resultType` first, because PROTOCOLS.md 4.6 puts it on every
-    // result, then the two members 4.7 names beside it in the order the
-    // table lists them. Every write below can fail for want of room and
-    // for no other reason: the writer escapes a string rather than
-    // refusing one.
-    writer.slice("{\"resultType\":\"" ++ mcp.result_type_value.input_required ++
-        "\",\"inputRequests\":") catch return error.BufferTooSmall;
-    writer.slice(requests) catch return error.BufferTooSmall;
-    writer.slice(",\"requestState\":") catch return error.BufferTooSmall;
-    writer.string(request_state) catch return error.BufferTooSmall;
-    writer.byte('}') catch return error.BufferTooSmall;
-    return writer.written();
-}
 
 /// Write a `u64` as decimal digits, with no sign and no separator.
 ///
@@ -1034,70 +928,6 @@ test "an object holding only whitespace gains no trailing comma" {
     );
 }
 
-test "classify treats an absent resultType as complete, as the spec requires" {
-    var scratch: [128]u8 = undefined;
-    const complete = try classifyResult("{\"content\":[]}", &scratch);
-    try testing.expect(complete.isComplete());
-
-    const interim = try classifyResult("{\"resultType\":\"input_required\"}", &scratch);
-    try testing.expect(!interim.isComplete());
-    try testing.expectEqual(mcp.KnownResultType.input_required, interim.known().?);
-
-    // A value the specification does not define is not guessed at, and not
-    // quietly treated as the safe-to-assume case.
-    const unknown = try classifyResult("{\"resultType\":\"weird\"}", &scratch);
-    try testing.expect(!unknown.isComplete());
-    try testing.expect(unknown.known() == null);
-}
-
-test "a body that is not a result is reported, not classified" {
-    var scratch: [128]u8 = undefined;
-    try testing.expectError(error.NotAResult, classifyResult("[1,2]", &scratch));
-    try testing.expectError(error.NotAResult, classifyResult("\"a string\"", &scratch));
-}
-
-test "the three result rules answer for a body with no session in hand" {
-    // No `Client` and no `Server` is built anywhere in this test, and none of
-    // the three takes one. What a body is does not depend on the session that
-    // put it on the wire, so a consumer holding the bytes and no session has to
-    // be able to ask anyway. Put one of them back inside a struct and this
-    // stops compiling, which is the property rather than a comment about it.
-    var scratch: [256]u8 = undefined;
-    var out: [512]u8 = undefined;
-
-    // The reading side. PROTOCOLS.md 4.6 makes a peer on an earlier revision
-    // omit `resultType`, and an absent one is `complete` rather than a fault.
-    const absent = try classifyResult("{\"content\":[]}", &scratch);
-    try testing.expect(absent.isComplete());
-
-    // The sending side, which is the mirror and not the same rule: `resultType`
-    // is required on a body this library built, and the two caching fields on
-    // one 4.6 marks cacheable.
-    const listing = try mcp.lookupMethod(.current, "tools/list");
-    try testing.expect(listing.cacheable);
-    try checkResult(
-        listing,
-        "{\"resultType\":\"complete\",\"ttlMs\":1,\"cacheScope\":\"public\",\"tools\":[]}",
-        &scratch,
-    );
-    try testing.expectError(error.NotAResult, checkResult(listing, "{\"tools\":[]}", &scratch));
-
-    // The one body PROTOCOLS.md 4.7 defines, on a method that may answer with
-    // it and not on one that may not, read back by the rule above: the two
-    // halves of this file are one exchange rather than two readers that agree
-    // today.
-    try testing.expectError(
-        error.InputRequiredUnexpected,
-        inputRequired("tools/list", "{}", "st", &out),
-    );
-    const interim = try classifyResult(
-        try inputRequired("tools/call", "{}", "st", &out),
-        &scratch,
-    );
-    try testing.expect(!interim.isComplete());
-    try testing.expectEqual(mcp.KnownResultType.input_required, interim.known().?);
-}
-
 test "a method the pinned revision removed never reaches the wire" {
     // The connection is `undefined` because the refusal happens before it is
     // touched: a method this revision removed must cost the caller no round
@@ -1464,7 +1294,7 @@ test "a result missing a required field is refused by the call" {
 
     const listing = try server.gate("tools/list");
     try testing.expect(listing.cacheable);
-    try checkResult(
+    try mcp.checkResult(
         listing,
         "{\"resultType\":\"complete\",\"ttlMs\":1000,\"cacheScope\":\"private\",\"tools\":[]}",
         &scratch,
@@ -1476,11 +1306,11 @@ test "a result missing a required field is refused by the call" {
     // The caching pair alone is not a result 4.6 describes.
     try testing.expectError(
         error.NotAResult,
-        checkResult(listing, "{\"tools\":[]}", &scratch),
+        mcp.checkResult(listing, "{\"tools\":[]}", &scratch),
     );
     try testing.expectError(
         error.NotAResult,
-        checkResult(
+        mcp.checkResult(
             listing,
             "{\"ttlMs\":1000,\"cacheScope\":\"private\",\"tools\":[]}",
             &scratch,
@@ -1488,38 +1318,42 @@ test "a result missing a required field is refused by the call" {
     );
     try testing.expectError(
         error.NotAResult,
-        checkResult(listing, "{\"resultType\":\"complete\",\"tools\":[]}", &scratch),
+        mcp.checkResult(listing, "{\"resultType\":\"complete\",\"tools\":[]}", &scratch),
     );
     try testing.expectError(
         error.NotAResult,
-        checkResult(listing, "{\"tools\":[],\"ttlMs\":1000}", &scratch),
+        mcp.checkResult(listing, "{\"tools\":[],\"ttlMs\":1000}", &scratch),
     );
     try testing.expectError(
         error.NotAResult,
-        checkResult(listing, "{\"tools\":[],\"cacheScope\":\"private\"}", &scratch),
+        mcp.checkResult(listing, "{\"tools\":[],\"cacheScope\":\"private\"}", &scratch),
     );
     // A body that is not an object never was a result, whatever it carries,
     // and neither was one whose `resultType` is not a string.
-    try testing.expectError(error.NotAResult, checkResult(listing, "[1,2]", &scratch));
+    try testing.expectError(error.NotAResult, mcp.checkResult(listing, "[1,2]", &scratch));
     try testing.expectError(
         error.NotAResult,
-        checkResult(listing, "{\"resultType\":5,\"ttlMs\":1,\"cacheScope\":\"public\"}", &scratch),
+        mcp.checkResult(
+            listing,
+            "{\"resultType\":5,\"ttlMs\":1,\"cacheScope\":\"public\"}",
+            &scratch,
+        ),
     );
 
     // A method whose result carries no caching hints is not read for the two:
     // that rule does not apply to it, and reading it would refuse a result the
     // specification allows. `resultType` is required either way, because 4.6
     // makes it a property of results rather than of the method. The read side
-    // is where an absent one is tolerated, and `classifyResult` is that side
+    // is where an absent one is tolerated, and `mcp.classifyResult` is that
     // — a peer on an earlier revision omits it and the client treats it as
     // `complete`, while a body this server built may not leave it out.
     const call = try server.gate("tools/call");
     try testing.expect(!call.cacheable);
-    try checkResult(call, "{\"resultType\":\"complete\",\"content\":[]}", &scratch);
-    try checkResult(call, "{\"resultType\":\"complete\"}", &scratch);
+    try mcp.checkResult(call, "{\"resultType\":\"complete\",\"content\":[]}", &scratch);
+    try mcp.checkResult(call, "{\"resultType\":\"complete\"}", &scratch);
     try testing.expectError(
         error.NotAResult,
-        checkResult(call, "{\"content\":[]}", &scratch),
+        mcp.checkResult(call, "{\"content\":[]}", &scratch),
     );
 }
 
@@ -1532,10 +1366,10 @@ test "an interim result is written only for a method PROTOCOLS.md 4.7 allows" {
     // body is written.
     try testing.expectError(
         error.InputRequiredUnexpected,
-        inputRequired("tools/list", requests, "st", &out),
+        mcp.inputRequired("tools/list", requests, "st", &out),
     );
 
-    const body = try inputRequired("tools/call", requests, "st", &out);
+    const body = try mcp.inputRequired("tools/call", requests, "st", &out);
     try testing.expectEqualStrings(
         "{\"resultType\":\"input_required\"," ++
             "\"inputRequests\":{\"e1\":{\"method\":\"elicitation/create\"}}," ++
@@ -1552,7 +1386,7 @@ test "an interim result is written only for a method PROTOCOLS.md 4.7 allows" {
     var tiny: [8]u8 = undefined;
     try testing.expectError(
         error.BufferTooSmall,
-        inputRequired("prompts/get", requests, "st", &tiny),
+        mcp.inputRequired("prompts/get", requests, "st", &tiny),
     );
 
     // A state carrying a quote and a backslash round-trips to the same
@@ -1562,7 +1396,7 @@ test "an interim result is written only for a method PROTOCOLS.md 4.7 allows" {
     const awkward_state = "a\"b\\c";
     var escaped: [512]u8 = undefined;
     const read_back = try mcp.decodeInputRequiredResult(
-        try inputRequired("resources/read", requests, awkward_state, &escaped),
+        try mcp.inputRequired("resources/read", requests, awkward_state, &escaped),
         &scratch,
     );
     try testing.expectEqualStrings(awkward_state, read_back.request_state.?);
@@ -1575,7 +1409,7 @@ test "an interim result is written only for a method PROTOCOLS.md 4.7 allows" {
     var short_out: [120]u8 = undefined;
     try testing.expectError(
         error.BufferTooSmall,
-        inputRequired("prompts/get", requests, long_state, &short_out),
+        mcp.inputRequired("prompts/get", requests, long_state, &short_out),
     );
 }
 
@@ -1601,7 +1435,7 @@ test "the discover body carries every member 4.4 and 4.6 name, in that order" {
     var scratch: [256]u8 = undefined;
     const info = try server.gate("server/discover");
     try testing.expect(info.cacheable);
-    try checkResult(info, try server.discoverBody("be careful", &out), &scratch);
+    try mcp.checkResult(info, try server.discoverBody("be careful", &out), &scratch);
 
     // The body is an object a reader walks, and `instructions` is the string
     // the caller passed rather than its own escaping of something else.
