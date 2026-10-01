@@ -102,3 +102,41 @@ invent one; the case is an explicit decode or encode failure instead.
 - **Note:** an earlier draft of `PROTOCOLS.md` §4.10 described `ContentBlock`
   as an open union. The artifact does not support that, and the transcription
   follows the artifact.
+
+## 6. `roots/list` and `sampling/createMessage` resolve at `2025-11-25`
+
+- **Decision:** `mcp.lookupMethod(.previous, …)` resolves `roots/list`,
+  `sampling/createMessage` and `elicitation/create`, each with
+  `present_at_current = false` and `deprecated = true`. Before this wave all
+  three were refused at every revision, and `AGENTS.md` restated that as
+  settled — which is how a defect becomes indistinguishable from a decision.
+- **Conflict:** two passages of `PROTOCOLS.md` point opposite ways.
+  §4.4 lists all three as "Removed in `2026-07-28`, and therefore decoded as
+  `UnknownMethod` **at that revision**", which reads as: they resolve at
+  `2025-11-25`. §9 "Not implemented" lists "MCP sampling and roots" as
+  excluded outright, which reads as: not at any revision. For
+  `elicitation/create` there is no conflict at all — §9 does not name it, §4.9's
+  deprecation registry does not list it, and the internal evidence is
+  decisive: `mcp.removed_methods` carries `notifications/elicitation/complete`
+  as a notification, so the library resolves the sibling beside a request it
+  refuses.
+- **Resolution:** §4.4 wins, for all three, because it is the method-registry
+  authority and it speaks to this exact question, whereas §9 is a scope list
+  about *surfaces*. The distinction that makes both true: §9's exclusion is
+  about the sampling and roots **capabilities** — `Roots`, the
+  `notifications/roots/list_changed` handler, the client sampling capability —
+  none of which this library models. The **MRTR input requests** are modelled
+  and always were: `mcp.input_requests` has carried all three with
+  `.deprecated = true` since before this wave, and `lookupInputRequest` finds
+  them independently of `lookupMethod`. So §9 is not contradicted by resolving
+  the names; it is obeyed about the surfaces it names.
+- **Consequence for the table.** The new rows carry `.client_to_server`, and
+  they are a table of their own rather than a reuse of `input_requests`. That
+  row's direction is `server_to_client_mrtr_only` and the session gate refuses
+  anything that is not `client_to_server`, so handing it the carried row would
+  resolve the name and then refuse it in **both** directions — a
+  `2025-11-25` server would decline to answer `roots/list` as well as a client
+  being unable to send it.
+- **Tests.** Two tests pinned the old behaviour as an expectation and were
+  deleted rather than inverted, which is this repository's rule for a test that
+  encodes the behaviour being removed.

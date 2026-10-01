@@ -43,8 +43,13 @@ Git.
   process's own streams to one. `ARCHITECTURE.md` records why this layer targets
   the `std.Io` interface rather than a concrete backend.
 - `src/mcp_session.zig` is the protocol layer above the connection. Everything
-  in it is revision rules: which methods exist, where capabilities travel, and
-  how a result is classified.
+  in it is revision rules: which methods exist at the pinned revision, which
+  way each travels, and where capabilities travel. How a result is
+  classified is deliberately **not** here — it reads facts out of a document
+  rather than out of a connection, so `classifyResult`, `checkResult` and
+  `inputRequired` live in `mcp.zig` beside the decoders they sit under. The
+  split is the tree's own rule: document facts are codec, connection and
+  pinned-session facts are session.
 - `src/acp_session.zig` is the ACP protocol layer above the connection. A
   session is pinned to one wire version for its whole life, because the two
   versions' method registries, capability spellings and permission shapes are
@@ -107,6 +112,11 @@ style; each one has a failure that is hard to see from the code alone.
   `Io` it did not receive, and only the examples and tests name
   `std.Io.Threaded`. This is what keeps the executor a consumer's choice; see
   `ARCHITECTURE.md`.
+  The one exception is `http.Server.init`, which takes an `Io.Reader` and an
+  `Io.Writer` and no `Io`: every wait that transport does is a read or a write,
+  and both already carry the interface. The exception is stated here rather
+  than only in the source, because a rule with an unrecorded exception is a
+  rule a reader has to discover by finding the thing that breaks it.
 - **`Io.Group.async` does not run its task until `await` or `cancel`.** A
   reader parked on a group nobody joins simply never starts, and the call
   waiting for its answer waits forever. Join the group.
