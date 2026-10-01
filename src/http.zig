@@ -981,9 +981,6 @@ pub const Exchange = struct {
 
     /// Release the connection. The exchange cannot be used afterwards.
     pub fn close(self: *Exchange) void {
-        if (self.request.connection) |c| {
-            std.debug.print("DBG exchange.close: reader.state={s} closing={}\n", .{ @tagName(self.request.reader.state), c.closing });
-        }
         self.request.deinit();
         self.* = undefined;
     }
@@ -1287,10 +1284,7 @@ pub const Stream = struct {
 
     /// End the stream. The connection is then ready for the next request.
     pub fn close(self: *Stream) Error!void {
-        self.body.end() catch |err| {
-            std.debug.print("DBG stream.close: body.end err={s}\n", .{@errorName(err)});
-            return error.Transport;
-        };
+        self.body.end() catch return error.Transport;
     }
 };
 
@@ -2531,6 +2525,43 @@ const Call = struct {
     }
 };
 
+/// Which step of a socket exchange a harness task could not finish.
+///
+/// A `failed` flag on its own says that something stopped, and these tasks
+/// run on a group beside each other, so a line printed by the one that
+/// stopped is ordered against neither the other task's output nor the test
+/// runner's own report. The test returns the member it was handed instead, so
+/// the step lands in the report the runner prints for that test, beside that
+/// test's name.
+const GaveUp = error{
+    /// The client never opened a connection to the endpoint.
+    NoConnection,
+    /// The POST did not go out.
+    NoPost,
+    /// Reading the reply failed, so the exchange stopped on the wire.
+    NoMessage,
+    /// A message was longer than the buffer the harness gave the reader.
+    MessageTooLarge,
+    /// No connection was ever accepted.
+    NoAccept,
+    /// The request could not be received.
+    NoRequest,
+    /// The peer closed the connection before a request arrived.
+    ClosedEarly,
+    /// The handler was built without a call, so nothing could be answered.
+    NoHandler,
+    /// The handler refused, so there was nothing to answer with.
+    NoDispatch,
+    /// The reply could not be opened as a stream.
+    NoStream,
+    /// The result did not reach the client.
+    NoResultSent,
+    /// A notification did not reach the client.
+    NoNotificationSent,
+    /// The stream was not ended, so the client could not see it close.
+    StreamNotEnded,
+};
+
 /// POSTs one message and reads a whole reply, event by event.
 const Listen = struct {
     io: Io,
@@ -2560,17 +2591,20 @@ const Listen = struct {
     ended: usize = 0,
     got: *bool,
     failed: *bool,
+    /// The step this task could not finish, or `null` while it is still
+    /// reading. The test returns it as its own error.
+    failure: ?GaveUp = null,
 
     fn run(self: *@This()) void {
         var client = openClient(self.http, self.endpoint) orelse {
             self.failed.* = true;
-            std.debug.print("DBG listen: openClient failed\n", .{});
+            self.failure = error.NoConnection;
             return;
         };
         var exchange: Exchange = undefined;
         client.post(&exchange, self.body, self.spec, &self.side.head, &self.side.transfer) catch {
             self.failed.* = true;
-            std.debug.print("DBG listen: post failed\n", .{});
+            self.failure = error.NoPost;
             return;
         };
         defer exchange.close();
@@ -2595,7 +2629,10 @@ const Listen = struct {
                 &self.side.next_out;
             const message = exchange.nextMessage(out) catch |err| {
                 self.failed.* = true;
-                std.debug.print("DBG listen: nextMessage failed err={s} after {d} messages\n", .{ @errorName(err), self.messages });
+                self.failure = switch (err) {
+                    error.BufferTooSmall => error.MessageTooLarge,
+                    else => error.NoMessage,
+                };
                 return;
             } orelse {
                 // The reply is over. An event carrying no data is a message
@@ -2608,7 +2645,6 @@ const Listen = struct {
             self.messages += 1;
             if (self.messages == 2) break;
         }
-        std.debug.print("DBG listen: messages={d} ended={d} first_len={d} second_len={d}\nDBG first='{s}'\nDBG second='{s}'\n", .{ self.messages, self.ended, self.first_len, self.second_len, self.side.out[0..self.first_len], self.side.next_out[0..self.second_len] });
         self.got.* = true;
     }
 };
@@ -2710,11 +2746,14 @@ const Subscribe = struct {
     notifications: []const []const u8,
     sent: *usize,
     failed: *bool,
+    /// The step this task could not finish, or `null` while it is still
+    /// running. The test returns it as its own error.
+    failure: ?GaveUp = null,
 
     fn run(self: *@This()) void {
         const stream = self.listener.accept(self.io) catch {
             self.failed.* = true;
-            std.debug.print("DBG subscribe: accept failed\n", .{});
+            self.failure = error.NoAccept;
             return;
         };
         defer stream.close(self.io);
@@ -2741,16 +2780,16 @@ const Subscribe = struct {
 
         const post = self.side.server.receive() catch {
             self.failed.* = true;
-            std.debug.print("DBG subscribe: receive error\n", .{});
+            self.failure = error.NoRequest;
             return;
         } orelse {
             self.failed.* = true;
-            std.debug.print("DBG subscribe: receive null\n", .{});
+            self.failure = error.ClosedEarly;
             return;
         };
         const dispatch = self.handler.call orelse {
             self.failed.* = true;
-            std.debug.print("DBG subscribe: no handler\n", .{});
+            self.failure = error.NoHandler;
             return;
         };
         // The two regions are the server's own and are separate arrays, the
@@ -2763,17 +2802,17 @@ const Subscribe = struct {
             self.side.server.buffers.answer,
         ) catch {
             self.failed.* = true;
-            std.debug.print("DBG subscribe: dispatch failed\n", .{});
+            self.failure = error.NoDispatch;
             return;
         };
         var out = self.side.server.respondStream(post) catch {
             self.failed.* = true;
-            std.debug.print("DBG subscribe: respondStream failed\n", .{});
+            self.failure = error.NoStream;
             return;
         };
         out.send(self.side.server.buffers.event, result orelse return) catch {
             self.failed.* = true;
-            std.debug.print("DBG subscribe: send result failed\n", .{});
+            self.failure = error.NoResultSent;
             return;
         };
         self.sent.* = 1;
@@ -2781,14 +2820,14 @@ const Subscribe = struct {
         for (self.notifications) |notification| {
             out.send(self.side.server.buffers.event, notification) catch {
                 self.failed.* = true;
-                std.debug.print("DBG subscribe: send notification {d} failed\n", .{self.sent.*});
+                self.failure = error.NoNotificationSent;
                 return;
             };
             self.sent.* += 1;
         }
         out.close() catch {
             self.failed.* = true;
-            std.debug.print("DBG subscribe: close failed\n", .{});
+            self.failure = error.StreamNotEnded;
             return;
         };
     }
@@ -2939,6 +2978,11 @@ test "a request carrying the removed session id is refused, and nothing is echoe
     group.async(io, Listen.run, .{&listen});
     group.await(io) catch {};
 
+    // The step the client reached is this test's own error, so the runner
+    // reports which step stopped rather than a test that failed having said
+    // nothing. `failed` is asserted after it because that flag is shared with
+    // the server task, which reports no step of its own.
+    if (listen.failure) |step| return step;
     try testing.expect(!failed);
     try testing.expect(got);
     try testing.expect(refused);
@@ -3073,6 +3117,7 @@ test "the same request is answered as a stream when the client accepts one" {
     group.async(io, Listen.run, .{&listen});
     group.await(io) catch {};
 
+    if (listen.failure) |step| return step;
     try testing.expect(!failed);
     try testing.expect(got);
     try testing.expectEqual(@as(usize, 1), answered);
@@ -3145,6 +3190,7 @@ test "a notification POST is answered 202 with no body" {
     group.async(io, Listen.run, .{&listen});
     group.await(io) catch {};
 
+    if (listen.failure) |step| return step;
     try testing.expect(!failed);
     try testing.expect(got);
     // The handler saw the notification, which is how a server learns of it, and
@@ -3342,6 +3388,10 @@ test "a stream keeps delivering after the result, which is what a subscription i
     group.async(io, Listen.run, .{&listen});
     group.await(io) catch {};
 
+    // Both tasks report the step they reached, the server's first: its step
+    // is the one that says whether the result ever went out.
+    if (serve.failure) |step| return step;
+    if (listen.failure) |step| return step;
     try testing.expect(!failed);
     try testing.expect(got);
     // Three messages went out and three came back, in order. A server that
