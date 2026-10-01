@@ -59,12 +59,28 @@
 //! null`: there is no member name, because the key is data. `Part.content` is
 //! null for the other reason, that a `oneof` has no member name of its own.
 //!
-//! **This is a name table, not a codec.** The tables say which name and which
-//! number a field has. Nothing here reads or writes ProtoJSON, and the values
-//! a peer sends still need encoding this file does not do: `Part.raw` to
-//! base64, `google.protobuf.Timestamp` to ISO-8601 UTC, and
-//! `google.protobuf.Value` and `google.protobuf.Struct` to arbitrary JSON.
-//! Without those a name table is not a decode or an encode path.
+//! **What this file encodes, and what it does not.** The tables below say
+//! which name and which number a field has, and the last section turns the flat
+//! half of them into a codec: every message with no `Part`, no `Message`, no
+//! `Task` and no `OAuthFlows` in it has a decoder and an encoder today. The
+//! content half has neither, and one field is the reason.
+//!
+//! Two of the three encodings an earlier revision of this note named as
+//! missing are not encodings. `TaskStatus.timestamp` and
+//! `ListTasksRequest.status_timestamp_after` are already the ISO-8601 text a
+//! peer sent, so there is no `Timestamp` to convert and re-formatting one would
+//! break the round trip the contract requires: re-encoding has to put back the
+//! peer's bytes, and a normalised spelling is not those bytes. Every
+//! `metadata`, every `PartContent.data`, every `AgentExtension.params` and
+//! every `AgentCardSignature.header` is already the borrowed JSON lexeme, read
+//! with `reader.rawValue`, which is what `bridge.Envelope.meta` does and why
+//! that is both the cheaper and the more faithful representation.
+//!
+//! So one blocker remains. `Part.raw` is the only `bytes` field in the module
+//! and ProtoJSON renders `bytes` as base64, which `json.zig` does not have yet.
+//! A `Part` carrying `text`, `url` or `data` could be decoded without it, but a
+//! codec that refuses an arm its own `oneof` declares is not a codec, so the
+//! content half waits for `json.base64`.
 //!
 //! `TaskState` and `Role` are declared `enum(u8)` because PROTOCOLS.md says so.
 //! The proto states no explicit backing type, and proto3's default is `int32`,
@@ -74,6 +90,7 @@
 
 const std = @import("std");
 const root = @import("root.zig");
+const json = @import("json.zig");
 const protocol = @This();
 
 const DecodeError = root.DecodeError;
@@ -500,14 +517,19 @@ pub fn fieldNumber(comptime T: type, comptime index: usize) u32 {
     return T.fields[index].number;
 }
 
-/// The index of the field of message `T` that ProtoJSON spells `json`, or null.
+/// The index of the field of message `T` that ProtoJSON spells `member_name`,
+/// or null.
 ///
 /// A member no field of `T` carries is null rather than a guess, which is what
 /// lets a decoder reject a name a newer revision added.
-pub fn findField(comptime T: type, json: []const u8) ?usize {
+///
+/// The parameter is not called `json`: that is the module holding the reader
+/// and the writer every decoder below is built from, and a parameter of that
+/// name would shadow it for the whole file.
+pub fn findField(comptime T: type, member_name: []const u8) ?usize {
     inline for (T.fields, 0..) |entry, index| {
         const name = entry.json orelse continue;
-        if (std.mem.eql(u8, name, json)) return index;
+        if (std.mem.eql(u8, name, member_name)) return index;
     }
     return null;
 }
@@ -752,8 +774,13 @@ comptime {
 
 /// `SendMessageConfiguration`, field numbers 1 to 4.
 pub const SendMessageConfiguration = struct {
-    /// 1.
-    accepted_output_modes: []const []const u8 = &.{},
+    /// 1. Optional, because `[]` and no member are the same list and different
+    /// bytes, and an encoder that writes one of them for the other changes a
+    /// request rather than restating it.
+    ///
+    /// The elements live in the caller's storage; see
+    /// `decodeSendMessageConfiguration`.
+    accepted_output_modes: ?[]const []const u8 = null,
     /// 2.
     task_push_notification_config: ?TaskPushNotificationConfig = null,
     /// 3.
@@ -764,11 +791,13 @@ pub const SendMessageConfiguration = struct {
     /// a 0.3 default as if it were a 1.0 one would make a caller wait on a call
     /// that returns immediately.
     ///
-    /// The proto declares the field a singular `bool`, so it has no presence
-    /// bit and ProtoJSON rejects `null` for it. PROTOCOLS.md calls it
-    /// "optional bool"; the proto's cardinality wins because absent and false
-    /// are the same thing on the wire and no peer sends `null`.
-    return_immediately: bool = false,
+    /// The proto declares the field a singular `bool`, so ProtoJSON rejects
+    /// `null` for it and no peer sends one. It is `?bool` anyway, and a decoder
+    /// still refuses a `null`: absent and false mean the same thing to a
+    /// caller and are two different documents to the encoder, so a peer that
+    /// wrote `"returnImmediately":false` is a peer whose bytes have to come
+    /// back.
+    return_immediately: ?bool = null,
 
     /// The ProtoJSON name of every field, in field order.
     pub const fields = [_]Field{
@@ -916,7 +945,7 @@ comptime {
 /// Fetch one task, optionally including this many history messages.
 pub const GetTaskRequest = struct {
     /// 1.
-    tenant: []const u8 = "",
+    tenant: ?[]const u8 = null,
     /// 2. Required.
     id: []const u8,
     /// 3. Explicit proto3 presence.
@@ -936,18 +965,30 @@ comptime {
 
 pub const ListTasksRequest = struct {
     /// 1.
-    tenant: []const u8 = "",
+    tenant: ?[]const u8 = null,
     /// 2.
-    context_id: []const u8 = "",
-    /// 3.
-    status: TaskState = .unspecified,
+    context_id: ?[]const u8 = null,
+    /// 3. Explicit presence in this library, though the proto declares the
+    /// field singular.
+    ///
+    /// The proto gives `TaskState` an implicit presence, so `unspecified` and
+    /// an absent member are the same value on the wire and `fromTag` says so.
+    /// They are two documents though, and the encoder has to put back the one
+    /// that arrived: a peer that wrote `"status":"TASK_STATE_UNSPECIFIED"` is a
+    /// peer that filtered, and a re-encode that drops the member changes what
+    /// it asked for. See the codec section's note on presence.
+    status: ?TaskState = null,
     /// 4. If present, 1 to 100 inclusive; see `isValidPageSize`.
     page_size: ?i32 = null,
     /// 5.
-    page_token: []const u8 = "",
+    page_token: ?[]const u8 = null,
     /// 6.
     history_length: ?i32 = null,
-    /// 7. ISO-8601 UTC in ProtoJSON.
+    /// 7. ISO-8601 UTC in ProtoJSON, carried as the text the peer wrote.
+    ///
+    /// There is no `Timestamp` to convert and none is wanted. Re-encoding has
+    /// to put back the peer's bytes, and a normalised spelling of the same
+    /// instant is not those bytes.
     status_timestamp_after: ?[]const u8 = null,
     /// 8. Explicit presence; absent defaults to false.
     include_artifacts: ?bool = null,
@@ -994,7 +1035,7 @@ comptime {
 
 pub const CancelTaskRequest = struct {
     /// 1.
-    tenant: []const u8 = "",
+    tenant: ?[]const u8 = null,
     /// 2. Required.
     id: []const u8,
     /// 3. Borrowed ProtoJSON `Struct`.
@@ -1014,7 +1055,7 @@ comptime {
 
 pub const SubscribeToTaskRequest = struct {
     /// 1.
-    tenant: []const u8 = "",
+    tenant: ?[]const u8 = null,
     /// 2. Required.
     id: []const u8,
 
@@ -1031,7 +1072,7 @@ comptime {
 
 pub const GetTaskPushNotificationConfigRequest = struct {
     /// 1.
-    tenant: []const u8 = "",
+    tenant: ?[]const u8 = null,
     /// 2. Required.
     task_id: []const u8,
     /// 3. Required.
@@ -1051,7 +1092,7 @@ comptime {
 
 pub const DeleteTaskPushNotificationConfigRequest = struct {
     /// 1.
-    tenant: []const u8 = "",
+    tenant: ?[]const u8 = null,
     /// 2. Required.
     task_id: []const u8,
     /// 3. Required.
@@ -1073,12 +1114,15 @@ comptime {
 pub const ListTaskPushNotificationConfigsRequest = struct {
     /// 1. Required.
     task_id: []const u8,
-    /// 2. Plain `int32`, not `optional int32` as in `ListTasksRequest`.
-    page_size: i32 = 0,
+    /// 2. Plain `int32`, not `optional int32` as in `ListTasksRequest`, and
+    /// therefore still recorded as presence here: the two documents
+    /// `"pageSize":0` and no `pageSize` are the same request and different
+    /// bytes, and only one of them can be written back.
+    page_size: ?i32 = null,
     /// 3.
-    page_token: []const u8 = "",
+    page_token: ?[]const u8 = null,
     /// 4.
-    tenant: []const u8 = "",
+    tenant: ?[]const u8 = null,
 
     /// The ProtoJSON name of every field, in field order.
     pub const fields = [_]Field{
@@ -1112,7 +1156,7 @@ comptime {
 
 pub const GetExtendedAgentCardRequest = struct {
     /// 1.
-    tenant: []const u8 = "",
+    tenant: ?[]const u8 = null,
 
     /// The ProtoJSON name of every field, in field order.
     pub const fields = [_]Field{
@@ -1653,10 +1697,12 @@ pub const AgentExtension = struct {
     uri: ?[]const u8 = null,
     /// 2.
     description: ?[]const u8 = null,
-    /// 3. A plain `bool`, because the proto declares the field singular and it
-    /// therefore has no presence bit. False is a flow that proceeds without
-    /// the extension, and ProtoJSON rejects `null` for it.
-    required: bool = false,
+    /// 3. A plain `bool` on the wire, so ProtoJSON rejects `null` for it and a
+    /// decoder refuses one. It is `?bool` anyway: false is a flow that proceeds
+    /// without the extension, and `"required":false` is what a peer writes when
+    /// it means that, so the member is a fact about the document and not only
+    /// about the value.
+    required: ?bool = null,
     /// 4. Extension settings, kept as the raw JSON the caller borrowed.
     params: ?[]const u8 = null,
 
@@ -2246,6 +2292,1528 @@ pub fn extensionSatisfied(
 /// The error a missing required extension produces.
 pub const extension_missing_error = A2aError.extension_support_required;
 
+// --- Codec: the flat request and config half -----------------------------------
+
+// What this section carries
+//
+// Every message below is one with no `Part`, no `Message`, no `Task` and no
+// `OAuthFlows` in it, and every one of them has a decoder and an encoder. The
+// content half has neither, and the reason is one field: `Part.raw` is the
+// only `bytes` field in the module, ProtoJSON renders `bytes` as base64, and
+// `json.zig` has no base64 yet.
+//
+// Presence, because the round trip is byte-exact
+//
+// PROTOCOLS.md section 2 makes the encoder the exact inverse of the decoder,
+// so a member the wire allows to omit is optional in Zig here and not a plain
+// scalar carrying a default. `{"required":false}` and `{}` are two documents,
+// and a struct holding one `false` for both cannot write either of them back.
+// That is why `AgentExtension.required` is a `?bool` and
+// `ListTasksRequest.status` is a `?TaskState`, and why `tenant` is a
+// `?[]const u8` on every request below rather than the `[]const u8 = ""` the
+// tables above used to declare: a peer that wrote `"tenant":""` is not a peer
+// this library may answer with no `tenant` at all.
+//
+// The messages further up, which have no codec yet, still hold plain defaults.
+// Changing one of those would be a type change with no decoder to justify it,
+// so it waits for the unit that writes that decoder.
+//
+// A repeated member resolves first-wins
+//
+// RFC 8259 section 4 says the names within an object *should* be unique, so a
+// repeat is a document the grammar permits and a decoder still has to pick
+// one. These take the first, for the reason `jsonrpc.decode` gives: a later
+// member must not be able to make a comparison that has already failed pass.
+// The discarded copy is still read as a value rather than stepped over
+// blindly, so a peer cannot hide a syntax error in the second slot of a name
+// the first slot already used.
+//
+// What a decoder does not model
+//
+// A member no field of a message carries is skipped, and re-encoding therefore
+// drops it. That is the same stated consequence `bridge.decodeEnvelope`
+// records. It is also why every `Struct` member here is carried as the
+// borrowed lexeme it arrived as rather than decoded into a shape: a shape
+// cannot write back a key a peer may send.
+//
+// Every decoder below checks `reader.atEnd()` after its member loop and never
+// inside it, so a body that is one JSON value and a second one behind it are
+// told apart.
+
+/// Read an `int32` member at the width its field declares.
+///
+/// ProtoJSON renders a 32-bit integer as a JSON number carrying neither a
+/// fraction nor an exponent, so the lexeme `json.Reader.number` scanned is
+/// converted here rather than at whatever width the scan covered. A fraction,
+/// an exponent or a value above `i32` is `error.InvalidField` and never a
+/// truncation: `1.5` is not a page size, and `2147483648` is a number no `int32`
+/// field can carry.
+fn readInt32(reader: *json.Reader) DecodeError!i32 {
+    return std.fmt.parseInt(i32, try reader.number(), 10) catch return error.InvalidField;
+}
+
+/// Write an `int32` member.
+///
+/// The buffer is a local rather than an allocation, and `-2147483648` is the
+/// widest value `i32` holds, so eleven bytes is the whole of it.
+fn writeInt32(writer: *json.Writer, value: i32) EncodeError!void {
+    var digits: [11]u8 = undefined;
+    const text = std.fmt.bufPrint(&digits, "{d}", .{value}) catch return error.BufferTooSmall;
+    try writer.slice(text);
+}
+
+/// Read a `repeated string` member into caller-owned storage.
+///
+/// `out` is the caller's array and `scratch` is the reader's escape buffer, so
+/// nothing allocates. A member with more elements than the caller reserved is
+/// `error.BufferTooSmall` rather than a truncated list, because a truncated
+/// list of accepted modes is a request that says something the caller did not
+/// mean. An array carrying no element is well formed and writes nothing.
+fn readStringList(reader: *json.Reader, out: [][]const u8, scratch: []u8) DecodeError!usize {
+    var count: usize = 0;
+    if (try reader.beginArray()) return count;
+    while (try reader.nextArrayElement()) {
+        if (count == out.len) return error.BufferTooSmall;
+        out[count] = try reader.string(scratch);
+        count += 1;
+    }
+    return count;
+}
+
+/// Write a `repeated string` member.
+fn writeStringList(items: []const []const u8, writer: *json.Writer) EncodeError!void {
+    try writer.byte('[');
+    for (items, 0..) |item, index| {
+        if (index != 0) try writer.byte(',');
+        try writer.string(item);
+    }
+    try writer.byte(']');
+}
+
+/// Decode a `google.protobuf.Empty` response body.
+///
+/// The message declares no field, so every member is one this shape does not
+/// model and every one of them is stepped over rather than refused. The delete
+/// response is the one body a peer may decorate and still be understood, and a
+/// re-encode of a decorated body drops the decoration, which is the stated
+/// consequence every decoder in this library records.
+pub fn decodeEmpty(raw: []const u8, scratch: []u8) DecodeError!Empty {
+    var reader = json.Reader.init(raw);
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |_| {
+            try reader.skipValue(scratch);
+        }
+    }
+    // The body is one JSON value. Bytes behind the closing brace are a second
+    // document the transport did not split, and a codec that accepted them
+    // would re-encode the body without them.
+    if (!reader.atEnd()) return error.MalformedJson;
+    return .{};
+}
+
+/// Encode a `google.protobuf.Empty` response body.
+pub fn encodeEmpty(_: Empty, writer: *json.Writer) EncodeError!void {
+    try writer.slice("{}");
+}
+
+/// Decode a `GetTaskRequest`.
+///
+/// `id` is the only REQUIRED member, and an empty one is refused for the
+/// reason `TaskStatusUpdateEvent.context_id` carries no default: an empty id
+/// is not a task. `historyLength` is `optional int32` in the proto and is
+/// carried as a presence here, so `"historyLength":0` and no `historyLength`
+/// are two requests and both survive a round trip.
+pub fn decodeGetTaskRequest(raw: []const u8, scratch: []u8) DecodeError!GetTaskRequest {
+    var reader = json.Reader.init(raw);
+    var request: GetTaskRequest = .{ .id = "" };
+    var saw_id = false;
+
+    if (try reader.beginObject()) return error.MissingField;
+
+    while (try reader.nextKey(scratch)) |key| {
+        if (std.mem.eql(u8, key, "tenant")) {
+            if (request.tenant != null) {
+                try reader.skipValue(scratch);
+            } else {
+                request.tenant = try reader.string(scratch);
+            }
+        } else if (std.mem.eql(u8, key, "id")) {
+            if (saw_id) {
+                try reader.skipValue(scratch);
+            } else {
+                request.id = try reader.string(scratch);
+                saw_id = true;
+            }
+        } else if (std.mem.eql(u8, key, "historyLength")) {
+            if (request.history_length != null) {
+                try reader.skipValue(scratch);
+            } else {
+                request.history_length = try readInt32(&reader);
+            }
+        } else {
+            try reader.skipValue(scratch);
+        }
+    }
+
+    if (!reader.atEnd()) return error.MalformedJson;
+
+    if (!saw_id) return error.MissingField;
+    // `encodeGetTaskRequest` refuses an empty `id` too, so a caller that
+    // decoded one can always write it back.
+    if (request.id.len == 0) return error.InvalidField;
+    return request;
+}
+
+/// Encode a `GetTaskRequest`.
+///
+/// Members go out in field-number order, so a body that already reads in that
+/// order comes back unchanged and one that does not comes back with the same
+/// members in it. `bridge.encodeEnvelope` is the same rule for the same reason.
+pub fn encodeGetTaskRequest(request: GetTaskRequest, writer: *json.Writer) EncodeError!void {
+    if (request.id.len == 0) return error.InvalidField;
+
+    try writer.byte('{');
+    // The separator is written in front of each member rather than baked into
+    // it, because `tenant` is optional and a comma where it stood is a
+    // document no reader is right to accept.
+    var separator: []const u8 = "";
+    if (request.tenant) |tenant| {
+        try writer.slice(separator);
+        try writer.slice("\"tenant\":");
+        try writer.string(tenant);
+        separator = ",";
+    }
+    try writer.slice(separator);
+    try writer.slice("\"id\":");
+    try writer.string(request.id);
+    if (request.history_length) |history_length| {
+        try writer.slice(",\"historyLength\":");
+        try writeInt32(writer, history_length);
+    }
+    try writer.byte('}');
+}
+
+/// Decode a `CancelTaskRequest`.
+///
+/// `metadata` is a `google.protobuf.Struct`, and it is carried as the borrowed
+/// lexeme rather than decoded into a shape. A shape cannot write back a key a
+/// peer may send, which is the defect `bridge.Envelope.meta` exists to remove,
+/// and borrowing costs no scratch however deeply the object nests.
+pub fn decodeCancelTaskRequest(raw: []const u8, scratch: []u8) DecodeError!CancelTaskRequest {
+    var reader = json.Reader.init(raw);
+    var request: CancelTaskRequest = .{ .id = "" };
+    var saw_id = false;
+
+    if (try reader.beginObject()) return error.MissingField;
+
+    while (try reader.nextKey(scratch)) |key| {
+        if (std.mem.eql(u8, key, "tenant")) {
+            if (request.tenant != null) {
+                try reader.skipValue(scratch);
+            } else {
+                request.tenant = try reader.string(scratch);
+            }
+        } else if (std.mem.eql(u8, key, "id")) {
+            if (saw_id) {
+                try reader.skipValue(scratch);
+            } else {
+                request.id = try reader.string(scratch);
+                saw_id = true;
+            }
+        } else if (std.mem.eql(u8, key, "metadata")) {
+            if (request.metadata != null) {
+                try reader.skipValue(scratch);
+            } else {
+                request.metadata = try reader.rawValue(scratch);
+            }
+        } else {
+            try reader.skipValue(scratch);
+        }
+    }
+
+    if (!reader.atEnd()) return error.MalformedJson;
+
+    if (!saw_id) return error.MissingField;
+    if (request.id.len == 0) return error.InvalidField;
+    return request;
+}
+
+/// Encode a `CancelTaskRequest`.
+pub fn encodeCancelTaskRequest(request: CancelTaskRequest, writer: *json.Writer) EncodeError!void {
+    if (request.id.len == 0) return error.InvalidField;
+
+    try writer.byte('{');
+    var separator: []const u8 = "";
+    if (request.tenant) |tenant| {
+        try writer.slice(separator);
+        try writer.slice("\"tenant\":");
+        try writer.string(tenant);
+        separator = ",";
+    }
+    try writer.slice(separator);
+    try writer.slice("\"id\":");
+    try writer.string(request.id);
+    if (request.metadata) |metadata| {
+        try writer.slice(",\"metadata\":");
+        try writer.slice(metadata);
+    }
+    try writer.byte('}');
+}
+
+/// Decode a `SubscribeToTaskRequest`.
+///
+/// The message declares two members and one of them is REQUIRED, so an empty
+/// object is not a subscription.
+pub fn decodeSubscribeToTaskRequest(
+    raw: []const u8,
+    scratch: []u8,
+) DecodeError!SubscribeToTaskRequest {
+    var reader = json.Reader.init(raw);
+    var request: SubscribeToTaskRequest = .{ .id = "" };
+    var saw_id = false;
+
+    if (try reader.beginObject()) return error.MissingField;
+
+    while (try reader.nextKey(scratch)) |key| {
+        if (std.mem.eql(u8, key, "tenant")) {
+            if (request.tenant != null) {
+                try reader.skipValue(scratch);
+            } else {
+                request.tenant = try reader.string(scratch);
+            }
+        } else if (std.mem.eql(u8, key, "id")) {
+            if (saw_id) {
+                try reader.skipValue(scratch);
+            } else {
+                request.id = try reader.string(scratch);
+                saw_id = true;
+            }
+        } else {
+            try reader.skipValue(scratch);
+        }
+    }
+
+    if (!reader.atEnd()) return error.MalformedJson;
+
+    if (!saw_id) return error.MissingField;
+    if (request.id.len == 0) return error.InvalidField;
+    return request;
+}
+
+/// Encode a `SubscribeToTaskRequest`.
+pub fn encodeSubscribeToTaskRequest(
+    request: SubscribeToTaskRequest,
+    writer: *json.Writer,
+) EncodeError!void {
+    if (request.id.len == 0) return error.InvalidField;
+
+    try writer.byte('{');
+    if (request.tenant) |tenant| {
+        try writer.slice("\"tenant\":");
+        try writer.string(tenant);
+        try writer.byte(',');
+    }
+    try writer.slice("\"id\":");
+    try writer.string(request.id);
+    try writer.byte('}');
+}
+
+/// Decode a `GetTaskPushNotificationConfigRequest`.
+///
+/// `taskId` and `id` are both REQUIRED, and both name something: the task a
+/// config belongs to, and the config within it. Neither may be empty.
+pub fn decodeGetTaskPushNotificationConfigRequest(
+    raw: []const u8,
+    scratch: []u8,
+) DecodeError!GetTaskPushNotificationConfigRequest {
+    var reader = json.Reader.init(raw);
+    var request: GetTaskPushNotificationConfigRequest = .{ .task_id = "", .id = "" };
+    var saw_task_id = false;
+    var saw_id = false;
+
+    if (try reader.beginObject()) return error.MissingField;
+
+    while (try reader.nextKey(scratch)) |key| {
+        if (std.mem.eql(u8, key, "tenant")) {
+            if (request.tenant != null) {
+                try reader.skipValue(scratch);
+            } else {
+                request.tenant = try reader.string(scratch);
+            }
+        } else if (std.mem.eql(u8, key, "taskId")) {
+            if (saw_task_id) {
+                try reader.skipValue(scratch);
+            } else {
+                request.task_id = try reader.string(scratch);
+                saw_task_id = true;
+            }
+        } else if (std.mem.eql(u8, key, "id")) {
+            if (saw_id) {
+                try reader.skipValue(scratch);
+            } else {
+                request.id = try reader.string(scratch);
+                saw_id = true;
+            }
+        } else {
+            try reader.skipValue(scratch);
+        }
+    }
+
+    if (!reader.atEnd()) return error.MalformedJson;
+
+    if (!saw_task_id or !saw_id) return error.MissingField;
+    if (request.task_id.len == 0 or request.id.len == 0) return error.InvalidField;
+    return request;
+}
+
+/// Encode a `GetTaskPushNotificationConfigRequest`.
+pub fn encodeGetTaskPushNotificationConfigRequest(
+    request: GetTaskPushNotificationConfigRequest,
+    writer: *json.Writer,
+) EncodeError!void {
+    if (request.task_id.len == 0 or request.id.len == 0) return error.InvalidField;
+
+    try writer.byte('{');
+    if (request.tenant) |tenant| {
+        try writer.slice("\"tenant\":");
+        try writer.string(tenant);
+        try writer.byte(',');
+    }
+    try writer.slice("\"taskId\":");
+    try writer.string(request.task_id);
+    try writer.slice(",\"id\":");
+    try writer.string(request.id);
+    try writer.byte('}');
+}
+
+/// Decode a `DeleteTaskPushNotificationConfigRequest`.
+pub fn decodeDeleteTaskPushNotificationConfigRequest(
+    raw: []const u8,
+    scratch: []u8,
+) DecodeError!DeleteTaskPushNotificationConfigRequest {
+    var reader = json.Reader.init(raw);
+    var request: DeleteTaskPushNotificationConfigRequest = .{ .task_id = "", .id = "" };
+    var saw_task_id = false;
+    var saw_id = false;
+
+    if (try reader.beginObject()) return error.MissingField;
+
+    while (try reader.nextKey(scratch)) |key| {
+        if (std.mem.eql(u8, key, "tenant")) {
+            if (request.tenant != null) {
+                try reader.skipValue(scratch);
+            } else {
+                request.tenant = try reader.string(scratch);
+            }
+        } else if (std.mem.eql(u8, key, "taskId")) {
+            if (saw_task_id) {
+                try reader.skipValue(scratch);
+            } else {
+                request.task_id = try reader.string(scratch);
+                saw_task_id = true;
+            }
+        } else if (std.mem.eql(u8, key, "id")) {
+            if (saw_id) {
+                try reader.skipValue(scratch);
+            } else {
+                request.id = try reader.string(scratch);
+                saw_id = true;
+            }
+        } else {
+            try reader.skipValue(scratch);
+        }
+    }
+
+    if (!reader.atEnd()) return error.MalformedJson;
+
+    if (!saw_task_id or !saw_id) return error.MissingField;
+    if (request.task_id.len == 0 or request.id.len == 0) return error.InvalidField;
+    return request;
+}
+
+/// Encode a `DeleteTaskPushNotificationConfigRequest`.
+pub fn encodeDeleteTaskPushNotificationConfigRequest(
+    request: DeleteTaskPushNotificationConfigRequest,
+    writer: *json.Writer,
+) EncodeError!void {
+    if (request.task_id.len == 0 or request.id.len == 0) return error.InvalidField;
+
+    try writer.byte('{');
+    if (request.tenant) |tenant| {
+        try writer.slice("\"tenant\":");
+        try writer.string(tenant);
+        try writer.byte(',');
+    }
+    try writer.slice("\"taskId\":");
+    try writer.string(request.task_id);
+    try writer.slice(",\"id\":");
+    try writer.string(request.id);
+    try writer.byte('}');
+}
+
+/// Decode a `ListTaskPushNotificationConfigsRequest`.
+///
+/// `pageSize` is a plain `int32` here rather than the `optional int32` of
+/// `ListTasksRequest`, and it is still carried as presence, because
+/// `"pageSize":0` and no `pageSize` are the same page and two different
+/// documents. `tenant` is field 4 in the proto although the source lists it
+/// first, so it is written last here too.
+pub fn decodeListTaskPushNotificationConfigsRequest(
+    raw: []const u8,
+    scratch: []u8,
+) DecodeError!ListTaskPushNotificationConfigsRequest {
+    var reader = json.Reader.init(raw);
+    var request: ListTaskPushNotificationConfigsRequest = .{ .task_id = "" };
+    var saw_task_id = false;
+
+    if (try reader.beginObject()) return error.MissingField;
+
+    while (try reader.nextKey(scratch)) |key| {
+        if (std.mem.eql(u8, key, "taskId")) {
+            if (saw_task_id) {
+                try reader.skipValue(scratch);
+            } else {
+                request.task_id = try reader.string(scratch);
+                saw_task_id = true;
+            }
+        } else if (std.mem.eql(u8, key, "pageSize")) {
+            if (request.page_size != null) {
+                try reader.skipValue(scratch);
+            } else {
+                request.page_size = try readInt32(&reader);
+            }
+        } else if (std.mem.eql(u8, key, "pageToken")) {
+            if (request.page_token != null) {
+                try reader.skipValue(scratch);
+            } else {
+                request.page_token = try reader.string(scratch);
+            }
+        } else if (std.mem.eql(u8, key, "tenant")) {
+            if (request.tenant != null) {
+                try reader.skipValue(scratch);
+            } else {
+                request.tenant = try reader.string(scratch);
+            }
+        } else {
+            try reader.skipValue(scratch);
+        }
+    }
+
+    if (!reader.atEnd()) return error.MalformedJson;
+
+    if (!saw_task_id) return error.MissingField;
+    if (request.task_id.len == 0) return error.InvalidField;
+    return request;
+}
+
+/// Encode a `ListTaskPushNotificationConfigsRequest`.
+pub fn encodeListTaskPushNotificationConfigsRequest(
+    request: ListTaskPushNotificationConfigsRequest,
+    writer: *json.Writer,
+) EncodeError!void {
+    if (request.task_id.len == 0) return error.InvalidField;
+
+    try writer.slice("{\"taskId\":");
+    try writer.string(request.task_id);
+    if (request.page_size) |page_size| {
+        try writer.slice(",\"pageSize\":");
+        try writeInt32(writer, page_size);
+    }
+    if (request.page_token) |page_token| {
+        try writer.slice(",\"pageToken\":");
+        try writer.string(page_token);
+    }
+    if (request.tenant) |tenant| {
+        try writer.slice(",\"tenant\":");
+        try writer.string(tenant);
+    }
+    try writer.byte('}');
+}
+
+/// Decode a `GetExtendedAgentCardRequest`.
+///
+/// The message declares one member and it is optional, so `{}` is a complete
+/// request: the card of the agent the caller reached, with no tenant segment.
+pub fn decodeGetExtendedAgentCardRequest(
+    raw: []const u8,
+    scratch: []u8,
+) DecodeError!GetExtendedAgentCardRequest {
+    var reader = json.Reader.init(raw);
+    var request: GetExtendedAgentCardRequest = .{};
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, "tenant")) {
+                if (request.tenant != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    request.tenant = try reader.string(scratch);
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    if (!reader.atEnd()) return error.MalformedJson;
+    return request;
+}
+
+/// Encode a `GetExtendedAgentCardRequest`.
+pub fn encodeGetExtendedAgentCardRequest(
+    request: GetExtendedAgentCardRequest,
+    writer: *json.Writer,
+) EncodeError!void {
+    if (request.tenant) |tenant| {
+        try writer.slice("{\"tenant\":");
+        try writer.string(tenant);
+        try writer.byte('}');
+        return;
+    }
+    try writer.slice("{}");
+}
+
+/// Decode a `ListTasksRequest`.
+///
+/// No member of this request is REQUIRED, so `{}` is a complete one: the
+/// first page of everything the tenant holds. `status` is a singular
+/// `TaskState` in the proto and is carried as presence anyway, because
+/// `"status":"TASK_STATE_UNSPECIFIED"` is a peer that filtered on an
+/// unspecified state and no member is a peer that did not filter at all.
+/// `statusTimestampAfter` is the ISO-8601 text the peer wrote: there is no
+/// `Timestamp` here to convert, and a normalised spelling of the same instant
+/// would not be the bytes that came in.
+pub fn decodeListTasksRequest(raw: []const u8, scratch: []u8) DecodeError!ListTasksRequest {
+    var reader = json.Reader.init(raw);
+    var request: ListTasksRequest = .{};
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, "tenant")) {
+                if (request.tenant != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    request.tenant = try reader.string(scratch);
+                }
+            } else if (std.mem.eql(u8, key, "contextId")) {
+                if (request.context_id != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    request.context_id = try reader.string(scratch);
+                }
+            } else if (std.mem.eql(u8, key, "status")) {
+                if (request.status != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    request.status = try TaskState.parse(try reader.string(scratch));
+                }
+            } else if (std.mem.eql(u8, key, "pageSize")) {
+                if (request.page_size != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    request.page_size = try readInt32(&reader);
+                }
+            } else if (std.mem.eql(u8, key, "pageToken")) {
+                if (request.page_token != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    request.page_token = try reader.string(scratch);
+                }
+            } else if (std.mem.eql(u8, key, "historyLength")) {
+                if (request.history_length != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    request.history_length = try readInt32(&reader);
+                }
+            } else if (std.mem.eql(u8, key, "statusTimestampAfter")) {
+                if (request.status_timestamp_after != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    request.status_timestamp_after = try reader.string(scratch);
+                }
+            } else if (std.mem.eql(u8, key, "includeArtifacts")) {
+                if (request.include_artifacts != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    request.include_artifacts = try reader.boolean();
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    if (!reader.atEnd()) return error.MalformedJson;
+    return request;
+}
+
+/// Encode a `ListTasksRequest`.
+///
+/// `status` goes out as the full proto name, because that is the spelling
+/// `TaskState.parse` accepts and the only one a peer sends.
+pub fn encodeListTasksRequest(request: ListTasksRequest, writer: *json.Writer) EncodeError!void {
+    try writer.byte('{');
+    var separator: []const u8 = "";
+    if (request.tenant) |tenant| {
+        try writer.slice(separator);
+        try writer.slice("\"tenant\":");
+        try writer.string(tenant);
+        separator = ",";
+    }
+    if (request.context_id) |context_id| {
+        try writer.slice(separator);
+        try writer.slice("\"contextId\":");
+        try writer.string(context_id);
+        separator = ",";
+    }
+    if (request.status) |status| {
+        try writer.slice(separator);
+        try writer.slice("\"status\":");
+        try writer.string(status.wireName());
+        separator = ",";
+    }
+    if (request.page_size) |page_size| {
+        try writer.slice(separator);
+        try writer.slice("\"pageSize\":");
+        try writeInt32(writer, page_size);
+        separator = ",";
+    }
+    if (request.page_token) |page_token| {
+        try writer.slice(separator);
+        try writer.slice("\"pageToken\":");
+        try writer.string(page_token);
+        separator = ",";
+    }
+    if (request.history_length) |history_length| {
+        try writer.slice(separator);
+        try writer.slice("\"historyLength\":");
+        try writeInt32(writer, history_length);
+        separator = ",";
+    }
+    if (request.status_timestamp_after) |after| {
+        try writer.slice(separator);
+        try writer.slice("\"statusTimestampAfter\":");
+        try writer.string(after);
+        separator = ",";
+    }
+    if (request.include_artifacts) |include_artifacts| {
+        try writer.slice(separator);
+        try writer.slice("\"includeArtifacts\":");
+        try writer.slice(if (include_artifacts) "true" else "false");
+    }
+    try writer.byte('}');
+}
+
+/// Decode an `AuthenticationInfo`.
+///
+/// `scheme` is the only REQUIRED member. `credentials` stays optional rather
+/// than defaulting to the empty string, because the two are different
+/// requests: no credential is a scheme sent without a secret, and an empty
+/// credential is a secret that happens to be blank.
+pub fn decodeAuthenticationInfo(raw: []const u8, scratch: []u8) DecodeError!AuthenticationInfo {
+    var reader = json.Reader.init(raw);
+    const info = try readAuthenticationInfo(&reader, scratch);
+    // The message is one JSON value, and the walk above stopped at its closing
+    // brace rather than at the end of the document.
+    if (!reader.atEnd()) return error.MalformedJson;
+    return info;
+}
+
+/// The walk `decodeAuthenticationInfo` opens, so a nested member can share its
+/// reader. The scratch bump is per reader, so the strings this hands out are
+/// regions of their own and not of the ones already handed out.
+fn readAuthenticationInfo(
+    reader: *json.Reader,
+    scratch: []u8,
+) DecodeError!AuthenticationInfo {
+    var info: AuthenticationInfo = .{ .scheme = "" };
+    var saw_scheme = false;
+
+    if (try reader.beginObject()) return error.MissingField;
+
+    while (try reader.nextKey(scratch)) |key| {
+        if (std.mem.eql(u8, key, "scheme")) {
+            if (saw_scheme) {
+                try reader.skipValue(scratch);
+            } else {
+                info.scheme = try reader.string(scratch);
+                saw_scheme = true;
+            }
+        } else if (std.mem.eql(u8, key, "credentials")) {
+            if (info.credentials != null) {
+                try reader.skipValue(scratch);
+            } else {
+                info.credentials = try reader.string(scratch);
+            }
+        } else {
+            try reader.skipValue(scratch);
+        }
+    }
+
+    if (!saw_scheme) return error.MissingField;
+    if (info.scheme.len == 0) return error.InvalidField;
+    return info;
+}
+
+/// Encode an `AuthenticationInfo`.
+pub fn encodeAuthenticationInfo(info: AuthenticationInfo, writer: *json.Writer) EncodeError!void {
+    if (info.scheme.len == 0) return error.InvalidField;
+
+    try writer.slice("{\"scheme\":");
+    try writer.string(info.scheme);
+    if (info.credentials) |credentials| {
+        try writer.slice(",\"credentials\":");
+        try writer.string(credentials);
+    }
+    try writer.byte('}');
+}
+
+/// Decode a `TaskPushNotificationConfig`.
+///
+/// This one message is the create-request body, the create response, and the
+/// get and list response, so the decoder has to hold every member the three
+/// uses carry. `url` is the only REQUIRED member and is where the agent posts
+/// the `StreamResponse`; an empty URL is not a webhook and is refused.
+pub fn decodeTaskPushNotificationConfig(
+    raw: []const u8,
+    scratch: []u8,
+) DecodeError!TaskPushNotificationConfig {
+    var reader = json.Reader.init(raw);
+    const config = try readTaskPushNotificationConfig(&reader, scratch);
+    // The configuration is one JSON value, and the `authentication` walk above
+    // stopped at its closing brace rather than at the end of the document.
+    if (!reader.atEnd()) return error.MalformedJson;
+    return config;
+}
+
+/// The walk `decodeTaskPushNotificationConfig` opens, so
+/// `decodeSendMessageConfiguration` can read one nested beside its own members
+/// on the same reader.
+fn readTaskPushNotificationConfig(
+    reader: *json.Reader,
+    scratch: []u8,
+) DecodeError!TaskPushNotificationConfig {
+    var config: TaskPushNotificationConfig = .{ .url = "" };
+    var saw_url = false;
+
+    if (try reader.beginObject()) return error.MissingField;
+
+    while (try reader.nextKey(scratch)) |key| {
+        if (std.mem.eql(u8, key, "tenant")) {
+            if (config.tenant != null) {
+                try reader.skipValue(scratch);
+            } else {
+                config.tenant = try reader.string(scratch);
+            }
+        } else if (std.mem.eql(u8, key, "id")) {
+            if (config.id != null) {
+                try reader.skipValue(scratch);
+            } else {
+                config.id = try reader.string(scratch);
+            }
+        } else if (std.mem.eql(u8, key, "taskId")) {
+            if (config.task_id != null) {
+                try reader.skipValue(scratch);
+            } else {
+                config.task_id = try reader.string(scratch);
+            }
+        } else if (std.mem.eql(u8, key, "url")) {
+            if (saw_url) {
+                try reader.skipValue(scratch);
+            } else {
+                config.url = try reader.string(scratch);
+                saw_url = true;
+            }
+        } else if (std.mem.eql(u8, key, "token")) {
+            if (config.token != null) {
+                try reader.skipValue(scratch);
+            } else {
+                config.token = try reader.string(scratch);
+            }
+        } else if (std.mem.eql(u8, key, "authentication")) {
+            if (config.authentication != null) {
+                try reader.skipValue(scratch);
+            } else {
+                // `null` and an absent member agree here: the normative row
+                // types this member as an object, and a configuration with no
+                // authentication sends none rather than an empty one.
+                reader.skipWhitespace();
+                if (reader.peek() == 'n') {
+                    try reader.nullLiteral();
+                } else {
+                    config.authentication = try readAuthenticationInfo(reader, scratch);
+                }
+            }
+        } else {
+            try reader.skipValue(scratch);
+        }
+    }
+
+    if (!saw_url) return error.MissingField;
+    if (config.url.len == 0) return error.InvalidField;
+    return config;
+}
+
+/// Encode a `TaskPushNotificationConfig`.
+pub fn encodeTaskPushNotificationConfig(
+    config: TaskPushNotificationConfig,
+    writer: *json.Writer,
+) EncodeError!void {
+    if (config.url.len == 0) return error.InvalidField;
+
+    try writer.byte('{');
+    var separator: []const u8 = "";
+    if (config.tenant) |tenant| {
+        try writer.slice(separator);
+        try writer.slice("\"tenant\":");
+        try writer.string(tenant);
+        separator = ",";
+    }
+    if (config.id) |id| {
+        try writer.slice(separator);
+        try writer.slice("\"id\":");
+        try writer.string(id);
+        separator = ",";
+    }
+    if (config.task_id) |task_id| {
+        try writer.slice(separator);
+        try writer.slice("\"taskId\":");
+        try writer.string(task_id);
+        separator = ",";
+    }
+    try writer.slice(separator);
+    try writer.slice("\"url\":");
+    try writer.string(config.url);
+    if (config.token) |token| {
+        try writer.slice(",\"token\":");
+        try writer.string(token);
+    }
+    if (config.authentication) |authentication| {
+        try writer.slice(",\"authentication\":");
+        try encodeAuthenticationInfo(authentication, writer);
+    }
+    try writer.byte('}');
+}
+
+/// Decode a `SendMessageConfiguration`.
+///
+/// `out_modes` is the caller's array of media types and `scratch` is the
+/// reader's escape buffer, so nothing allocates. The order is the one
+/// `acp.decodePermissionRequest` takes for the same reason: a configuration
+/// with more accepted modes than the caller reserved is reported rather than
+/// truncated, because a truncated list of accepted modes is a request that
+/// says something the caller did not mean.
+///
+/// An absent `acceptedOutputModes` and an empty one are both carried, and the
+/// two are told apart: the field is null for the first and a zero-length slice
+/// for the second, and the encoder writes `[]` for the one and nothing for the
+/// other.
+pub fn decodeSendMessageConfiguration(
+    raw: []const u8,
+    out_modes: [][]const u8,
+    scratch: []u8,
+) DecodeError!SendMessageConfiguration {
+    var reader = json.Reader.init(raw);
+    var configuration: SendMessageConfiguration = .{};
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, "acceptedOutputModes")) {
+                if (configuration.accepted_output_modes != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    const count = try readStringList(&reader, out_modes, scratch);
+                    configuration.accepted_output_modes = out_modes[0..count];
+                }
+            } else if (std.mem.eql(u8, key, "taskPushNotificationConfig")) {
+                if (configuration.task_push_notification_config != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    // `null` and an absent member agree here. The normative
+                    // row types this member as an object, and a configuration
+                    // with no push config sends none rather than an empty one.
+                    reader.skipWhitespace();
+                    if (reader.peek() == 'n') {
+                        try reader.nullLiteral();
+                    } else {
+                        configuration.task_push_notification_config =
+                            try readTaskPushNotificationConfig(&reader, scratch);
+                    }
+                }
+            } else if (std.mem.eql(u8, key, "historyLength")) {
+                if (configuration.history_length != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    configuration.history_length = try readInt32(&reader);
+                }
+            } else if (std.mem.eql(u8, key, "returnImmediately")) {
+                if (configuration.return_immediately != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    configuration.return_immediately = try reader.boolean();
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    if (!reader.atEnd()) return error.MalformedJson;
+    return configuration;
+}
+
+/// Encode a `SendMessageConfiguration`.
+pub fn encodeSendMessageConfiguration(
+    configuration: SendMessageConfiguration,
+    writer: *json.Writer,
+) EncodeError!void {
+    try writer.byte('{');
+    var separator: []const u8 = "";
+    if (configuration.accepted_output_modes) |modes| {
+        try writer.slice(separator);
+        try writer.slice("\"acceptedOutputModes\":");
+        try writeStringList(modes, writer);
+        separator = ",";
+    }
+    if (configuration.task_push_notification_config) |config| {
+        try writer.slice(separator);
+        try writer.slice("\"taskPushNotificationConfig\":");
+        try encodeTaskPushNotificationConfig(config, writer);
+        separator = ",";
+    }
+    if (configuration.history_length) |history_length| {
+        try writer.slice(separator);
+        try writer.slice("\"historyLength\":");
+        try writeInt32(writer, history_length);
+        separator = ",";
+    }
+    if (configuration.return_immediately) |return_immediately| {
+        try writer.slice(separator);
+        try writer.slice("\"returnImmediately\":");
+        try writer.slice(if (return_immediately) "true" else "false");
+    }
+    try writer.byte('}');
+}
+
+/// Decode an `AgentInterface`.
+///
+/// Three of the four members are REQUIRED and none of them may be empty. The
+/// version is not parsed here: PROTOCOLS.md section 5.1 forbids a patch
+/// component in a card, so `parseVersion` is what a consumer reads the
+/// declared text with, and this decoder keeps the bytes so a re-encode puts
+/// back what the agent published.
+pub fn decodeAgentInterface(raw: []const u8, scratch: []u8) DecodeError!AgentInterface {
+    var reader = json.Reader.init(raw);
+    var interface: AgentInterface = .{
+        .url = "",
+        .protocol_binding = "",
+        .protocol_version = "",
+    };
+    var saw_url = false;
+    var saw_binding = false;
+    var saw_version = false;
+
+    if (try reader.beginObject()) return error.MissingField;
+
+    while (try reader.nextKey(scratch)) |key| {
+        if (std.mem.eql(u8, key, "url")) {
+            if (saw_url) {
+                try reader.skipValue(scratch);
+            } else {
+                interface.url = try reader.string(scratch);
+                saw_url = true;
+            }
+        } else if (std.mem.eql(u8, key, "protocolBinding")) {
+            if (saw_binding) {
+                try reader.skipValue(scratch);
+            } else {
+                interface.protocol_binding = try reader.string(scratch);
+                saw_binding = true;
+            }
+        } else if (std.mem.eql(u8, key, "tenant")) {
+            if (interface.tenant != null) {
+                try reader.skipValue(scratch);
+            } else {
+                interface.tenant = try reader.string(scratch);
+            }
+        } else if (std.mem.eql(u8, key, "protocolVersion")) {
+            if (saw_version) {
+                try reader.skipValue(scratch);
+            } else {
+                interface.protocol_version = try reader.string(scratch);
+                saw_version = true;
+            }
+        } else {
+            try reader.skipValue(scratch);
+        }
+    }
+
+    if (!reader.atEnd()) return error.MalformedJson;
+
+    if (!saw_url or !saw_binding or !saw_version) return error.MissingField;
+    if (interface.url.len == 0 or interface.protocol_binding.len == 0) return error.InvalidField;
+    if (interface.protocol_version.len == 0) return error.InvalidField;
+    return interface;
+}
+
+/// Encode an `AgentInterface`.
+pub fn encodeAgentInterface(
+    interface: AgentInterface,
+    writer: *json.Writer,
+) EncodeError!void {
+    if (interface.url.len == 0 or interface.protocol_binding.len == 0) return error.InvalidField;
+    if (interface.protocol_version.len == 0) return error.InvalidField;
+
+    try writer.slice("{\"url\":");
+    try writer.string(interface.url);
+    try writer.slice(",\"protocolBinding\":");
+    try writer.string(interface.protocol_binding);
+    if (interface.tenant) |tenant| {
+        try writer.slice(",\"tenant\":");
+        try writer.string(tenant);
+    }
+    try writer.slice(",\"protocolVersion\":");
+    try writer.string(interface.protocol_version);
+    try writer.byte('}');
+}
+
+/// Decode an `AgentProvider`.
+pub fn decodeAgentProvider(raw: []const u8, scratch: []u8) DecodeError!AgentProvider {
+    var reader = json.Reader.init(raw);
+    var provider: AgentProvider = .{ .url = "", .organization = "" };
+    var saw_url = false;
+    var saw_organization = false;
+
+    if (try reader.beginObject()) return error.MissingField;
+
+    while (try reader.nextKey(scratch)) |key| {
+        if (std.mem.eql(u8, key, "url")) {
+            if (saw_url) {
+                try reader.skipValue(scratch);
+            } else {
+                provider.url = try reader.string(scratch);
+                saw_url = true;
+            }
+        } else if (std.mem.eql(u8, key, "organization")) {
+            if (saw_organization) {
+                try reader.skipValue(scratch);
+            } else {
+                provider.organization = try reader.string(scratch);
+                saw_organization = true;
+            }
+        } else {
+            try reader.skipValue(scratch);
+        }
+    }
+
+    if (!reader.atEnd()) return error.MalformedJson;
+
+    if (!saw_url or !saw_organization) return error.MissingField;
+    if (provider.url.len == 0 or provider.organization.len == 0) return error.InvalidField;
+    return provider;
+}
+
+/// Encode an `AgentProvider`.
+pub fn encodeAgentProvider(provider: AgentProvider, writer: *json.Writer) EncodeError!void {
+    if (provider.url.len == 0 or provider.organization.len == 0) return error.InvalidField;
+
+    try writer.slice("{\"url\":");
+    try writer.string(provider.url);
+    try writer.slice(",\"organization\":");
+    try writer.string(provider.organization);
+    try writer.byte('}');
+}
+
+/// Decode an `AgentCardSignature`.
+///
+/// `header` is the JWS unprotected header and ProtoJSON spells it as a JSON
+/// object rather than base64url, so it is carried as the borrowed lexeme it
+/// arrived as. `protected` and `signature` stay as the base64url text: this is
+/// not a `bytes` field and there is nothing to convert.
+pub fn decodeAgentCardSignature(
+    raw: []const u8,
+    scratch: []u8,
+) DecodeError!AgentCardSignature {
+    var reader = json.Reader.init(raw);
+    var signature: AgentCardSignature = .{ .protected = "", .signature = "" };
+    var saw_protected = false;
+    var saw_signature = false;
+
+    if (try reader.beginObject()) return error.MissingField;
+
+    while (try reader.nextKey(scratch)) |key| {
+        if (std.mem.eql(u8, key, "protected")) {
+            if (saw_protected) {
+                try reader.skipValue(scratch);
+            } else {
+                signature.protected = try reader.string(scratch);
+                saw_protected = true;
+            }
+        } else if (std.mem.eql(u8, key, "signature")) {
+            if (saw_signature) {
+                try reader.skipValue(scratch);
+            } else {
+                signature.signature = try reader.string(scratch);
+                saw_signature = true;
+            }
+        } else if (std.mem.eql(u8, key, "header")) {
+            if (signature.header != null) {
+                try reader.skipValue(scratch);
+            } else {
+                signature.header = try reader.rawValue(scratch);
+            }
+        } else {
+            try reader.skipValue(scratch);
+        }
+    }
+
+    if (!reader.atEnd()) return error.MalformedJson;
+
+    if (!saw_protected or !saw_signature) return error.MissingField;
+    if (signature.protected.len == 0 or signature.signature.len == 0) return error.InvalidField;
+    return signature;
+}
+
+/// Encode an `AgentCardSignature`.
+pub fn encodeAgentCardSignature(
+    signature: AgentCardSignature,
+    writer: *json.Writer,
+) EncodeError!void {
+    if (signature.protected.len == 0 or signature.signature.len == 0) return error.InvalidField;
+
+    try writer.slice("{\"protected\":");
+    try writer.string(signature.protected);
+    try writer.slice(",\"signature\":");
+    try writer.string(signature.signature);
+    if (signature.header) |header| {
+        try writer.slice(",\"header\":");
+        try writer.slice(header);
+    }
+    try writer.byte('}');
+}
+
+/// Decode an `AgentExtension`.
+///
+/// No field carries a REQUIRED annotation, not even `uri`, so a peer may
+/// declare an extension this library cannot name and `{}` is still an
+/// extension. `params` is a `google.protobuf.Struct` and is carried as the
+/// borrowed lexeme, so a setting this library does not model survives the
+/// round trip; `required` is recorded as presence, so a peer that wrote
+/// `"required":false` gets that member back rather than none.
+pub fn decodeAgentExtension(raw: []const u8, scratch: []u8) DecodeError!AgentExtension {
+    var reader = json.Reader.init(raw);
+    var extension: AgentExtension = .{};
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, "uri")) {
+                if (extension.uri != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    extension.uri = try reader.string(scratch);
+                }
+            } else if (std.mem.eql(u8, key, "description")) {
+                if (extension.description != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    extension.description = try reader.string(scratch);
+                }
+            } else if (std.mem.eql(u8, key, "required")) {
+                if (extension.required != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    extension.required = try reader.boolean();
+                }
+            } else if (std.mem.eql(u8, key, "params")) {
+                if (extension.params != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    extension.params = try reader.rawValue(scratch);
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    if (!reader.atEnd()) return error.MalformedJson;
+    return extension;
+}
+
+/// Encode an `AgentExtension`.
+pub fn encodeAgentExtension(extension: AgentExtension, writer: *json.Writer) EncodeError!void {
+    try writer.byte('{');
+    var separator: []const u8 = "";
+    if (extension.uri) |uri| {
+        try writer.slice(separator);
+        try writer.slice("\"uri\":");
+        try writer.string(uri);
+        separator = ",";
+    }
+    if (extension.description) |description| {
+        try writer.slice(separator);
+        try writer.slice("\"description\":");
+        try writer.string(description);
+        separator = ",";
+    }
+    if (extension.required) |required| {
+        try writer.slice(separator);
+        try writer.slice("\"required\":");
+        try writer.slice(if (required) "true" else "false");
+        separator = ",";
+    }
+    if (extension.params) |params| {
+        try writer.slice(separator);
+        try writer.slice("\"params\":");
+        try writer.slice(params);
+    }
+    try writer.byte('}');
+}
+
+/// Decode an `ApiKeySecurityScheme`.
+///
+/// This is one of the four `SecurityScheme` arms that stand alone. The
+/// `oauth2` arm does not, because it reaches `OAuthFlows`, whose `scopes` is a
+/// `map<string, string>`: that walk is over keys rather than member names, so
+/// `findField` is the wrong tool for it and the union above has no codec until
+/// that arm has one. These four are decoded as the messages they are, which is
+/// what a caller holding one entry of a card's `securitySchemes` needs.
+pub fn decodeApiKeySecurityScheme(
+    raw: []const u8,
+    scratch: []u8,
+) DecodeError!ApiKeySecurityScheme {
+    var reader = json.Reader.init(raw);
+    var scheme: ApiKeySecurityScheme = .{ .location = .query, .name = "" };
+    var saw_location = false;
+    var saw_name = false;
+
+    if (try reader.beginObject()) return error.MissingField;
+
+    while (try reader.nextKey(scratch)) |key| {
+        if (std.mem.eql(u8, key, "description")) {
+            if (scheme.description != null) {
+                try reader.skipValue(scratch);
+            } else {
+                scheme.description = try reader.string(scratch);
+            }
+        } else if (std.mem.eql(u8, key, "location")) {
+            if (saw_location) {
+                try reader.skipValue(scratch);
+            } else {
+                scheme.location = try ApiKeyLocation.parse(try reader.string(scratch));
+                saw_location = true;
+            }
+        } else if (std.mem.eql(u8, key, "name")) {
+            if (saw_name) {
+                try reader.skipValue(scratch);
+            } else {
+                scheme.name = try reader.string(scratch);
+                saw_name = true;
+            }
+        } else {
+            try reader.skipValue(scratch);
+        }
+    }
+
+    if (!reader.atEnd()) return error.MalformedJson;
+
+    if (!saw_location or !saw_name) return error.MissingField;
+    // An empty header name names no header, and a query parameter with no name
+    // is not a credential the receiver can read.
+    if (scheme.name.len == 0) return error.InvalidField;
+    return scheme;
+}
+
+/// Encode an `ApiKeySecurityScheme`.
+pub fn encodeApiKeySecurityScheme(
+    scheme: ApiKeySecurityScheme,
+    writer: *json.Writer,
+) EncodeError!void {
+    if (scheme.name.len == 0) return error.InvalidField;
+
+    try writer.byte('{');
+    if (scheme.description) |description| {
+        try writer.slice("\"description\":");
+        try writer.string(description);
+        try writer.byte(',');
+    }
+    try writer.slice("\"location\":");
+    try writer.string(scheme.location.string());
+    try writer.slice(",\"name\":");
+    try writer.string(scheme.name);
+    try writer.byte('}');
+}
+
+/// Decode an `HttpAuthSecurityScheme`.
+pub fn decodeHttpAuthSecurityScheme(
+    raw: []const u8,
+    scratch: []u8,
+) DecodeError!HttpAuthSecurityScheme {
+    var reader = json.Reader.init(raw);
+    var scheme: HttpAuthSecurityScheme = .{ .scheme = "" };
+    var saw_scheme = false;
+
+    if (try reader.beginObject()) return error.MissingField;
+
+    while (try reader.nextKey(scratch)) |key| {
+        if (std.mem.eql(u8, key, "description")) {
+            if (scheme.description != null) {
+                try reader.skipValue(scratch);
+            } else {
+                scheme.description = try reader.string(scratch);
+            }
+        } else if (std.mem.eql(u8, key, "scheme")) {
+            if (saw_scheme) {
+                try reader.skipValue(scratch);
+            } else {
+                scheme.scheme = try reader.string(scratch);
+                saw_scheme = true;
+            }
+        } else if (std.mem.eql(u8, key, "bearerFormat")) {
+            if (scheme.bearer_format != null) {
+                try reader.skipValue(scratch);
+            } else {
+                scheme.bearer_format = try reader.string(scratch);
+            }
+        } else {
+            try reader.skipValue(scratch);
+        }
+    }
+
+    if (!reader.atEnd()) return error.MalformedJson;
+
+    if (!saw_scheme) return error.MissingField;
+    if (scheme.scheme.len == 0) return error.InvalidField;
+    return scheme;
+}
+
+/// Encode an `HttpAuthSecurityScheme`.
+pub fn encodeHttpAuthSecurityScheme(
+    scheme: HttpAuthSecurityScheme,
+    writer: *json.Writer,
+) EncodeError!void {
+    if (scheme.scheme.len == 0) return error.InvalidField;
+
+    try writer.byte('{');
+    if (scheme.description) |description| {
+        try writer.slice("\"description\":");
+        try writer.string(description);
+        try writer.byte(',');
+    }
+    try writer.slice("\"scheme\":");
+    try writer.string(scheme.scheme);
+    if (scheme.bearer_format) |bearer_format| {
+        try writer.slice(",\"bearerFormat\":");
+        try writer.string(bearer_format);
+    }
+    try writer.byte('}');
+}
+
+/// Decode an `OpenIdConnectSecurityScheme`.
+pub fn decodeOpenIdConnectSecurityScheme(
+    raw: []const u8,
+    scratch: []u8,
+) DecodeError!OpenIdConnectSecurityScheme {
+    var reader = json.Reader.init(raw);
+    var scheme: OpenIdConnectSecurityScheme = .{ .open_id_connect_url = "" };
+    var saw_url = false;
+
+    if (try reader.beginObject()) return error.MissingField;
+
+    while (try reader.nextKey(scratch)) |key| {
+        if (std.mem.eql(u8, key, "description")) {
+            if (scheme.description != null) {
+                try reader.skipValue(scratch);
+            } else {
+                scheme.description = try reader.string(scratch);
+            }
+        } else if (std.mem.eql(u8, key, "openIdConnectUrl")) {
+            if (saw_url) {
+                try reader.skipValue(scratch);
+            } else {
+                scheme.open_id_connect_url = try reader.string(scratch);
+                saw_url = true;
+            }
+        } else {
+            try reader.skipValue(scratch);
+        }
+    }
+
+    if (!reader.atEnd()) return error.MalformedJson;
+
+    if (!saw_url) return error.MissingField;
+    if (scheme.open_id_connect_url.len == 0) return error.InvalidField;
+    return scheme;
+}
+
+/// Encode an `OpenIdConnectSecurityScheme`.
+pub fn encodeOpenIdConnectSecurityScheme(
+    scheme: OpenIdConnectSecurityScheme,
+    writer: *json.Writer,
+) EncodeError!void {
+    if (scheme.open_id_connect_url.len == 0) return error.InvalidField;
+
+    try writer.byte('{');
+    if (scheme.description) |description| {
+        try writer.slice("\"description\":");
+        try writer.string(description);
+        try writer.byte(',');
+    }
+    try writer.slice("\"openIdConnectUrl\":");
+    try writer.string(scheme.open_id_connect_url);
+    try writer.byte('}');
+}
+
+/// Decode a `MutualTlsSecurityScheme`.
+///
+/// The only member is an optional description, so `{}` is a complete
+/// scheme: mutual TLS is asserted by the transport and the message adds
+/// nothing to it.
+pub fn decodeMutualTlsSecurityScheme(
+    raw: []const u8,
+    scratch: []u8,
+) DecodeError!MutualTlsSecurityScheme {
+    var reader = json.Reader.init(raw);
+    var scheme: MutualTlsSecurityScheme = .{};
+
+    const is_empty = try reader.beginObject();
+    if (!is_empty) {
+        while (try reader.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, "description")) {
+                if (scheme.description != null) {
+                    try reader.skipValue(scratch);
+                } else {
+                    scheme.description = try reader.string(scratch);
+                }
+            } else {
+                try reader.skipValue(scratch);
+            }
+        }
+    }
+
+    if (!reader.atEnd()) return error.MalformedJson;
+    return scheme;
+}
+
+/// Encode a `MutualTlsSecurityScheme`.
+pub fn encodeMutualTlsSecurityScheme(
+    scheme: MutualTlsSecurityScheme,
+    writer: *json.Writer,
+) EncodeError!void {
+    if (scheme.description) |description| {
+        try writer.slice("{\"description\":");
+        try writer.string(description);
+        try writer.byte('}');
+        return;
+    }
+    try writer.slice("{}");
+}
+
 const testing = std.testing;
 
 /// Assert that every `oneof` member's field number is its tag ordinal plus one.
@@ -2450,13 +4018,18 @@ test "a numeric Role tag decodes and one above the range is UnknownTag" {
 
 test "returnImmediately is a plain bool whose false means blocking" {
     // The proto declares the field singular, so there is no third state
-    // between absent and false, and `null` is not a value a peer sends.
+    // between absent and false on the wire, and `null` is not a value a peer
+    // sends. The Zig field is `?bool` anyway, because absent and false are the
+    // same answer and two different documents, and a decoder that recorded
+    // only the answer could not write the document back.
     const blocking: SendMessageConfiguration = .{};
-    try testing.expect(!blocking.return_immediately);
+    try testing.expectEqual(@as(?bool, null), blocking.return_immediately);
     const immediate: SendMessageConfiguration = .{ .return_immediately = true };
-    try testing.expect(immediate.return_immediately);
+    try testing.expectEqual(@as(?bool, true), immediate.return_immediately);
     // The inversion matters: false blocks, so a caller that ignores the flag
-    // waits, and one that reads it as 0.3's `blocking` waits too.
+    // waits, and one that reads it as 0.3's `blocking` waits too. An absent
+    // member is the same call, so a caller reads null as blocking.
+    try testing.expect(!(blocking.return_immediately orelse false));
 }
 
 test "the terminal set is the four stated states" {
@@ -2895,19 +4468,22 @@ test "AgentExtension carries required at 3 and its settings at 4" {
     try testing.expectEqual(@as(u32, 3), fieldNumber(AgentExtension, 2));
     try testing.expectEqual(@as(u32, 4), fieldNumber(AgentExtension, 3));
     try testing.expectEqualStrings("params", jsonName(AgentExtension, 3).?);
-    // `required` is a singular bool with no presence bit, so false is the
-    // whole of a declaration that does not demand the extension.
+    // `required` is a singular bool on the wire, so a peer writes `false`
+    // rather than omitting it, and this field records which of the two arrived.
     const uri = "https://example.com/extensions/geolocation/v1";
     const extension: AgentExtension = .{ .uri = uri };
-    try testing.expect(!extension.required);
+    try testing.expectEqual(@as(?bool, null), extension.required);
     try testing.expectEqual(@as(?[]const u8, null), extension.params);
     const demanding: AgentExtension = .{ .uri = uri, .required = true };
-    try testing.expect(demanding.required);
+    try testing.expectEqual(@as(?bool, true), demanding.required);
     // A required extension the client did not activate is -32008, not a
     // silent skip, and the same extension activated does satisfy it.
     const other = [_][]const u8{"https://example.com/extensions/citations/v1"};
-    try testing.expect(!extensionSatisfied(&other, demanding.required, uri));
-    try testing.expect(extensionSatisfied(&.{uri}, demanding.required, uri));
+    try testing.expect(!extensionSatisfied(&other, demanding.required orelse false, uri));
+    try testing.expect(extensionSatisfied(&.{uri}, demanding.required orelse false, uri));
+    // A declaration that does not demand the extension is satisfied by an
+    // activation list that does not carry it, whether it said so or not.
+    try testing.expect(extensionSatisfied(&other, extension.required orelse false, uri));
 }
 
 test "AgentSkill numbers four required fields ahead of four optional ones" {
@@ -3118,4 +4694,762 @@ test "A2A-Extensions reports a short output buffer rather than losing a URI" {
     // What came back is what the requirement check matches against.
     try testing.expect(extensionSatisfied(&two, true, "https://b.example.com/y"));
     try testing.expect(!extensionSatisfied(&two, true, "https://c.example.com/z"));
+}
+
+test "Empty decodes an empty object and refuses a second document behind it" {
+    var scratch: [64]u8 = undefined;
+    var out: [64]u8 = undefined;
+
+    const empty = try decodeEmpty("{}", &scratch);
+    var writer = json.Writer.init(&out);
+    try encodeEmpty(empty, &writer);
+    try testing.expectEqualStrings("{}", writer.written());
+
+    // A member this message does not model is stepped over rather than
+    // refused, and a re-encode of a decorated body drops the decoration. That
+    // is the stated consequence every decoder in this library records, and the
+    // delete response is the one body a peer may decorate.
+    const decorated = try decodeEmpty("{\"traceId\":\"abc\"}", &scratch);
+    writer = json.Writer.init(&out);
+    try encodeEmpty(decorated, &writer);
+    try testing.expectEqualStrings("{}", writer.written());
+
+    // The tail is the other half. `{} trailing` skips the member loop and
+    // still has to be refused, and accepting it would re-encode the body
+    // without the half that arrived.
+    try testing.expectError(error.MalformedJson, decodeEmpty("{} trailing", &scratch));
+    try testing.expectError(error.MalformedJson, decodeEmpty("{\"a\":1} tail", &scratch));
+    // Trailing whitespace is not trailing data.
+    try testing.expectError(error.MalformedJson, decodeEmpty("[]", &scratch));
+    _ = try decodeEmpty("{}\n", &scratch);
+}
+
+test "GetTaskRequest round-trips every member it models" {
+    var scratch: [128]u8 = undefined;
+    var out: [256]u8 = undefined;
+
+    const full = "{\"tenant\":\"acme\",\"id\":\"task-1\",\"historyLength\":10}";
+    const request = try decodeGetTaskRequest(full, &scratch);
+    try testing.expectEqualStrings("acme", request.tenant.?);
+    try testing.expectEqualStrings("task-1", request.id);
+    try testing.expectEqual(@as(?i32, 10), request.history_length);
+    var writer = json.Writer.init(&out);
+    try encodeGetTaskRequest(request, &writer);
+    try testing.expectEqualStrings(full, writer.written());
+
+    // `"historyLength":0` and no `historyLength` are two documents, and only
+    // presence tells them apart. An encoder that omitted the default would
+    // answer the first with the second.
+    const zero = try decodeGetTaskRequest("{\"id\":\"t\",\"historyLength\":0}", &scratch);
+    try testing.expectEqual(@as(?i32, 0), zero.history_length);
+    writer = json.Writer.init(&out);
+    try encodeGetTaskRequest(zero, &writer);
+    try testing.expectEqualStrings("{\"id\":\"t\",\"historyLength\":0}", writer.written());
+
+    // `"tenant":""` is the same request and different bytes from no tenant at
+    // all, so a `tenant` that is a plain string with a default answers this
+    // one with the other.
+    const blank = try decodeGetTaskRequest("{\"tenant\":\"\",\"id\":\"t\"}", &scratch);
+    try testing.expectEqualStrings("", blank.tenant.?);
+    writer = json.Writer.init(&out);
+    try encodeGetTaskRequest(blank, &writer);
+    try testing.expectEqualStrings("{\"tenant\":\"\",\"id\":\"t\"}", writer.written());
+
+    // `id` is REQUIRED and may not be empty, and the encoder refuses the same
+    // value so that anything this decoder accepts can be written back.
+    try testing.expectError(error.MissingField, decodeGetTaskRequest("{}", &scratch));
+    try testing.expectError(error.MissingField, decodeGetTaskRequest("{\"tenant\":\"a\"}", &scratch));
+    try testing.expectError(
+        error.InvalidField,
+        decodeGetTaskRequest("{\"id\":\"\"}", &scratch),
+    );
+    // The refusal comes before the first byte, so a writer handed a value it
+    // cannot encode is left untouched and can be reused with another one.
+    var refusal = json.Writer.init(&out);
+    try testing.expectError(
+        error.InvalidField,
+        encodeGetTaskRequest(.{ .id = "" }, &refusal),
+    );
+    try testing.expectEqual(@as(usize, 0), refusal.written().len);
+    // A member the message does not model is skipped, and a repeat takes the
+    // first occurrence.
+    const extra = try decodeGetTaskRequest(
+        "{\"id\":\"first\",\"id\":\"second\",\"unknown\":[1,2]}",
+        &scratch,
+    );
+    try testing.expectEqualStrings("first", extra.id);
+    // A tail is refused, and the check is after the member loop.
+    try testing.expectError(
+        error.MalformedJson,
+        decodeGetTaskRequest("{\"id\":\"t\"} trailing", &scratch),
+    );
+}
+
+test "CancelTaskRequest carries its metadata lexeme" {
+    var scratch: [256]u8 = undefined;
+    var out: [512]u8 = undefined;
+
+    // `metadata` is a `google.protobuf.Struct`, so a key this library does not
+    // model has to survive. A typed shape cannot write one back, which is the
+    // defect `bridge.Envelope.meta` exists to remove.
+    const body = "{\"id\":\"task-1\",\"metadata\":{\"reason\":\"user\",\"depth\":2}}";
+    const request = try decodeCancelTaskRequest(body, &scratch);
+    try testing.expectEqualStrings("{\"reason\":\"user\",\"depth\":2}", request.metadata.?);
+    var writer = json.Writer.init(&out);
+    try encodeCancelTaskRequest(request, &writer);
+    try testing.expectEqualStrings(body, writer.written());
+
+    // A `null` metadata is the four bytes `null` and not an absent member:
+    // re-encoding has to put back what arrived.
+    const nulled = try decodeCancelTaskRequest("{\"id\":\"t\",\"metadata\":null}", &scratch);
+    try testing.expectEqualStrings("null", nulled.metadata.?);
+    writer = json.Writer.init(&out);
+    try encodeCancelTaskRequest(nulled, &writer);
+    try testing.expectEqualStrings("{\"id\":\"t\",\"metadata\":null}", writer.written());
+
+    try testing.expectError(error.MissingField, decodeCancelTaskRequest("{}", &scratch));
+    try testing.expectError(
+        error.MalformedJson,
+        decodeCancelTaskRequest("{\"id\":\"t\"} x", &scratch),
+    );
+}
+
+test "SubscribeToTaskRequest round-trips and refuses an empty id" {
+    var scratch: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+
+    const body = "{\"tenant\":\"acme\",\"id\":\"task-1\"}";
+    const request = try decodeSubscribeToTaskRequest(body, &scratch);
+    try testing.expectEqualStrings("acme", request.tenant.?);
+    var writer = json.Writer.init(&out);
+    try encodeSubscribeToTaskRequest(request, &writer);
+    try testing.expectEqualStrings(body, writer.written());
+
+    // No tenant at all is the other shape, and it is not the empty tenant.
+    const bare = try decodeSubscribeToTaskRequest("{\"id\":\"task-1\"}", &scratch);
+    try testing.expectEqual(@as(?[]const u8, null), bare.tenant);
+    writer = json.Writer.init(&out);
+    try encodeSubscribeToTaskRequest(bare, &writer);
+    try testing.expectEqualStrings("{\"id\":\"task-1\"}", writer.written());
+
+    try testing.expectError(error.MissingField, decodeSubscribeToTaskRequest("{}", &scratch));
+    try testing.expectError(
+        error.MissingField,
+        decodeSubscribeToTaskRequest("{\"tenant\":\"acme\"}", &scratch),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeSubscribeToTaskRequest("{\"id\":\"t\"} x", &scratch),
+    );
+}
+
+test "GetTaskPushNotificationConfigRequest needs both ids and refuses a tail" {
+    var scratch: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+
+    const body = "{\"tenant\":\"acme\",\"taskId\":\"task-1\",\"id\":\"cfg-1\"}";
+    const request = try decodeGetTaskPushNotificationConfigRequest(body, &scratch);
+    try testing.expectEqualStrings("task-1", request.task_id);
+    try testing.expectEqualStrings("cfg-1", request.id);
+    var writer = json.Writer.init(&out);
+    try encodeGetTaskPushNotificationConfigRequest(request, &writer);
+    try testing.expectEqualStrings(body, writer.written());
+
+    // Both are REQUIRED: one names the task a config belongs to and the other
+    // the config within it, and neither is a request without both.
+    try testing.expectError(
+        error.MissingField,
+        decodeGetTaskPushNotificationConfigRequest("{\"taskId\":\"t\"}", &scratch),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeGetTaskPushNotificationConfigRequest("{\"id\":\"c\"}", &scratch),
+    );
+    try testing.expectError(
+        error.InvalidField,
+        decodeGetTaskPushNotificationConfigRequest("{\"taskId\":\"t\",\"id\":\"\"}", &scratch),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeGetTaskPushNotificationConfigRequest("{\"taskId\":\"t\",\"id\":\"c\"} x", &scratch),
+    );
+}
+
+test "DeleteTaskPushNotificationConfigRequest needs both ids and refuses a tail" {
+    var scratch: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+
+    const body = "{\"taskId\":\"task-1\",\"id\":\"cfg-1\"}";
+    const request = try decodeDeleteTaskPushNotificationConfigRequest(body, &scratch);
+    try testing.expectEqualStrings("task-1", request.task_id);
+    var writer = json.Writer.init(&out);
+    try encodeDeleteTaskPushNotificationConfigRequest(request, &writer);
+    try testing.expectEqualStrings(body, writer.written());
+
+    try testing.expectError(
+        error.MissingField,
+        decodeDeleteTaskPushNotificationConfigRequest("{\"taskId\":\"t\"}", &scratch),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeDeleteTaskPushNotificationConfigRequest("{\"taskId\":\"t\",\"id\":\"c\"} x", &scratch),
+    );
+    // The response to this one is `google.protobuf.Empty`, so a config read
+    // back from it would be a body the peer never sends.
+    try testing.expectError(
+        error.MissingField,
+        decodeDeleteTaskPushNotificationConfigRequest("{}", &scratch),
+    );
+}
+
+test "ListTaskPushNotificationConfigsRequest keeps an explicit zero page size" {
+    var scratch: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+
+    const body = "{\"taskId\":\"task-1\",\"pageSize\":25,\"pageToken\":\"c1\",\"tenant\":\"acme\"}";
+    const request = try decodeListTaskPushNotificationConfigsRequest(body, &scratch);
+    try testing.expectEqual(@as(?i32, 25), request.page_size);
+    try testing.expectEqualStrings("c1", request.page_token.?);
+    // `tenant` is field 4 although the source lists it first, so it goes out
+    // last and comes back where it started.
+    try testing.expectEqualStrings("acme", request.tenant.?);
+    var writer = json.Writer.init(&out);
+    try encodeListTaskPushNotificationConfigsRequest(request, &writer);
+    try testing.expectEqualStrings(body, writer.written());
+
+    // A plain `int32` in the proto is still presence here: `"pageSize":0` is a
+    // page size a peer wrote and no `pageSize` is one it did not.
+    const zero = try decodeListTaskPushNotificationConfigsRequest(
+        "{\"taskId\":\"t\",\"pageSize\":0}",
+        &scratch,
+    );
+    try testing.expectEqual(@as(?i32, 0), zero.page_size);
+    writer = json.Writer.init(&out);
+    try encodeListTaskPushNotificationConfigsRequest(zero, &writer);
+    try testing.expectEqualStrings("{\"taskId\":\"t\",\"pageSize\":0}", writer.written());
+
+    try testing.expectError(
+        error.MissingField,
+        decodeListTaskPushNotificationConfigsRequest("{}", &scratch),
+    );
+    // A repeated member takes the first occurrence, and the copy that is
+    // discarded is still read as a value so a peer cannot hide a syntax error
+    // in the second slot of a name the first slot already used.
+    const repeated = try decodeListTaskPushNotificationConfigsRequest(
+        "{\"taskId\":\"t\",\"pageSize\":1,\"pageSize\":2}",
+        &scratch,
+    );
+    try testing.expectEqual(@as(?i32, 1), repeated.page_size);
+    try testing.expectError(
+        error.MalformedJson,
+        decodeListTaskPushNotificationConfigsRequest(
+            "{\"taskId\":\"t\",\"pageSize\":1,\"pageSize\":}",
+            &scratch,
+        ),
+    );
+    // A fraction and a value above `i32` are not a page size.
+    try testing.expectError(
+        error.InvalidField,
+        decodeListTaskPushNotificationConfigsRequest("{\"taskId\":\"t\",\"pageSize\":1.5}", &scratch),
+    );
+    try testing.expectError(
+        error.InvalidField,
+        decodeListTaskPushNotificationConfigsRequest("{\"taskId\":\"t\",\"pageSize\":1e3}", &scratch),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeListTaskPushNotificationConfigsRequest("{\"taskId\":\"t\"} x", &scratch),
+    );
+}
+
+test "ListTasksRequest keeps an explicit unspecified status" {
+    var scratch: [128]u8 = undefined;
+    var out: [512]u8 = undefined;
+
+    // `"status":"TASK_STATE_UNSPECIFIED"` is a peer that filtered on an
+    // unspecified state. A `status` that is a plain enum with a default answers
+    // it with no member at all, which is a peer that did not filter.
+    const filtered = try decodeListTasksRequest(
+        "{\"status\":\"TASK_STATE_UNSPECIFIED\"}",
+        &scratch,
+    );
+    try testing.expectEqual(@as(?TaskState, .unspecified), filtered.status);
+    var writer = json.Writer.init(&out);
+    try encodeListTasksRequest(filtered, &writer);
+    try testing.expectEqualStrings("{\"status\":\"TASK_STATE_UNSPECIFIED\"}", writer.written());
+
+    // Every member at once, in field order, with the timestamp left as the text
+    // the peer wrote rather than a re-rendering of the instant.
+    const body = "{\"tenant\":\"acme\",\"contextId\":\"ctx-1\"," ++
+        "\"status\":\"TASK_STATE_WORKING\",\"pageSize\":10,\"pageToken\":\"p1\"," ++
+        "\"historyLength\":5,\"statusTimestampAfter\":\"2026-01-02T03:04:05Z\"," ++
+        "\"includeArtifacts\":true}";
+    const request = try decodeListTasksRequest(body, &scratch);
+    try testing.expectEqual(@as(?TaskState, .working), request.status);
+    try testing.expectEqual(@as(?bool, true), request.include_artifacts);
+    try testing.expectEqualStrings("2026-01-02T03:04:05Z", request.status_timestamp_after.?);
+    writer = json.Writer.init(&out);
+    try encodeListTasksRequest(request, &writer);
+    try testing.expectEqualStrings(body, writer.written());
+
+    // `{}` is a complete request: the first page of everything.
+    const bare = try decodeListTasksRequest("{}", &scratch);
+    try testing.expectEqual(@as(?TaskState, null), bare.status);
+    try testing.expectEqual(@as(?[]const u8, null), bare.tenant);
+    writer = json.Writer.init(&out);
+    try encodeListTasksRequest(bare, &writer);
+    try testing.expectEqualStrings("{}", writer.written());
+
+    // A tag this library does not know is `UnknownTag`, never a fallback to
+    // `unspecified`, which would be indistinguishable from a peer that said it.
+    try testing.expectError(
+        error.UnknownTag,
+        decodeListTasksRequest("{\"status\":\"TASK_STATE_UNKNOWN\"}", &scratch),
+    );
+    // ProtoJSON spells a state with its full proto name, so the Zig short form
+    // is not a value a peer sends.
+    try testing.expectError(
+        error.UnknownTag,
+        decodeListTasksRequest("{\"status\":\"working\"}", &scratch),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeListTasksRequest("{} trailing", &scratch),
+    );
+}
+
+test "GetExtendedAgentCardRequest decodes an empty object and keeps a blank tenant" {
+    var scratch: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+
+    // The only member is optional, so `{}` is a complete request.
+    const bare = try decodeGetExtendedAgentCardRequest("{}", &scratch);
+    try testing.expectEqual(@as(?[]const u8, null), bare.tenant);
+    var writer = json.Writer.init(&out);
+    try encodeGetExtendedAgentCardRequest(bare, &writer);
+    try testing.expectEqualStrings("{}", writer.written());
+
+    const body = "{\"tenant\":\"acme\"}";
+    const request = try decodeGetExtendedAgentCardRequest(body, &scratch);
+    try testing.expectEqualStrings("acme", request.tenant.?);
+    writer = json.Writer.init(&out);
+    try encodeGetExtendedAgentCardRequest(request, &writer);
+    try testing.expectEqualStrings(body, writer.written());
+
+    const blank = try decodeGetExtendedAgentCardRequest("{\"tenant\":\"\"}", &scratch);
+    writer = json.Writer.init(&out);
+    try encodeGetExtendedAgentCardRequest(blank, &writer);
+    try testing.expectEqualStrings("{\"tenant\":\"\"}", writer.written());
+
+    try testing.expectError(
+        error.MalformedJson,
+        decodeGetExtendedAgentCardRequest("{\"tenant\":\"a\"} x", &scratch),
+    );
+}
+
+test "AuthenticationInfo keeps an empty credential apart from none" {
+    var scratch: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+
+    // No credential is a scheme sent without a secret; an empty credential is a
+    // secret that happens to be blank. They are different requests and both
+    // come back.
+    const body = "{\"scheme\":\"Bearer\",\"credentials\":\"\"}";
+    const blank = try decodeAuthenticationInfo(body, &scratch);
+    try testing.expectEqualStrings("", blank.credentials.?);
+    var writer = json.Writer.init(&out);
+    try encodeAuthenticationInfo(blank, &writer);
+    try testing.expectEqualStrings(body, writer.written());
+
+    const bare = try decodeAuthenticationInfo("{\"scheme\":\"Bearer\"}", &scratch);
+    try testing.expectEqual(@as(?[]const u8, null), bare.credentials);
+    writer = json.Writer.init(&out);
+    try encodeAuthenticationInfo(bare, &writer);
+    try testing.expectEqualStrings("{\"scheme\":\"Bearer\"}", writer.written());
+
+    try testing.expectError(error.MissingField, decodeAuthenticationInfo("{}", &scratch));
+    try testing.expectError(
+        error.InvalidField,
+        decodeAuthenticationInfo("{\"scheme\":\"\"}", &scratch),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeAuthenticationInfo("{\"scheme\":\"Bearer\"} x", &scratch),
+    );
+}
+
+test "TaskPushNotificationConfig round-trips the create body and its nested auth" {
+    var scratch: [256]u8 = undefined;
+    var out: [512]u8 = undefined;
+
+    // This one message is the create body, the create response, and the get
+    // and list response, so every member the three carry has to survive.
+    const body = "{\"tenant\":\"acme\",\"id\":\"cfg-1\",\"taskId\":\"task-1\"," ++
+        "\"url\":\"https://client.example.com/hook\",\"token\":\"tok\"," ++
+        "\"authentication\":{\"scheme\":\"Bearer\",\"credentials\":\"s3cret\"}}";
+    const config = try decodeTaskPushNotificationConfig(body, &scratch);
+    try testing.expectEqualStrings("https://client.example.com/hook", config.url);
+    try testing.expectEqualStrings("s3cret", config.authentication.?.credentials.?);
+    var writer = json.Writer.init(&out);
+    try encodeTaskPushNotificationConfig(config, &writer);
+    try testing.expectEqualStrings(body, writer.written());
+
+    // `url` is the only REQUIRED member, so a client that knows only where to
+    // post can still build one.
+    const minimal = try decodeTaskPushNotificationConfig(
+        "{\"url\":\"https://c.example.com/hook\"}",
+        &scratch,
+    );
+    try testing.expectEqual(@as(?AuthenticationInfo, null), minimal.authentication);
+    writer = json.Writer.init(&out);
+    try encodeTaskPushNotificationConfig(minimal, &writer);
+    try testing.expectEqualStrings("{\"url\":\"https://c.example.com/hook\"}", writer.written());
+
+    // A `null` authentication and an absent one agree, so it is dropped rather
+    // than decoded into an object with nothing in it.
+    const nulled = try decodeTaskPushNotificationConfig(
+        "{\"url\":\"https://c.example.com/hook\",\"authentication\":null}",
+        &scratch,
+    );
+    try testing.expectEqual(@as(?AuthenticationInfo, null), nulled.authentication);
+
+    try testing.expectError(error.MissingField, decodeTaskPushNotificationConfig("{}", &scratch));
+    try testing.expectError(
+        error.InvalidField,
+        decodeTaskPushNotificationConfig("{\"url\":\"\"}", &scratch),
+    );
+    try testing.expectError(
+        error.MissingField,
+        decodeTaskPushNotificationConfig(
+            "{\"url\":\"https://c.example.com/hook\",\"authentication\":{}}",
+            &scratch,
+        ),
+    );
+    // The tail is checked after the whole walk, so a nested object beside one
+    // still reports it rather than swallowing it.
+    try testing.expectError(
+        error.MalformedJson,
+        decodeTaskPushNotificationConfig("{\"url\":\"https://c.example.com/hook\"} x", &scratch),
+    );
+}
+
+test "SendMessageConfiguration keeps an empty mode list apart from none" {
+    var scratch: [128]u8 = undefined;
+    var out: [512]u8 = undefined;
+    var modes: [2][]const u8 = undefined;
+
+    // `[]` and no member are the same list and two documents, and only
+    // presence tells them apart.
+    const empty = try decodeSendMessageConfiguration(
+        "{\"acceptedOutputModes\":[]}",
+        &modes,
+        &scratch,
+    );
+    try testing.expectEqual(@as(usize, 0), empty.accepted_output_modes.?.len);
+    var writer = json.Writer.init(&out);
+    try encodeSendMessageConfiguration(empty, &writer);
+    try testing.expectEqualStrings("{\"acceptedOutputModes\":[]}", writer.written());
+
+    const body = "{\"acceptedOutputModes\":[\"text/plain\",\"application/json\"]," ++
+        "\"taskPushNotificationConfig\":{\"url\":\"https://c.example.com/hook\"}," ++
+        "\"historyLength\":3,\"returnImmediately\":false}";
+    const configuration = try decodeSendMessageConfiguration(body, &modes, &scratch);
+    try testing.expectEqual(@as(usize, 2), configuration.accepted_output_modes.?.len);
+    try testing.expectEqualStrings("application/json", configuration.accepted_output_modes.?[1]);
+    // `returnImmediately` is a plain bool on the wire, and a peer that wrote
+    // `false` gets that member back rather than none.
+    try testing.expectEqual(@as(?bool, false), configuration.return_immediately);
+    try testing.expectEqualStrings(
+        "https://c.example.com/hook",
+        configuration.task_push_notification_config.?.url,
+    );
+    writer = json.Writer.init(&out);
+    try encodeSendMessageConfiguration(configuration, &writer);
+    try testing.expectEqualStrings(body, writer.written());
+
+    // No member at all is the third document, and the field is null for it.
+    const bare = try decodeSendMessageConfiguration("{}", &modes, &scratch);
+    try testing.expectEqual(@as(?[]const []const u8, null), bare.accepted_output_modes);
+    writer = json.Writer.init(&out);
+    try encodeSendMessageConfiguration(bare, &writer);
+    try testing.expectEqualStrings("{}", writer.written());
+
+    // A list with more modes than the caller reserved is reported rather than
+    // truncated, because a truncated list of accepted modes says something the
+    // caller did not mean.
+    var one: [1][]const u8 = undefined;
+    try testing.expectError(
+        error.BufferTooSmall,
+        decodeSendMessageConfiguration(
+            "{\"acceptedOutputModes\":[\"text/plain\",\"application/json\"]}",
+            &one,
+            &scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeSendMessageConfiguration("{\"historyLength\":1} x", &modes, &scratch),
+    );
+}
+
+test "AgentInterface round-trips its four members" {
+    var scratch: [128]u8 = undefined;
+    var out: [256]u8 = undefined;
+
+    const body = "{\"url\":\"https://api.example.com/a2a/v1\"," ++
+        "\"protocolBinding\":\"JSONRPC\",\"tenant\":\"acme\",\"protocolVersion\":\"1.0\"}";
+    const interface = try decodeAgentInterface(body, &scratch);
+    try testing.expectEqualStrings("JSONRPC", interface.protocol_binding);
+    try testing.expectEqualStrings("acme", interface.tenant.?);
+    // The declared text is kept, not parsed: a re-encode has to put back what
+    // the agent published, and PROTOCOLS.md section 5.1 is what a consumer
+    // reads it with.
+    try testing.expectEqualStrings("1.0", interface.protocol_version);
+    var writer = json.Writer.init(&out);
+    try encodeAgentInterface(interface, &writer);
+    try testing.expectEqualStrings(body, writer.written());
+
+    // Three of the four members are REQUIRED.
+    try testing.expectError(error.MissingField, decodeAgentInterface("{}", &scratch));
+    try testing.expectError(
+        error.MissingField,
+        decodeAgentInterface(
+            "{\"url\":\"https://a\",\"protocolBinding\":\"JSONRPC\"}",
+            &scratch,
+        ),
+    );
+    try testing.expectError(
+        error.InvalidField,
+        decodeAgentInterface(
+            "{\"url\":\"\",\"protocolBinding\":\"JSONRPC\",\"protocolVersion\":\"1.0\"}",
+            &scratch,
+        ),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeAgentInterface(
+            "{\"url\":\"https://a\",\"protocolBinding\":\"JSONRPC\",\"protocolVersion\":\"1.0\"} x",
+            &scratch,
+        ),
+    );
+}
+
+test "AgentProvider round-trips both required members" {
+    var scratch: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+
+    const body = "{\"url\":\"https://example.com\",\"organization\":\"Example\"}";
+    const provider = try decodeAgentProvider(body, &scratch);
+    try testing.expectEqualStrings("Example", provider.organization);
+    var writer = json.Writer.init(&out);
+    try encodeAgentProvider(provider, &writer);
+    try testing.expectEqualStrings(body, writer.written());
+
+    try testing.expectError(error.MissingField, decodeAgentProvider("{}", &scratch));
+    try testing.expectError(
+        error.MissingField,
+        decodeAgentProvider("{\"url\":\"https://example.com\"}", &scratch),
+    );
+    try testing.expectError(
+        error.InvalidField,
+        decodeAgentProvider("{\"url\":\"https://example.com\",\"organization\":\"\"}", &scratch),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeAgentProvider("{\"url\":\"https://a\",\"organization\":\"B\"} x", &scratch),
+    );
+}
+
+test "AgentCardSignature carries its header lexeme" {
+    var scratch: [128]u8 = undefined;
+    var out: [256]u8 = undefined;
+
+    // The unprotected header is a JSON object rather than base64url, so a key
+    // this library does not model has to survive as the bytes that arrived.
+    const body = "{\"protected\":\"eyJhbGciOiJFUzI1NiJ9\"," ++
+        "\"signature\":\"MEUCIQ\",\"header\":{\"kid\":\"key-1\",\"x\":[1,2]}}";
+    const signature = try decodeAgentCardSignature(body, &scratch);
+    try testing.expectEqualStrings("{\"kid\":\"key-1\",\"x\":[1,2]}", signature.header.?);
+    var writer = json.Writer.init(&out);
+    try encodeAgentCardSignature(signature, &writer);
+    try testing.expectEqualStrings(body, writer.written());
+
+    const minimal = try decodeAgentCardSignature(
+        "{\"protected\":\"a\",\"signature\":\"b\"}",
+        &scratch,
+    );
+    try testing.expectEqual(@as(?[]const u8, null), minimal.header);
+    writer = json.Writer.init(&out);
+    try encodeAgentCardSignature(minimal, &writer);
+    try testing.expectEqualStrings("{\"protected\":\"a\",\"signature\":\"b\"}", writer.written());
+
+    try testing.expectError(error.MissingField, decodeAgentCardSignature("{}", &scratch));
+    try testing.expectError(
+        error.MissingField,
+        decodeAgentCardSignature("{\"protected\":\"a\"}", &scratch),
+    );
+    try testing.expectError(
+        error.InvalidField,
+        decodeAgentCardSignature("{\"protected\":\"\",\"signature\":\"b\"}", &scratch),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeAgentCardSignature("{\"protected\":\"a\",\"signature\":\"b\"} x", &scratch),
+    );
+}
+
+test "AgentExtension keeps an explicit required false and an unmodelled param" {
+    var scratch: [128]u8 = undefined;
+    var out: [256]u8 = undefined;
+
+    // `"required":false` is a peer that said the extension is optional. A
+    // `required` that is a plain bool with a default answers it with no member
+    // at all, which is a peer that said nothing.
+    const body = "{\"uri\":\"https://example.com/ext\"," ++
+        "\"description\":\"Geography\",\"required\":false," ++
+        "\"params\":{\"units\":\"metric\",\"unknown\":{\"a\":1}}}";
+    const extension = try decodeAgentExtension(body, &scratch);
+    try testing.expectEqual(@as(?bool, false), extension.required);
+    try testing.expectEqualStrings(
+        "{\"units\":\"metric\",\"unknown\":{\"a\":1}}",
+        extension.params.?,
+    );
+    var writer = json.Writer.init(&out);
+    try encodeAgentExtension(extension, &writer);
+    try testing.expectEqualStrings(body, writer.written());
+
+    // No field carries a REQUIRED annotation, so `{}` is still an extension.
+    const bare = try decodeAgentExtension("{}", &scratch);
+    try testing.expectEqual(@as(?bool, null), bare.required);
+    writer = json.Writer.init(&out);
+    try encodeAgentExtension(bare, &writer);
+    try testing.expectEqualStrings("{}", writer.written());
+
+    const demanding = try decodeAgentExtension("{\"required\":true}", &scratch);
+    try testing.expectEqual(@as(?bool, true), demanding.required);
+    // ProtoJSON rejects `null` for a plain bool, so a decoder refuses one
+    // rather than reading it as absent.
+    try testing.expectError(
+        error.MalformedJson,
+        decodeAgentExtension("{\"required\":null}", &scratch),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeAgentExtension("{\"required\":false} x", &scratch),
+    );
+}
+
+test "an ApiKeySecurityScheme round-trips its location" {
+    var scratch: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+
+    const body = "{\"description\":\"Key\",\"location\":\"header\",\"name\":\"X-Key\"}";
+    const scheme = try decodeApiKeySecurityScheme(body, &scratch);
+    try testing.expectEqual(ApiKeyLocation.header, scheme.location);
+    try testing.expectEqualStrings("X-Key", scheme.name);
+    var writer = json.Writer.init(&out);
+    try encodeApiKeySecurityScheme(scheme, &writer);
+    try testing.expectEqualStrings(body, writer.written());
+
+    const bare = try decodeApiKeySecurityScheme(
+        "{\"location\":\"cookie\",\"name\":\"sid\"}",
+        &scratch,
+    );
+    writer = json.Writer.init(&out);
+    try encodeApiKeySecurityScheme(bare, &writer);
+    try testing.expectEqualStrings("{\"location\":\"cookie\",\"name\":\"sid\"}", writer.written());
+
+    // `location` accepts exactly the three stated spellings and nothing else.
+    try testing.expectError(
+        error.UnknownTag,
+        decodeApiKeySecurityScheme("{\"location\":\"body\",\"name\":\"X\"}", &scratch),
+    );
+    try testing.expectError(error.MissingField, decodeApiKeySecurityScheme("{}", &scratch));
+    try testing.expectError(
+        error.InvalidField,
+        decodeApiKeySecurityScheme("{\"location\":\"query\",\"name\":\"\"}", &scratch),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeApiKeySecurityScheme("{\"location\":\"query\",\"name\":\"X\"} x", &scratch),
+    );
+}
+
+test "an HttpAuthSecurityScheme round-trips its bearer format" {
+    var scratch: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+
+    const body = "{\"description\":\"Token\",\"scheme\":\"bearer\",\"bearerFormat\":\"JWT\"}";
+    const scheme = try decodeHttpAuthSecurityScheme(body, &scratch);
+    try testing.expectEqualStrings("JWT", scheme.bearer_format.?);
+    var writer = json.Writer.init(&out);
+    try encodeHttpAuthSecurityScheme(scheme, &writer);
+    try testing.expectEqualStrings(body, writer.written());
+
+    const bare = try decodeHttpAuthSecurityScheme("{\"scheme\":\"basic\"}", &scratch);
+    writer = json.Writer.init(&out);
+    try encodeHttpAuthSecurityScheme(bare, &writer);
+    try testing.expectEqualStrings("{\"scheme\":\"basic\"}", writer.written());
+
+    try testing.expectError(error.MissingField, decodeHttpAuthSecurityScheme("{}", &scratch));
+    try testing.expectError(
+        error.InvalidField,
+        decodeHttpAuthSecurityScheme("{\"scheme\":\"\"}", &scratch),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeHttpAuthSecurityScheme("{\"scheme\":\"basic\"} x", &scratch),
+    );
+}
+
+test "an OpenIdConnectSecurityScheme round-trips its url" {
+    var scratch: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+
+    const body = "{\"description\":\"OIDC\",\"openIdConnectUrl\":\"https://idp.example.com/.well-known/openid-configuration\"}";
+    const scheme = try decodeOpenIdConnectSecurityScheme(body, &scratch);
+    try testing.expectEqualStrings(
+        "https://idp.example.com/.well-known/openid-configuration",
+        scheme.open_id_connect_url,
+    );
+    var writer = json.Writer.init(&out);
+    try encodeOpenIdConnectSecurityScheme(scheme, &writer);
+    try testing.expectEqualStrings(body, writer.written());
+
+    try testing.expectError(
+        error.MissingField,
+        decodeOpenIdConnectSecurityScheme("{}", &scratch),
+    );
+    try testing.expectError(
+        error.InvalidField,
+        decodeOpenIdConnectSecurityScheme("{\"openIdConnectUrl\":\"\"}", &scratch),
+    );
+    try testing.expectError(
+        error.MalformedJson,
+        decodeOpenIdConnectSecurityScheme("{\"openIdConnectUrl\":\"https://x\"} x", &scratch),
+    );
+}
+
+test "a MutualTlsSecurityScheme is an empty object" {
+    var scratch: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+
+    // The only member is an optional description, so `{}` is a complete
+    // scheme: mutual TLS is asserted by the transport.
+    const bare = try decodeMutualTlsSecurityScheme("{}", &scratch);
+    try testing.expectEqual(@as(?[]const u8, null), bare.description);
+    var writer = json.Writer.init(&out);
+    try encodeMutualTlsSecurityScheme(bare, &writer);
+    try testing.expectEqualStrings("{}", writer.written());
+
+    const described = try decodeMutualTlsSecurityScheme("{\"description\":\"mTLS\"}", &scratch);
+    try testing.expectEqualStrings("mTLS", described.description.?);
+    writer = json.Writer.init(&out);
+    try encodeMutualTlsSecurityScheme(described, &writer);
+    try testing.expectEqualStrings("{\"description\":\"mTLS\"}", writer.written());
+
+    try testing.expectError(
+        error.MalformedJson,
+        decodeMutualTlsSecurityScheme("{\"description\":\"mTLS\"} x", &scratch),
+    );
 }
