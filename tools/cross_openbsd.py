@@ -32,9 +32,9 @@ reaches the OpenBSD loader, and how the installed system is booted afterwards:
 
 from __future__ import annotations
 
-import contextlib
 from dataclasses import dataclass
 import fcntl
+import guest_process
 import gzip
 import hashlib
 import io
@@ -42,11 +42,10 @@ import os
 from pathlib import Path
 import select
 import shutil
-import signal
 import subprocess
 import sys
 import tarfile
-import tempfile
+import guest_storage
 import time
 from collections.abc import Sequence
 
@@ -1061,13 +1060,23 @@ def drive_loader(child: object, port: Port, arguments: Sequence[str]) -> None:
 
 def drive_installer(command: list[str], port: Port) -> bytes:
     """Boot the installer image and answer the prompts that come before the
-    response file: whatever boots the image, then the installer entry point."""
+    response file: whatever boots the image, then the installer entry point.
+
+    The emulator is adopted from `/proc` the moment the terminal library has
+    forked it, and the library's own `close(force=True)`, `terminate()` and
+    finaliser are taken away on that object, so the only signals this machine
+    can receive are the two `Guard.stop` sends and each of them is authorised
+    by the same five facts read again immediately before it goes out.
+    """
     import pexpect
 
     console = Console()
-    child = pexpect.spawn(command[0], command[1:], timeout=FIRMWARE_TIMEOUT,
-                          encoding=None)
+    label = f"{port.emulator} installing {port.port}"
+    guard = guest_process.Guard()
+    guest = guest_process.spawn(guard, command, label, timeout=FIRMWARE_TIMEOUT)
+    child = guest.console
     child.logfile_read = console
+    failure: BaseException | None = None
     try:
         if port.install_boot == "uboot":
             drive_uboot_install(child, port)
@@ -1093,11 +1102,14 @@ def drive_installer(command: list[str], port: Port) -> bytes:
         # do_autoinstall(8) reboots into nothing; -no-reboot ends the machine.
         child.expect(pexpect.EOF, timeout=CONSOLE_TIMEOUT)
     except pexpect.ExceptionPexpect as error:
-        raise BootstrapError(
-            f"the {port.port} installer did not complete: {error}"
-        ) from error
+        failure = BootstrapError(f"the {port.port} installer did not complete: {error}")
+    except BaseException as error:
+        failure = error
     finally:
-        child.close(force=True)
+        stop = guest_process.finish(guest, guest_process.SHUTDOWN_GRACE)
+    guest_process.require_stopped(stop, label, failure)
+    if failure is not None:
+        raise failure
     return console.text()
 
 
@@ -1155,8 +1167,8 @@ def installed_image(port: Port) -> Path:
         image = Path(required_environment(port.media))
         if not image.is_file():
             raise BootstrapError(f"{image} is not a file")
-        with tempfile.TemporaryDirectory(prefix=f"bootstrap-{port.port}-",
-                                         dir=cache) as raw:
+        with guest_storage.temporary_directory(prefix=f"bootstrap-{port.port}-",
+                                                dir=cache) as raw:
             work = Path(raw)
             # The published image is never opened for writing: CD media is
             # attached read-only, and disk media gets a private overlay.
@@ -1168,7 +1180,7 @@ def installed_image(port: Port) -> Path:
             converted = work / "base.qcow2"
             subprocess.run(["qemu-img", "convert", "-O", "qcow2", str(disk),
                             str(converted)], check=True)
-            os.replace(converted, final)
+            guest_storage.publish(converted, final)
     return final
 
 
@@ -1176,44 +1188,54 @@ def installed_image(port: Port) -> Path:
 # Public interface
 # --------------------------------------------------------------------------
 
-def terminate(process: subprocess.Popen[bytes]) -> None:
-    """Stop the machine and everything it started, however we got here."""
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGKILL)
-    with contextlib.suppress(subprocess.TimeoutExpired, ProcessLookupError):
-        process.wait(60)
-
 
 def watch_guest(port: Port, command: list[str]) -> bytes:
-    """Run a guest whose firmware boots it unattended, and keep its console."""
+    """Run a guest whose firmware boots it unattended, and keep its console.
+
+    This is the one emulator here that is not on a terminal, and it is still
+    not exempt: `start_new_session=True` is what makes the group kill a group
+    of one, and the guard reads every member of that group before it signals
+    it, so the group is a decision and not a number. `SIGTERM` first, then the
+    same five facts read again before a `SIGKILL` that only a child still
+    there after the grace can earn.
+    """
     console = Console()
-    process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
-                               stdout=subprocess.PIPE,
-                               stderr=subprocess.STDOUT, start_new_session=True)
-    assert process.stdout is not None
+    label = f"{port.emulator} for {port.port}"
+    guard = guest_process.Guard()
+    child = guard.spawn(command, label, stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        start_new_session=True)
+    assert child.process.stdout is not None
+    status = 0
+    failure: BaseException | None = None
     try:
-        deadline = time.monotonic() + RUN_TIMEOUT
-        with process.stdout:
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise subprocess.TimeoutExpired(command, RUN_TIMEOUT)
-                if not select.select([process.stdout], [], [],
-                                     min(remaining, 30))[0]:
-                    continue
-                chunk = process.stdout.read1(65536)
-                if not chunk:
-                    break
-                console.write(chunk)
-        status = process.wait(max(1, deadline - time.monotonic()))
-    except subprocess.TimeoutExpired as expired:
-        terminate(process)
-        raise BootstrapError(
-            f"the {port.port} guest did not halt within {RUN_TIMEOUT} seconds"
-        ) from expired
-    except BaseException:
-        terminate(process)
-        raise
+        try:
+            deadline = time.monotonic() + RUN_TIMEOUT
+            with child.process.stdout:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(command, RUN_TIMEOUT)
+                    if not select.select([child.process.stdout], [], [],
+                                         min(remaining, 30))[0]:
+                        continue
+                    chunk = child.process.stdout.read1(65536)
+                    if not chunk:
+                        break
+                    console.write(chunk)
+            status = child.process.wait(max(1, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired as error:
+            raise BootstrapError(
+                f"the {port.port} guest did not halt within {RUN_TIMEOUT} seconds"
+            ) from error
+    except BaseException as error:
+        failure = error
+    finally:
+        stop = guest_process.finish(guest_process.Guest(label, None, child, guard),
+                                    guest_process.SHUTDOWN_GRACE)
+    guest_process.require_stopped(stop, label, failure)
+    if failure is not None:
+        raise failure
     if status != 0:
         raise BootstrapError(
             f"{port.emulator} exited {status} for {port.port}; "
@@ -1225,16 +1247,23 @@ def drive_guest(port: Port, command: list[str]) -> bytes:
     """Run a guest whose firmware or kernel has to be answered.
 
     The suite's receipt is the evidence, so the machine is stopped once it has
-    printed a complete one even if it cannot power itself off; a machine that
-    powers off on its own is never stopped early.
+    printed a complete one even if it cannot power the machine off; a machine
+    that powers off on its own is never stopped early. Both cases go through
+    the guard: the console's own `close(force=True)` and `terminate(force=True)`
+    are replaced by the same guarded stop when the console is adopted, so this
+    function has no path that signals a pid without reading it first.
     """
     import pexpect
 
     console = Console()
-    child = pexpect.spawn(command[0], command[1:], timeout=CONSOLE_TIMEOUT,
-                          encoding=None)
+    label = f"{port.emulator} for {port.port}"
+    guard = guest_process.Guard()
+    guest = guest_process.spawn(guard, command, label, timeout=CONSOLE_TIMEOUT)
+    child = guest.console
     child.logfile_read = console
     deadline = time.monotonic() + RUN_TIMEOUT
+    shutdown = None
+    failure: BaseException | None = None
     try:
         if port.run_boot == "uboot":
             drive_uboot_run(child, port)
@@ -1267,13 +1296,19 @@ def drive_guest(port: Port, command: list[str]) -> bytes:
                         timeout=SHUTDOWN_GRACE) == 1:
             # The suite is finished; a guest with no way to power the machine
             # off is stopped here instead of holding the run open until the
-            # outer deadline.
-            child.terminate(force=True)
+            # outer deadline. Its stop is kept, so the teardown below reports
+            # this one rather than a second, emptier reading of the same child.
+            shutdown = guest_process.finish(guest, guest_process.SHUTDOWN_GRACE)
     except pexpect.ExceptionPexpect as error:
-        raise BootstrapError(
-            f"the {port.port} guest did not complete: {error}") from error
+        failure = BootstrapError(f"the {port.port} guest did not complete: {error}")
+    except BaseException as error:
+        failure = error
     finally:
-        child.close(force=True)
+        stop = (shutdown if shutdown is not None
+                else guest_process.finish(guest, guest_process.SHUTDOWN_GRACE))
+    guest_process.require_stopped(stop, label, failure)
+    if failure is not None:
+        raise failure
     return console.text()
 
 
@@ -1283,6 +1318,13 @@ def run_guest(target: str, artifact: Path) -> bytes:
     The base image is installed on first use and reused unchanged; the run
     itself is a private overlay of that image, so the first boot hook always
     sees a freshly installed system.
+
+    Both emulators this can start — the one that installs the base image and
+    the one that runs the suite — are adopted from `/proc` when they are forked
+    and stopped only through the guard. A cancellation is an exception rather
+    than a signal this process sends to itself: raising unwinds into the same
+    teardown every other exit takes, so a cancelled run still accounts for the
+    machine it was driving, exactly once.
     """
     if target not in PORTS:
         raise BootstrapError(f"unsupported OpenBSD target: {target}")
@@ -1290,16 +1332,19 @@ def run_guest(target: str, artifact: Path) -> bytes:
     if not payload.is_file():
         raise BootstrapError(f"payload {payload} is not a file")
     port = PORTS[target]
-    image = installed_image(port)
-    # A private firmware variable store and a private scratch per run; both are
-    # discarded, so nothing the firmware or the guest writes is kept and the
-    # cached base image is never touched.
-    with tempfile.TemporaryDirectory(prefix=f"run-{port.port}-",
-                                     dir=cache_root()) as raw:
-        work = Path(raw)
-        command = runtime_command(port, image, payload, work)
-        receipt = (watch_guest(port, command) if port.run_boot == "firmware"
-                   else drive_guest(port, command))
+    handlers = guest_process.install_cancellation()
+    try:
+        image = installed_image(port)
+        # Private firmware and guest scratch leave the cached base unchanged.
+        # Checked cleanup removes them, or retains them and reports a refusal.
+        with guest_storage.temporary_directory(prefix=f"run-{port.port}-",
+                                                dir=cache_root()) as raw:
+            work = Path(raw)
+            command = runtime_command(port, image, payload, work)
+            receipt = (watch_guest(port, command) if port.run_boot == "firmware"
+                       else drive_guest(port, command))
+    finally:
+        guest_process.restore_cancellation(handlers)
     if COMPLETE not in receipt:
         raise BootstrapError(f"the {target} guest produced no complete receipt")
     return receipt
@@ -1316,10 +1361,23 @@ def _main(argv: Sequence[str]) -> int:
     run.add_argument("target", choices=TARGETS)
     run.add_argument("artifact", type=Path)
     args = parser.parse_args(argv)
-    if args.operation == "bootstrap":
-        print(installed_image(PORTS[args.target]))
-    else:
-        run_guest(args.target, args.artifact)
+    try:
+        if args.operation == "bootstrap":
+            # The installer drives a machine too, so a cancelled bootstrap is
+            # unwound the same way a cancelled run is.
+            handlers = guest_process.install_cancellation()
+            try:
+                print(installed_image(PORTS[args.target]))
+            finally:
+                guest_process.restore_cancellation(handlers)
+        else:
+            run_guest(args.target, args.artifact)
+    except guest_process.Cancelled as cancelled:
+        print(f"cross-openbsd: {cancelled}", file=sys.stderr)
+        return 128 + cancelled.signum
+    except (BootstrapError, RuntimeError, OSError) as error:
+        print(f"cross-openbsd: {error}", file=sys.stderr)
+        return 1
     return 0
 
 

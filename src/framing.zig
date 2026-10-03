@@ -10,6 +10,10 @@
 //! same way, and a test feeds it from a slice rather than a socket, so the
 //! framing has to stand on its own.
 //!
+//! The published surface is [`Framer`] and its methods, [`writeFrame`],
+//! [`delimiter`] and [`Error`]. Nothing here allocates and nothing here is
+//! released: the one buffer is the caller's and it has to outlive the framer.
+//!
 //! ## No allocation, and a hard bound
 //!
 //! The buffer is the caller's, so a peer that never sends a newline cannot
@@ -66,7 +70,16 @@ pub const Error = error{
 /// be taken, one partial frame being assembled, and free space. Sliding the
 /// held bytes down to the front reclaims the space behind them, so a long
 /// stream does not walk the buffer forward until it is exhausted.
+///
+/// The slices `next`, `partial` and `freeSpace` hand back all borrow
+/// `buffer`, and every call that writes or slides invalidates them. That
+/// includes a `push` that refuses: it slides the held bytes before it measures
+/// the free region, so the refusal is not a way to keep a slice alive.
 pub const Framer = struct {
+    /// The caller's buffer, borrowed for the whole life of the framer and
+    /// never copied. It holds the frames taken, the frame being assembled and
+    /// the free region in one linear run, so a caller that keeps a frame past
+    /// the next call has to copy it out first.
     buffer: []u8,
     /// Start of the region not yet handed to the caller.
     start: usize = 0,
@@ -89,6 +102,12 @@ pub const Framer = struct {
     /// The offered chunk is the unit, so the complete frames it carried are
     /// discarded with it. Taking frames with [`Framer.next`] between pushes
     /// keeps the free region open and avoids the refusal.
+    ///
+    /// A refused push still slides what the framer holds, so the slices `next`
+    /// and `partial` handed out before it are invalidated whether or not any
+    /// byte was copied. What the refusal preserves is the bytes: nothing of
+    /// the offered chunk reaches the buffer, and what arrived before it is
+    /// still there for `partial` to report.
     pub fn push(self: *Framer, bytes: []const u8) Error!void {
         if (bytes.len == 0) return;
         self.compact();
@@ -104,6 +123,13 @@ pub const Framer = struct {
     /// An empty line yields an empty frame rather than null. The JSON layer
     /// refuses it, which is a better error than a connection that silently
     /// swallows a stray newline and waits forever for a message.
+    ///
+    /// The frame borrows `Framer.buffer`, so the next call that writes or
+    /// slides invalidates it — `push`, `slide`, `filled` and `reset` all move
+    /// or overwrite the bytes it names, and `push` does so even when it refuses.
+    /// Taking a frame and reading the next is the ordinary loop; a caller that
+    /// keeps frames past that point copies them out, because there is no copy
+    /// here and no ownership to transfer.
     pub fn next(self: *Framer) ?[]const u8 {
         const region = self.buffer[self.start..self.end];
         const at = std.mem.indexOfScalar(u8, region, delimiter) orelse return null;
@@ -129,12 +155,18 @@ pub const Framer = struct {
     /// This is the size report available after `error.FrameTooLarge`: what
     /// arrived before the refused push is still here, and the bytes of the
     /// refused push are nowhere.
+    ///
+    /// This borrows `Framer.buffer` on the same terms as `next`: the next write
+    /// or slide invalidates it, including a refused `push`.
     pub fn partial(self: *const Framer) []const u8 {
         return self.buffer[self.start..self.end];
     }
 
     /// Slide the unconsumed bytes to the front so a full buffer can be reused
     /// instead of being reported as full while holding only one byte.
+    ///
+    /// It moves the held bytes, so it invalidates every slice `next` and
+    /// `partial` handed out on the same terms a `push` does.
     pub fn slide(self: *Framer) void {
         self.compact();
     }
@@ -147,11 +179,22 @@ pub const Framer = struct {
     /// caller must record what it read before touching the framer again.
     /// `next` leaves the region alone: it only advances the start of what has
     /// already been received.
+    ///
+    /// A `push` that is refused slides the held bytes before it measures, so the
+    /// region is invalidated by that too and not only by an accepted one.
     pub fn freeSpace(self: *Framer) []u8 {
         return self.buffer[self.end..];
     }
 
     /// Record `count` bytes read into the region from [`Framer.freeSpace`].
+    ///
+    /// `count` must not exceed the length of that region. That is a caller
+    /// precondition with no error attached, because a count past the end would
+    /// put bytes the caller never wrote into the region the framer frames and
+    /// hands to `next`. `std.debug.assert` diagnoses a violation in Debug and
+    /// ReleaseSafe and is unchecked in ReleaseFast and ReleaseSmall, so a
+    /// release build that breaks it reads whatever was in the buffer rather
+    /// than stopping.
     pub fn filled(self: *Framer, count: usize) void {
         std.debug.assert(count <= self.buffer.len - self.end);
         self.end += count;
@@ -180,9 +223,12 @@ pub const Framer = struct {
 
 /// Write one frame and its delimiter.
 ///
-/// Refuses a message containing a raw newline. The caller has already broken
-/// the framing by the time those bytes reach the wire, and writing them would
-/// split one message into two that the peer then fails to decode.
+/// Refuses a message containing a raw newline, having written none of it. The
+/// caller has already broken the framing by the time those bytes reach the
+/// wire, and writing them would split one message into two that the peer then
+/// fails to decode. A write that fails afterwards is `error.WriteFailed` from
+/// the writer itself, and the bytes it had already accepted are gone: this
+/// cannot put them back, so a caller retrying re-sends the whole frame.
 pub fn writeFrame(bytes: []const u8, writer: *std.Io.Writer) std.Io.Writer.Error!void {
     if (std.mem.indexOfScalar(u8, bytes, delimiter) != null) return error.WriteFailed;
     try writer.writeAll(bytes);

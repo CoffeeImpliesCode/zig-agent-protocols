@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-import tempfile
+import guest_storage
 from collections.abc import Iterable
 
 GUESTS = {
@@ -157,7 +157,7 @@ def build_payload(args: argparse.Namespace) -> None:
     for root in roots:
         if not (tests / root).is_file():
             raise GuestFailure(f"exported test root is missing: {root!r}")
-    with tempfile.TemporaryDirectory(prefix="guest-seed-", dir=args.cache) as temporary:
+    with guest_storage.temporary_directory(prefix="guest-seed-", dir=args.cache) as temporary:
         seed = Path(temporary)
         (seed / "meta-data").write_text(f"instance-id: zig-agent-proto-{args.target}\n"
                                         "local-hostname: cross-test\n", encoding="ascii")
@@ -182,14 +182,14 @@ def prepared_image(target: str) -> Path:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if image.is_file():
             return image
-        with tempfile.TemporaryDirectory(prefix="prepare-", dir=cache) as temporary:
+        with guest_storage.temporary_directory(prefix="prepare-", dir=cache) as temporary:
             raw, converted = Path(temporary) / "base.raw", Path(temporary) / "base.qcow2"
             with raw.open("wb") as output:
                 subprocess.run(["xz", "--decompress", "--stdout", str(source)],
                                stdout=output, check=True)
             subprocess.run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2",
                             str(raw), str(converted)], check=True)
-            os.replace(converted, image)
+            guest_storage.publish(converted, image)
     return image
 
 
@@ -226,6 +226,7 @@ def run_guest(args: argparse.Namespace) -> None:
             "-drive", f"file={firmware / 'edk2-riscv-vars.fd'},format=raw,if=pflash,unit=1,snapshot=on",
         ]
         import pexpect
+        import guest_process
 
         class Console:
             def __init__(self) -> None:
@@ -240,9 +241,14 @@ def run_guest(args: argparse.Namespace) -> None:
                 sys.stdout.buffer.flush()
 
         console = Console()
-        child = pexpect.spawn(command[0], command[1:], timeout=900, encoding=None)
-        child.logfile_read = console
+        guard = guest_process.Guard()
+        handlers = guest_process.install_cancellation()
+        guest = None
+        failure: BaseException | None = None
         try:
+            guest = guest_process.spawn(guard, command, args.target, timeout=900)
+            child = guest.console
+            child.logfile_read = console
             # RISC-V boots from its FDT, not ACPI. The generic VM's comconsole
             # setting names no console this architecture's EFI loader provides.
             child.expect(rb"Autoboot")
@@ -258,29 +264,59 @@ def run_guest(args: argparse.Namespace) -> None:
                            b"mount -t cd9660 /dev/vtbd1 /home/cross-data && "
                            b"sh /home/cross-data/suite.sh; shutdown -p now")
             child.expect(pexpect.EOF)
-        except pexpect.ExceptionPexpect as error:
-            raise GuestFailure(f"FreeBSD console did not complete: {error}") from error
+        except BaseException as error:
+            failure = error
         finally:
-            child.close(force=True)
+            try:
+                stopped = guest_process.finish(guest) if guest is not None else None
+            finally:
+                guest_process.restore_cancellation(handlers)
+        if stopped is not None:
+            guest_process.require_stopped(stopped, args.target, failure)
+        if failure is not None:
+            raise failure
         if child.exitstatus != 0:
             raise GuestFailure(f"QEMU exited {child.exitstatus}, signal {child.signalstatus}")
         count_tests(b"".join(console.chunks).splitlines(), expected_roots(args.target, args.artifact))
         return
+    import guest_process
+
     chunks: list[bytes] = []
-    with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                          stderr=subprocess.STDOUT) as process:
+    guard = guest_process.Guard()
+    handlers = guest_process.install_cancellation()
+    child = None
+    failure: BaseException | None = None
+    try:
+        child = guard.spawn(command, args.target, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            start_new_session=True)
+        process = child.process
         assert process.stdout is not None
         while chunk := process.stdout.read1(65536):
             sys.stdout.buffer.write(chunk)
             sys.stdout.buffer.flush()
             chunks.append(chunk)
         status = process.wait()
+    except BaseException as error:
+        failure = error
+    finally:
+        try:
+            stopped = (guest_process.finish(guest_process.Guest(args.target, None, child, guard))
+                       if child is not None else None)
+        finally:
+            guest_process.restore_cancellation(handlers)
+    if stopped is not None:
+        guest_process.require_stopped(stopped, args.target, failure)
+        process.stdout.close()
+    if failure is not None:
+        raise failure
     if status != 0:
         raise GuestFailure(f"QEMU exited {status}")
     count_tests(b"".join(chunks).splitlines(), expected_roots(args.target, args.artifact))
 
 
 def main() -> int:
+    import guest_process
     import cross_freebsd_arm
     import cross_freebsd_power
     import cross_netbsd
@@ -326,6 +362,9 @@ def main() -> int:
             required = manifest_roots(args.require_manifest) if args.require_manifest else None
             with args.log.open("rb") as log:
                 print(count_tests(log, required))
+    except guest_process.Cancelled as error:
+        print(f"cross-guest: {error}", file=sys.stderr)
+        return 128 + error.signum
     except (GuestFailure, RuntimeError, OSError, subprocess.CalledProcessError) as error:
         print(f"cross-guest: {error}", file=sys.stderr)
         return 1

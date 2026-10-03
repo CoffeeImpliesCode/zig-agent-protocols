@@ -1,11 +1,11 @@
 {
   "schema": "zig-agent-proto/interop-sdk-pins/1",
   "purpose": "Every version, byte and API fact an interoperability peer depends on, with the primary source each one came from. The peer scripts read this file and refuse to run against an environment that does not match it, so a pin that silently drifts is a failed run rather than a claim nobody checked.",
-  "compiled": "2026-10-01",
+  "compiled": "2026-10-03",
   "declarative_only": "No pip, no uv, no system installation. Everything below is realised by devenv.nix against the nixpkgs revision devenv.lock already pins. test/interop/*.py are development tooling and are never imported by the library, which keeps its zero-dependency guarantee.",
   "environment": {
     "nixpkgs": {
-      "role": "the only source of Python packages here",
+      "role": "the pinned Python package set and build tooling; exact published SDK artifacts override versions absent from that revision",
       "repo": "NixOS/nixpkgs",
       "channel": "nixpkgs-unstable",
       "rev": "c7def046b9a883d46974757852106483d741586f",
@@ -46,7 +46,7 @@
         "upstream_tag": "v1.29.0",
         "src": "fetchFromGitHub { owner = \"modelcontextprotocol\"; repo = \"python-sdk\"; tag = \"v1.29.0\"; hash = \"sha256-lRlj5RT/R5zrYL5XpdQR2l9t99G94WTsubN0gSQekMc=\"; }",
         "nixpkgs_relaxations": ["pydantic-settings"],
-        "why_this_version": "1.29.0 is the newest mcp whose LATEST_PROTOCOL_VERSION is exactly 2025-11-25 and the newest revision nixpkgs pins at this rev. 1.30.0 also carries 2025-11-25 (src/mcp/types.py line 27 in the 1.30.0 sdist), so the nixpkgs pin is not protocol-stale, and the whole 1.x line is refused for nothing else: 1.9.4 and earlier stop at 2025-03-26."
+        "why_this_version": "The locked nixpkgs package is 1.29.0 and carries LATEST_PROTOCOL_VERSION 2025-11-25. Version 1.30.0 carries the same revision. The separate mcp-current entry covers 2026-07-28 without replacing this previous-revision peer."
       },
       "source_bytes": {
         "pypi_sdist": {
@@ -115,15 +115,315 @@
       ],
       "alternatives_rejected": [
         {
-          "what": "mcp 2.2.0 with the mcp-types 2.2.0 split",
-          "why": "genuine and supports 2025-11-25, but it is a rewrite: handlers are constructor-registered as (ctx, params) callables, the dispatcher gained a per-request cancel mode, and every deprecated 1.x symbol is gone. Nothing in the pinned nixpkgs provides it, so adopting it means a hand-written override of both distributions, and it buys no protocol coverage 1.29.0 lacks.",
-          "facts": "mcp 2.2.0 requires mcp-types==2.2.0; mcp_types/version.py KNOWN_PROTOCOL_VERSIONS lists 2024-11-05 through 2026-07-28, with 2026-07-28 served through server/discover rather than the initialize handshake"
-        },
-        {
           "what": "mcp 1.9.4",
           "why": "LATEST_PROTOCOL_VERSION is 2025-03-26 (src/mcp/types.py line 25 of the 1.9.4 sdist), so it cannot negotiate the required revision at all"
         }
       ]
+    },
+    "mcp-current": {
+      "distribution": "mcp",
+      "version": "2.3.0",
+      "types_distribution": "mcp-types",
+      "types_version": "2.3.0",
+      "role": "independent peer for the MCP 2026-07-28 exchange; the Zig participant src/mcp_current_interop.zig is the client, this SDK is the server. The original mcp_peer.py remains legitimate coverage for the separately supported 2025-11-25 revision; neither is a compatibility shim for the other.",
+      "source_bytes": {
+        "mcp": {
+          "upstream": {
+            "repo": "https://github.com/modelcontextprotocol/python-sdk",
+            "tag": "v2.3.0",
+            "tag_commit": "2118f14f8a19bc158d8a1cf90af58d85d187f849",
+            "tag_ref_type": "commit",
+            "tag_ref_note": "refs/tags/v2.3.0 resolves to a commit object, not an annotated tag; recorded so a re-fetch distinguishes the two.",
+            "release_page": "https://github.com/modelcontextprotocol/python-sdk/releases/tag/v2.3.0",
+            "ref_object_api": "https://api.github.com/repos/modelcontextprotocol/python-sdk/git/ref/tags/v2.3.0",
+            "retrieved": "2026-10-03"
+          },
+          "pypi_sdist": {
+            "url": "https://files.pythonhosted.org/packages/9d/8d/e0d339616f4810e9051d4aba6887afab289ab1f81875fe908b606cdfd0e3/mcp-2.3.0.tar.gz",
+            "filename": "mcp-2.3.0.tar.gz",
+            "sha256_hex": "8b147a50441cf059dc88c684e0aeed3687f0aa0f39c6cde7b90330effd2b34d8",
+            "sha256_sri": "sha256-ixR6UEQc8FnciMaE4K7tNofwqg85xs3nuQMw7/0rNNg=",
+            "verification": "downloaded and hashed locally on 2026-10-03; the SRI is the base64 of that hex, which is what Nix re-derives for a fetchurl flat hash"
+          },
+          "pypi_wheel": {
+            "url": "https://files.pythonhosted.org/packages/20/d7/4a2878f128df729db3ca04e71bfce26405cc2e0c9ebe19c592feeb4c61b9/mcp-2.3.0-py3-none-any.whl",
+            "filename": "mcp-2.3.0-py3-none-any.whl",
+            "sha256_hex": "dd0c44c089d16453e8ae31a3877a0054d7a2314caaa81f5e0541b9b1734b2377",
+            "sha256_sri": "sha256-3QxEwInRZFPorjGjh3oAVNeiMUyqqB9eBUG5sXNLI3c=",
+            "verification": "downloaded and hashed locally on 2026-10-03"
+          },
+          "primary_metadata": "https://pypi.org/pypi/mcp/2.3.0/json"
+        },
+        "mcp_types": {
+          "upstream": {
+            "repo": "https://github.com/modelcontextprotocol/python-sdk",
+            "note": "Same repository and same release as mcp, but a SEPARATE distribution with its own sdist and wheel. Its build system is declared in its own pyproject.toml, read from its own published sdist bytes below.",
+            "retrieved": "2026-10-03"
+          },
+          "pypi_sdist": {
+            "url": "https://files.pythonhosted.org/packages/9e/2d/7c251e34207f6c51000312fc8839111ac45cfe02023f90b44e7f1051dd8e/mcp_types-2.3.0.tar.gz",
+            "filename": "mcp_types-2.3.0.tar.gz",
+            "sha256_hex": "d1e46549edb35ee19a94940fcee6d1addd7e589ab7ea92dda83f5d84781fc362",
+            "sha256_sri": "sha256-0eRlSe2zXuGalJQPzubRrd1+WJq36pLdqD9dhHgfw2I=",
+            "verification": "downloaded and hashed locally on 2026-10-03"
+          },
+          "pypi_wheel": {
+            "url": "https://files.pythonhosted.org/packages/ce/48/32583066b155bb5d4507e7887dc88ee23118cc4de8e2a12870c49719e2a8/mcp_types-2.3.0-py3-none-any.whl",
+            "filename": "mcp_types-2.3.0-py3-none-any.whl",
+            "sha256_hex": "968efdbdaedfab06adae40d378a34395f1090c5921d4be3c9cde283aaf76d91d",
+            "sha256_sri": "sha256-lo79va7fqwatrkDTeKNDlfEJDFkh1L48nN4oOq922R0=",
+            "verification": "downloaded and hashed locally on 2026-10-03"
+          },
+          "primary_metadata": "https://pypi.org/pypi/mcp-types/2.3.0/json"
+        }
+      },
+      "requires_python": ">=3.10",
+      "build_system": {
+        "mcp": {
+          "provenance": "verbatim from [build-system] of the extracted 2.3.0 sdist pyproject.toml",
+          "requires": [
+            "hatchling",
+            "uv-dynamic-versioning"
+          ],
+          "build_backend": "hatchling.build",
+          "version_source": "[tool.hatch.version] source = \"uv-dynamic-versioning\"",
+          "uv_dynamic_versioning": {
+            "vcs": "git",
+            "style": "pep440",
+            "bump": true
+          },
+          "wheel_target_packages": [
+            "src/mcp"
+          ],
+          "wheel_target_consequence": "The MCP wheel does not supply the separate mcp-types distribution. The runtime requires mcp-types==2.3.0, so the declared interpreter builds both distributions from their own pinned artifacts.",
+          "project_declares_version": "dynamic = [\"version\"] (no static version in pyproject)",
+          "pkg_info": {
+            "Metadata-Version": "2.4",
+            "Name": "mcp",
+            "Version": "2.3.0"
+          }
+        },
+        "mcp_types": {
+          "provenance": "verbatim from [build-system] of the extracted mcp_types-2.3.0 sdist pyproject.toml. NOT inferred from mcp and NOT from repo-sibling reasoning: the bytes were downloaded from the PyPI URL and extracted for this entry.",
+          "requires": [
+            "hatchling",
+            "uv-dynamic-versioning"
+          ],
+          "build_backend": "hatchling.build",
+          "version_source": "[tool.hatch.version] source = \"uv-dynamic-versioning\"",
+          "uv_dynamic_versioning": {
+            "vcs": "git",
+            "style": "pep440",
+            "bump": true
+          },
+          "wheel_target_packages": [
+            "mcp_types"
+          ],
+          "sdist_force_include": {
+            "../../LICENSE": "LICENSE"
+          },
+          "project_declares_version": "dynamic = [\"version\"] (no static version in pyproject)",
+          "pkg_info": {
+            "Metadata-Version": "2.4",
+            "Name": "mcp-types",
+            "Version": "2.3.0"
+          },
+          "difference_from_mcp_that_bites": "mcp-types declares NO fallback-version, so uv-dynamic-versioning has nothing to read from an unpacked sdist with no .git and the derivation must supply 2.3.0 explicitly. (httpx2 and httpcore2 do set fallback-version = \"0.0.0\"; the MCP pair does not.)"
+        },
+        "upstream_build_constraint_dependencies": {
+          "provenance": "[tool.uv] build-constraint-dependencies in the 2.3.0 sdist pyproject.toml, copied verbatim; [build-system].requires itself is unpinned",
+          "pins": [
+            "hatchling==1.29.0",
+            "uv-dynamic-versioning==0.14.0",
+            "dunamai==1.26.1",
+            "jinja2==3.1.6",
+            "markupsafe==3.0.3",
+            "packaging==26.1",
+            "pathspec==1.0.4",
+            "pluggy==1.6.0",
+            "tomlkit==0.14.0",
+            "trove-classifiers==2026.1.14.14",
+            "setuptools==82.0.1"
+          ]
+        }
+      },
+      "runtime_requirements": {
+        "mcp": [
+          "anyio>=4.10; python_version >= \"3.14\"",
+          "anyio>=4.9; python_version < \"3.14\"",
+          "httpx2>=2.10.0",
+          "jsonschema>=4.20.0",
+          "mcp-types==2.3.0",
+          "opentelemetry-api>=1.28.0",
+          "pydantic>=2.12.0",
+          "pyjwt[crypto]>=2.10.1",
+          "python-multipart>=0.0.9",
+          "pywin32>=311; sys_platform == \"win32\"",
+          "sse-starlette>=3.0.0",
+          "starlette>=0.27; python_version < \"3.14\"",
+          "starlette>=0.48.0; python_version >= \"3.14\"",
+          "typing-extensions>=4.13.0",
+          "typing-inspection>=0.4.1",
+          "uvicorn>=0.31.1; sys_platform != \"emscripten\""
+        ],
+        "mcp_types": [
+          "pydantic>=2.12.0",
+          "typing-extensions>=4.13.0"
+        ],
+        "provenance": "requires_dist of https://pypi.org/pypi/mcp/2.3.0/json and https://pypi.org/pypi/mcp-types/2.3.0/json, retrieved 2026-10-03",
+        "extras_not_used": {
+          "cli": [
+            "python-dotenv>=1.0.0",
+            "typer>=0.16.0"
+          ],
+          "rich": [
+            "rich>=13.9.4"
+          ],
+          "consequence": "the peer registers tools with decorators and runs over stdio, so neither extra is needed and neither should be in the environment"
+        },
+        "new_distributions_required": {
+          "httpx2": "Distinct distribution from httpx. The environment supplies a patched version meeting >=2.10.0 and its exactly matching httpcore2 dependency without relaxing constraints.",
+          "opentelemetry-api": ">=1.28.0 and a hard runtime import (mcp.server._otel, mcp.shared._otel), so the build fails without it rather than degrading.",
+          "coverage_note": "the peer's serve role is stdio-only and exercises no HTTP transport, so httpx2/httpcore2 are build-time prerequisites of the distribution here, not something a run covers. Record them as build inputs, not as coverage."
+        }
+      },
+      "protocol": {
+        "latest_modern_version": "2026-07-28",
+        "latest_handshake_version": "2025-11-25",
+        "modern_protocol_versions": [
+          "2026-07-28"
+        ],
+        "known_protocol_versions": [
+          "2024-11-05",
+          "2025-03-26",
+          "2025-06-18",
+          "2025-11-25",
+          "2026-07-28"
+        ],
+        "handshake_protocol_versions": [
+          "2024-11-05",
+          "2025-03-26",
+          "2025-06-18",
+          "2025-11-25"
+        ],
+        "oldest_supported_version": "2024-11-05",
+        "provenance": "mcp_types/version.py of the extracted mcp_types-2.3.0 sdist: KNOWN_PROTOCOL_VERSIONS, MODERN_PROTOCOL_VERSIONS, HANDSHAKE_PROTOCOL_VERSIONS, LATEST_MODERN_VERSION",
+        "consequence": "2026-07-28 is the newest revision this SDK serves and the newest modern (per-request-envelope) revision. It is served through server/discover, not through an initialize handshake."
+      },
+      "runtime_assertions": [
+        "importlib.metadata.version('mcp') == '2.3.0'",
+        "importlib.metadata.version('mcp-types') == '2.3.0'",
+        "mcp_types.version.MODERN_PROTOCOL_VERSIONS == ('2026-07-28',)",
+        "mcp_types.version.LATEST_MODERN_VERSION == '2026-07-28'",
+        "mcp_types.version.KNOWN_PROTOCOL_VERSIONS == ('2024-11-05','2025-03-26','2025-06-18','2025-11-25','2026-07-28')",
+        "mcp_types.version.HANDSHAKE_PROTOCOL_VERSIONS == ('2024-11-05','2025-03-26','2025-06-18','2025-11-25')",
+        "these resolve: mcp.server.MCPServer, mcp.server.CacheHint, mcp.server.mcpserver.Context, mcp.server.mcpserver.exceptions.ToolError, mcp.server.stdio.stdio_server, mcp_types.InputRequiredResult, mcp_types.ElicitRequest, mcp_types.ElicitRequestFormParams"
+      ],
+      "runtime_assertions_note": "every role of the peer runs check_pins and check_api before it starts a server or launches a child, so an environment that does not match refuses instead of testing something else. The version-registry assertions read the SDK itself rather than the pin file: a pin records what the environment should contain and only the SDK can say what it does.",
+      "api": {
+        "server_entry": "mcp.server.MCPServer(name, version=..., instructions=..., cache_hints={...})",
+        "tool_decorator": "MCPServer.tool()",
+        "tool_context": "mcp.server.mcpserver.Context, injectable as a trailing `ctx` parameter; exposes ctx.input_responses (None on the first round) and ctx.request_state (the opaque state after unsealing)",
+        "tool_error": "mcp.server.mcpserver.exceptions.ToolError",
+        "cache_hint": "mcp.server.CacheHint(ttl_ms=..., scope='public'|'private')",
+        "stdio_transport": "mcp.server.stdio.stdio_server(), an async context manager yielding (read_stream, write_stream)",
+        "server_run": "MCPServer._lowlevel_server.run(read_stream, write_stream, MCPServer._lowlevel_server.create_initialization_options())",
+        "interim_result_type": "mcp_types.InputRequiredResult(input_requests={key: ElicitRequest}, request_state=str)",
+        "elicit_request": "mcp_types.ElicitRequest(params=ElicitRequestFormParams(message=..., requested_schema=...))",
+        "provenance": "Tagged source and published sdists. Exploratory SDK-only captures establish SDK behavior, not compiled Zig interoperability; the integrated captured exchange must establish that separately.",
+        "dual_era_first_request_routing": "MCPServer._lowlevel_server.run drives mcp.server.runner.serve_dual_era_loop, which serves BOTH the handshake era and the modern per-request-envelope era on ONE connection and picks which from the envelope of the connection's FIRST request (runner._has_modern_envelope tests for the reserved io.modelcontextprotocol/protocolVersion key in params._meta). A client that opens with a handshake-era frame is answered in the handshake era for the rest of the run, and every later modern-envelope request is then refused with -32600. Consequence for this exchange: the first request must be server/discover, and the supervisor asserts the first request on the wire IS server/discover.",
+        "per_request_envelope": "mcp.shared.inbound.classify_inbound_request runs a validation ladder whose rung one requires params._meta to be an object carrying BOTH io.modelcontextprotocol/protocolVersion and io.modelcontextprotocol/clientCapabilities. Missing either is INVALID_PARAMS (-32602) naming the key. rung three: the version must be a string in MODERN_PROTOCOL_VERSIONS, else INVALID_PARAMS for a non-string or -32022 with data {supported, requested}.",
+        "peer_error_from_bad_params": "A tools/call whose params omit the required `name` is answered with ErrorData(code=INVALID_PARAMS=-32602, message='Invalid request parameters') and no result member, produced by the SDK's own inbound request validation rather than by the peer script.",
+        "removed_method_at_current": "On a connection already serving 2026-07-28: `initialize` is answered -32022 with message 'connection is serving the 2026-07-28 protocol; the initialize handshake is not accepted' and data {supported, requested}. Every other removed or stream-carried top-level name (`ping`, `logging/setLevel`, `resources/subscribe`, `resources/unsubscribe`, `notifications/initialized`, `notifications/progress`, `notifications/message`, `notifications/tools/list_changed`, `notifications/resources/list_changed`, `notifications/prompts/list_changed`, `notifications/resources/updated`, `notifications/subscriptions/acknowledged`, `notifications/roots/list_changed`, `notifications/elicitation/complete`, `sampling/createMessage`, `elicitation/create`, `roots/list`) is answered -32601 with data set to the method name. Source: mcp/shared/inbound.py classify_inbound_request and mcp/server/runner.py _serve_modern_stream; verified by the refusal probe, which drives all of them on one connection.",
+        "cache_hint_applied_to_results": "MCPServer(cache_hints={'tools/list': CacheHint(ttl_ms=..., scope=...)}) fills ttlMs and cacheScope on the handler's result in mcp/server/runner.py via mcp.server.caching.apply_cache_hint, per field: a value the handler set explicitly wins. Consequence for the run: the checks assert the configured values (60000/public), never the SDK defaults, because a default would pass a check that never looked at the hint.",
+        "tool_error_carries_message": "A ToolError reaches the client as isError:true carrying the handler's own message, composed with the SDK's own prefix (observed: 'Error executing tool fail: deliberate tool failure'). Any other exception is wrapped as UnexpectedToolError and arrives with the handler's message withheld ('Error executing tool <name>'). Asserting the message survives is therefore what tells the anticipated-failure path from the crash path; a check demanding an exact string would pin the SDK's wording rather than its behaviour.",
+        "request_state_sealing": "mcp.server.request_state.RequestStateBoundary is appended to Server.middleware by MCPServer and seals requestState outbound into an opaque token (observed prefix 'v1.') and unseals it inbound, restoring the handler's plaintext. The wire token is not the handler's state. Consequence for the run: this is the one claim the wire alone cannot support — a token that was sealed and never unsealed looks identical on the wire — so the peer records what the handler actually received on a side channel and the supervisor checks the two differ AND that the handler got its own plaintext back.",
+        "invalid_request_state": "A retry whose requestState does not unseal is answered ErrorData(code=INVALID_PARAMS=-32602, message='Invalid or expired requestState', data={'reason': 'invalid_request_state'}). A client that invented or re-encoded the state gets this, which is what the refusal probe asserts.",
+        "handler_annotations_must_resolve": "The SDK reads each tool handler's annotations with typing.get_type_hints (mcp/server/mcpserver/resolve.py _type_hints), which resolves a DEFERRED annotation against the defining module's globals. A peer that uses `from __future__ import annotations` while importing mcp inside a function gets InvalidSignature('Unable to evaluate type annotations for callable ...') at tool registration. This is why test/interop/mcp_current_peer.py has no `from __future__ import annotations`, stated as a comment at the top of that file."
+      },
+      "alternatives_rejected": [
+        {
+          "what": "mcp 1.29.0 (the pinned previous-revision entry)",
+          "why": "genuine and already the peer for 2025-11-25, but its newest revision is the handshake era: MODERN_PROTOCOL_VERSIONS does not exist in it and there is no 2026-07-28 to negotiate. It cannot serve this exchange at all, and that peer stays as legitimate coverage for the revision it does support."
+        },
+        {
+          "what": "mcp 2.2.0",
+          "why": "the 2.x rewrite is available at 2.3.0 with the same mcp-types split and 2026-07-28 support, so the older 2.x buys nothing this entry does not already carry."
+        }
+      ],
+      "nix": {
+        "mechanism": "isolated declared Python interpreter with exact source artifacts and dependency floors",
+        "attribute": "mcpCurrentSdk, mcpTypesCurrentSdk and mcpCurrentPython in devenv.nix",
+        "src": "https://files.pythonhosted.org/packages/9d/8d/e0d339616f4810e9051d4aba6887afab289ab1f81875fe908b606cdfd0e3/mcp-2.3.0.tar.gz",
+        "types_src": "https://files.pythonhosted.org/packages/9e/2d/7c251e34207f6c51000312fc8839111ac45cfe02023f90b44e7f1051dd8e/mcp_types-2.3.0.tar.gz",
+        "http_dependency_note": "Declared SDK prerequisite, not HTTP coverage from this stdio peer. Exact patched HTTPX2/HTTPCore2 versions are pinned by the development environment."
+      }
+    },
+    "agent-client-protocol": {
+      "distribution": "agent-client-protocol",
+      "version": "1.0.0rc2",
+      "role": "official SDK agent for stable ACP wire 1 and explicitly selected experimental wire 2 over real stdio",
+      "nix": {
+        "mechanism": "local buildPythonPackage over the exact published prerelease, isolated from the MCP interpreters",
+        "attribute": "acpSdk in devenv.nix",
+        "build_system": ["pdm-backend"],
+        "version_source_fix": "None. The published sdist already declares version 1.0.0rc2; its tag's older project version is not the artifact built here."
+      },
+      "source_bytes": {
+        "pypi_sdist": {
+          "url": "https://files.pythonhosted.org/packages/57/ac/53520d32dd6afb8cef77bf2b731f9eb451d4a8dffbf0df104a1148724eed/agent_client_protocol-1.0.0rc2.tar.gz",
+          "sha256_hex": "c83b875efd036a95273d582daf02b29a509024d0232a2afd6187ce8d5564277d"
+        },
+        "pypi_wheel": {
+          "filename": "agent_client_protocol-1.0.0rc2-py3-none-any.whl",
+          "url": "https://files.pythonhosted.org/packages/67/65/fefe1b5d234cb04e2e7e4fe3214865dfd01ced621a01eb00b58d26becfca/agent_client_protocol-1.0.0rc2-py3-none-any.whl",
+          "sha256_hex": "bd12a0b726c895353a6f7cf7b23d62d5f64191974a1cfadb83fe27ccdd8a0124"
+        },
+        "provenance": "https://pypi.org/pypi/agent-client-protocol/1.0.0rc2/json; publisher digests retrieved 2026-10-03"
+      },
+      "upstream": {
+        "repo": "https://github.com/agentclientprotocol/python-sdk",
+        "tag": "1.0.0rc2",
+        "tag_commit": "9d07d7871ef4b220b8507e15fc4b1560f0950a64",
+        "license": "Apache-2.0",
+        "provenance": "tagged source and LICENSE, retrieved 2026-10-03"
+      },
+      "requires_python": "<3.15,>=3.10",
+      "runtime_requirements": ["pydantic>=2.7", "pydantic-core>=2.18.1"],
+      "protocol": {
+        "PROTOCOL_VERSION": 1,
+        "stable_schema": "schema-v1.23.0",
+        "experimental_protocol_version": 2,
+        "experimental_schema": "schema-v2.0.0-alpha.5",
+        "selection": "Wire 1 is the default. Wire 2 requires --protocol-version 2 and acp.experimental.v2. There is no runtime fallback."
+      },
+      "api": {
+        "stable_agent": ["acp.Agent", "acp.run_agent", "acp.InitializeResponse"],
+        "stable_schema_types": ["AgentCapabilities", "AgentMessageChunk", "Implementation", "McpCapabilities", "NewSessionResponse", "PermissionOption", "PromptCapabilities", "PromptResponse", "RequestPermissionResponse", "TextContentBlock", "ToolCallUpdate"],
+        "experimental_agent": ["acp.experimental.v2.Agent", "acp.experimental.v2.run_agent"],
+        "experimental_schema_types": ["InitializeResponse", "Implementation", "AgentCapabilities", "NewSessionResponse", "PromptResponse", "UserMessageChunk", "TextContentBlock", "PermissionOption"],
+        "connection_callbacks": ["session_update", "request_permission"],
+        "permission_cancelled": {"outcome": {"outcome": "cancelled"}},
+        "permission_selected": {"outcome": {"outcome": "selected", "optionId": "the offered id"}},
+        "permission_kinds": ["allow_once", "allow_always", "reject_once", "reject_always"],
+        "prompt_response_v1": "required stopReason: end_turn|max_tokens|max_turn_requests|refusal|cancelled",
+        "prompt_response_v2": "required messageId",
+        "permission_request_v2": "required title replaces v1 toolCall",
+        "framing": "JSON-RPC 2.0 NDJSON; notifications have no id",
+        "provenance": "src/acp and src/acp/experimental/v2 at the pinned tag"
+      },
+      "runtime_assertions": [
+        "importlib.metadata.version('agent-client-protocol') == '1.0.0rc2'",
+        "acp.PROTOCOL_VERSION == 1",
+        "wire 2 additionally requires acp.experimental.v2.PROTOCOL_VERSION == 2"
+      ],
+      "alternatives_rejected": [
+        {
+          "what": "agent-client-protocol 0.12.1",
+          "why": "latest stable SDK supports wire 1 but has no acp.experimental.v2 runtime; it cannot close the wire-2 coverage gap"
+        }
+      ],
+      "not_claimed": "The SDK is a prerelease and wire 2 is experimental. Neither run establishes an upstream mcp/message or RFD bridge implementation."
     },
     "a2a-sdk": {
       "distribution": "a2a-sdk",
@@ -236,6 +536,19 @@
         "flags": ["--slow-entered-file <path>", "--report-file <path>", "--cancel-timeout-ms <n>"],
         "why_the_flag_exists": "the canceller task waits for the file the peer writes when its slow tool starts, so the cancellation cannot race the request; --cancel-timeout-ms bounds that marker wait"
       },
+      "mcp-current": {
+        "file": "src/mcp_current_interop.zig",
+        "role": "MCP 2026-07-28 stdio client through conn.Conn, stdio.Stdio and mcp_session.Client at Revision.current",
+        "build": "zig build interop-mcp-current installs zig-agent-proto-mcp-current-interop; the step builds only",
+        "scope": "server/discover; cacheable tools/list; successful tool result; tool failure distinct from JSON-RPC error; input-required outcome and opaque-state retry under a new id; removed methods refused before writing"
+      },
+      "acp": {
+        "file": "src/acp_interop.zig",
+        "role": "ACP stdio client through acp_session.Client, with stable wire 1 by default and experimental wire 2 only when explicitly requested",
+        "build": "zig build interop-acp installs zig-agent-proto-acp-interop; the step builds only",
+        "scope": "initialize, session/new, session/prompt, agent session/update and a permission offer containing a granting option that the client cancels; no consent is emitted",
+        "not_claimed": "The SDK's unstable mcp/message extension differs from the RFD binding. Neither wire version establishes MCP-over-ACP interoperability."
+      },
       "a2a": {
         "file": "src/a2a_interop.zig",
         "role": "A2A 1.0 unary JSON-RPC over std.http, through the public a2a_http module. The client role discovers the agent card, binds the first advertised JSONRPC 1.0 interface, checks it against the endpoint it was told to expect and sends two typed SendMessage calls, one answered as a Task and one as a Message. The server role serves the card at the well-known path and answers one typed SendMessage per request, in whichever arm of the result oneof the request's text asked for.",
@@ -259,6 +572,17 @@
         "runs": "the genuine mcp SDK server as a child process over its own stdio, relayed byte for byte by the supervisor"
       },
       {
+        "file": "test/interop/mcp_current_peer.py",
+        "roles": ["supervise", "serve", "refusals", "selftest"],
+        "runs": "the pinned MCP 2.3.0 SDK server over real relayed stdio, with captured envelopes and SDK request-state observations"
+      },
+      {
+        "file": "test/interop/acp_peer.py",
+        "roles": ["supervise", "serve"],
+        "runs": "the official ACP SDK agent over real relayed stdio; checks the captured permission cancellation against the SDK's parsed outcome",
+        "experimental": "--protocol-version 2 explicitly selects acp.experimental.v2; no fallback to wire 1"
+      },
+      {
         "file": "test/interop/a2a_peer.py",
         "roles": ["supervise", "serve", "probe", "zig-interop"],
         "runs": "the genuine a2a-sdk JSON-RPC server on loopback HTTP, the genuine a2a-sdk client against it as a baseline, and both directions of the exchange with the Zig participant, with the wire relayed through this process so every byte that crossed is captured",
@@ -270,11 +594,13 @@
     "capture_bytes_per_direction": 262144,
     "capture_note": "the supervisor stops recording at the cap and fails the run; a truncated capture is never reported as a passing one",
     "deadline_seconds_default": 60,
-    "readiness": "a child announces readiness on standard output and is waited for with whatever budget is left of the deadline; a child that starts and then says nothing is killed with its process group rather than waited on, so the deadline is enforced while waiting and not only between reads",
-    "cleanup": "every child is started in its own process group; a failure or a timeout kills the group and reaps it, so no run leaves an orphan or a blocked reader"
+    "readiness": "HTTP peers announce their bound endpoint on stdout; stdio peers start with protocol frames. Readiness and all exchanges share the run's deadline. Teardown reports the accepted signals, exit status and any guard refusal.",
+    "cleanup": "Linux procfs is required before spawning. Before each group signal, the shared process guard checks child identity, caller UID, full argv, own and ancestor groups, and group-member ownership. SIGTERM precedes a bounded wait and freshly guarded SIGKILL. An unprovable target is left unsignalled and the run fails with explicit refusal evidence."
   },
   "not_claimed": [
     "nothing here is a claim that a run passed: these pins record what the peers depend on, and the evidence that a run passed is that run's captured wire and reports, not this file",
+    "the ACP wire-2 exchange is experimental and must be requested explicitly",
+    "the ACP SDK's unstable extension is not evidence for the repository's MCP-over-ACP RFD binding",
     "the A2A participant covers the unary JSON-RPC slice only: nothing here claims REST, gRPC, SSE or streaming, push notification configuration, a remote task store or authentication"
   ]
 }

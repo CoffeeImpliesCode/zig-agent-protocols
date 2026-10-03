@@ -58,6 +58,23 @@
 //!
 //! Buffers are the caller's throughout, as in `conn.zig`. Nothing here
 //! allocates, and a body a peer sends is read into a buffer the caller sized.
+//! Nothing is released either: a client releases nothing but the connection one
+//! [`Exchange`] holds, and a server has no teardown at all.
+//!
+//! Where a call reads one of the caller's regions while it writes another, the
+//! two must be different memory, and that is this library's contract rather
+//! than a detail of one call site: [`Server.Buffers`] names every pair that is
+//! required and [`checkPost`] refuses `body` and `scratch` sharing a byte with
+//! [`error.OverlappingBuffers`] before it decodes anything. Both are faults of
+//! the caller's own buffers, so neither is answered to the peer as a `400`.
+//!
+//! Every wait this transport does is a socket read or a socket write, and
+//! `std.http` names no cancellation of its own, so no call here returns
+//! `error.Canceled`: the tag is in [`Error`] only because [`conn.Error`] is
+//! unioned in for the tags both layers do raise. A caller that cancels the
+//! `Io` sees `error.Transport` from the client half and
+//! `error.MalformedRequest` from the server half, which is what each of those
+//! two does with a read that failed for a reason it cannot name.
 
 const std = @import("std");
 const conn = @import("conn.zig");
@@ -175,7 +192,10 @@ pub const Error = error{
 /// of them and the client to support both, so this is an enum of two rather
 /// than a set of strings.
 pub const MediaType = enum {
+    /// `application/json`: one JSON body framed with `content-length`.
     json,
+    /// `text/event-stream`: an SSE stream framed with `transfer-encoding:
+    /// chunked`. A reply that never ends is this one, not the other.
     event_stream,
 };
 
@@ -203,8 +223,16 @@ pub fn mediaType(value: []const u8) ?MediaType {
 }
 
 /// Which response types a POST's `Accept` header allows.
+///
+/// Both default to true, which is what a request with no `Accept` means: HTTP
+/// reads a missing header as one that takes any media type. [`parseAccept`]
+/// starts from the header when there is one.
 pub const Accept = struct {
+    /// Whether a JSON body is a legal answer. True when the header admitted
+    /// it, and true when no header arrived.
     json: bool = true,
+    /// Whether an event stream is a legal answer, decided the same way as
+    /// `json` and independently of it.
     event_stream: bool = true,
     /// Whether the header arrived at all. It does not change what is allowed:
     /// HTTP reads a request with no `Accept` as one that takes any media type,
@@ -371,15 +399,28 @@ pub const Removed = struct {
 /// Slices borrow the header block or `readHeaders`' scratch, so both must
 /// outlive the `Headers` and everything built from it.
 pub const Headers = struct {
+    /// The `MCP-Protocol-Version` value, or null when the header did not
+    /// arrive. Spliced as it was sent: this transport never rewrites it.
     protocol_version: ?[]const u8 = null,
+    /// The `Mcp-Method` value, or null. Borrows `scratch` rather than the head
+    /// when the peer sent it base64-wrapped.
     method: ?[]const u8 = null,
+    /// The `Mcp-Name` value, or null. Borrows `scratch` when it was
+    /// sentinel-encoded.
     name: ?[]const u8 = null,
+    /// The `Accept` value as sent, or null. Read by [`parseAccept`]; this
+    /// transport adds no `Accept` of its own.
     accept: ?[]const u8 = null,
+    /// The `Content-Type` value as sent, or null. Read by [`mediaType`].
     content_type: ?[]const u8 = null,
     /// `Origin` is not MCP's, but `research/normative/mcp-2026-07-28.md` §4
     /// requires a server to validate it, so it is carried through rather than
     /// dropped.
     origin: ?[]const u8 = null,
+    /// The `Authorization` header as sent, or null, borrowed from the header
+    /// block. It is carried because a server has to make its own decision about
+    /// it; a [`Post`] keeps only the fact that one arrived, so a credential
+    /// never reaches the value a caller is likely to log.
     authorization: ?[]const u8 = null,
     /// A header removed at `2026-07-28` arrived, and which of the two.
     ///
@@ -410,6 +451,17 @@ pub const Headers = struct {
 /// peer may send, and `scratch` backs the base64 decoding. A value that is
 /// not sentinel-encoded borrows the header block, so an all-ASCII request
 /// needs no scratch at all.
+///
+/// `params` and `scratch` are written as the walk goes, so an error leaves
+/// whatever had been written and the caller may reuse both; no `Headers` is
+/// returned in that case. `error.BufferTooSmall` is the caller's own — a
+/// `params` array with no room for one more derived header, or a `scratch`
+/// with no room for one more decoded value — and
+/// `error.DuplicateHeader`, `error.MalformedRequest` and every other refusal
+/// are facts about the block the peer sent.
+///
+/// Nothing is allocated and nothing is retained past `head`, `params` and
+/// `scratch`.
 pub fn readHeaders(head: []const u8, params: []ParamHeader, scratch: []u8) Error!Headers {
     // `http.HeaderIterator` unwraps its finds, so a block this function did
     // not check would be a panic rather than an error. Every byte here is
@@ -599,6 +651,15 @@ pub const Post = struct {
     /// PROTOCOLS.md 4.2 and it is not restated here. `body_value` is the value
     /// the tool's own `inputSchema` declares, which only the tool's dispatcher
     /// knows.
+    ///
+    /// `converted` and `scratch` are the caller's, and they must be different
+    /// memory: the rendered body value is written into the first and the
+    /// header's decoded value into the second, and the comparison reads both at
+    /// once. Neither is retained. `error.BufferTooSmall` is a shortage of one
+    /// of those two and says nothing about the request; every other refusal is
+    /// a verdict this returns rather than an error.
+    ///
+    /// Nothing is copied out of the `Post` and no allocation happens here.
     pub fn checkParam(
         self: Post,
         annotation: []const u8,
@@ -633,9 +694,24 @@ pub fn requiresName(method: []const u8) bool {
 /// anything; then the headers that duplicate body values, each of which
 /// either agrees or is `-32020` and `400 Bad Request`.
 ///
+/// `body` and `scratch` must not share a byte, and this is checked before
+/// anything else is done: the body decode reads `body` and writes `scratch` at
+/// once, so one array behind both puts the unescaped name of the very request
+/// being checked on top of the bytes the comparison reads. That is the
+/// caller's own two regions, so it is [`error.OverlappingBuffers`] rather than
+/// a `400` about a peer that sent a legal request. The refusal precedes every
+/// decode, so `body` and `scratch` hold exactly what the caller passed in.
+///
 /// `scratch` backs the body decode, and the [`Post`] returned may borrow it,
-/// so [`Post`] says which buffer each field lives in.
+/// so [`Post`] says which buffer each field lives in. Every other refusal is a
+/// fact about the request: the two buffers are the only state this call
+/// touches, and on an error neither has been written past the decode the
+/// overlap check precedes.
 pub fn checkPost(headers: Headers, body: []const u8, scratch: []u8) Error!Post {
+    // Before the version, before the media types and before the body decode:
+    // this is the caller's own pair of buffers, and every check below reads
+    // `body` while writing `scratch`.
+    if (conn.overlaps(body, scratch)) return error.OverlappingBuffers;
     // `x-mcp-header` is a JSON Schema keyword. A peer that sent it as a
     // header is either confused about which side of the wire it is on or
     // echoing a name back at us, and neither is a request to serve.
@@ -975,6 +1051,15 @@ pub fn readEvent(reader: *Io.Reader, out: []u8) Error!?[]const u8 {
 // --- The client ----------------------------------------------------------------
 
 /// The headers one POST carries beyond the ones the transport always sends.
+///
+/// It owns nothing and borrows every value: `method`, `name`, each entry of
+/// `params` and each entry of `extra` are the caller's own text, and a header
+/// carrying an escape is the caller's to encode, because `requestHeaders`
+/// splices these strings verbatim and the encoded form is what the peer reads.
+/// The `PostHeaders` value and its entry arrays are needed only through
+/// `Client.requestHeaders`. The returned headers still borrow the strings:
+/// keep all header-name and header-value text alive and unmodified while that
+/// result is used, through `Exchange.close` when passed to `Client.post`.
 pub const PostHeaders = struct {
     /// The value for `Mcp-Method`. Required by PROTOCOLS.md 4.2 from
     /// `2026-07-28`, and not defaulted here: a client that could send a POST
@@ -999,16 +1084,44 @@ pub const PostHeaders = struct {
 ///
 /// The caller owns the storage and it must not move once `post` has filled it:
 /// `std.http` points the response back into the request, so a struct returned
-/// by value would leave a pointer into the copy that just died.
+/// by value would leave a pointer into the copy that just died. It is armed by
+/// a successful [`Client.post`] and nothing else: `post` fills every field
+/// before it returns, and an unarmed value is `undefined` rather than an
+/// empty exchange, so a caller that reaches for one after a failed `post` is
+/// reading bytes it never wrote.
+///
+/// One [`Client.post`], one [`Exchange.close`], in that order. `close` releases
+/// the connection back to the borrowed [`http.Client`] and then overwrites the
+/// whole struct, so a second `close` is a second deallocation and any read of
+/// `status`, `hasHeader`, `nextMessage` or a field after it is a read of
+/// `undefined`. The `Exchange` itself is not copied either: `post` writes the
+/// value it was handed and `std.http`'s pointers are aimed at that address.
+///
+/// Every buffer the exchange reads through is the caller's and must outlive it:
+/// the header fields `head` [`Client.post`] fills, the chunked staging
+/// `transfer`, and the `out` each `nextMessage` is given. A failed `post` has
+/// released the connection on the way out, so the exchange is already cleaned
+/// and must not be closed again.
 pub const Exchange = struct {
+    /// The request as `std.http` holds it. Filled by [`Client.post`]; read
+    /// through `status` and `hasHeader` rather than directly, because
+    /// `receiveHead` points the response back into it.
     request: http.Client.Request,
+    /// The reply head and its body reader. `head.bytes` is `std.http`'s own head
+    /// buffer, read by `receiveHead`, and its strings are invalidated by the
+    /// first `nextMessage`. `request` in it points back at `Exchange.request`,
+    /// which is why this value must not move.
     response: http.Client.Response,
     /// Whether the reply is an event stream. Read before the body reader is
     /// taken, because taking it invalidates the head's strings.
     kind: MediaType,
+    /// The chunked staging the body reader writes through, borrowed from
+    /// [`Client.post`] and not retained beyond the exchange.
     transfer: []u8,
     /// The body reader, created on first use. `std.http` allows it once.
     body: ?*Io.Reader = null,
+    /// Whether the reply has been read to its end, so `nextMessage` returns
+    /// null from then on rather than reading a body that is finished.
     drained: bool = false,
 
     /// The HTTP status the peer answered with.
@@ -1038,6 +1151,17 @@ pub const Exchange = struct {
     /// An empty slice is not that, and the two are kept apart deliberately: an
     /// event stream may dispatch an event carrying no data, and a reply that
     /// ended on it has not ended.
+    ///
+    /// `out` is the caller's and the returned slice borrows it, so it is live
+    /// until the caller writes it again or closes the exchange. The first call
+    /// takes the body reader, which is what invalidates the head's strings, so
+    /// `status` and `hasHeader` come before it.
+    ///
+    /// `error.BufferTooSmall` leaves the exchange usable and `out` holding a
+    /// prefix of the message that did not fit; a stream can be read again from
+    /// the event after it, and a single body cannot, because the bytes already
+    /// read are the ones that were dropped. `error.Transport` leaves the
+    /// connection gone, so the exchange is closed and not read again.
     pub fn nextMessage(self: *Exchange, out: []u8) Error!?[]const u8 {
         if (self.drained) return null;
         // The body reader is taken on the first read and kept, because
@@ -1068,6 +1192,15 @@ pub const Exchange = struct {
     }
 
     /// Release the connection. The exchange cannot be used afterwards.
+    ///
+    /// Exactly one call per successful [`Client.post`], and none at all after a
+    /// failed one: that path released the connection already. The borrowed
+    /// [`http.Client`] and every buffer stay the caller's and are not released
+    /// here.
+    ///
+    /// The whole struct is overwritten afterwards, so this is the last call on
+    /// this exchange. A second call deallocates twice, and reading any field
+    /// afterwards reads `undefined`.
     pub fn close(self: *Exchange) void {
         self.request.deinit();
         // SAFETY: `close` is the last call on the exchange; no statement after its `defer` reads it.
@@ -1103,9 +1236,15 @@ pub const Reply = struct {
     /// message into the decode scratch, so the one place a caller can read a
     /// well-formed error is the message it arrived in.
     body: []const u8,
-    /// The JSON-RPC error code, or null.
+    /// The JSON-RPC error code, or null when the peer answered with a result.
+    ///
+    /// The only member that owns its value: it is read out of `message` and
+    /// copied here, so it stays valid after the buffer `message` borrows is
+    /// reused. A peer may answer with an error on any status, so read it
+    /// rather than deriving a refusal from `status`.
     error_code: ?i32,
-    /// Whether the reply arrived on an event stream.
+    /// Whether the answer arrived on an event stream rather than in a single
+    /// body. It says how it was framed, not whether it succeeded.
     streamed: bool,
     /// Whether `message` is the JSON-RPC response to this call, or is empty
     /// because the peer answered with something this transport cannot read.
@@ -1120,18 +1259,40 @@ pub const Reply = struct {
 };
 
 /// A client for one MCP endpoint.
+///
+/// It owns nothing and has no teardown: the [`http.Client`] is borrowed, so
+/// its allocator, its `Io` and its connection pool are the caller's and stay
+/// the caller's; the endpoint is a value whose slices borrow the caller's own
+/// text; and every buffer a call needs is handed in per call. A `Client` may be
+/// copied freely, and a copy names the same endpoint on the same borrowed
+/// client.
+///
+/// Neither [`Client.post`] nor [`Client.call`] writes through the receiver, so
+/// what makes one safe to share between threads is the borrowed
+/// [`http.Client`] and its own rules, not this struct. A caller that shares one
+/// across threads still gives each thread its own [`Client.Buffers`], because
+/// those are written by the call that was handed them.
 pub const Client = struct {
+    /// The borrowed `std.http` client, which owns the connection pool and the
+    /// allocator behind it. It must outlive this client, and this transport
+    /// never closes it: an exchange returns its connection to it and the
+    /// caller releases the client itself.
     http: *http.Client,
-    /// The endpoint. Borrowed, and it must outlive the client: `std.http`
-    /// re-resolves the URI in place when it follows a redirect, and this
-    /// transport never follows one.
+    /// The endpoint. The `std.Uri` is a value, and the slices inside it borrow
+    /// the caller's own text, which must therefore outlive the client.
+    /// `std.http` re-resolves the URI in place when it follows a redirect, and
+    /// this transport never follows one.
     uri: std.Uri,
+    /// The revision sent as `MCP-Protocol-Version` on every request this
+    /// client makes. `mcp.Revision.current` is the one a server accepts, and
+    /// [`Client.post`] sends whatever is here rather than reading a global.
     revision: mcp.Revision,
     /// An already-open connection, or null to let `std.http` open one.
     ///
     /// A caller holding a connection uses this rather than the pool: a Unix
     /// socket and a TLS session both exist before any request is made, and
-    /// neither is reachable through a URI.
+    /// neither is reachable through a URI. The connection is borrowed and is
+    /// returned to its owner by [`Exchange.close`], not released.
     connection: ?*http.Client.Connection = null,
 
     /// The buffers one exchange needs. The caller's, as everywhere else here.
@@ -1145,6 +1306,13 @@ pub const Client = struct {
         decode: []u8,
     };
 
+    /// Bind to `uri`, speaking `revision`, over the borrowed client.
+    ///
+    /// Nothing is opened and nothing is allocated, so this cannot fail and
+    /// needs no release: the returned value owns no connection, no buffer and
+    /// no storage. `http_client` must outlive it, and the text `uri`'s slices
+    /// borrow must too. The result may be copied, and each copy names the same
+    /// endpoint over the same client.
     pub fn init(http_client: *http.Client, uri: std.Uri, revision: mcp.Revision) Client {
         return .{ .http = http_client, .uri = uri, .revision = revision };
     }
@@ -1155,6 +1323,14 @@ pub const Client = struct {
     /// because both are MUSTs and neither is the caller's to forget. The
     /// spellings are `mcp.header_name`'s, so the all-caps version header and
     /// the title-case ones cannot drift apart.
+    ///
+    /// `out[0..3]` is the smallest slice this can return, and the returned
+    /// slice borrows `out`, so it is live until the caller writes `out` again.
+    /// `error.BufferTooSmall` leaves `out` untouched: the size is decided
+    /// before anything is written.
+    /// The result also borrows the source strings as `PostHeaders` describes;
+    /// copying the header entries does not copy their text. `out` must not
+    /// overlap the source entry arrays or strings, unchecked in every mode.
     pub fn requestHeaders(
         self: Client,
         spec: PostHeaders,
@@ -1193,11 +1369,26 @@ pub const Client = struct {
 
     /// POST one JSON-RPC message and hand back the still-open reply.
     ///
-    /// `head` receives the header block and must outlive the exchange, because
-    /// `std.http` keeps the slice rather than copying it. A redirect is
-    /// refused rather than followed: a POST whose body has already been sent
-    /// cannot be replayed, and a client that silently retried a tool call
-    /// would be calling it twice.
+    /// `head` receives the header fields to send. `std.http` keeps that slice
+    /// in the request rather than copying it, so it must stay alive and
+    /// unmodified until [`Exchange.close`], and `transfer` is live until then
+    /// as the chunked staging the body reader writes through. The caller's
+    /// `out` for [`Exchange.nextMessage`] outlives the exchange too.
+    ///
+    /// `exchange` must be the caller's own storage at a stable address and
+    /// must not be copied while the exchange is open; [`Exchange`] says what
+    /// that costs. On success it is armed and the caller owns the reply until
+    /// [`Exchange.close`]. On an error it is not armed: the request has been
+    /// released on the way out, so the caller closes nothing, and reading any
+    /// field of it reads a request that was already deinitialized.
+    ///
+    /// A redirect is refused rather than followed, and a failed call is never
+    /// retried: a POST whose body has already been sent cannot be replayed, and
+    /// a client that silently retried a tool call would be calling it twice.
+    ///
+    /// This blocks on the socket for as long as the peer takes. No cancellation
+    /// point is inspected here, so a cancelled `Io` arrives as
+    /// `error.Transport` and not as `error.Canceled`.
     pub fn post(
         self: *Client,
         exchange: *Exchange,
@@ -1264,12 +1455,25 @@ pub const Client = struct {
 
     /// POST one JSON-RPC message and return the message that answers `id`.
     ///
+    /// The exchange this opens is closed before returning, on every path, so
+    /// the caller never owns one here: the reply it returns borrows
+    /// `buffers.out`, and is valid until the caller writes that buffer again.
+    ///
     /// Messages on the same stream that are not the answer are stepped over:
     /// a server may send notifications for other subscriptions first, and the
     /// specification forbids it from sending independent requests on this
     /// stream, so a message that is neither a response for `id` nor a
     /// notification is one this client has no way to route and is reported
     /// rather than dropped.
+    ///
+    /// `error.NoResponse` is a reply that carried no bytes at all;
+    /// `error.BufferTooSmall` is the caller's own `out` or `decode`. The
+    /// connection is released on every path and nothing is left for the caller
+    /// to release; the buffers keep what the peer sent and may be reused.
+    ///
+    /// This blocks on the socket for as long as the peer takes, which for a
+    /// stream is as long as the peer keeps it open. No cancellation point is
+    /// inspected here, so a cancelled `Io` arrives as `error.Transport`.
     pub fn call(
         self: *Client,
         id: i64,
@@ -1350,8 +1554,18 @@ pub const ResponseShape = enum {
 ///
 /// The caller owns it and must [`Stream.close`] it. The staging buffer is the
 /// caller's too, and outlives the stream: `std.http` writes the chunk header
-/// out of it on every flush.
+/// out of it on every flush. A stream is opened by [`Server.respondStream`] and
+/// stands for a reply that has begun, so it must be closed on every path out —
+/// including one that failed — or the connection carries an unfinished body
+/// into the next request.
+///
+/// It is not copyable in use: `std.http`'s body writer holds pointers into the
+/// caller's staging, so `send` and `close` must run on the value
+/// `respondStream` returned, at that address.
 pub const Stream = struct {
+    /// The chunked body writer, borrowed from `std.http`. Read and written
+    /// through `send` and `close` rather than directly, because it carries the
+    /// two-level flush those two depend on.
     body: http.BodyWriter,
 
     /// Send one JSON-RPC message as one event.
@@ -1359,6 +1573,17 @@ pub const Stream = struct {
     /// `event` is scratch for the framing and is not retained. The flush is
     /// per event rather than per stream because a subscription that buffers
     /// until it ends is not a subscription.
+    ///
+    /// `error.BufferTooSmall` is the caller's own `event`, which
+    /// `error.InvalidField` is the message's: a message carrying a newline
+    /// cannot be framed, and these same bytes fail the same way however often
+    /// they are sent, so the caller fixes the message rather than retrying it.
+    /// `error.Transport` means the connection is gone, and the stream must be
+    /// closed rather than written to again.
+    ///
+    /// This blocks on the socket for as long as the peer takes. No
+    /// cancellation point is inspected here, so a cancelled `Io` arrives as
+    /// `error.Transport`.
     pub fn send(self: *Stream, event: []u8, message: []const u8) Error!void {
         const framed = try writeEvent(event, message);
         self.body.writer.writeAll(framed) catch return error.Transport;
@@ -1378,6 +1603,14 @@ pub const Stream = struct {
     }
 
     /// End the stream. The connection is then ready for the next request.
+    ///
+    /// Exactly once per stream, on the path out of whatever opened it. After
+    /// it the stream may not be sent on or closed again; `error.Transport`
+    /// leaves the connection unusable rather than merely unfinished, and the
+    /// caller hangs up instead of serving the next request on it.
+    ///
+    /// This blocks on the socket for as long as the peer takes to read the
+    /// final chunk.
     pub fn close(self: *Stream) Error!void {
         self.body.end() catch return error.Transport;
     }
@@ -1389,7 +1622,19 @@ pub const Stream = struct {
 /// caller that wants a listener accepts and constructs one per connection.
 /// Nothing is kept between requests, because `Mcp-Session-Id` was removed at
 /// `2026-07-28` and there is nothing this revision permits to keep.
+///
+/// It owns nothing and has no teardown: the reader and the writer are the
+/// caller's, and `std.http.Server` keeps raw pointers to both, so they must
+/// outlive it. Every buffer is the caller's too, and [`Buffers`] says which of
+/// them must be different memory from which.
+///
+/// One `Server` serves one connection on one thread: `receive` holds the
+/// request being answered in a field, and the next `receive` overwrites it. A
+/// caller that wants concurrency accepts one connection per server.
 pub const Server = struct {
+    /// The borrowed `std.http.Server`, which holds the raw reader and writer
+    /// pointers `init` was given. It is not released here: a caller that wants
+    /// the connection closed closes the stream underneath it.
     http: std.http.Server,
     /// The request being answered. `std.http` answers through the request, so
     /// it has to survive from `receive` to whichever `respond` follows.
@@ -1398,6 +1643,43 @@ pub const Server = struct {
     buffers: Buffers,
 
     /// Every buffer one server needs. None is allocated here.
+    ///
+    /// **Every two of these must be different memory**, and [`Server.init`]
+    /// proves it with `conn.overlaps` before a request is on the wire. The
+    /// pairs are not a preference: each one is a pair that is live at the same
+    /// time as the answer written over the next.
+    ///
+    /// - `params` against `head_scratch`, `body` and `body_scratch`.
+    ///   [`Post.params`] is the prefix of this array `readHeaders` filled, and
+    ///   each entry's `value` points into `head_scratch`; so the array's own
+    ///   storage is live while `receive` writes the body and decodes it, and a
+    ///   decode landing on the array replaces entries a caller still holds.
+    /// - `body` against `head_scratch` and `body_scratch`. `Post.body` is
+    ///   `buffers.body`, and `Post.method` and `Post.name` point into the two
+    ///   scratches, so one array behind `body` and either scratch has the
+    ///   unescaped name written over the message it belongs to.
+    /// - `head_scratch` against `body_scratch`, for the same reason: both can
+    ///   hold an unescaped `Post` member at once, and one is written after the
+    ///   other has been read.
+    /// - `body` against `decode_scratch` and `answer`. The handler reads
+    ///   `post.body` and writes those two.
+    /// - `decode_scratch` against `answer`, the pair the handler is given as
+    ///   two arguments.
+    /// - `transfer` against `body`: the body reader stages through `transfer`
+    ///   into `body`.
+    /// - `event` against `stream`: the framing is written out of `event` into
+    ///   the stream's own staging, and one region cannot be both ends of a
+    ///   copy.
+    ///
+    /// The check is an assertion, so it is live in `Debug` and `ReleaseSafe`
+    /// and is compiled out in `ReleaseFast` and `ReleaseSmall`. A caller that
+    /// hands two regions sharing a byte gets a trap where the check is
+    /// compiled in, and in the two modes that remove it a `Post` is answered
+    /// from bytes another region is writing.
+    ///
+    /// A zero-length region is no region: `conn.overlaps` ignores one, so an
+    /// empty field costs nothing here. Every other field has to be non-empty
+    /// for the work it names, and `transfer` is the one that says so here.
     pub const Buffers = struct {
         /// Room for the derived parameter headers, one per `Mcp-Param-{Name}`
         /// the peer may send.
@@ -1441,14 +1723,33 @@ pub const Server = struct {
     /// the reader and the writer: every wait this transport does is a read or
     /// a write, and both already carry the interface.
     ///
-    /// `decode_scratch` and `answer` are checked here to be different memory.
-    /// They reach the handler as two arguments, so one array behind both of
-    /// them is a caller fault that would put the answer over the decode it is
-    /// being written from, and this is the one place that can see both before
-    /// a request is on the wire. The check is an assert rather than an error
-    /// because a peer cannot cause it: the bytes are the caller's own.
+    /// Every pair of [`Buffers`] regions is checked here to be different
+    /// memory, and the doc on [`Buffers`] is what says which pair is required
+    /// and why. All of them are the caller's own bytes, so a failure is a
+    /// caller fault this one call site can see before a request is on the wire
+    /// and no peer can cause it: an assertion rather than an error, which is
+    /// live in `Debug` and `ReleaseSafe` and compiled out in `ReleaseFast` and
+    /// `ReleaseSmall`.
     pub fn init(in: *Io.Reader, out: *Io.Writer, buffers: Buffers) Server {
-        std.debug.assert(!conn.overlaps(buffers.decode_scratch, buffers.answer));
+        // All nine regions and every pair of them, so a field added to
+        // `Buffers` is a line this list has to gain. `params` is measured by
+        // its own storage bytes, which is what `Post.params` keeps live.
+        const regions = [_][]const u8{
+            std.mem.sliceAsBytes(buffers.params),
+            buffers.head_scratch,
+            buffers.body,
+            buffers.body_scratch,
+            buffers.decode_scratch,
+            buffers.answer,
+            buffers.transfer,
+            buffers.event,
+            buffers.stream,
+        };
+        for (regions, 0..) |left, index| {
+            for (regions[index + 1 ..]) |right| {
+                std.debug.assert(!conn.overlaps(left, right));
+            }
+        }
         return .{ .http = std.http.Server.init(in, out), .buffers = buffers };
     }
 
@@ -1461,6 +1762,21 @@ pub const Server = struct {
     /// when the request is answered, so a connection is reusable after an
     /// answer; a caller that answers nothing must hang up rather than call
     /// `receive` again.
+    ///
+    /// The [`Post`] returned borrows every buffer in [`Buffers`], and it is
+    /// valid until the next `receive` on this server, because that is what
+    /// overwrites them. Each refusal leaves the head in place, so
+    /// `respondJson`, `respondStream`, `respondAccepted` or `reject` is what
+    /// ends it and what drains a body left unread.
+    ///
+    /// `error.BodyTooLarge` and `error.BufferTooSmall` are the caller's own
+    /// sizes and `error.OverlappingBuffers` is the caller's own two regions
+    /// sharing a byte; none of them is a fact about the peer, and none is a
+    /// `400`.
+    ///
+    /// This blocks on the socket for as long as the peer takes. No
+    /// cancellation point is inspected here, so a cancelled reader arrives as
+    /// `error.MalformedRequest` rather than as `error.Canceled`.
     pub fn receive(self: *Server) Error!?Post {
         const request = self.http.receiveHead() catch |err| switch (err) {
             error.HttpConnectionClosing => return null,
@@ -1493,6 +1809,17 @@ pub const Server = struct {
     }
 
     /// Answer with one JSON body.
+    ///
+    /// `response` is the caller's own bytes and is written out before this
+    /// returns; it is not retained. `error.NotAcceptable` is the request's own
+    /// `Accept` refusing this reply type, and nothing was written; a peer that
+    /// accepted an event stream only is refused here because the caller asked
+    /// for the wrong shape.
+    ///
+    /// One answer per request: this ends the reply, and the next `receive`
+    /// reads the next request on the same connection.
+    ///
+    /// This blocks on the socket for as long as the peer takes to read it.
     pub fn respondJson(self: *Server, post: Post, response: []const u8) Error!void {
         if (!post.accept.allows(.json)) return error.NotAcceptable;
         const request = &(self.request orelse return error.MalformedRequest);
@@ -1505,6 +1832,15 @@ pub const Server = struct {
     }
 
     /// Answer with an event stream the caller owns.
+    ///
+    /// The returned [`Stream`] is the caller's from here: it must be closed
+    /// exactly once, and it borrows [`Buffers.stream`] as its staging, which
+    /// must stay alive and unmodified until then. Closing it is what makes the
+    /// connection ready for the next request.
+    ///
+    /// `error.NotAcceptable` is the request's own `Accept` refusing this reply
+    /// type and nothing was written; `error.MalformedRequest` is a server that
+    /// has not received a request.
     ///
     /// `X-Accel-Buffering: no` is here because
     /// `research/normative/mcp-2026-07-28.md` §4 says a server SHOULD send it
@@ -1529,12 +1865,22 @@ pub const Server = struct {
     }
 
     /// `202 Accepted` with no body: the answer to a notification POST.
+    ///
+    /// It takes no `Post` because it answers no body, and it ends the reply.
+    /// `error.MalformedRequest` is a server that has not received a request,
+    /// which is a caller's own misuse of this type and not a peer's document.
     pub fn respondAccepted(self: *Server) Error!void {
         const request = &(self.request orelse return error.MalformedRequest);
         request.respond("", .{ .status = .accepted }) catch return error.Transport;
     }
 
     /// Answer with a status and, when the failure has a JSON-RPC body, one.
+    ///
+    /// `body` is the caller's bytes and is not retained; `status` is the
+    /// caller's own choice, because only the caller knows which status fits a
+    /// fault it decided. Answering here ends the reply, and it is what drains
+    /// a body left unread on the socket, so a refusal is still a reusable
+    /// connection where the peer asked for one.
     pub fn reject(self: *Server, status: std.http.Status, body: []const u8) Error!void {
         const request = &(self.request orelse return error.MalformedRequest);
         var headers = [_]http.Header{.{
@@ -1553,9 +1899,28 @@ pub const Server = struct {
     /// Streamable HTTP without a second dispatch table, which is the point of
     /// `conn.Conn` being the only place a message is sorted.
     ///
+    /// It runs inline on the calling thread, inside this call, before this
+    /// returns, and it runs only once per answer — no reply is dispatched on
+    /// another thread, and a handler that blocks blocks the connection. It may
+    /// not call back into this `Server`: the request it would answer is the one
+    /// being answered here, and `std.http` allows one reply per head. What it
+    /// is handed is this caller's own: `post.body` and the envelope it
+    /// returns borrow [`Buffers.body`] and [`Buffers.answer`] and are written
+    /// out before this returns, so a handler keeps nothing.
+    ///
+    /// `handler.ctx` reaches the callback unchanged, `null` included, and
+    /// `handler.call` being null is [`Error.NoAnswer`]: nothing was run and
+    /// nothing was written.
+    ///
     /// A notification is answered `202` with no body whatever the handler
     /// returns, because a notification has no answer to send. A request the
-    /// handler declines is [`Error.NoAnswer`] rather than an invented status.
+    /// handler declines is [`Error.NoAnswer`] rather than an invented status,
+    /// and the connection is left with a request begun and no reply, so the
+    /// caller hangs up rather than calling `receive` again. An error the
+    /// handler returns is this caller's, and nothing is written for it.
+    ///
+    /// The status returned is the one this reply carried. This blocks on the
+    /// socket for as long as the peer takes.
     pub fn answer(
         self: *Server,
         post: Post,
@@ -2216,6 +2581,50 @@ test "a body scratch too small is the caller's shortage, not the peer's request"
             "\"name\":\"echo\"}}",
         &scratch,
     )).name.?);
+}
+
+test "one array behind the body and its scratch is refused before the body is read" {
+    var params: [2]ParamHeader = undefined;
+    var head_scratch: [512]u8 = undefined;
+    const head = "POST /mcp HTTP/1.1\r\n" ++
+        "MCP-Protocol-Version: 2026-07-28\r\n" ++
+        "Mcp-Method: tools/list\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "\r\n";
+    const headers = try readHeaders(head, &params, &head_scratch);
+
+    // An escaped method is the body that needs `scratch` at all: the decode
+    // writes the unescaped name into it while it reads the bytes it was
+    // handed, so a caller that sized one array for both gets the request's own
+    // name written over the request.
+    const text = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools\\u002Flist\"," ++
+        "\"params\":{\"_meta\":{\"io.modelcontextprotocol/" ++
+        "protocolVersion\":\"2026-07-28\"}}}";
+
+    // One array, laid out as the caller laid it out: the request first, the
+    // room to decode it into after it.
+    var shared: [1024]u8 = undefined;
+    @memcpy(shared[0..text.len], text);
+    // The same body with a scratch of its own is served, so the refusal below
+    // is about the two regions and not about the request.
+    try testing.expectEqualStrings("tools/list", (try checkPost(
+        headers,
+        shared[0..text.len],
+        shared[text.len..],
+    )).method);
+    // The decode above wrote into the tail, and wrote nothing into the body:
+    // the escaped name it produced is the one the header names.
+    try testing.expectEqualStrings(text, shared[0..text.len]);
+
+    // The same array handed as both. This is the caller's own pair of buffers,
+    // so it carries this library's own tag and not a `400` about the peer.
+    try testing.expectError(
+        error.OverlappingBuffers,
+        checkPost(headers, shared[0..text.len], shared[0..shared.len]),
+    );
+    // The refusal precedes every decode, so a body this module would have
+    // served is byte for byte what the caller passed in.
+    try testing.expectEqualStrings(text, shared[0..text.len]);
 }
 
 test "a derived parameter header is checked against the value arguments carries" {
@@ -3601,11 +4010,13 @@ test "a stream answer whose terminating chunk cannot be written is a transport f
 
         // Consume staged bytes first. Only data-vector bytes contribute to the result.
         fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+            const vector_count = data.len;
+            std.debug.assert(vector_count > 0);
             const self: *Self = @fieldParentPtr("writer", w);
             const buffered = w.buffer[0..w.end];
-            const prefix = data[0 .. data.len - 1];
-            const last = data[data.len - 1];
-            if (self.refuse_terminator and self.carries(buffered, data, splat)) {
+            const prefix = data[0 .. vector_count - 1];
+            const last = data[prefix.len];
+            if (self.refuse_terminator and self.carries(buffered, prefix, last, splat)) {
                 try self.record(buffered);
                 for (prefix) |bytes| try self.record(bytes);
                 for (0..splat) |_| try self.record(last);
@@ -3639,14 +4050,15 @@ test "a stream answer whose terminating chunk cannot be written is a transport f
         fn carries(
             _: *const Self,
             buffered: []const u8,
-            data: []const []const u8,
+            prefix: []const []const u8,
+            last: []const u8,
             splat: usize,
         ) bool {
             if (std.mem.indexOf(u8, buffered, chunk_terminator) != null) return true;
-            for (data[0 .. data.len - 1]) |bytes| {
+            for (prefix) |bytes| {
                 if (std.mem.indexOf(u8, bytes, chunk_terminator) != null) return true;
             }
-            return splat != 0 and std.mem.indexOf(u8, data[data.len - 1], chunk_terminator) != null;
+            return splat != 0 and std.mem.indexOf(u8, last, chunk_terminator) != null;
         }
     };
 

@@ -13,7 +13,12 @@ Two roles, both in this one file because they are two ends of the same wire:
 ``--role supervise``
     Starts that peer and the Zig client as two children, relays bytes between
     them verbatim, records the raw wire, asserts what the exchange has to
-    prove, and kills and reaps everything on any path out.
+    prove, and reaps everything on any path out — through ``process_guard.py``,
+    which is shared with the other supervisors: the polite signal first, and
+    only ever against a pid whose ``/proc`` still shows the command line, the
+    owner, the start time and a process group that is neither this harness's
+    own nor any of this harness's ancestors', with every one of those read
+    again before the signal that is not refusable goes out.
 
 What the exchange proves, and how each claim is checked:
 
@@ -79,8 +84,6 @@ import argparse
 import json
 import os
 import selectors
-import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -89,6 +92,19 @@ import time
 from collections import deque
 from pathlib import Path
 from typing import Any, Iterable, NamedTuple
+
+# The teardown of every child this file starts is shared with the other
+# supervisors: one module decides which pids this run is allowed to signal
+# and in what order, because four copies of that decision drift apart.
+from process_guard import (Child, DeadlineMissed, Guard, ProcessGuardError, Stop,
+                           refusals)
+
+# Where a run's work directory comes from and who may take it away, shared for
+# the same reason as the guard above: one place decides whether a directory may
+# be written into and whether it may be removed, because four copies of that
+# decision drift apart — and this one had drifted into four `rmtree` calls.
+from workdir import (WorkDirRefused, approved_scratch_root, remove_directory,
+                     require_named_directory, require_private_directory)
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_PINS = HERE / "sdk-pins.json"
@@ -205,39 +221,36 @@ def is_system_temporary(path: Path) -> bool:
 
 
 def scratch_root() -> Path:
-    """The only directory a generated work directory may be created in."""
-    raw = os.environ.get("TMPDIR")
-    require(
-        raw is not None and raw.strip() != "",
-        "TMPDIR is not set. This peer keeps a run's work on the scratch the environment "
-        "provides and never falls back to a system temporary directory: export "
-        "TMPDIR=<scratch>, or pass --work-dir <dir> to name the place yourself.",
-    )
-    require(Path(raw).is_absolute(), f"TMPDIR={raw!r} is not an absolute path")
-    root = Path(raw)
-    require(
-        not is_system_temporary(root),
-        f"TMPDIR={raw!r} is a system temporary directory, which is shared with every process "
-        f"on the host. Point TMPDIR at this machine's own scratch instead.",
-    )
-    root.mkdir(parents=True, exist_ok=True)
-    require(os.access(root, os.W_OK | os.X_OK), f"TMPDIR={raw!r} is not writable")
-    return root
+    """The only directory a generated work directory may be created in.
+
+    The rule itself lives in `workdir`, because the repository's remover
+    enforces the same one: a directory created anywhere it would refuse to
+    remove is a directory this run could only ever leave behind.
+    """
+    try:
+        return approved_scratch_root()
+    except WorkDirRefused as refusal:
+        raise InteropFailure(str(refusal)) from None
 
 
 class WorkDir:
-    """Where one run's evidence goes, and who takes it away afterwards.
+    """Where one run's evidence goes, and who may take it away afterwards.
 
-    Generated or named, the only difference is who may keep it: a generated
-    directory is removed when the run ends, on every path out, and the run
-    says which of the two happened rather than printing a path that is no
-    longer there.
+    Generated or named, the only difference is who may keep it. A generated
+    directory is removed when the run ends, on every path out, through the
+    repository's own remover, which checks ownership, mode, volume, mount
+    points and liveness before it removes anything. A named directory is a
+    deliverable and is never removed by this run at all.
     """
 
     def __init__(self, requested: str | None, prefix: str) -> None:
         if requested is None:
             self.path = Path(tempfile.mkdtemp(prefix=prefix, dir=os.fspath(scratch_root())))
             self.temporary = True
+            try:
+                require_private_directory(self.path)
+            except WorkDirRefused as refusal:
+                raise InteropFailure(str(refusal)) from None
             return
         named = Path(requested)
         require(named.is_absolute(), f"--work-dir {requested!r} is not an absolute path")
@@ -247,8 +260,15 @@ class WorkDir:
             f"every process on the host. If you want the capture kept, name a directory on "
             f"this machine's own storage.",
         )
-        require(not named.exists() or named.is_dir(),
-                f"--work-dir {named} exists and is not a directory")
+        # Checked before anything is written, not after: the capture and the
+        # reports go into this directory, so a directory this account does not
+        # own is a write into somebody else's storage whatever happens to it
+        # afterwards, and a symlink means the bytes land somewhere the name
+        # does not describe.
+        try:
+            require_named_directory(named)
+        except WorkDirRefused as refusal:
+            raise InteropFailure(str(refusal)) from None
         self.path = named
         self.temporary = False
         self.path.mkdir(parents=True, exist_ok=True)
@@ -257,24 +277,55 @@ class WorkDir:
         return self.path / name
 
     def notice(self) -> str:
+        """What to print about this directory: a policy, not an outcome.
+
+        Deliberately silent about removal. Three of the four supervisors print
+        this before the removal has run at all, so a line claiming the
+        directory is gone would be claiming something that has not happened —
+        and on a refusal it would keep claiming it. `remove_temporary` is what
+        says whether it was.
+        """
         if self.temporary:
-            return (f"  temporary work removed: {self.path}\n"
+            return (f"  temporary work directory, removed when the run ends: {self.path}\n"
                     f"  pass --work-dir <dir> to keep the wire capture and the reports")
         return f"  capture and reports: {self.path}"
 
     def discard(self) -> None:
-        shutil.rmtree(self.path)
+        """Remove this generated directory through the repository's remover."""
+        try:
+            remove_directory(self.path)
+        except WorkDirRefused as refusal:
+            raise InteropFailure(str(refusal)) from None
 
 
 def remove_temporary(work: WorkDir) -> None:
-    """Take a generated work directory away, or say where it still is."""
+    """Take a generated work directory away, without ever hiding why a run failed.
+
+    A refusal raises when the run was otherwise succeeding, because a directory
+    this run could not take away means the run did not do what it says it did.
+    It does not raise when the run was already failing: there it is a second
+    finding rather than the reason the exchange failed, and it is printed
+    beside the original instead of replacing it. That distinction is the whole
+    point of this function — `main` catches `InteropFailure` and prints one
+    line without a traceback, so raising from here during a failure would
+    replace the line naming what actually went wrong with a line about a
+    directory, and the real cause would survive only as context nothing prints.
+
+    A named directory is a deliverable and is left alone whatever else is true.
+    """
     if not work.temporary:
         return
+    # Read before the attempt: inside the handler below, `sys.exc_info()`
+    # reports this refusal rather than whatever the run is unwinding from.
+    already_failing = sys.exc_info()[0] is not None
     try:
         work.discard()
-    except OSError as exc:  # pragma: no cover - the filesystem refused
-        print(f"  the temporary work directory could not be removed and is still at "
-              f"{work.path}: {exc}", file=sys.stderr)
+    except InteropFailure as refusal:
+        if not already_failing:
+            raise
+        print(f"  cleanup, reported beside the failure above: {refusal}", file=sys.stderr)
+        return
+    print(f"  temporary work removed: {work.path}")
 
 
 class BoundedLog:
@@ -609,20 +660,6 @@ def close_fd(stream: Any) -> None:
         pass
 
 
-def terminate(process: subprocess.Popen[bytes], grace: float) -> int | None:
-    """Kill a child's whole process group, then reap it. Never leaves an orphan."""
-    if process.poll() is not None:
-        return process.returncode
-    try:
-        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):  # pragma: no cover - already gone
-        process.kill()
-    try:
-        return process.wait(timeout=grace)
-    except subprocess.TimeoutExpired:  # pragma: no cover - SIGKILL is not refusable
-        return None
-
-
 class Stamp(NamedTuple):
     """One relay write: which direction, which of its bytes, and when.
 
@@ -790,13 +827,20 @@ class Relay:
             raise InteropFailure(self.failure)
 
 
-def wait_for(process: subprocess.Popen[bytes], deadline: float) -> int:
+def wait_for(guard: Guard, child: Child, deadline: float) -> Stop:
+    """Wait for a child to leave, and stop it if the deadline arrives first.
+
+    The guard is what stops it on the way past, because it is the only thing in
+    this run permitted to signal anything; this only says so in the words this
+    run uses for a deadline miss.
+    """
     try:
-        return process.wait(timeout=max(deadline - time.monotonic(), 0.1))
-    except subprocess.TimeoutExpired:
-        code = terminate(process, 5.0)
+        return guard.wait(child, deadline)
+    except DeadlineMissed as missed:
         raise InteropFailure(
-            f"a child did not exit within the deadline; killed and reaped, exit {code}"
+            f"a {child.label} did not exit within the deadline; stopped with "
+            f"{missed.stop.sent} and reaped, exit {missed.stop.exit}"
+            f"{missed.stop.refusal_note}"
         ) from None
 
 
@@ -846,42 +890,58 @@ def supervise_run(args: argparse.Namespace, pins: dict[str, Any], record: dict[s
     # an instant on the same clock. Converted once, here.
     deadline = time.monotonic() + args.deadline
 
-    peer: subprocess.Popen[bytes] | None = None
-    zig: subprocess.Popen[bytes] | None = None
+    # The guard is built before either child exists, so a system where the
+    # target checks cannot be read fails this run with nothing running rather
+    # than half a teardown away.
+    guard = Guard()
+    peer_argv = [sys.executable, str(Path(__file__).resolve()), "--role", "serve",
+                 "--pins", str(args.pins), "--report", str(peer_report),
+                 "--slow-entered-file", str(slow_marker), "--slow-seconds", str(args.slow_seconds)]
+    zig_argv = [str(zig_binary), "--slow-entered-file", str(slow_marker),
+                "--report-file", str(zig_report)]
+
+    peer: Child | None = None
+    zig: Child | None = None
     drains: list[threading.Thread] = []
     # Filled by the relay as it writes, and read by the checks: what crossed,
     # in which direction, and in what order.
     stamps: list[Stamp] = []
+    # How each child left, kept as evidence beside the wire it left with.
+    stops: list[Stop] = []
     started = time.monotonic()
     try:
-        peer = subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), "--role", "serve",
-             "--pins", str(args.pins), "--report", str(peer_report),
-             "--slow-entered-file", str(slow_marker), "--slow-seconds", str(args.slow_seconds)],
+        peer = guard.spawn(
+            peer_argv, "peer",
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=True,
         )
-        drains.append(pump(peer.stderr, peer_log))
-        zig = subprocess.Popen(
-            [str(zig_binary), "--slow-entered-file", str(slow_marker),
-             "--report-file", str(zig_report)],
+        drains.append(pump(peer.process.stderr, peer_log))
+        zig = guard.spawn(
+            zig_argv, "Zig client",
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=True,
         )
-        drains.append(pump(zig.stderr, zig_log))
-        require(peer.stdin is not None and peer.stdout is not None, "the peer's pipes were not created")
-        require(zig.stdin is not None and zig.stdout is not None, "the Zig client's pipes were not created")
+        drains.append(pump(zig.process.stderr, zig_log))
+        require(peer.process.stdin is not None and peer.process.stdout is not None,
+                "the peer's pipes were not created")
+        require(zig.process.stdin is not None and zig.process.stdout is not None,
+                "the Zig client's pipes were not created")
 
-        relay = Relay(peer, zig, client_to_server, server_to_client, deadline, args.deadline, stamps)
+        relay = Relay(peer.process, zig.process, client_to_server, server_to_client,
+                      deadline, args.deadline, stamps)
         relay.run()
         relay.finish()
 
-        peer_code = wait_for(peer, deadline)
-        zig_code = wait_for(zig, deadline)
+        stops.append(wait_for(guard, peer, deadline))
+        stops.append(wait_for(guard, zig, deadline))
     finally:
-        for process in (peer, zig):
-            if process is not None and process.poll() is None:
-                terminate(process, 5.0)
+        for child in (peer, zig):
+            # A child no wait has already accounted for. Decided from the list
+            # rather than from `poll()`, which would reap and hand the pid back
+            # before the guard has read it; a record that already says how this
+            # child left is not worth a second row.
+            if child is not None and not any(s.child == child.label for s in stops):
+                stops.append(guard.stop(child, 5.0))
         for drain in drains:
             # End of file arrives when the child the pipe belongs to is gone.
             # The join is bounded so a pipe that somehow outlives its child
@@ -892,12 +952,31 @@ def supervise_run(args: argparse.Namespace, pins: dict[str, Any], record: dict[s
         peer_log.close()
         zig_log.close()
 
+    exits = {stop.child: stop for stop in stops}
+    require("peer" in exits and "Zig client" in exits,
+            "a child was started but nothing recorded how it exited, so this run cannot say "
+            f"whether the exchange completed: {[stop._asdict() for stop in stops]}")
+    peer_stop = exits["peer"]
+    zig_stop = exits["Zig client"]
+    peer_code = peer_stop.exit
+    zig_code = zig_stop.exit
+    # A guard that refused left behind a process this run could not prove it
+    # started, and reported it as such. Said here, before anything about exit
+    # codes, because a refusal has no exit status to check.
+    require(not refusals(stops),
+            "this run could not prove a pid was the child it started, so it did not signal that "
+            "process and cannot say the exchange ended: "
+            + "; ".join(refusals(stops)))
+
     elapsed = round(time.monotonic() - started, 3)
     require(peer_code == 0,
-            f"the peer exited with {peer_code}; {stderr_note(peer_log, work, 'the peer')}")
+            f"the peer exited with {peer_code}"
+            + peer_stop.refusal_note
+            + f"; {stderr_note(peer_log, work, 'the peer')}")
     require(zig_code == 0,
-            f"the Zig client exited with {zig_code}; "
-            f"{stderr_note(zig_log, work, 'the Zig client')}")
+            f"the Zig client exited with {zig_code}"
+            + zig_stop.refusal_note
+            + f"; {stderr_note(zig_log, work, 'the Zig client')}")
     require(
         not client_to_server.truncated and not server_to_client.truncated,
         f"the capture hit its {limit}-byte bound; raise limits.capture_bytes_per_direction in "
@@ -946,6 +1025,11 @@ def supervise_run(args: argparse.Namespace, pins: dict[str, Any], record: dict[s
         # The timeline computed above, which is the same ordering evidence the
         # checks above were made from.
         "relay_writes": timeline,
+        # How each child left, kept beside the wire it left with: the signals
+        # that were sent, the status `waitpid` reported, and any refusal from
+        # the target guards. A teardown that refused is evidence too, and a run
+        # that hid one would be a run whose ending nobody could account for.
+        "child_stops": [stop._asdict() for stop in stops],
         "findings": findings,
         "capture": {
             "client_to_server": str(work / "wire-client-to-server.log"),
@@ -1328,9 +1412,10 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument("--zig-binary", default="zig-out/bin/zig-agent-proto-mcp-interop",
                         help="the Zig MCP client executable; supervise only")
     parser.add_argument("--work-dir", default=None,
-                        help="an absolute path outside /tmp and /var/tmp where the capture and "
-                             "the reports are kept; a generated directory under TMPDIR otherwise, "
-                             "removed when the run ends either way it went")
+                        help="an absolute path outside /tmp and /var/tmp, owned by this account "
+                             "and not a symlink, where the capture and the reports are kept and "
+                             "never removed by this run; a generated directory under TMPDIR "
+                             "otherwise, removed when the run ends")
     parser.add_argument("--preflight", action="store_true",
                         help="check TMPDIR and the work-directory policy and exit, with no SDK, "
                              "no pins and no child process")
@@ -1355,7 +1440,7 @@ def main(argv: Iterable[str]) -> int:
         if args.role == "serve":
             return run_serve(args)
         return run_supervise(args)
-    except InteropFailure as failure:
+    except (InteropFailure, ProcessGuardError) as failure:
         print(f"mcp interop FAILED: {failure}", file=sys.stderr)
         return 1
 

@@ -1027,7 +1027,7 @@ pub fn run(io: std.Io, out: *std.Io.Writer, iterations: u32, samples: u32) !void
     var accepted_len: usize = 0;
     for (corpus, 0..) |row, at| {
         hasher.update(row.bytes);
-        corpus_bytes += @intCast(row.bytes.len);
+        corpus_bytes += row.bytes.len;
         if (!row.accept) {
             try checkRefusal(row, &st);
             continue;
@@ -1060,7 +1060,7 @@ pub fn run(io: std.Io, out: *std.Io.Writer, iterations: u32, samples: u32) !void
         accepted_len += 1;
         // The byte totals count what the timed decodes were handed, so a figure
         // here cannot describe a corpus other than the measured one.
-        decode_bytes += @intCast(input.len);
+        decode_bytes += input.len;
         scratch_required = @max(scratch_required, json.Reader.requiredScratchLen(input));
         scratch_used = @max(scratch_used, try measureHighWater(row, input, &st));
     }

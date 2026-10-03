@@ -17,12 +17,31 @@ Everything else about it is a refusal: analyzer output it cannot parse, an
 analyzer that exits with anything but its own two finding statuses, an
 annotation that maps to no finding, and any other recursive parse function.
 
+The wrapper owns two things about the run besides the adjudication. It owns
+the source list the analyzer is given: a named import is answered from the
+wiring in `build.zig`, which the analyzer reads only while walking up from a
+directory it was given, so a list that stops at `src/` would leave the walk
+without it and degrade every named import in the tree with nothing in the
+report to say so. It therefore names the governing `build.zig` when the
+checkout has one, which is what puts the checkout root among the directories
+that walk starts from. It also owns the directory that list is read in: the
+analyzer is started in the checkout `GATE_PROJECT_ROOT` names, because every
+name in that list is relative to it and a run whose own process is somewhere
+else still has to analyze the checkout it asked about. The last thing it
+touches is the analyzer's `unresolved-import-lookups` counter, which counts
+lookups, one per file and module name, and not missing imports.
+
 These tests drive the wrapper as the house gate drives it: as a subprocess, with
 a controlled analyzer standing in for `zbc` and a controlled source tree. The
 analyzer stand-in exists so a decision can be pinned without depending on what
 the installed analyzer happens to report today; what is asserted is the
 wrapper's decision — which findings stay open, which one is adjudicated, and
 which exit status the gate is handed — never that a string was copied.
+
+What a stand-in never does here is record the command line it was handed and
+be compared against it: it opens the sources it was named instead, so the
+directory it was started in is a fact these cases can fail on rather than an
+incidental one.
 """
 
 from __future__ import annotations
@@ -59,7 +78,10 @@ WEAK_RATIONALE = (
 # The report comes from a file rather than from the environment because a
 # five-hundred-finding report is larger than one environment string can hold,
 # and an environment that cannot hold it would fail the spawn instead of the
-# behaviour under test.
+# behaviour under test. Before it reports anything it opens every source it was
+# named, the way an analyzer reads what it was told to analyze: a stand-in that
+# answered without reading would leave the directory it was started in as a
+# detail no case here could see.
 FAKE_ANALYZER = '''#!/usr/bin/env python3
 import os
 import sys
@@ -69,9 +91,16 @@ hang = os.environ.get("FAKE_ANALYZER_SLEEP")
 if hang:
     time.sleep(float(hang))
 
+for name in sys.argv[1:]:
+    if name.startswith("-"):
+        continue
+    with open(name, encoding="utf-8", errors="replace") as source:
+        source.read()
+
 with open(os.environ["FAKE_ANALYZER_REPORT"], encoding="utf-8") as report:
     sys.stdout.write(report.read())
-sys.stderr.write("zbc: selected=2 analyzed=2 failed=0 findings=1 parser=Zig-0.16.0 "
+sys.stderr.write(os.environ.get("FAKE_ANALYZER_SUMMARY") or
+                 "zbc: selected=2 analyzed=2 failed=0 findings=1 parser=Zig-0.16.0 "
                  "unresolved-import-lookups=2\\n")
 sys.exit(int(os.environ["FAKE_ANALYZER_EXIT"]))
 '''
@@ -136,8 +165,16 @@ def json_source(
 
 def run_gate(tmp_path: Path, *, sources: dict[str, str], stdout: str, exit_code: int,
              requested: tuple[str, ...] = ("src/json.zig",), analyzer_sleep: float | None = None,
-             env_extra: dict[str, str] | None = None):
-    """Run the wrapper the way the gate does, against a controlled tree."""
+             env_extra: dict[str, str] | None = None, summary: str | None = None,
+             caller_cwd: Path | None = None):
+    """Run the wrapper the way the gate does, against a controlled tree.
+
+    `summary` replaces the analyzer's own stderr line, which is where it states
+    what it selected and how many named imports its build wiring did not answer.
+
+    `caller_cwd` is where the wrapper's own process is started, which is not
+    necessarily the checkout `GATE_PROJECT_ROOT` names.
+    """
     project = tmp_path / "project"
     project.mkdir(exist_ok=True)
     for relative, text in sources.items():
@@ -159,13 +196,14 @@ def run_gate(tmp_path: Path, *, sources: dict[str, str], stdout: str, exit_code:
         "FAKE_ANALYZER_REPORT": str(report),
         "FAKE_ANALYZER_EXIT": str(exit_code),
         "FAKE_ANALYZER_SLEEP": "" if analyzer_sleep is None else str(analyzer_sleep),
+        "FAKE_ANALYZER_SUMMARY": summary or "",
     })
     env.update(env_extra or {})
     return subprocess.run(
         [sys.executable, str(WRAPPER), *requested],
         capture_output=True,
         text=True,
-        cwd=str(project),
+        cwd=str(project if caller_cwd is None else caller_cwd),
         env=env,
         timeout=180,
     )
@@ -566,3 +604,108 @@ def test_wrapper_refuses_to_delegate_to_itself(tmp_path):
     )
     assert result.returncode == 2, result.stdout + result.stderr
     assert "itself" in result.stderr or "zbc" in result.stderr
+
+
+# --- the governing build file, and what the import counter counts -----------
+
+BUILD_FILE = '''const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    // A module minted by a build step has no source path of its own, so it
+    // reads as unwired however the prose around it describes it.
+    const lib_mod = b.addModule("zig-agent-proto", .{
+        .root_source_file = b.path("src/root.zig"),
+        .imports = &.{.{ .name = "testio", .module = testio_mod }},
+    });
+}
+'''
+
+CONSUMER = (
+    'const std = @import("std");\n'
+    'const agent = @import("zig-agent-proto");\n'
+    'const options = @import("build_options");\n'
+)
+
+UNRESOLVED_SUMMARY = (
+    "zbc: selected=3 analyzed=3 failed=0 findings=1 parser=Zig-0.16.0 "
+    "unresolved-import-lookups=25"
+)
+
+
+def test_the_analyzer_reads_the_checkout_the_environment_names(tmp_path):
+    """The checkout reaches the analyzer as a directory, not as an argument.
+
+    The wrapper hands over source names relative to the checkout and starts the
+    analyzer there, so a run whose own process happens to be somewhere else — a
+    CI job that changed directory before invoking the gate, or a harness that
+    runs every tool from one place — still analyzes the checkout
+    `GATE_PROJECT_ROOT` names. Started anywhere else the analyzer opens no
+    source, reports no finding, and the gate hands back a refusal about a run
+    that never happened instead of a verdict about this tree.
+    """
+    elsewhere = tmp_path / "not-the-checkout"
+    elsewhere.mkdir()
+    text, line = json_source()
+    result = run_gate(
+        tmp_path,
+        sources={"build.zig": BUILD_FILE, "src/json.zig": text},
+        stdout=analyzer_stdout(tmp_path / "project", [
+            finding("src/json.zig", RECURSION_RULE, "error", line),
+        ]),
+        exit_code=1,
+        caller_cwd=elsewhere,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "zbc-reviewed: 1" in result.stdout
+
+
+def test_an_empty_file_list_fails_closed_even_though_a_build_file_exists(tmp_path):
+    """The refusal is about the list the caller passed; the wrapper does not fill it in."""
+    result = run_gate(
+        tmp_path,
+        sources={"build.zig": BUILD_FILE, "src/json.zig": "// json\n"},
+        stdout="[]",
+        exit_code=0,
+        requested=(),
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "no source file" in result.stderr
+
+
+def test_an_annotation_in_the_build_file_the_wrapper_adds_is_still_refused(tmp_path):
+    """A file this wrapper names to the analyzer is a file it has to judge."""
+    text, _ = json_source()
+    result = run_gate(
+        tmp_path,
+        sources={"build.zig": f"{MARKER_PREFIX} {RECURSION_RULE}\n", "src/json.zig": text},
+        stdout="[]",
+        exit_code=0,
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "build.zig" in result.stderr
+
+
+def test_a_nonzero_lookup_counter_does_not_open_a_reviewed_only_run(tmp_path):
+    """The counter is not a finding: it counts lookups, one per file and name.
+
+    `std` is one of them in every file that reaches a qualified std name,
+    because the type engine resolves `std` from the toolchain `zig env` reports
+    and never from `build.zig`. A nonzero count is therefore the normal state
+    of a tree where nothing is wrong, and failing on it would fail every run.
+    """
+    text, line = json_source()
+    result = run_gate(
+        tmp_path,
+        sources={"build.zig": BUILD_FILE, "src/json.zig": text, "src/other.zig": CONSUMER},
+        stdout=analyzer_stdout(tmp_path / "project", [
+            finding("src/json.zig", RECURSION_RULE, "error", line),
+        ]),
+        exit_code=1,
+        requested=("src/json.zig", "src/other.zig"),
+        summary=UNRESOLVED_SUMMARY,
+    )
+    # The only finding is the reviewed one, and a counter that is twenty-five
+    # rather than zero does not turn a clean run into an open one.
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"reviewed({RECURSION_RULE})" in result.stdout
+    assert f"error({RECURSION_RULE})" not in result.stdout

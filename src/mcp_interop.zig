@@ -258,6 +258,57 @@ const Report = struct {
     ok: bool = false,
 };
 
+/// The most bytes a failure message holds.
+///
+/// `fail` copies into the buffer it is handed and every caller hands it one of
+/// these, so `failure` is one of them and nothing longer. It is named because
+/// the report's bound below has to include it: `failure` is a slice into a
+/// buffer declared in `main` rather than a store inside [`Report`], and a
+/// bound reading `@sizeOf(Report)` alone would be a bound about a report this
+/// run does not write.
+const failure_capacity: usize = 512;
+
+/// The most bytes the report's own storage holds as text.
+///
+/// Every peer string in [`Report`] is a slice into a fixed array declared
+/// beside it — `keep` is the one place those slices are made — so
+/// `@sizeOf(Report)` covers all of them along with the slice headers, the
+/// counters and the lock this struct carries. Reading it rather than summing
+/// the arrays out by hand is what makes a store added here widen the bound
+/// with it. `revision` is the one member no store covers: it is this run's
+/// pin, spelled by the constant at the top of this file rather than copied
+/// out of anything, so it adds its own length here instead of being counted
+/// as the sixteen bytes of a slice header.
+const report_text_capacity: usize = @sizeOf(Report) + failure_capacity + revision.string().len;
+
+/// The most bytes one decoded byte costs in the report.
+///
+/// `json.Writer.string` escapes what the JSON grammar forbids and passes
+/// every other byte through, so the widest case is a control byte written as
+/// `\u00XX`: six bytes for one. A peer answering with control bytes in its
+/// tool names, its negotiated revision or the text it echoed fills every store
+/// in this report with them, and a bound sized for printable text is short by
+/// six times over.
+const report_escape_width: usize = 6;
+
+/// The bytes the report spends on what is not a decoded byte.
+///
+/// Every member name with its quotes and its colon, the brackets, the commas
+/// and one decimal rendering per number: well under a kilobyte for this schema
+/// at its widest. It is a fixed number rather than a derived one because the
+/// schema is fixed, and 2048 is the next step above that kilobyte — slack this
+/// file does not have to keep true by hand, in place of a bound that moves
+/// every time a member is added.
+const report_syntax_capacity: usize = 2048;
+
+/// The buffer the report is composed in, before the one write that hands it to
+/// the file.
+///
+/// Six bytes for every byte the report's own storage holds, plus the syntax
+/// around them: the whole report at the worst escaping a peer can produce,
+/// with nothing allocated to get there and nothing grown when it does not fit.
+const report_capacity: usize = report_escape_width * report_text_capacity + report_syntax_capacity;
+
 /// What the two tasks share: the id of the in-flight call the cancelling task
 /// has to name, and nothing else.
 const Shared = struct {
@@ -341,7 +392,7 @@ pub fn main(init: std.process.Init) !void {
     // The report is a string, so it needs storage that outlives every task
     // below, and so does the message a failed check leaves behind. Both are
     // fixed buffers, because the failure path allocates nothing either.
-    var message: [512]u8 = undefined;
+    var message: [failure_capacity]u8 = undefined;
     var detail: [256]u8 = undefined;
     var report: Report = .{ .io = io };
 
@@ -459,7 +510,7 @@ fn budgetTask(
     io: Io,
     ending: *Ending,
     report: *Report,
-    message: *[512]u8,
+    message: *[failure_capacity]u8,
     done: *Io.Semaphore,
 ) void {
     // A deadline on the monotonic clock rather than one sleep, so the budget
@@ -498,7 +549,7 @@ fn clientTask(
     ending: *Ending,
     done: *Io.Semaphore,
     report: *Report,
-    message: *[512]u8,
+    message: *[failure_capacity]u8,
 ) void {
     defer {
         // Marked before the post, and on every path out including a failed
@@ -728,7 +779,7 @@ fn cancelTask(
     shared: *Shared,
     options: *const Options,
     report: *Report,
-    message: *[512]u8,
+    message: *[failure_capacity]u8,
 ) void {
     const marker = options.slow_entered_file orelse return;
     var detail: [256]u8 = undefined;
@@ -795,8 +846,26 @@ fn offerNames(available: []const []const u8, name: []const u8) bool {
 /// than refusing keeps a long peer string from turning a check into a
 /// failure: every check below compares the whole decoded text, and only the
 /// report is bounded.
+///
+/// The cut is on a code point. `text` came out of a decoder, so it is valid
+/// UTF-8, and the only thing uncertain about a prefix of it is where a code
+/// point ends: a cut at the storage's capacity can land between a lead byte and
+/// its continuations, and the report then holds bytes the JSON grammar has no
+/// spelling for — `json.Writer.string` passes every byte it does not forbid
+/// straight through, so those bytes would leave the file as a document the
+/// reader on the far side refuses with `InvalidUtf8`. So the code point the cut
+/// landed in is the one dropped, and what is kept is the longest prefix that is
+/// whole code points.
 fn keep(storage: []u8, text: []const u8) []const u8 {
-    const room = @min(text.len, storage.len);
+    var room = @min(text.len, storage.len);
+    if (room < text.len) {
+        // `text[room]` is the first byte that did not fit. A continuation byte
+        // there is the tail of a code point that starts inside the prefix, so
+        // the cut moves back to that code point's lead byte — the walk stops
+        // on the lead byte rather than going past it, because the byte before
+        // it may be the tail of one of its own.
+        while (room > 0 and (text[room] & 0xc0) == 0x80) : (room -= 1) {}
+    }
     @memcpy(storage[0..room], text[0..room]);
     return storage[0..room];
 }
@@ -944,12 +1013,12 @@ fn cause(step: []const u8, detail: []u8, err: anyerror) []const u8 {
 /// the mechanism that ended it, and a peer that stopped talking half way
 /// through a call would be reported as a call that failed with `Canceled` — the
 /// one thing that error never means on this wire.
-fn record(report: *Report, message: *[512]u8, step: []const u8, detail: []u8, err: anyerror) void {
+fn record(report: *Report, message: *[failure_capacity]u8, step: []const u8, detail: []u8, err: anyerror) void {
     if (err == error.Canceled) return;
     fail(report, message, cause(step, detail, err));
 }
 
-fn fail(report: *Report, message: *[512]u8, text: []const u8) void {
+fn fail(report: *Report, message: *[failure_capacity]u8, text: []const u8) void {
     report.mutex.lockUncancelable(report.io);
     defer report.mutex.unlock(report.io);
     // The first failure is the finding; a later one is a consequence of it.
@@ -1004,10 +1073,30 @@ fn namedTools(report: *const Report) []const []const u8 {
     return report.tools[0..@min(report.tool_count, report.tools.len)];
 }
 
+/// Write the report to the path this run was given, or to nothing at all when
+/// it named none.
 fn writeReport(io: Io, options: *const Options, report: *const Report) !void {
     const path = options.report_file orelse return;
-    var buffer: [1024]u8 = undefined;
-    var text = json.Writer.init(&buffer);
+    var buffer: [report_capacity]u8 = undefined;
+    const document = try encodeReport(&buffer, report);
+
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data = document,
+    });
+}
+
+/// The report as one JSON object, in the caller's buffer.
+///
+/// Every value the peer sent went through `json.Writer.string`, so a text
+/// carrying a quote, a backslash or a control byte leaves here as a string
+/// literal rather than as a member that ends early or bytes a reader on the far
+/// side refuses. The buffer is sized from [`report_capacity`], which is the
+/// whole report at the worst escaping a peer can produce; a buffer with no room
+/// is `error.BufferTooSmall` with the prefix already written left as it was,
+/// never a document cut short.
+fn encodeReport(buffer: []u8, report: *const Report) proto.EncodeError![]const u8 {
+    var text = json.Writer.init(buffer);
     try text.slice("{\"revision\":");
     try text.string(report.revision);
     try text.slice(",\"protocol_version\":");
@@ -1033,10 +1122,7 @@ fn writeReport(io: Io, options: *const Options, report: *const Report) !void {
     try boolean(&text, report.ok);
     try text.byte('}');
 
-    try std.Io.Dir.cwd().writeFile(io, .{
-        .sub_path = path,
-        .data = text.written(),
-    });
+    return text.written();
 }
 
 fn number(text: *json.Writer, value: anytype) !void {
@@ -1244,4 +1330,93 @@ test "tools/list: what the answer has to carry, and what it must not" {
     try testing.expectEqualStrings("echo", outer.names[0]);
     const inner = try toolNames("{\"tools\":[{\"name\":\"echo\",\"name\":\"slow\"}]}", &out, &scratch);
     try testing.expectEqualStrings("echo", inner.names[0]);
+}
+
+test "report: a peer string too long for its store is cut on a code point" {
+    // A store that cannot hold what a peer sent truncates rather than refuses,
+    // so where the cut lands decides whether the report is readable at all.
+    // Every capacity from none to the whole string is checked, because a cut
+    // inside a code point is invisible at the capacities either side of it and
+    // is the only case that matters.
+    const text = "aé€😀z";
+    for (0..text.len + 1) |capacity| {
+        var storage: [text.len]u8 = undefined;
+        const kept = keep(storage[0..capacity], text);
+        try testing.expect(std.unicode.utf8ValidateSlice(kept));
+        try testing.expect(std.mem.startsWith(u8, text, kept));
+        if (kept.len == text.len) {
+            // Nothing was dropped, which is the whole string and nothing else.
+            try testing.expectEqual(text.len, capacity);
+            continue;
+        }
+        // What is left out is exactly the one code point that did not fit, so
+        // what is kept is the longest prefix a store of this size could hold.
+        const dropped = std.unicode.utf8ByteSequenceLength(text[kept.len]) catch
+            return error.TestUnexpectedResult;
+        try testing.expect(kept.len + dropped > capacity);
+    }
+
+    // The case that reads as the rule: a four-byte code point that would have
+    // fit by two of its bytes is dropped whole, because a prefix ending inside
+    // one is not a string at all.
+    var storage: [7]u8 = undefined;
+    try testing.expectEqualStrings("aé€", keep(&storage, text));
+}
+
+test "report: a complete report of control bytes fits the buffer the run gives it" {
+    // Every store in the report filled to its capacity with the worst byte on
+    // the wire, and every count at the most a peer can be credited with. A peer
+    // answering with control bytes in its tool names, its negotiated revision
+    // or the text it echoed is an ordinary thing for it to do, and the report
+    // is the only account of what it said: a run that was complete and could
+    // not say so failed for having been complete.
+
+    // A control byte takes six JSON bytes.
+    const fillWorst = struct {
+        fn fill(storage: []u8) []const u8 {
+            @memset(storage, 0x01);
+            return storage;
+        }
+    }.fill;
+
+    var report: Report = .{ .io = testing.io };
+    report.protocol_version = fillWorst(&report.version_text);
+    for (report.tools, 0..) |_, index| {
+        report.tools[index] = fillWorst(&report.tool_name_store[index]);
+    }
+    report.tool_count = report.tools.len;
+    report.echo_text = fillWorst(&report.echo_store);
+    report.fail_is_error = true;
+    report.peer_error_code = std.math.minInt(i32);
+    report.cancelled_error_code = std.math.minInt(i32);
+    var message: [failure_capacity]u8 = undefined;
+    report.failure = fillWorst(message[0 .. failure_capacity - 1]);
+    report.ok = false;
+
+    var buffer: [report_capacity]u8 = undefined;
+    const document = try encodeReport(&buffer, &report);
+
+    // One complete JSON value: every member walked, and nothing after it.
+    var reader = json.Reader.init(document);
+    var scratch: [64]u8 = undefined;
+    if (!try reader.beginObject()) {
+        while (try reader.nextKey(&scratch)) |_| try reader.skipValue(&scratch);
+    }
+    try testing.expect(reader.atEnd());
+
+    // Six bytes on the wire for every byte the peer sent, and one string back
+    // to the reader: the escaping is what makes the wide report the same
+    // account of the run as a narrow one.
+    const echo = json.memberText(document, "echo_text", &scratch) orelse
+        return error.TestUnexpectedResult;
+    var echo_reader = json.Reader.init(echo);
+    var decoded: [report.echo_store.len]u8 = undefined;
+    var expected: [report.echo_store.len]u8 = undefined;
+    try testing.expectEqualStrings(fillWorst(&expected), try echo_reader.string(&decoded));
+
+    // A buffer that cannot hold the whole report is refused rather than cut
+    // short: half a document is one no reader can parse, and the supervisor
+    // would read it as a report about a run that never happened.
+    var narrow: [64]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, encodeReport(&narrow, &report));
 }

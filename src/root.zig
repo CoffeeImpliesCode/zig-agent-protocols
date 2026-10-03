@@ -27,24 +27,34 @@
 //! consumer's build. `testio.zig` is the shared test executor, which the build
 //! adds to this module as the named import `testio`, and `bench_codec.zig` and
 //! `bench_runtime.zig` are the two benchmark modules, which the `run-bench`
-//! driver reaches as named imports of its own. The eight other roots under
-//! `src/` are programs rather than library surface: five demonstrations, the
-//! two interoperability participants and the benchmark driver.
+//! driver reaches as named imports of its own. The ten other roots under
+//! `src/` are programs rather than library surface: five demonstrations, four
+//! interoperability participants and the benchmark driver.
 //!
 //! Encoding contract, from PROTOCOLS.md section 2:
 //!
 //!   - Decoding is total. It returns a `DecodeError` and never `unreachable`,
 //!     because every byte on these wires is attacker-controlled input.
-//!   - Encoding is the exact inverse: `decode(encode(x)) == x` and
-//!     `encode(decode(b)) == b` for every accepted input.
-//!   - Nothing in a codec, framing, connection or session path allocates. The
-//!     caller supplies every buffer; slices borrow from the caller's memory
-//!     and nothing is retained past the call. The one allocator a consumer can
-//!     meet is the one its own borrowed `std.http.Client` carries, which the
-//!     standard library spends on that client's connection pool, and no
-//!     protocol byte in this library is ever composed out of it.
-//!   - Unknown enum tags and unknown method names are errors, never a silent
-//!     fallback, so a peer speaking a newer revision cannot crash an older one.
+//!   - Modeled wire values and represented presence round-trip; encoded JSON
+//!     is stable after its first normalization. Source whitespace, modeled
+//!     member order and string escapes are not lexical provenance. Opaque raw
+//!     JSON carried by a model keeps its bytes; unmodeled members may be skipped.
+//!   - Codec, framing, connection and session code allocates no wire storage.
+//!     Returned values borrow caller input, scratch, arenas or output until
+//!     reuse. Runtime objects retain caller buffers and backend capabilities:
+//!     their owning type documents the required keepalive and cleanup.
+//!     Borrowed `std.http.Client` and `Io` implementations may allocate for
+//!     transport pools or execution; that is not a no-heap backend guarantee.
+//!   - Closed enum decoders and revision method lookups reject unknown values
+//!     rather than selecting a silent fallback. The generic JSON-RPC codec
+//!     carries method text; protocol registries decide which names are supported.
+//!
+//! Supported consumer entry: the native Zig module `zig-agent-proto`, using
+//! stable Zig 0.16.0. The installed static archive is not a C ABI and does not
+//! force analysis of every lazy declaration. Public type and method doc comments
+//! define caller preconditions and error residue. Assertions diagnose caller
+//! misuse in Debug and ReleaseSafe; ReleaseFast and ReleaseSmall do not turn
+//! unchecked alias or lifetime misuse into a recoverable wire error.
 
 const std = @import("std");
 
@@ -67,6 +77,11 @@ pub const stdio = @import("stdio.zig");
 ///
 /// It is the union of the per-protocol failure modes because a caller that
 /// decodes bytes does not know in advance which protocol produced them.
+///
+/// This is a shared upper bound, not a claim that each decoder can return every
+/// member. A failed decode returns no value; scratch and arenas may be dirty or
+/// partly consumed as documented on the owning boundary. No error frees caller
+/// storage. Inputs and writable decode regions must be separate.
 pub const DecodeError = error{
     /// Input ended before the value was complete.
     Truncated,
@@ -90,13 +105,19 @@ pub const DecodeError = error{
     LimitExceeded,
 };
 
-/// The encode error set.
+/// Shared upper bound for encoding failures; individual encoders use a subset.
 ///
-/// Smaller than `DecodeError` on purpose: encoding a value that could not have
-/// been decoded is a programming error, not a wire condition.
+/// Encoders reject the modeled conditions named in their contracts. Unchecked
+/// text primitives require valid UTF-8 caller text; decoded strings satisfy it.
+/// Writer-taking encoders document logical rollback or partial-prefix residue.
+/// Backing bytes may be dirty on failure. Caller-owned source values must not
+/// alias bytes the writer will overwrite.
 pub const EncodeError = error{
+    /// The caller's writable output cannot hold the complete encoding.
     BufferTooSmall,
+    /// A value or raw JSON member is not valid for this wire shape.
     InvalidField,
+    /// An enum/discriminator has no supported wire spelling.
     UnknownTag,
 };
 

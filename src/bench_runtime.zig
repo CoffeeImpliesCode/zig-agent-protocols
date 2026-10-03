@@ -84,10 +84,14 @@
 //!   nobody asked for, and it is detected on the connection's own orphan hook
 //!   rather than by waiting for a timeout.
 //! - Every peer is used through the teardown discipline `runtime_demo.zig`
-//!   uses: `shutdown` before `close`, and the task that reads the descriptor
-//!   is the only one that releases it. `ConnSide.releases` counts the releases
-//!   and the tests assert it is exactly one per side, on the success path and on
-//!   every failure path, which is the no-use-after-close check.
+//!   uses: `shutdown` before `close`, and the side's *owner* releases the
+//!   descriptor, once every task that can touch it has been joined. Never the
+//!   reader: a connection is read by the pump and written by whichever
+//!   caller is inside `Conn.call`, and those are different tasks, so a
+//!   reader that closed it on its way out took it away from a write that was
+//!   still pending. `ConnSide.releases` counts the releases and the tests
+//!   assert it is exactly one per side, on the success path and on every
+//!   failure path, which is the no-use-after-close check.
 //!
 //! ## Bounds
 //!
@@ -500,18 +504,29 @@ pub const Defect = enum {
 /// who released the descriptor.
 ///
 /// The same shape `runtime_demo.Side` uses, and for the same reason: the
-/// reader is the only task that touches the descriptor, so it is the task that
-/// releases it, and a caller that hangs up tells the connection to stop and
-/// lets the next read return instead of closing the descriptor under it.
+/// reader and the writer of a connection are two different tasks, and only
+/// one of them may close the descriptor. Here that one is this type's
+/// owner, reached through [`RoundTrip.collect`], which releases after the
+/// group join rather than from inside a reader or a writer.
+///
+/// What went wrong before is why ownership is tracked explicitly. The reader
+/// was assumed to be the only task that touched the descriptor, so the
+/// reader released it. It is not the only one: the caller's `Conn.call`
+/// writes through the very same stream, and a caller that was between its
+/// `writeFrame` and its answer wait when the reader noticed the peer's
+/// hangup and released had its pending write land on a descriptor number
+/// `close` had already returned. `Io.Threaded` answers `EBADF` there by
+/// aborting the process rather than by returning an error, so a run that
+/// should have reported `PeerEnded` died instead.
 const ConnSide = struct {
-    // SAFETY: open assigns it first, and hangUp and release only run once open has returned.
+    // SAFETY: open assigns it first, and hangUp and releaseSafe only run once open has returned.
     io: Io = undefined,
     buffers: proto.stdio.Buffers = .{},
     // SAFETY: handed to Stream.Reader.init as its storage; the reader reads back its own bytes.
     reader_buffer: [4096]u8 = undefined,
     // SAFETY: handed to Stream.Writer.init as its storage; the writer reads back its own bytes.
     writer_buffer: [4096]u8 = undefined,
-    // SAFETY: conn.Conn.init assigns it before pumping is set, and the pump task starts after that.
+    // SAFETY: conn.Conn.init assigns it before the pump task starts, and the pump starts after that.
     connection: conn.Conn = undefined,
     // SAFETY: open assigns the descriptor it was handed before either teardown path can run.
     stream: Io.net.Stream = undefined,
@@ -521,8 +536,21 @@ const ConnSide = struct {
     reader: Io.net.Stream.Reader = undefined,
     // SAFETY: Stream.Writer.init assigns it, and open hands that interface to conn.Conn.init.
     writer: Io.net.Stream.Writer = undefined,
+    /// Whether this side owns a descriptor at all, which `open` decides.
+    ///
+    /// This is what makes releasing safe on a side that was never opened: a
+    /// refused connect reaches the owner with nothing to release, and
+    /// `stream` is `undefined` there. `releaseSafe` reads this flag and not
+    /// the descriptor, so that path is not a read of undefined storage.
+    owned: bool = false,
+    /// Whether `open` built `connection`.
+    ///
+    /// Tracked apart from `owned` because the two are reached at different
+    /// points: the descriptor is owned before `Conn.init`, which can refuse,
+    /// and the connection only exists once it has returned. `hangUp` needs
+    /// the first and the second separately.
+    connected: bool = false,
     closed: bool = false,
-    pumping: bool = false,
     released: bool = false,
     /// How many times the descriptor was released. Must be one, and the
     /// tests say so: a second release closes whatever the process opened
@@ -545,6 +573,17 @@ const ConnSide = struct {
     ) (conn.Error || Io.ConcurrentError)!void {
         self.io = io;
         self.stream = stream;
+        self.owned = true;
+        // Ownership is taken before `Conn.init`, which can refuse, so a
+        // refusal still leaves a descriptor this side owns and the owner's
+        // release accounts for it. That is the refused-open path: it has to
+        // hang up and release exactly once, neither leak it nor close it
+        // twice.
+        //
+        // `connected` is deliberately not set here. It is false until
+        // `Conn.init` returns, and `hangUp` reads it before closing the
+        // connection, because stopping a `Conn` that was never built would
+        // write through undefined state.
         self.reader = Io.net.Stream.Reader.init(stream, io, &self.reader_buffer);
         self.writer = Io.net.Stream.Writer.init(stream, io, &self.writer_buffer);
         self.connection = try conn.Conn.init(
@@ -553,51 +592,68 @@ const ConnSide = struct {
             &self.writer.interface,
             self.buffers.config(),
         );
+        self.connected = true;
         if (handler) |h| self.connection.setHandler(h);
         if (orphan) |h| self.connection.setOrphanHandler(h);
-        self.pumping = true;
-        group.concurrent(io, ConnSide.pump, .{self}) catch |err| {
-            self.pumping = false;
-            return err;
-        };
+        try group.concurrent(io, ConnSide.pump, .{self});
     }
 
-    /// Read until the peer hangs up, then release the stream.
+    /// Read until the connection is told to stop or the peer hangs up.
+    ///
+    /// This task does not release the stream. It is the task that reads it,
+    /// and reading is not the only thing done to a descriptor: the caller
+    /// writes the same one from a task of its own, and a reader that closed
+    /// it would take it away from a write already in flight. The owner
+    /// releases, after the join that covers both tasks.
     fn pump(self: *ConnSide) void {
         self.connection.pump();
-        self.release();
     }
 
-    /// Stop the reader and wake it, and let the pump release the descriptor.
+    /// Stop the reader and wake it, without closing anything.
     ///
-    /// `shutdown` before `close`, and the pump releases rather than this call:
-    /// closing a descriptor does not interrupt a read already blocked on it,
-    /// and a caller that closed it under a live pump would have that pump read
-    /// a freed descriptor. Telling the connection first is what makes the loop
-    /// stop, and the pump then leaves at its next turn and closes the stream
-    /// on its way out, after the last read that can touch it.
+    /// `shutdown` before any `close`, and no `close` here at all. Closing a
+    /// descriptor does not interrupt a read already blocked on it, so the
+    /// peer would sit on an open description and the group would never
+    /// finish; but closing it also answers a writer that is still pending on
+    /// it, with `EBADF` and a process abort rather than an error.
+    /// `shutdown` wakes the blocked read with end of stream and leaves the
+    /// descriptor usable, which is the whole of what this call needs.
+    ///
+    /// `connection.close` is what makes the loop stop rather than ask again:
+    /// `conn.pump` treats a zero-byte read as "ask again", so a shutdown
+    /// alone lets it come straight back to the same descriptor.
+    ///
+    /// Safe to call more than once, and safe on a side that was never opened,
+    /// which is what the deferred call on the refused-connect path reaches.
     fn hangUp(self: *ConnSide) void {
         if (self.closed) return;
         self.closed = true;
-        if (self.released) return;
-        if (self.pumping) {
-            self.connection.close();
-            // Best effort, and only ever a wake-up: `close` above has already
-            // told the pump to stop, and the pump is still the task that
-            // releases the descriptor. A shutdown that cannot be sent means the
-            // peer is already gone, which is the case this runs in.
-            // gate-reviewed-zlint-next-statement: suppressed-errors
-            // ziglint-ignore: Z026
-            // zwanzig-disable-next-line: empty-catch-engine
-            self.stream.shutdown(self.io, .both) catch {};
-            return;
-        }
-        self.release();
+        if (!self.owned) return;
+        // Skipped when `Conn.init` refused: there is no connection to stop,
+        // and stopping one that was never built would write through
+        // undefined state. The shutdown below still runs, so a peer with
+        // bytes still in flight is not left waiting on an open description.
+        if (self.connected) self.connection.close();
+        // Best effort, and only ever a wake-up: `close` above has already told
+        // the pump to stop, and a shutdown that cannot be sent means the peer
+        // is already gone, which is the case this runs in.
+        // gate-reviewed-zlint-next-statement: suppressed-errors
+        // ziglint-ignore: Z026
+        // zwanzig-disable-next-line: empty-catch-engine
+        self.stream.shutdown(self.io, .both) catch {};
     }
 
-    /// Release the descriptor once, and only on a stream that still has one.
-    fn release(self: *ConnSide) void {
-        if (self.released) return;
+    /// Release the descriptor, once, from the owner.
+    ///
+    /// The name says what the guards are for. Every path that reaches here
+    /// runs after the group join, so no reader and no writer can still be on
+    /// this stream and the release is the last thing done to it. The `owned`
+    /// guard is what makes it legal on a side that never held a descriptor —
+    /// the refused-connect path, where `stream` is `undefined` — and the
+    /// `released` guard is what keeps a second call from closing whatever the
+    /// process opened next.
+    fn releaseSafe(self: *ConnSide) void {
+        if (!self.owned or self.released) return;
         self.released = true;
         self.releases += 1;
         // Best effort before the close, which releases the descriptor whether
@@ -926,15 +982,16 @@ const Latencies = struct {
     /// answer and the window order — which is the order they were measured in
     /// — survives.
     fn stats(self: *const Latencies) Stats {
-        std.debug.assert(self.count > 0);
         var values: [max_samples]u64 = undefined;
         var total_ns: u64 = 0;
         for (self.windows[0..self.count], 0..) |window, index| {
             values[index] = window.ns / @as(u64, @max(window.ops, 1));
             total_ns += window.ns;
         }
-        const first = values[0];
         const windowed = values[0..self.count];
+        const window_count = windowed.len;
+        std.debug.assert(window_count > 0);
+        const first = windowed[0];
         insertionSort(windowed);
         return .{
             .windows = self.count,
@@ -942,7 +999,7 @@ const Latencies = struct {
             .total_ns = total_ns,
             .first_window_ns_per_op = first,
             .min_window_ns_per_op = windowed[0],
-            .max_window_ns_per_op = windowed[windowed.len - 1],
+            .max_window_ns_per_op = windowed[window_count - 1],
             .median_ns_per_op = median(windowed),
             .p90_ns_per_op = nearestRank(windowed, 90, 100),
             .p99_ns_per_op = nearestRank(windowed, 99, 100),
@@ -1020,10 +1077,10 @@ pub fn nearestRank(sorted: []const u64, numerator: u64, denominator: u64) u64 {
 /// mean of the two middle values — truncated to whole nanoseconds — on an
 /// even one.
 pub fn median(sorted: []const u64) u64 {
-    std.debug.assert(sorted.len > 0);
     const n = sorted.len;
+    std.debug.assert(n > 0);
     if (n % 2 == 1) return sorted[n / 2];
-    const lower = sorted[n / 2 - 1];
+    const lower = sorted[(n - 1) / 2];
     const upper = sorted[n / 2];
     return lower + (upper - lower) / 2;
 }
@@ -1054,7 +1111,8 @@ fn insertionSort(values: []u64) void {
 /// while that task waits on its own `Io.Group` waits for every task in the
 /// group to finish unwinding — both peers and both pumps are in it. A deadline
 /// therefore cannot leave a task behind, and cannot leave a descriptor behind
-/// either, because a pump releases its descriptor on the way out of every path.
+/// either: the supervisor's release runs after that join on every path out of
+/// it, so it runs whether the workload finished first or was cancelled.
 fn bounded(comptime Work: type, io: Io, self: *Work, budget_ns: i96) Work.Outcome {
     const Race = Io.Select(union(enum) {
         work: Work.Outcome,
@@ -1183,11 +1241,12 @@ const RoundTrip = struct {
         };
         // A peer that answers one request and then hangs up has to be told
         // when that request has been answered. The handler runs on the reader
-        // task and cannot close the descriptor under itself, so it asks and
-        // this task — the one that owns the side — does it.
+        // task, and a reader may not close a descriptor any writer can still
+        // be on, so it asks and this task hangs the side up instead.
         if (self.echo.defect == .hang_up) {
-            // Whatever ended the wait, the descriptor is shut down: the pump
-            // is reading it and this task is the only one that may close it.
+            // Whatever ended the wait, the connection is stopped and the
+            // descriptor shut down so the pump's blocked read returns. The
+            // close itself is `collect`'s, after the join.
             _ = self.handoff.waitHangUp(self.io);
             self.peer_side.hangUp();
         }
@@ -1197,8 +1256,8 @@ const RoundTrip = struct {
     fn runClient(self: *RoundTrip) void {
         const io = self.io;
         // On every path out of this task, and before the flag that lets the
-        // peer stop waiting: the peer's pump sees the end of the stream and
-        // returns on its own.
+        // peer stop waiting: the peer's pump sees the end of the stream the
+        // hang-up below shuts down and returns on its own.
         defer self.handoff.signalDone(io);
 
         const stream = self.endpoint.address.connect(io, .{ .mode = .stream }) catch {
@@ -1210,8 +1269,11 @@ const RoundTrip = struct {
         // them believes has already been queued. Nothing is announced when the
         // connect fails, and that is what the peer reads instead.
         self.handoff.announceConnection(io);
-        // Declared after the connect, because a side that was never opened has
-        // no descriptor to hang up on.
+
+        // Declared after the connect, because a side that was never opened
+        // owns no descriptor to stop. This stops the connection and wakes the
+        // reader; the descriptor itself is `collect`'s to close, after the
+        // join that covers this task's own writes to it.
         defer self.client_side.hangUp();
         self.client_side.open(io, &self.group, stream, null, .{
             .ctx = self,
@@ -1313,7 +1375,7 @@ const RoundTrip = struct {
         const io = self.io;
         if (checkArgs(self.iterations, self.samples)) |_| {} else |err| {
             self.fail(err);
-            return self.outcome;
+            return self.collect();
         }
         self.echo.io = io;
         self.echo.handoff = &self.handoff;
@@ -1322,12 +1384,12 @@ const RoundTrip = struct {
         self.group.concurrent(io, RoundTrip.runPeer, .{self}) catch |err| {
             self.fail(err);
             self.group.cancel(io);
-            return self.outcome;
+            return self.collect();
         };
         self.group.concurrent(io, RoundTrip.runClient, .{self}) catch |err| {
             self.fail(err);
             self.group.cancel(io);
-            return self.outcome;
+            return self.collect();
         };
         // Await both peers and pumps; cancellation still drains the group.
 
@@ -1339,7 +1401,32 @@ const RoundTrip = struct {
         // ziglint-ignore: Z026
         // zwanzig-disable-next-line: empty-catch-engine
         self.group.await(io) catch {};
+        return self.collect();
+    }
 
+    /// Release both descriptors, then read the counters the report prints.
+    ///
+    /// This is the owner half of the teardown, and it is here rather than in
+    /// a reader or a writer because neither of those is the last task on the
+    /// stream. The pump is the task that reads it and the client task is the
+    /// one that writes it; the pump returns the moment the peer hangs up,
+    /// which can be while `Conn.call` is still between writing its request
+    /// and waiting for the answer. Closing there took the descriptor out from
+    /// under that write, and `EBADF` on a closed descriptor is a process
+    /// abort rather than an error, so the run died instead of reporting the
+    /// `PeerEnded` it had diagnosed.
+    ///
+    /// Every path through `supervise` ends here, so every path accounts for
+    /// both descriptors exactly once: a side that was never opened owns
+    /// nothing and is not released, and a side whose open was refused still
+    /// does.
+    ///
+    /// The release comes before the copies on purpose. The counts are read
+    /// after the release, so a release that did not happen shows up as a zero
+    /// instead of being reported as one that did.
+    fn collect(self: *RoundTrip) Outcome {
+        self.client_side.releaseSafe();
+        self.peer_side.releaseSafe();
         // Every task that could report a failure has been joined; the read
         // goes through the same lock the writes did, so no access to the
         // field in this workload skips that discipline.
@@ -1360,8 +1447,13 @@ const RoundTrip = struct {
         return bounded(RoundTrip, io, self, self.budget_ns);
     }
 
-    /// Join or cancel every pump before releasing the listening socket.
-    /// Each pump owns and closes its connected stream.
+    /// Cancel whatever is left, then release the listening socket.
+    ///
+    /// The connected streams are not this call's business: `collect` owns
+    /// them and released both after the join that covered every task on them,
+    /// so by the time `drive` unwinds into here both are already closed. The
+    /// cancel is what keeps a task `bounded` abandoned from still running
+    /// against a listener this call is about to close.
     fn close(self: *RoundTrip, io: Io) void {
         self.group.cancel(io);
         self.endpoint.close(io);
@@ -1636,9 +1728,9 @@ const FirstEvent = struct {
         // Best effort, and it changes nothing that follows either way: the
         // exchange is closed on this path whatever the shutdown did, and a
         // shutdown that cannot be sent means the peer is already gone.
-        // gate-reviewed-zlint-next-statement: suppressed-errors
         // ziglint-ignore: Z026
         defer {
+            // gate-reviewed-zlint-next-statement: suppressed-errors
             connection.stream_reader.stream.shutdown(io, .both) catch {};
             exchange.close();
         }
@@ -2228,10 +2320,16 @@ test "a hanging-up peer stops answering before its owner shuts down" {
 }
 
 test "a peer that hangs up mid-run is reported, and both descriptors are released once" {
-    // One answer, then the peer hangs up. The client's second call is waiting
-    // on a descriptor that is about to be shut down, which is the race the
-    // teardown discipline exists for: `shutdown` wakes the blocked read, the
-    // reader task releases the descriptor, and nobody closes it twice.
+    // One answer, then the peer hangs up. The client's next call is either
+    // writing or waiting on a descriptor the peer's hang-up is about to shut
+    // down, which is the race the teardown discipline exists for: `shutdown`
+    // wakes the blocked read without closing anything, the owner releases
+    // both descriptors after the join, and nobody closes one twice.
+    //
+    // Before the discipline was corrected the reader released on its way out,
+    // which is the whole of this test's failure: on a target slow enough for
+    // the writer to still be inside `writeFrame`, the run aborted inside
+    // `netWritePosix` on `EBADF` instead of reporting `PeerEnded` here.
     var round_trip: RoundTrip = .{ .iterations = 8, .samples = 1, .defect = .hang_up };
     const outcome = round_trip.drive(testing.io);
 
@@ -2240,6 +2338,128 @@ test "a peer that hangs up mid-run is reported, and both descriptors are release
     try testing.expectEqual(@as(u32, 1), outcome.answered);
     try testing.expectEqual(@as(u32, 1), outcome.client_releases);
     try testing.expectEqual(@as(u32, 1), outcome.peer_releases);
+}
+
+/// A writer that is let go only once its reader has returned.
+///
+/// This is the task the abort used to be reachable from, split out so the
+/// test below can put a gate in front of it. It writes a whole frame
+/// through the very writer `conn.Conn` was handed in `open` and flushes it,
+/// which is the same `netWritePosix` the connection's own write path reaches
+/// and the same one that answered `EBADF`.
+///
+/// The releases it saw at the moment of that write are the assertion: a
+/// reader that closed the descriptor on its way out would leave one there
+/// and take it away from this task. The join below is what makes reading
+/// that field here safe.
+const GatedWrite = struct {
+    // SAFETY: the test assigns it before the writer task is spawned, and the
+    // task that reads it is joined before the test's storage ends.
+    io: Io,
+    /// The side whose descriptor is written. Nothing else in this test
+    /// writes, and the pump reads the other direction of the same socket.
+    side: *ConnSide,
+    /// Posted by the test once the reader task has been joined.
+    go: Io.Semaphore = .{},
+    /// Releases the side held when this task wrote.
+    releases_at_write: u32 = 0,
+    /// A whole framed message, because this is the framed writer and a frame
+    /// is what it exists to carry.
+    frame: []const u8 = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/probe\"}\n",
+
+    fn write(self: *GatedWrite) void {
+        // The gate. A wait that cannot be met is a broken test rather than a
+        // result, and there is nothing here to report it to: the posting task
+        // posts unconditionally once it has joined the reader.
+        self.go.wait(self.io) catch return;
+        self.releases_at_write = self.side.releases;
+        // The flush is what reaches the socket: the frame is shorter than the
+        // writer's buffer, so without it `writeAll` would only stage bytes
+        // and no syscall would be made at all.
+        self.side.writer.interface.writeAll(self.frame) catch return;
+        self.side.writer.interface.flush() catch return;
+    }
+};
+
+test "a reader that has returned does not take the descriptor its caller writes" {
+    // The regression, with the ordering pinned instead of left to the
+    // scheduler.
+    //
+    // What went wrong: the pump read the peer's hang-up, released, and closed
+    // the descriptor — while the client task was still writing on it. The
+    // writer was a different task from the reader, which is the whole reason
+    // the reader had no business closing. `Io.Threaded` answers `EBADF` from a
+    // closed descriptor by aborting the process, so a run that should have
+    // reported `PeerEnded` died instead. It only showed on slow targets,
+    // which is exactly the signature of a race rather than a logic fault.
+    //
+    // Everything here is real and nothing is timed. A real `Io.Threaded`, a
+    // real loopback listener, a real `conn.Conn`, and a real peer that really
+    // hangs up. The reader task is the shipped `ConnSide.pump`, spawned by the
+    // shipped `ConnSide.open`, on a group that holds nothing else — so
+    // awaiting that group *is* the proof that the reader has returned, and
+    // only then is the writer released through a semaphore. No sleep, no
+    // retry, and no peeking at anything the run is supposed to decide.
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const bound = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try bound.listen(io, .{});
+    defer listener.deinit(io);
+    // The kernel's own choice read back off the listening socket, so this
+    // cannot collide with anything else this machine is running.
+    const address = try Io.net.IpAddress.parse("127.0.0.1", listener.socket.address.getPort());
+
+    // Two groups on purpose: joining the reader's is the gate, and the writer
+    // has to be somewhere else so that joining it does not wait for the very
+    // task being gated.
+    var reader_group: Io.Group = .init;
+    defer reader_group.cancel(io);
+    var writer_group: Io.Group = .init;
+    defer writer_group.cancel(io);
+
+    // Connected before the accept so the connection is already queued and
+    // `accept` below cannot block the gate shut.
+    const stream = try address.connect(io, .{ .mode = .stream });
+    var client_side: ConnSide = .{};
+    // The connection is owned by the side from here on: `open` assigns it
+    // before the pump can touch it, and both groups are joined before this
+    // scope's storage ends.
+    try client_side.open(io, &reader_group, stream, null, null);
+
+    var gate: GatedWrite = .{ .io = io, .side = &client_side };
+    try writer_group.concurrent(io, GatedWrite.write, .{&gate});
+
+    // The peer hangs up. `shutdown` before `close`, because a close on a
+    // socket whose peer still has unread bytes answers with a reset, and this
+    // is meant to be the orderly end of the stream that wakes the reader.
+    const peer = try listener.accept(io);
+    // Best effort: the close below releases the descriptor either way, and a
+    // shutdown that cannot be sent means the peer is already gone — which is
+    // the case this is arranging.
+    peer.shutdown(io, .both) catch {};
+    peer.close(io);
+
+    // The reader has returned, and it released nothing: the descriptor is
+    // still the caller's to write on.
+    try reader_group.await(io);
+    try testing.expectEqual(@as(u32, 0), client_side.releases);
+
+    // Now the writer writes, against a descriptor whose reader has already
+    // returned. Under the old discipline that write is the abort.
+    gate.go.post(io);
+    try writer_group.await(io);
+
+    // Seen from the writer's own task, after the join that orders the read:
+    // the reader closed nothing while this task could still be flushing.
+    try testing.expectEqual(@as(u32, 0), gate.releases_at_write);
+
+    // And the owner closes it, once, and only now that both tasks are gone.
+    client_side.releaseSafe();
+    try testing.expectEqual(@as(u32, 1), client_side.releases);
+    client_side.releaseSafe();
+    try testing.expectEqual(@as(u32, 1), client_side.releases);
 }
 
 /// A `netConnectIp` that refuses every connect, so no connect in the test

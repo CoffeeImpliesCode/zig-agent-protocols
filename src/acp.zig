@@ -38,6 +38,75 @@
 //! *capability* is never an error in either version, so a decoded capability
 //! records whether this library names the path and the caller decides what an
 //! unknown one is worth.
+//!
+//! ## What this module does not do
+//!
+//! It parses and writes ACP messages and holds the two registries, the
+//! capability vocabularies and the discriminator tables the rest of the tree
+//! asks about. It opens no transport, owns no allocator and keeps nothing past
+//! a call: `framing` and `stdio` carry bytes, `conn` frames and matches
+//! them, and the whole decode/encode surface below borrows buffers the caller
+//! supplies. It models no batch array, no HTTP binding and no `ToolCallUpdate`
+//! or `_meta` object; each of those is carried as the borrowed lexeme it
+//! arrived as, and the sections below say which members that costs. The
+//! admission rules for a call — the method's version, its side, whether it
+//! expects an answer, and the conditional `authMethods` rule — are not decided
+//! here either; see `acp_session.checkCall`.
+//!
+//! ## What the encoders guarantee
+//!
+//! The round trip this module publishes is over modelled values and presence,
+//! not over bytes. Every decoder here is total and returns a `DecodeError`; no
+//! decode path in this file asserts a caller precondition, so there is no check
+//! here that is present in Debug or ReleaseSafe and unchecked in ReleaseFast
+//! or ReleaseSmall — a refusal is always a returned tag rather than a mode
+//! dependent abort. Every encoder refuses the values its own decoder could not
+//! have returned, and it decides those refusals before it writes a byte, so an
+//! `error.InvalidField` or `error.UnknownTag` leaves the caller's buffer
+//! untouched. What survives `decode` then `encode` is the value: the same tag,
+//! the same fields, the same presence, and the same first-wins reading of a
+//! repeated member, so the re-encoded document decodes back to that value.
+//!
+//! **Byte identity is not part of that promise.** Three things are re-spelled
+//! even when a document carries nothing this module fails to model: whitespace
+//! is dropped, a string is written with the escapes this library chooses rather
+//! than the ones the peer spelled, and a member order is the encoder's wherever
+//! the schema does not fix one. So `{"a": 1}` and `{"a":"A"}` both come back as
+//! `{"a":"A"}`-style output, and a caller must not compare bytes. What the
+//! tests in this file do instead is pin the *losses* — the member that records
+//! nothing, the repeat that is spent, the member of the other version — and a
+//! few canonical documents where the re-encode does reproduce the source
+//! exactly. Each encoder names its own classes, and `writeFrame` is the one
+//! entry point where bytes are reproduced verbatim, because it copies the
+//! caller's bytes rather than composing a document.
+//!
+//! The one error that can arrive after a write is `error.BufferTooSmall`, and
+//! every encoder here says what the caller's buffer holds on that path. A
+//! prefix is never a document a peer can be sent, so a caller that mishandles
+//! the error must not find a half-written message already in its memory.
+//!
+//! ## Encoded string fields are the caller's UTF-8 obligation
+//!
+//! Every encoder here writes its strings through `json.Writer.string`, which
+//! documents that the text must already be valid UTF-8, escapes what the
+//! grammar forbids, passes every other byte through unchanged, and checks
+//! nothing in any optimize mode. This module does not add a check behind it:
+//! there is no `std.debug.assert` on these paths, so a string that is not valid
+//! UTF-8 is not refused in Debug either — it is written, and this library's own
+//! reader then refuses the document with `error.InvalidUtf8` on the far side of
+//! the wire. A string that arrived through a decoder is already valid, because
+//! `json.Reader.string` validates it; a string a caller built by hand is not,
+//! and validating it is the caller's. Every encoder that writes a caller-supplied
+//! string says so on its own declaration — a replay `type`, an option id, a
+//! `toolCall` lexeme, a session id, a title, a description, an option's id,
+//! name and kind, a subject's tag, command, `cwd` and ids, and a capability
+//! path's member names.
+//!
+//! Two members are written with `json.Writer.slice` rather than `string`, and
+//! they carry their own obligation instead. A `toolCall` lexeme and a
+//! `subject` are spliced in verbatim, so what they must be is exactly one
+//! complete JSON value, and the encoders check that; the frame bytes
+//! [`writeFrame`] takes are checked for UTF-8 by that function itself.
 
 const std = @import("std");
 const root = @import("root.zig");
@@ -57,6 +126,16 @@ pub const WireVersion = enum(u16) {
     /// The draft wire version, gated.
     draft = 2,
 
+    /// The version this library speaks for the wire number `value`, or `null`
+    /// for every other number.
+    ///
+    /// Total and allocation-free. `null` covers a version this library has not
+    /// read and a version number that is not a wire version at all, which are
+    /// the same answer for a caller: it cannot hand this number to a registry,
+    /// a capability table or a discriminator table without naming a version
+    /// this library does not implement. A caller that keeps a peer's
+    /// `protocolVersion` rather than speaking it is what wants the `null`, and
+    /// [`Negotiated.unsupported`] is the variant that carries the number on.
     pub fn fromNumber(value: u16) ?WireVersion {
         return switch (value) {
             1 => .stable,
@@ -65,6 +144,11 @@ pub const WireVersion = enum(u16) {
         };
     }
 
+    /// The wire number for this version, the inverse of [`WireVersion.fromNumber`]
+    /// over both tags.
+    ///
+    /// Total, allocation-free and comptime-known per tag, so a handshake or a
+    /// dispatch key can be computed from a value with no branch.
     pub fn number(self: WireVersion) u16 {
         return @intFromEnum(self);
     }
@@ -137,23 +221,76 @@ pub fn negotiate(requested: u16, supported: []const WireVersion) Negotiated {
 /// embedded newlines, so a raw newline is unambiguous.
 pub const frame_delimiter: u8 = '\n';
 
-/// A frame taken from a stdio byte stream.
+/// One frame split out of a byte buffer, as [`nextFrame`] returns it.
+///
+/// Every field borrows the `input` that was passed, at the offsets that field
+/// names: `bytes` and `rest` are two views of one buffer and never overlap,
+/// and `rest` begins one byte past the delimiter that ended `bytes`. Nothing
+/// here is copied and nothing is owned, so the whole value dies with `input`:
+/// overwriting or releasing the buffer invalidates both slices, and a `Frame`
+/// kept across the call that wrote the next message reads bytes that are no
+/// longer the frame it names. Copying a `Frame` copies the two views, not the
+/// bytes, so a copy is not a second owner and there is nothing to release.
+///
+/// `bytes` is the message in the message namespace, so it is what a JSON
+/// decoder takes next; `rest` is the byte-stream remainder and belongs to the
+/// caller's next [`nextFrame`].
 pub const Frame = struct {
-    /// The message bytes, excluding the delimiter.
+    /// The message bytes, excluding the delimiter. Empty when the input began
+    /// with the delimiter, which is a blank line rather than a message; the
+    /// JSON layer refuses it, and it is reported here as an empty frame rather
+    /// than as the end of the input.
     bytes: []const u8,
-    /// Everything after the delimiter, for the next call.
+    /// Everything after the delimiter, for the next call. Empty when
+    /// `unterminated`, and it borrows the tail of `input` rather than a
+    /// separate allocation, so it never needs releasing.
     rest: []const u8,
     /// True when the frame ended the input rather than a delimiter.
+    ///
+    /// The input may be a partial arrival rather than the whole message, so
+    /// this is what tells a caller the bytes it holds are not yet a frame: a
+    /// caller that streams must wait for the delimiter instead of handing
+    /// `bytes` on. `framing.Framer` is the route for bytes that arrive in
+    /// pieces, and it reports the same fact through `next` returning `null`.
     unterminated: bool,
 };
 
-/// Take the next frame from `input`.
+/// Take the next frame from `input`, splitting at the first [`frame_delimiter`].
+///
+/// The returned [`Frame`] borrows `input`; nothing allocates and nothing is
+/// copied, so the frame is valid exactly as long as `input` is unchanged.
+///
+/// ## Which delimiter, and which bytes belong to the frame
 ///
 /// An embedded newline cannot appear inside a frame, because a newline is the
 /// delimiter; a JSON string carrying one is escaped by the encoder, so the
-/// framing stays unambiguous. Input that is not valid UTF-8 is rejected here
-/// rather than at a later parse, because the specification requires UTF-8 and
-/// a frame that cannot be text is not a message.
+/// framing stays unambiguous. The split is on `'\n'` and on nothing else, so a
+/// peer that sends CRLF leaves its carriage return at the end of `bytes` rather
+/// than losing it: JSON calls `'\r'` insignificant whitespace, so the message
+/// still decodes. `framing.Framer.next` is the other supported route and
+/// makes the opposite choice, because a byte stream is a different namespace
+/// from a message and there the `'\r'` belongs to the line ending, so it is
+/// stripped before the frame is handed over. A caller holding a complete
+/// message uses this pair; a caller receiving bytes in pieces uses the framer.
+/// Both reach the same message text and neither depends on the other.
+///
+/// ## Partial input
+///
+/// With no delimiter in `input`, `bytes` is the whole of `input`, `rest` is
+/// empty and `unterminated` is true. That is a partial arrival, not a malformed
+/// frame and not a refusal: the bytes may be the start of a larger message and
+/// this function cannot tell. Nothing is consumed and no state is held, so a
+/// streaming caller calls again with `input` plus the bytes that arrived since.
+///
+/// ## Errors
+///
+/// `error.InvalidUtf8` when `bytes` is not valid UTF-8, which the specification
+/// requires and which is why the check is here rather than at a later parse: a
+/// frame that cannot be text is not a message. The refusal happens before any
+/// result value exists, so a caller learns the frame is unusable rather than
+/// holding a half-built one, and `input` is untouched and still its own. A
+/// second document behind the delimiter is not an error here: that is a second
+/// frame, and the next call reads it.
 pub fn nextFrame(input: []const u8) DecodeError!Frame {
     const newline = std.mem.findScalar(u8, input, frame_delimiter);
     const bytes = if (newline) |at| input[0..at] else input;
@@ -167,30 +304,60 @@ pub fn nextFrame(input: []const u8) DecodeError!Frame {
     };
 }
 
-/// Append a frame and its delimiter.
+/// Append `bytes` as one frame and the delimiter behind it.
 ///
-/// This is the exact inverse of [`nextFrame`], as PROTOCOLS.md section 2
-/// requires: a byte sequence this accepts is one `nextFrame` reads back
-/// unchanged, and a sequence this refuses is one `nextFrame` refuses too. The
-/// bytes reach the wire, so a message this library itself could not decode is a
-/// failure the peer discovers and this library cannot.
+/// ## The two namespaces
 ///
-/// The UTF-8 check belongs here rather than being left to `json.Writer.string`,
-/// which documents that an unvalidated value is a programming error. That
-/// position holds for a decoded value, whose bytes a decoder already checked.
-/// This function takes raw bytes rather than a decoded value, so there is no
-/// such guarantee behind them and the encoder is the last place that can refuse.
+/// This writes the delimiter [`nextFrame`] splits on and nothing else, so the
+/// two agree on where a frame boundary is. No carriage return is appended,
+/// because in the message namespace a CR is not a line ending: the only CR a
+/// caller writes is one the peer sent inside `bytes`, and that one is passed
+/// through, because JSON calls it insignificant whitespace. The stream
+/// namespace is the other route, and `framing.Framer` is where a line ending
+/// is a transport fact a reader strips from every frame.
 ///
-/// Both refusals are `error.InvalidField`, which is what an `EncodeError` can
-/// say: `error.InvalidUtf8` belongs to `DecodeError`, and a caller of this
+/// ## What the pair agrees on
+///
+/// The agreement is over frame values rather than over bytes. A byte sequence
+/// [`nextFrame`] accepts is one this writes and `nextFrame` reads back as the
+/// same message; a sequence this refuses is one `nextFrame` refuses too. What
+/// the call adds is the delimiter, so the buffer afterwards holds the message
+/// plus one `'\n'`, and a caller that wants the message alone reads it back
+/// out of that. Nothing here parses JSON: these bytes reach the wire, so a
+/// message this library could not decode is a failure the peer discovers and
+/// this library cannot. The pair is about framing.
+///
+/// ## Errors, and what is left behind
+///
+/// `error.InvalidField` for a `bytes` carrying an embedded delimiter, and for a
+/// `bytes` that is not valid UTF-8. Both refusals precede the first write, so
+/// they leave `writer` exactly as it was and a caller may retry with different
+/// bytes in the same buffer. The one tag for both is what an `EncodeError` can
+/// say, where `error.InvalidUtf8` would be the reading tag: a caller of this
 /// function is asking what may be written, not what was read.
+///
+/// `error.BufferTooSmall` comes from `writer`, and `json.Writer.slice` is
+/// all-or-nothing: it either copies all of `bytes` or writes none of them. So
+/// the buffer afterwards is either untouched — too small for the message — or
+/// holds all of `bytes` with no delimiter behind it, because the one byte that
+/// did not fit was the delimiter. Both are neither a frame nor a message, so a
+/// caller must discard what it holds rather than send or parse it, and retrying
+/// means starting a fresh writer over a larger buffer. Nothing here allocates,
+/// and `bytes` is only read.
+///
+/// The UTF-8 check belongs here rather than being left to
+/// `json.Writer.string`, which documents that an unvalidated value is a
+/// programming error. That position holds for a decoded value, whose bytes a
+/// decoder already checked. This function takes raw bytes rather than a
+/// decoded value, so there is no such guarantee behind them and the encoder is
+/// the last place that can refuse.
 pub fn writeFrame(bytes: []const u8, writer: *json.Writer) EncodeError!void {
     // A caller that handed us a raw newline has already broken the framing, and
     // writing it would split one message into two on the wire.
     if (std.mem.findScalar(u8, bytes, frame_delimiter) != null) return error.InvalidField;
     // A frame that is not text is not a message, which is what `nextFrame`
-    // already says. Both checks precede the first write, so a refusal leaves
-    // the writer untouched and a caller can retry with a different buffer.
+    // already says. The two checks stay ahead of the first write: moving one
+    // below it would make a refusal leave a prefix behind.
     if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidField;
     try writer.slice(bytes);
     try writer.byte(frame_delimiter);
@@ -209,8 +376,27 @@ pub const Side = enum {
 };
 
 /// A method as one version's registry states it.
+///
+/// Every field is a wire fact read out of a comptime table, so a value copied
+/// out of one is a value and not a handle: copies are independent, nothing here
+/// owns anything, and there is nothing to release. The string fields point at
+/// the registry's own static storage rather than at anything a caller passed,
+/// so they stay valid for the life of the program.
+///
+/// The fields are what the registries are transcribed from, and reading them is
+/// how a caller builds a dispatch table. None of them is a decision: the gates
+/// say what a peer has to advertise, and turning them into "this call may go
+/// out" also needs the side, the arity and the version checks that
+/// [`isMethodSupported`] names and `acp_session.checkCall` applies.
 pub const MethodInfo = struct {
+    /// The wire spelling, and the only name a call is looked up or sent under.
+    /// It is not borrowed from a caller's slice: [`lookupMethod`] returns the
+    /// registry's own string, so the entry outlives whatever was passed in.
     name: []const u8,
+    /// The side the method *lives on*, which is how the registries spell it: an
+    /// `.agent` entry is called by the client on the agent, so a client asks
+    /// about `.agent` and the agent asks about `.client`. `.protocol` is on
+    /// neither side and is callable from either.
     side: Side,
     /// A notification has no result, so JSON-RPC carries no `id` for it.
     notification: bool = false,
@@ -321,12 +507,27 @@ pub const protocol_methods = [_]MethodInfo{
     .{ .name = "$/cancel_request", .side = .protocol, .notification = true },
 };
 
-/// Look a method up, pinned to a wire version.
+/// Look `name` up in `version`'s registries and return that entry, or
+/// `error.UnknownMethod` when no registry for `version` carries it.
 ///
 /// A method the other version removed is `error.UnknownMethod` rather than a
 /// value the caller might send, which is the whole point of section 6.4: an
-/// adapter must reject advertised v1 `fs` or `terminal` support when speaking v2
-/// rather than silently dropping it.
+/// adapter must reject advertised v1 `fs` or `terminal` support when speaking
+/// v2 rather than silently dropping it.
+///
+/// The result is a copy of one comptime table entry, so it is readable after
+/// this returns and copies of it are copies of a value rather than of an
+/// owner: nothing here needs releasing. Its `name` points at the registry's
+/// own static string, not at `name`, so it stays valid whatever the caller
+/// does with the bytes it passed. The side-independent table is searched on
+/// both versions, and the first entry whose name matches wins; no two
+/// registries in a version carry the same name, and a test holds that.
+///
+/// This is a lookup and nothing more. It applies no gate, so the entry it
+/// returns is not a decision that the call may be made: the capability gate
+/// ([`isMethodSupported`]), the side, the arity and the auth-methods rule are
+/// four separate checks, and `acp_session.checkCall` is where all of them are
+/// applied together.
 pub fn lookupMethod(version: WireVersion, name: []const u8) DecodeError!MethodInfo {
     // Both registries are comptime globals, so taking their addresses here is
     // not a runtime pointer into a temporary.
@@ -344,12 +545,15 @@ pub fn lookupMethod(version: WireVersion, name: []const u8) DecodeError!MethodIn
     return error.UnknownMethod;
 }
 
-/// Whether a peer advertising `advertised` may call `info`.
+/// Whether `advertised` carries the capability `info` is gated on. This is
+/// the gate check alone.
 ///
-/// A method with no gate is baseline and always callable. A method with one
-/// gate needs that capability. A method with two gates needs either of them,
-/// because `gate2` is an alternative spelling of the same requirement rather
-/// than a second one.
+/// A method with no gate is baseline and always answers true. A method with
+/// one gate needs that capability. A method with two gates needs either of
+/// them, because `gate2` is an alternative spelling of the same requirement
+/// rather than a second one; an `info` with an empty `gate` and a non-empty
+/// `gate2` is therefore baseline here, which is what both shipped registries
+/// mean, and no entry in either has that shape.
 ///
 /// `elicitation/create` is the case the schema forces. PROTOCOLS.md section 6.5
 /// gates it per mode, so form mode and URL mode each enable it; one gate field
@@ -358,8 +562,39 @@ pub fn lookupMethod(version: WireVersion, name: []const u8) DecodeError!MethodIn
 /// other, where the two sources name different gates for one method rather than
 /// one gate covering two.
 ///
-/// Omission means unsupported, so an empty `advertised` set supports only the
-/// ungated methods.
+/// Omission means unsupported, so an empty `advertised` set answers true for
+/// the ungated methods and false for every gated one.
+///
+/// ## What this does not decide
+///
+/// A true answer is not admission, and `info` arrives by value, so nothing here
+/// says where it came from. Three further obligations live elsewhere, and a
+/// caller that reads this function as the whole gate has skipped all of them:
+///
+/// - **The version.** `info` must have come from [`lookupMethod`] for the
+///   negotiated version. A `MethodInfo` copied out of the other version's
+///   registry answers this function happily, and a v1 `fs/read_text_file` is
+///   gated by a capability an adapter may still be holding from an old
+///   handshake.
+/// - **The side and the arity.** `info.side` must be the side the call is made
+///   on, and `info.notification` must agree with whether the caller expects an
+///   answer. Neither is reachable from these two arguments.
+/// - **`conditional_on_auth_methods`.** The v2 auth methods are gated on the
+///   peer having sent a non-empty `authMethods` array, which is not a
+///   capability path and so cannot appear in `advertised`. The flag is on
+///   [`MethodInfo`] and this function does not read it.
+///
+/// `acp_session.checkCall` is what enforces all four together: it calls
+/// [`lookupMethod`] first — so the version is settled before anything is read
+/// out of the entry — then applies the side, the arity and the auth-methods
+/// tests, and reaches this function last. A caller dispatching its own calls
+/// wants those four in that order.
+///
+/// Total and allocation-free. `advertised` is compared by exact byte equality,
+/// so it has to hold the paths in the spelling [`Capability.path`] records — a
+/// v1 path relative to that side's own capability object, a v2 path carrying
+/// the `capabilities` root — and a path in any other spelling simply does not
+/// match. [`advertisedPaths`] produces such a list from a decoded set.
 pub fn isMethodSupported(info: MethodInfo, advertised: []const []const u8) bool {
     if (info.gate.len == 0) return true;
     if (contains(advertised, info.gate)) return true;
@@ -367,8 +602,18 @@ pub fn isMethodSupported(info: MethodInfo, advertised: []const []const u8) bool 
     return false;
 }
 
-/// The `auth/login`, `auth/logout` and `authenticate` methods, which v1 and v2
-/// spell differently, section 6.4.
+/// The two auth method names for `version`, which v1 and v2 spell
+/// differently, section 6.4.
+///
+/// `login` is the method that authenticates and `logout` the one that ends the
+/// session; a caller pairs them with its own registry entry rather than with a
+/// literal, so a dispatch table does not carry two spellings per site. Both
+/// returned slices point at static storage inside this file and are never
+/// released; the struct is returned by value, so a copy costs nothing and owns
+/// nothing. The v2 names are the two methods [`MethodInfo`] marks
+/// `conditional_on_auth_methods`, which is why they are named together: the
+/// gate a caller has to check for both is the peer's `authMethods` array and
+/// not a capability path.
 pub fn authMethodName(version: WireVersion) struct { login: []const u8, logout: []const u8 } {
     return switch (version) {
         .stable => .{ .login = "authenticate", .logout = "logout" },
@@ -393,6 +638,18 @@ pub const v2_removed_methods = [_][]const u8{
 };
 
 /// The v1 to v2 concept renames, section 6.4.
+///
+/// Each name appears as a `_v1` / `_v2` pair, and the pair is the fact: a
+/// concept keeps its meaning and changes the member or member path it lives
+/// under, so a caller translating between the versions reads both sides rather
+/// than deriving one from the other. The v2 side is not always the v1 side
+/// with a prefix — `clientInfo` becomes `info`, and the two capability members
+/// collapse onto one shared `capabilities` — so the pairs are written out
+/// rather than computed.
+///
+/// Every value is a wire spelling inside a comptime struct, so nothing here is
+/// allocated and nothing is released; a caller may hold any of them for as
+/// long as it likes.
 pub const v2_renames = struct {
     pub const client_info_v1 = "clientInfo";
     pub const client_info_v2 = "info";
@@ -450,12 +707,31 @@ pub const v1_agent_capabilities = [_][]const u8{
     "session.resume",
     "session.close",
     // The binding's own key. The released v1 schema does not define it, and it
-    // is listed because the RFD proposes it and `bridge` carries the path.
+    // is listed because the RFD proposes it and `bridge` carries the path. One
+    // released SDK declares the key from a schema snapshot that is not a
+    // released artifact and marks it unstable; PROTOCOLS.md 6.5.1 has both.
     "mcpCapabilities.acp",
 };
 
+/// Whether `path` is one of the v1 gates the *client* capability object
+/// declares, spelled the way [`Capability.path`] records them: relative to
+/// that object, so `fs.readTextFile` rather than
+/// `clientCapabilities.fs.readTextFile`.
+///
 /// v1 has no closed capability set: an unknown capability is not a decode
-/// error, which is the documented non-breaking extension mechanism.
+/// error, which is the documented non-breaking extension mechanism. So a
+/// `false` here is never a rejection — it is the answer "this library does not
+/// name it", and the caller decides what an unrecognised path is worth. A
+/// `true` is stronger and means the path is one this library will form-check
+/// on the way in and on the way out.
+///
+/// Per side, and the side is the point: the same path can be a client gate and
+/// not an agent gate. Reading it against the wrong side's table would report
+/// a capability the peer never advertised under that object, so
+/// [`isKnownCapability`] is the one dispatch both versions and both sides go
+/// through.
+///
+/// Total and allocation-free, over a comptime table of static strings.
 pub fn isKnownV1ClientCapability(path: []const u8) bool {
     for (v1_client_capabilities) |known| {
         if (std.mem.eql(u8, known, path)) return true;
@@ -463,6 +739,17 @@ pub fn isKnownV1ClientCapability(path: []const u8) bool {
     return false;
 }
 
+/// Whether `path` is one of the v1 gates the *agent* capability object
+/// declares, spelled the way [`Capability.path`] records them: relative to
+/// that object, so `loadSession` and `session.delete` rather than
+/// `agentCapabilities.sessionCapabilities.delete`.
+///
+/// Everything [`isKnownV1ClientCapability`] says applies here unchanged — a
+/// `false` is an unrecognised path rather than a rejection, the table is
+/// comptime and static, and the comparison is exact byte equality — with the
+/// agent's own table behind it. The two tables are disjoint in the entries the
+/// registries gate on, and a path outside both is an extension point on either
+/// side.
 pub fn isKnownV1AgentCapability(path: []const u8) bool {
     for (v1_agent_capabilities) |known| {
         if (std.mem.eql(u8, known, path)) return true;
@@ -470,10 +757,18 @@ pub fn isKnownV1AgentCapability(path: []const u8) bool {
     return false;
 }
 
-/// Whether `path` names a v1 capability of either side.
+/// Whether `path` names a v1 capability of either side, without saying which.
 ///
 /// v1 has no closed capability set, so this is a known-value check and not a
 /// validation: an unknown path is an extension point, not an error.
+///
+/// It also drops the side, which is deliberate and is what makes it the wrong
+/// question to ask when a path comes off the wire. A decoder must ask per side,
+/// because that is what decides whether the member is form-checked: a client
+/// object carrying `promptCapabilities.image` names no client capability, and
+/// under this function it would read as known. [`isKnownCapability`] takes the
+/// version and the side and is the one a decode or an encode should ask;
+/// [`v1CapabilityForm`] is per side for the same reason.
 pub fn isKnownV1Capability(path: []const u8) bool {
     return isKnownV1ClientCapability(path) or isKnownV1AgentCapability(path);
 }
@@ -504,7 +799,7 @@ const v1_boolean_paths = [_][]const u8{
     "auth.terminal",
 };
 
-/// The form each v1 gate uses, section 6.5.
+/// The form the v1 schema gives the gate at `path`, section 6.5.
 ///
 /// v1 types the filesystem, the terminal, terminal-mode authentication,
 /// session loading, the three prompt content kinds and everything under
@@ -512,6 +807,16 @@ const v1_boolean_paths = [_][]const u8{
 /// object. A path this library does not know has no form it can claim, and
 /// reports the presence object because that form asserts the least: section
 /// 6.5 makes an unknown capability an extension point, not an error.
+///
+/// The question is asked of `path` alone, so it drops the side, and that is the
+/// same limitation [`isKnownV1Capability`] has. For the boolean domains and
+/// paths in this file the two sides' answers coincide, because none of them
+/// appears on both tables; where they did not, this would answer for a
+/// capability of the other side. A decoder and an encoder therefore do not ask
+/// this — they ask [`isKnownCapability`] for the side first and consult the
+/// form only for a path that side names — and this function is here for a
+/// caller holding a path and nothing else. Total, allocation-free, and it
+/// borrows nothing.
 pub fn v1CapabilityForm(path: []const u8) CapabilityForm {
     if (!isKnownV1Capability(path)) return .presence_object;
     for (v1_boolean_domains) |domain| {
@@ -545,6 +850,20 @@ pub const UnknownTagPolicy = enum {
     catch_all,
 };
 
+/// The answer [`classifyTag`] gives a discriminator string that is in none of
+/// the named values, for `version`.
+///
+/// One rule, read off the version: v1's unions are closed and the string is
+/// not a value this protocol has, v2's declare the free-string `other` branch
+/// and the string is one. Total and allocation-free, and it consults nothing
+/// but the tag.
+///
+/// This is the version rule alone. It does not say a caller may act on either
+/// answer: `RequestPermissionOutcome` has no catch-all branch in either
+/// version, so an unrecognised outcome there is `error.UnknownTag` regardless
+/// of what this returns, and PROTOCOLS.md section 6.6 forbids reading it as
+/// approval. The unions that actually gained a catch-all are the ones the
+/// `classify*` functions below enumerate.
 pub fn unknownTagPolicy(version: WireVersion) UnknownTagPolicy {
     return switch (version) {
         .stable => .reject,
@@ -565,7 +884,24 @@ pub const TagClass = union(enum) {
     undefined_tag,
 };
 
-/// Classify `tag` against the named values of one version's union.
+/// Classify `tag` against `named`, the values one version's union declares.
+///
+/// A string equal to one of `named` is `.{ .named = index }` with that entry's
+/// index in `named`, so the caller reads the table it already holds rather than
+/// re-matching the string. Anything else is decided by the version alone:
+/// `.{ .other }` where the schema declares the catch-all, and
+/// `.{ .undefined_tag }` where its unions are closed.
+///
+/// `named` is compared by exact byte equality in the order given, and `tag`
+/// points at the caller's bytes; neither is copied and neither is retained, so
+/// the answer is a tag and an index and nothing that needs releasing. Nothing
+/// allocates. A `named` table with a duplicate entry answers with the lower
+/// index, which is why every table in this file is checked for that.
+///
+/// The result is a classification and not a decision: `.{ .other }` says the
+/// schema defines the value, not that this library knows what it means. A
+/// union with no catch-all answers `.{ .undefined_tag }` at v1 even when its
+/// table is empty, which is what a v1 `state_update` gets.
 pub fn classifyTag(
     version: WireVersion,
     named: []const []const u8,
@@ -587,6 +923,17 @@ pub fn classifyTag(
 /// is an implementation-specific extension, while an unknown value without the
 /// prefix is reserved for a future ACP variant. A proxy forwards the first and
 /// may have to understand the second, so the two are not interchangeable.
+///
+/// Only the first byte is read, so an empty `tag` is `false` rather than an
+/// error: it names no variant and so is not an extension of one. Total,
+/// allocation-free, and nothing is retained — this is a classification the
+/// caller acts on, and the tag itself is what a caller keeps, because "which
+/// arm of the catch-all is this" is not decided here.
+///
+/// This is about the *spelling*. Whether the schema gives an unrecognised
+/// string a value at all is [`classifySessionUpdate`], and at v1 the answer to
+/// that is `.{ .undefined_tag }` for this tag too: the prefix is a v2
+/// convention, not a v1 one.
 pub fn isImplementationExtension(tag: []const u8) bool {
     return tag.len != 0 and tag[0] == '_';
 }
@@ -637,6 +984,29 @@ pub const v2_stop_reasons = [_][]const u8{
     "cancelled",
 };
 
+/// Classify a `StopReason` string at `version`, against that version's own
+/// table.
+///
+/// The two tables carry the same five strings in the same order, so the
+/// `.{ .named = index }` answer means the same thing at both versions and the
+/// index can be used against [`v1_stop_reasons`] or [`v2_stop_reasons`]
+/// without knowing which one produced it. The versions differ in what happens
+/// to a string in neither table: `.{ .undefined_tag }` at v1, whose `StopReason`
+/// union is closed, and `.{ .other }` at v2, whose is not. That difference is
+/// the whole point of taking the version, and it is why a v2 reader has to be
+/// ready for a reason it has never seen rather than assuming the v1 vocabulary
+/// is closed.
+///
+/// v2 also moved the reason: at v1 it ends the `session/prompt` result, at v2
+/// it arrives in an idle `state_update`. The classification is the same; where
+/// the string was found is not, and a caller that has to tell a finished prompt
+/// from an idle session has to look at the message rather than at this answer.
+///
+/// Total, allocation-free, and nothing is retained: `tag` is compared against
+/// a comptime table of static strings and the result is a tag and an index. A
+/// `.named` answer is this library's reading of the string and not a decision
+/// to end the session; what a caller does with `cancelled` versus `end_turn` is
+/// the session layer's rule, not this function's.
 pub fn classifyStopReason(version: WireVersion, tag: []const u8) TagClass {
     return switch (version) {
         .stable => classifyTag(.stable, &v1_stop_reasons, tag),
@@ -651,7 +1021,19 @@ pub const v1_session_config_option_types = [_][]const u8{ "select", "boolean" };
 /// union that gained the catch-all.
 pub const v2_session_config_option_types = [_][]const u8{ "select", "boolean" };
 
-/// Classify a `SessionConfigOption` `type`.
+/// Classify a `SessionConfigOption` `type` at `version`, against that
+/// version's own table.
+///
+/// The two tables carry the same two values in the same order, so the
+/// `.{ .named = index }` answer means the same thing at both versions. They
+/// differ in what a string outside the pair is: `.{ .undefined_tag }` at v1,
+/// whose union is closed, and `.{ .other }` at v2, whose is not.
+///
+/// Total, allocation-free, and nothing is retained: `tag` is compared against
+/// a comptime table of static strings and the result is a tag and an index. A
+/// `type` is a spelling of the option's own kind and not to be confused with
+/// [`PermissionOptionKindValue`], which is what a `kind` member decodes to and
+/// which has its own four values.
 pub fn classifySessionConfigOptionType(version: WireVersion, tag: []const u8) TagClass {
     return switch (version) {
         .stable => classifyTag(.stable, &v1_session_config_option_types, tag),
@@ -671,14 +1053,22 @@ pub fn classifyElicitationMode(version: WireVersion, tag: []const u8) TagClass {
 // --- Session config options and `replayFrom`, section 6.4 -----------------------
 
 /// The v2 `SessionConfigOptionCategory` values.
+///
+/// This is a name-holder over static wire spellings: it owns nothing, allocates
+/// nothing and is never released. The v2 side of the version difference is
+/// what these names are for, so a v1 reader should ask
+/// [`isSessionModeCategory`] rather than matching one of them.
 pub const session_config_option_category = struct {
     /// The category that carries a session mode. PROTOCOLS.md section 6.4:
     /// `session/set_mode`, the `SessionMode*` types and `current_mode_update`
     /// are all replaced by a config option carrying this category, so a v2
     /// reader looking for the v1 mode surface has to look here instead.
     pub const mode = "mode";
+    /// The category that names the model the session runs on.
     pub const model = "model";
+    /// The category that names the configuration applied to that model.
     pub const model_config = "model_config";
+    /// The category that names how much reasoning the session shows.
     pub const thought_level = "thought_level";
 };
 
@@ -695,7 +1085,14 @@ pub const v2_session_config_categories = [_][]const u8{
     session_config_option_category.thought_level,
 };
 
-/// Whether `category` is the category that replaced the v1 mode surface.
+/// Whether `category` is the one that replaced the v1 mode surface.
+///
+/// `mode` is the only category that means this, so the answer is "is this
+/// category a session mode?" rather than "is this a category?". The comparison
+/// is exact and case-sensitive. There is no absent case: an unrecognised
+/// category is simply not this one, and a v1 reader has no established
+/// category set at all, which is why the question is only worth asking once the
+/// version is known. Total and allocation-free, and `category` is only read.
 pub fn isSessionModeCategory(category: []const u8) bool {
     return std.mem.eql(u8, category, session_config_option_category.mode);
 }
@@ -713,17 +1110,46 @@ pub const replay_from_type = struct {
 /// a `type` this library does not know is the schema's `other` branch and is
 /// carried rather than refused. Unlike a permission outcome, no approval is
 /// derived from a replay point, so the catch-all gives up nothing.
+///
+/// The `.start` arm is a tag with no borrow. The `.other` arm is a tag and a
+/// borrow of the peer's own text, so a copy is a copy of the handle rather
+/// than of the string, nothing is allocated or released, and an `.other` value
+/// read from a document is valid exactly as long as the buffer it was decoded
+/// into.
 pub const ReplayFrom = union(enum) {
-    /// `{"type": "start"}`, carrying nothing but optional `_meta`.
+    /// `{"type": "start"}`, carrying nothing but optional `_meta`. The `_meta`
+    /// is not modelled, so a document carrying one re-encodes without it; the
+    /// arm is still the one place the wire can spell this point.
     start,
     /// Any other `type`. The rest of the object belongs to the peer that sent
     /// it and is not this library's to interpret: neither arm carries it, so
     /// a document with members beside `type` re-encodes without them.
     /// [`encodeReplayFrom`] records that loss and what closing it would take.
+    ///
+    /// The value cannot be `replay_from_type.start`, which the decoder gives
+    /// the `.start` arm and the encoder refuses here, so a tag on this arm and
+    /// a decoded document always agree on which arm the wire spells.
     other: []const u8,
 };
 
-/// Decode a v2 `ReplayFrom` object.
+/// Decode a v2 `ReplayFrom` object out of `raw`, using `scratch` for keys and
+/// for the `type` string.
+///
+/// `.{ .other }`'s tag borrows `raw` where the string carried no escape and
+/// `scratch` where it did, so both buffers must stay alive and unmodified while
+/// the value is read. `.{ .start }` borrows nothing. Nothing allocates and
+/// there is nothing to release.
+///
+/// `error.MissingField` when the object carries no `type`, `error.MalformedJson`
+/// for a second value behind the closing brace, and the reader's own tags for
+/// everything else; `error.BufferTooSmall` is the caller's scratch being too
+/// narrow for a key or an escaped `type`. On every one of those `raw` and
+/// `scratch` are the caller's still, so the same buffers can be reused for the
+/// next document.
+///
+/// A `type` this library does not name is not an error here, because the v2
+/// schema defines the catch-all that receives it — the opposite of
+/// [`decodePermissionOutcome`], whose union has none in either version.
 pub fn decodeReplayFrom(raw: []const u8, scratch: []u8) DecodeError!ReplayFrom {
     var reader = json.Reader.init(raw);
     var tag: ?[]const u8 = null;
@@ -762,22 +1188,54 @@ pub fn decodeReplayFrom(raw: []const u8, scratch: []u8) DecodeError!ReplayFrom {
     return .{ .other = kind };
 }
 
-/// Encode a v2 `ReplayFrom` object.
+/// Write `value` as a v2 `ReplayFrom` object, with no leading or trailing
+/// bytes.
 ///
-/// The exact inverse of [`decodeReplayFrom`]: the two agree on every value one
-/// of them can reach, and a value this refuses is one the decoder could not
-/// have returned.
+/// Every value [`decodeReplayFrom`] can return is written, and a value this
+/// refuses is one that decoder could not have returned: `.other` holding
+/// `replay_from_type.start`, which would be a document that decodes as the
+/// other arm — the arm the caller asked to encode is the one the wire cannot
+/// spell.
 ///
-/// Two classes of byte sequence the pair does not agree on, and both are the
-/// decoder's to answer for. `ReplayFromStart` carries an optional `_meta` that
-/// this module models nowhere, and the `other` branch sets
-/// `additionalProperties`, so a document carrying members beside `type` of
-/// either kind decodes to a value that re-encodes to `{"type":"…"}`. Refusing
-/// the value would not help, because the members are gone before any encoder
-/// sees the result; they have to be carried by [`ReplayFrom`] itself, and that
-/// is a change to the shape rather than to this function. Carrying them means
-/// a borrowed lexeme beside the tag on both arms, and `src/acp_session.zig`
-/// and `src/testkit.zig` both match on and construct those arms.
+/// ## What the round trip does not carry
+///
+/// The guarantee is over the replay point, not over the document it arrived
+/// in, and there is one class of input the pair reads differently.
+/// `ReplayFromStart` carries an optional `_meta` that this module models
+/// nowhere, and the `other` branch sets `additionalProperties`, so a document
+/// carrying members beside `type` of either kind decodes to a value that
+/// re-encodes to `{"type":"…"}`. Refusing the value would not help, because the
+/// members are gone before any encoder sees the result; they have to be carried
+/// by [`ReplayFrom`] itself, and that is a change to the shape rather than to
+/// this function. Carrying them means a borrowed lexeme beside the tag on both
+/// arms, and `src/acp_session.zig` and `src/testkit.zig` both match on and
+/// construct those arms.
+///
+/// Everything else survives: the same arm, the same tag, and no members beyond
+/// `type`, so the bytes here decode back to the value that was written. They
+/// are not the source bytes in general — whitespace is dropped and the tag is
+/// re-escaped — and only the canonical `{"type":"…"}` spelling the tests pin
+/// comes back exactly.
+///
+/// ## The caller's UTF-8
+///
+/// An `.other` tag is written through `json.Writer.string`, which requires
+/// valid UTF-8 and checks nothing in any optimize mode. A tag from
+/// [`decodeReplayFrom`] is valid, because `json.Reader.string` validated it; a
+/// tag a caller built by hand is its own to validate, and an invalid one is
+/// written rather than refused, leaving this library's own reader to reject the
+/// document with `error.InvalidUtf8`. There is no assert on this path, so
+/// nothing catches it in Debug either.
+///
+/// ## Errors, and what is left behind
+///
+/// `error.InvalidField` is decided before the first write, so it leaves
+/// `writer` untouched. `error.BufferTooSmall` is the only tag that arrives
+/// mid-document: `writer` then holds a prefix of the object, which is not one,
+/// so a caller discards it and retries with a larger buffer.
+///
+/// `value` is only read: nothing is allocated, nothing is retained, and an
+/// `.other` tag has to outlive the call rather than the value.
 pub fn encodeReplayFrom(value: ReplayFrom, writer: *json.Writer) EncodeError!void {
     switch (value) {
         .start => try writer.slice("{\"type\":\"" ++ replay_from_type.start ++ "\"}"),
@@ -814,7 +1272,8 @@ pub const v2_agent_capabilities = [_][]const u8{
     "capabilities.session.additionalDirectories",
     // The binding's own key, as `mcpCapabilities.acp` is at v1. The released
     // v2 schema does not define it either, and it is listed because the RFD
-    // proposes it and `bridge` carries the path.
+    // proposes it and `bridge` carries the path. A released SDK declares it
+    // from a snapshot it marks unstable; PROTOCOLS.md 6.5.1 records that.
     "capabilities.session.mcp.acp",
 };
 
@@ -844,6 +1303,14 @@ pub fn isKnownV2Capability(side: Side, path: []const u8) bool {
 }
 
 /// One member of a capability object, as it arrived.
+///
+/// A decoded entry borrows. `path` is a region of the `paths` buffer
+/// [`decodeCapabilityObject`] was given, so writing that buffer again or
+/// releasing it invalidates every entry at once. Nothing here is allocated and
+/// nothing needs releasing; a copy is a copy of the handle rather than of the
+/// path, so both copies name the same bytes and both die with them. That is why
+/// a session that has to keep answering gates keeps the path list
+/// ([`advertisedPaths`]) and drops the entries rather than the other way round.
 pub const Capability = struct {
     /// The dotted path in the spelling a [`MethodInfo`] gate uses, so a decoded
     /// set can be handed straight to [`isMethodSupported`]. A v1 path is
@@ -851,7 +1318,9 @@ pub const Capability = struct {
     /// section 6.5 spells its gates; a v2 path keeps the `capabilities` root,
     /// because that is the member both sides carry in v2. Keeping the root is
     /// what stops a v1 path and a v2 path for the same feature from being the
-    /// same string across a version cutover.
+    /// same string across a version cutover. A hand-built entry has to carry the
+    /// root too, or the encoder refuses it rather than writing a member name
+    /// the walk would read back as a different path.
     path: []const u8,
     /// Whether this library names the path.
     ///
@@ -860,10 +1329,20 @@ pub const Capability = struct {
     /// with the flag off and the caller can tell a gate it may rely on from one
     /// it merely forwards.
     known: bool,
-    /// The form the member had on the wire.
+    /// The form the member had on the wire, and the one fact about the member
+    /// that decides whether it advertises: the two forms assert support
+    /// differently, and a boolean's value has to be read on top of it.
     form: CapabilityForm,
     /// The value of a boolean member, or null for a presence object, which
     /// asserts support by being there rather than by a value.
+    ///
+    /// `null` on a `.boolean` member is not a wire value: the walk reads one as
+    /// a missing member and records no entry at all, and
+    /// [`encodeCapabilityObject`] refuses to write it. It appears only in a
+    /// hand-built entry, where it means "there is no boolean here to write",
+    /// and the encoder answers that with `error.InvalidField` rather than
+    /// guessing `false` — which would say a member it cannot spell advertises
+    /// "unsupported".
     value: ?bool,
 
     /// Whether this member advertises support.
@@ -871,7 +1350,12 @@ pub const Capability = struct {
     /// A presence object advertises by existing, which is why an empty object
     /// is the whole message. A `false` boolean is the v1 spelling of
     /// "unsupported", so the value has to be read rather than assumed from the
-    /// member's presence.
+    /// member's presence. A `.boolean` member with no value answers false,
+    /// which matches the one thing this library writes for it: a member the
+    /// walk could not read as a capability at all.
+    ///
+    /// Total and allocation-free. The entry arrives by value, so this borrows
+    /// nothing and retains nothing; it is safe to call from any thread.
     pub fn advertised(self: Capability) bool {
         return switch (self.form) {
             .presence_object => true,
@@ -881,20 +1365,55 @@ pub const Capability = struct {
 };
 
 /// The leaves of one decoded capability object.
+///
+/// A pure borrow: `entries` is a slice of the caller's own array and every
+/// `Capability.path` inside it points into the caller's `paths` buffer, so a
+/// set owns nothing, allocates nothing and needs no release. Copying a set
+/// copies the slice header rather than the entries, so a copy names the same
+/// storage and dies with it. A hand-built set is a supported value — the
+/// encoders take one — and then both obligations are the builder's: the paths
+/// have to come from somewhere that outlives the write, and they have to carry
+/// the spelling the encoder writes from.
+///
+/// The order of `entries` is what [`encodeCapabilityObject`] reads to rebuild
+/// the nesting, so a set built by hand has to reproduce the parent-then-child
+/// order a decode produces.
 pub const CapabilitySet = struct {
-    /// The entries, in wire order, in caller-owned storage.
+    /// The entries, in wire order, in caller-owned storage. Every member the
+    /// object carried is represented: the ones that recorded, as entries, and
+    /// the ones that recorded nothing — an explicit `null`, a value no schema
+    /// declares — as nothing at all. `out[0..entries.len]` is what the walk
+    /// wrote, and a slot past it belongs to the walk's own bookkeeping rather
+    /// than to this set.
     entries: []const Capability,
     /// Whether the capability member was on the wire at all. Omission means
     /// unsupported in both versions, so a caller can tell "advertised nothing"
-    /// from "advertised an empty object".
+    /// from "advertised an empty object". The two are written differently:
+    /// `false` produces no member and `true` produces `{}`, so a set carrying
+    /// this flag round-trips through the encoder.
     present: bool,
 };
 
 /// Flatten a decoded set into the path list [`isMethodSupported`] takes.
 ///
-/// `out` is caller-owned and the result borrows it; nothing allocates. A buffer
-/// too small is reported rather than truncated, because a truncated list reads
-/// as a peer that advertised less than it did.
+/// Only members that advertise are copied, so the list is the peer's support
+/// and not merely its vocabulary: a v1 boolean answered `false` is a member on
+/// the wire and no support here. A capability this library does not name is
+/// included — whether it is worth anything is the caller's judgment — so a
+/// vendor path reaches a gate the caller chose to gate on it.
+///
+/// `out` is caller-owned and the result borrows it; nothing allocates and
+/// nothing is copied, so the returned paths still point into whatever
+/// `set.entries` pointed into and the list is valid exactly as long as both
+/// that buffer and `out` are unchanged. `out` past the returned length keeps
+/// whatever the caller had put there.
+///
+/// `error.BufferTooSmall` is the caller's own array being too short, and it is
+/// reported rather than truncated: a truncated list reads as a peer that
+/// advertised less than it did, which is the one answer a caller may not
+/// invent. On that path the first `out.len` slots hold paths that are real, but
+/// no count is returned, so a caller must discard them and retry with a bigger
+/// array. There is no other error.
 pub fn advertisedPaths(set: CapabilitySet, out: [][]const u8) DecodeError![]const []const u8 {
     var count: usize = 0;
     for (set.entries) |entry| {
@@ -1369,6 +1888,33 @@ fn childPath(version: WireVersion, path: []const u8) []const u8 {
 /// the v1 extension rule on purpose: the rule keeps an unknown *capability*
 /// legal, and a wrong form on a known one, or any boolean at v2, is a shape the
 /// schema does not define rather than a capability this library has not read.
+///
+/// ## What comes back, and what it borrows
+///
+/// The result is a [`CapabilitySet`] over `out`: `entries` is the front of that
+/// array and every `Capability.path` in it is a region of `paths`, so the whole
+/// set is valid exactly as long as the caller leaves `paths` and `out` alone.
+/// Writing `paths` again, or releasing it, invalidates every path in the set at
+/// once — which is why the encoder takes the paths with it rather than copying
+/// them. `scratch` is spent on keys and is dead the moment the walk returns;
+/// nothing in the result points into it. `present` is true on every successful
+/// return, including for an empty object, because an empty object is a peer
+/// that advertised nothing rather than an absent member;
+/// `decodeInitializeCapabilities` is where the absent case is distinguished.
+///
+/// ## Errors, and what is left behind
+///
+/// `error.BufferTooSmall` is the caller's own shortage in all three buffers and
+/// nothing else, and on that path the entries already written into `out[0..n]`
+/// and the regions already built in `paths` must be discarded: no count is
+/// returned, so a caller cannot tell a truncated set from a whole one.
+/// `error.LimitExceeded` is a document nested past `json.max_depth`, and
+/// `error.MalformedJson` is a second value behind the object's closing brace or
+/// a syntax error inside it. `error.InvalidField` is a `.protocol` side or a
+/// member in a form its version does not declare. `error.MissingField`,
+/// `error.Truncated`, `error.InvalidUtf8` and the reader's own tags come from
+/// the JSON walk. On every one of them `raw` is untouched, so the same buffers
+/// can be handed to the next document.
 pub fn decodeCapabilityObject(
     version: WireVersion,
     side: Side,
@@ -1414,7 +1960,8 @@ pub fn decodeCapabilityObject(
     return .{ .entries = out[0..walk.count], .present = true };
 }
 
-/// Refuse a member whose form its version does not declare for its path.
+/// Refuse a member whose form its version does not declare for its path, and a
+/// v2 path the walk could not have recorded.
 ///
 /// The rule `CapabilityWalk.checkForm` applies on the reading side, asked the
 /// same way: per `side`, through [`isKnownCapability`]. An encoder that did
@@ -1424,6 +1971,15 @@ pub fn decodeCapabilityObject(
 /// than a capability this library has not read. A validator that asked
 /// side-independently would go further than its decoder and refuse a value the
 /// decoder had returned.
+///
+/// The v2 root is the same kind of rule and the same reason: the walk writes
+/// the root into `paths` before the first member, so a recorded path always
+/// carries it and a path that does not is one no walk produced. The comparison
+/// is against `capabilities.` with the dot in it, so it is a whole leading path
+/// component and not a prefix match: `capabilitiesFoo.bar` does not begin with
+/// `capabilities.`, and neither does a bare `capabilities`. v1 is untouched by
+/// this rule, because a v1 path is relative to the side's own object and
+/// carries no root.
 fn validateCapabilityEntry(
     version: WireVersion,
     side: Side,
@@ -1448,27 +2004,130 @@ fn validateCapabilityEntry(
             if (entry.form != v1CapabilityForm(entry.path)) return error.InvalidField;
         },
         .draft => {
+            // The root is written into `paths` ahead of the first member, so a
+            // path the walk recorded always begins with it and the member name
+            // this writes is what is left after the root comes off. A path that
+            // does not begin with the root has no member name this function can
+            // take: it would be written as one name containing dots, which the
+            // walk would read back as that name with the root prepended — a
+            // different path, from a document no walk produced. Refusing it
+            // keeps what this writes and what this reads the same value. The
+            // constant carries the dot, so this is a leading path *component*:
+            // `capabilitiesFoo.bar` and a bare `capabilities` are refused too,
+            // because neither is a path the walk could have recorded.
+            if (!std.mem.startsWith(u8, entry.path, v2_capabilities_root)) {
+                return error.InvalidField;
+            }
             if (entry.form != v2_capability_form) return error.InvalidField;
         },
     }
 }
 
-/// Refuse a set the decoder for `version` and `side` could not have returned.
+/// The container levels already spent above the capability object that
+/// [`encodeCapabilityObject`] writes: none. The object that call writes is the
+/// whole document, so the capability object itself is the seed: a level spent
+/// ahead of every presence object, because it is the container they sit inside.
+const capability_object_depth = 1;
+
+/// The container levels already spent above that same object inside the body
+/// [`encodeInitializeCapabilities`] writes.
 ///
-/// Separate from [`encodeCapabilityObject`] so that
-/// `encodeInitializeCapabilities` can run it before it writes the member
-/// name: a refusal that reached the caller after `{"capabilities":` had
-/// landed in the buffer would leave a prefix that reads as a member and is
-/// not a document.
+/// The budget is over the document rather than over the member, and this is a
+/// whole document: `decodeInitializeCapabilities` opens the body with
+/// `json.Reader.beginObject` and then reads the member with `rawValue`, which
+/// spends a level on the object the member carries. So the same set is one
+/// level shallower here than it is on its own, and it is the *document* the
+/// bound is about rather than the part of it this library spells.
+const initialize_body_depth = capability_object_depth + 1;
+
+/// Refuse a set the decoder for `version` and `side` could not have returned
+/// in a document `base_depth` says the set is written into.
+///
+/// Separate from the writers so that a caller can run this before it writes
+/// anything: a refusal that reached the caller after `{"capabilities":` had
+/// landed in the buffer would leave a prefix that reads as a member and is not
+/// a document. How deep a set may nest is one of those same facts — no decode
+/// returns a set past `json.max_depth` — so [`validateCapabilityDepth`] is
+/// asked here too, rather than left to the writer's own array.
+///
+/// `base_depth` is how much of that budget the containers around the set have
+/// already spent: [`capability_object_depth`] for a set written on its own and
+/// [`initialize_body_depth`] for the `initialize` member, which is a whole
+/// body carrying the object as one of its members. It is passed rather than
+/// assumed because the two writers are at different depths over the same
+/// entries, and a validator that picked one of them would refuse a set the
+/// other can write.
 fn validateCapabilitySet(
     version: WireVersion,
     side: Side,
     set: CapabilitySet,
+    base_depth: usize,
 ) EncodeError!void {
     // Neither schema gives a capability object to a side-independent method,
     // and `decodeCapabilityObject` refuses that before it reads a byte.
     if (side == .protocol) return error.InvalidField;
     for (set.entries) |entry| try validateCapabilityEntry(version, side, entry);
+    try validateCapabilityDepth(version, set, base_depth);
+}
+
+/// Refuse a set nested deeper than any decode could have produced in a
+/// document `base_depth` says the set is written into.
+///
+/// The bound is `json.max_depth`, charged the way the decoder charges it, and
+/// `base_depth` is how much of it is already spent before the first presence
+/// object: the capability object is a container because it is the member and
+/// `decodeCapabilityObject` opens it with `json.Reader.beginObject` before it
+/// reads a member of it, and the `initialize` body around it is a container
+/// because it is the document. So a set carrying `json.max_depth - base_depth`
+/// presence objects below the capability object is the deepest any decode
+/// admits — the members of the last one sit at walk depth `json.max_depth`,
+/// which is the level `CapabilityWalk.walkMember` still accepts, and the
+/// object above them is the last whose `enterContainer` has a level left to
+/// spend. One presence object more is `error.InvalidField` here, where nothing
+/// has been written, rather than a document no decode could read back. A
+/// boolean spends no level, because `enterContainer` is never asked for one, so
+/// a scalar inside the deepest admissible object is an ordinary member.
+///
+/// The walk below is the write loop of [`writeCapabilityObject`] with the
+/// bytes left out: the same entries in the same order, the same
+/// [`capabilityClosedLevels`] closing what `path` is not inside, and the same
+/// [`isCapabilityAncestor`] deciding that. A deep branch followed by a sibling
+/// therefore unwinds rather than sums, and only the deepest branch is charged;
+/// a bound derived any other way would refuse a set the writer can spell or
+/// admit one the decoder refuses, which is the drift this shares its
+/// unwinding to prevent.
+///
+/// Allocation-free and off the writer's buffer: the open objects are entry
+/// indices in an array of this frame, bounded before an index is stored
+/// rather than after.
+fn validateCapabilityDepth(
+    version: WireVersion,
+    set: CapabilitySet,
+    base_depth: usize,
+) EncodeError!void {
+    // The containers `base_depth` counts are spent on every entry and are not
+    // presence objects, so their levels are a constant charged here rather
+    // than indices: the decoder spends them opening the objects around the set
+    // and never gives them back.
+    //
+    // Indexed by `depth`, which the check below bounds by
+    // `json.max_depth - base_depth`, so the array is never indexed out of
+    // range — and `base_depth` is at least `capability_object_depth`, so that
+    // bound is inside the array rather than one past it.
+    var open: [json.max_depth]usize = undefined;
+    var depth: usize = 0;
+    for (set.entries, 0..) |entry, index| {
+        depth -= capabilityClosedLevels(version, set.entries, open[0..depth], entry.path);
+        // A boolean spends no level: `json.Reader.enterContainer` is never
+        // asked for one, so a scalar inside the deepest admissible object is
+        // read and recorded like any other member.
+        if (entry.form != .presence_object) continue;
+        // Checked before the index is stored, so `open[depth]` is written at
+        // most at `json.max_depth - 1 - base_depth`.
+        if (depth + base_depth >= json.max_depth) return error.InvalidField;
+        open[depth] = index;
+        depth += 1;
+    }
 }
 
 /// The member name a top-level path takes inside the capability object.
@@ -1515,27 +2174,120 @@ fn isCapabilityAncestor(
     return version == .stable and isV1SessionGate(parent, path);
 }
 
-/// Encode a capability object into `writer`.
+/// How many of the objects in `open` `path` is not inside.
 ///
-/// The exact inverse of [`decodeCapabilityObject`] over the set it returns. A
-/// document the walk can produce re-encodes to the same bytes: the entries
-/// are recorded parent first, so the nesting comes back in the order it went
-/// out, and nothing is written for a member that recorded nothing. A member a
-/// peer spelled twice is one the walk spent, so it is one member here: the
-/// re-encoded document carries the occurrence that was read and not the one
-/// that was dropped, which is the same loss the decoder made on the way in and
-/// the one every other member walk in this library already makes.
+/// `open` holds the entries of the presence objects still open, oldest first,
+/// which is what makes the deepest one the last recorded: a prefix is shorter
+/// than what it prefixes, and the walk records an ancestor before anything
+/// inside it. Each object the test does not answer for has closed already, so
+/// the count is how many closing braces the writer owes before the member
+/// `path` takes — and, in [`validateCapabilityDepth`], how many levels the
+/// entry gives back.
 ///
-/// The entries are expected in the order the walk recorded them, which is
-/// what a decoded set carries. The nesting is read from the paths, so a
-/// hand-built set whose paths are not a parent-then-child chain writes a
-/// shape the walk would never have produced.
+/// The write loop and the depth pass both ask this instead of running an
+/// unwinding of their own. A bound counted against one shape and a document
+/// written from another is the drift the shared question exists to stop.
+fn capabilityClosedLevels(
+    version: WireVersion,
+    entries: []const Capability,
+    open: []const usize,
+    path: []const u8,
+) usize {
+    var closed: usize = 0;
+    while (closed < open.len and !isCapabilityAncestor(
+        version,
+        entries[open[open.len - 1 - closed]].path,
+        path,
+    )) {
+        closed += 1;
+    }
+    return closed;
+}
+
+/// Write `set` as a capability object, with no leading or trailing bytes.
+///
+/// ## What the round trip guarantees
+///
+/// The agreement is over the set, not over the bytes. A document
+/// [`decodeCapabilityObject`] accepted re-encodes to a document that decodes
+/// back to the same entries: the same paths, the same forms, the same values,
+/// the same `present`, and the same nesting, because the entries are recorded
+/// parent first and the nesting is rebuilt from the paths. The bytes are not
+/// the source bytes in general: whitespace is dropped and a member name that
+/// needed an escape is written with this library's escapes, so
+/// `{"terminal": true}` comes back as `{"terminal":true}` and only the
+/// canonical spellings the tests pin reproduce their source exactly.
+///
+/// Two classes of member do not come back, and both are losses the decoder
+/// made on the way in rather than choices this function makes:
+/// nothing is written for a member that recorded nothing — an explicit `null`,
+/// a string, a number, an array — and a member a peer spelled twice is one the
+/// walk spent, so the re-encoded document carries the occurrence that was read
+/// and not the one that was dropped. That is the same loss every other member
+/// walk in this library already makes.
+///
+/// ## The caller's UTF-8
+///
+/// Member names are written through `json.Writer.string`, which requires valid
+/// UTF-8 and checks nothing in any optimize mode. A name taken off a decoded
+/// wire is valid, because `json.Reader.string` validated it; a name inside a
+/// hand-built path is the builder's to validate, and an invalid one is written
+/// rather than refused, leaving this library's own reader to reject the
+/// document with `error.InvalidUtf8`. There is no assert on this path, so
+/// nothing catches it in Debug either.
+///
+/// ## The shape the entries have to have
+///
+/// `set.entries` is read as a parent-then-child chain in the order the walk
+/// recorded it, which is what a decoded set carries and what a hand-built set
+/// has to reproduce: every entry that is a descendant of an earlier one comes
+/// before any entry that is not. The nesting, the separators and the member
+/// names are all read off the paths, so an ordering that is not a chain does
+/// not fail — it writes a different document, and one the walk would not have
+/// produced. A caller building a set by hand therefore owns that obligation,
+/// and the cheapest way to meet it is to decode rather than to spell.
+///
+/// A v2 `path` must begin with the `capabilities` root, because the root is
+/// the member's own name and this function writes the contents of that member.
+/// That is `error.InvalidField` rather than a document with dots in a member
+/// name: the walk would read such a name back as a path with the root
+/// prepended, so the two would disagree about the value.
 ///
 /// [`Capability.known`] is neither read nor written. It is a fact about this
 /// library's tables rather than about the wire, so the decoder derives it with
 /// [`isKnownCapability`] and the encoder has nothing to say about it. A set
 /// built by hand keeps the flag its caller gave it, so a caller that wants the
 /// derived answer has to ask [`isKnownCapability`] itself.
+///
+/// ## Errors, and what is left behind
+///
+/// Every refusal of the set itself — a `.protocol` side, an entry whose form
+/// its version does not declare, a boolean with no value, a presence object
+/// with one, a v2 path with no root — is `error.InvalidField` or
+/// `error.UnknownTag` and is decided before the first byte is written, so
+/// those leave `writer` untouched. A `present = false` set is refused the same
+/// way: a capability object *is* the member, and `{}` would decode as a member
+/// that was there and advertised nothing, which is `present = true`.
+///
+/// Nesting is a fact about the set rather than a shortage, so it is refused
+/// before the first byte: the capability object is a container too, and
+/// [`validateCapabilityDepth`] charges it as one through
+/// `capability_object_depth`. That makes a set carrying `json.max_depth - 1`
+/// presence objects below the root the deepest this library can read — its
+/// members sit at walk depth `json.max_depth` — and one presence object more
+/// an `error.InvalidField` no decode could have returned. The bound is over
+/// the document this function writes, which is the capability object itself;
+/// [`encodeInitializeCapabilities`] charges one more level for the body
+/// around it and so refuses a set one level shallower.
+///
+/// `error.BufferTooSmall` is then the caller's own shortage and has one
+/// source: `writer` running out of room. On that path `writer` holds a prefix
+/// of the object — up to a complete member, with no closing braces — so a
+/// caller discards it and retries with a larger buffer rather than appending
+/// to it.
+///
+/// `set` is only read: nothing is allocated, nothing is retained, and the
+/// paths behind the entries have to outlive the call rather than the value.
 pub fn encodeCapabilityObject(
     version: WireVersion,
     side: Side,
@@ -1546,26 +2298,45 @@ pub fn encodeCapabilityObject(
     // this can spell: `{}` would decode as a member that was there and
     // advertised nothing, which is `present = true`.
     if (!set.present) return error.InvalidField;
-    try validateCapabilitySet(version, side, set);
+    try validateCapabilitySet(version, side, set, capability_object_depth);
+    try writeCapabilityObject(version, set, writer);
+}
 
+/// Write `set` as a capability object, with no leading or trailing bytes, for
+/// a caller that has already run [`validateCapabilitySet`] for the document
+/// it is writing into.
+///
+/// Both public entry points validate at their actual container depth before
+/// calling this writer. The split avoids duplicate validation and prevents the
+/// initializer from substituting the weaker standalone depth budget.
+fn writeCapabilityObject(
+    version: WireVersion,
+    set: CapabilitySet,
+    writer: *json.Writer,
+) EncodeError!void {
     // The set is flat, so the nesting is rebuilt from the paths. The object
     // still open above an entry is its deepest ancestor, which is the last
-    // one recorded before it: a prefix is shorter than what it prefixes, and
-    // the walk records an ancestor before anything inside it. Anything else
-    // has closed already, and closes here.
-    var open: [json.max_depth + 1]usize = undefined;
+    // one recorded before it, and `capabilityClosedLevels` is the one place
+    // the test for that is asked: here to write the braces, and in
+    // `validateCapabilityDepth` to count the depth the same set spends.
+    //
+    // Indexed by `depth`, which that preflight has already bounded by
+    // `json.max_depth` minus the containers around the set, so `open` has a
+    // slot for every depth this reaches and nothing here checks it a second
+    // time.
+    var open: [json.max_depth]usize = undefined;
     var depth: usize = 0;
 
     try writer.byte('{');
     for (set.entries, 0..) |entry, index| {
-        while (depth != 0 and !isCapabilityAncestor(
+        const closed = capabilityClosedLevels(
             version,
-            set.entries[open[depth - 1]].path,
+            set.entries,
+            open[0..depth],
             entry.path,
-        )) {
-            depth -= 1;
-            try writer.byte('}');
-        }
+        );
+        for (0..closed) |_| try writer.byte('}');
+        depth -= closed;
         // A member needs a comma before it when the one before it was not its
         // own ancestor, and that is the whole rule: an ancestor wrote the
         // object this one goes inside, so the object is already open and no
@@ -1578,13 +2349,6 @@ pub fn encodeCapabilityObject(
             entry.path,
         )) {
             try writer.byte(',');
-        }
-        // Bounded by the same depth `CapabilityWalk` refuses past, so a set
-        // nested deeper than any decode can produce is reported rather than
-        // written past the end of the stack. It is checked before the member
-        // is written, so the refusal is the last thing a caller sees.
-        if (entry.form == .presence_object and depth == open.len) {
-            return error.BufferTooSmall;
         }
         const key = if (depth == 0) capabilityRootKey(version, entry.path) else capabilityChildKey(
             version,
@@ -1632,11 +2396,44 @@ fn capabilityMemberName(version: WireVersion, side: Side) DecodeError![]const u8
     };
 }
 
-/// Decode the capability member of an `initialize` request or response.
+/// Decode the capability member out of an `initialize` body at `version` for
+/// `side`, into `out` and `paths`, using `scratch` for keys.
 ///
 /// The member is optional in every version, so an initialize that advertises
 /// nothing decodes to an absent set rather than an error: section 6.5 makes
-/// omission mean unsupported, which is a set of no paths.
+/// omission mean unsupported, which is a set of no paths. `present` is how a
+/// caller tells those two apart from an empty object, and it is the one field
+/// [`encodeInitializeCapabilities`] writes differently for them.
+///
+/// Buffers are the caller's throughout and the result borrows them, exactly as
+/// [`decodeCapabilityObject`] documents: every `Capability.path` is a region
+/// of `paths`, and the value is valid until the caller writes that buffer or
+/// releases it. `out` is written from the front and holds one slot per member
+/// the object carries, claims from the back, so `out[0..entries.len]` is the
+/// set and the remainder is the walk's own bookkeeping. The nested capability
+/// object is borrowed from `raw` rather than copied, so it costs `scratch`
+/// nothing and the keys read to find it are dead by the time the nested walk
+/// runs — which is why one buffer serves both.
+///
+/// `error.BufferTooSmall` is the caller's own shortage and nothing else:
+/// `out` too small for the members the object carries, `paths` too small for
+/// the paths it records, or `scratch` too small for a key. Every other error is
+/// a fact about the peer's document — `MalformedJson` for a second value behind
+/// the body's closing brace, `Truncated`, `InvalidUtf8`, `MissingField`,
+/// `InvalidField` for a member in a form its version does not declare,
+/// `LimitExceeded` past `json.max_depth` — which this body is two levels deep
+/// before the set begins, because the body is a container and the member is
+/// read with `rawValue`, which spends a level opening the object it carries.
+/// That is the same budget [`encodeInitializeCapabilities`] charges, so the
+/// deepest body it writes is one with `json.max_depth - 2` presence objects
+/// below the member, and a set one level deeper than
+/// `encodeCapabilityObject` can write is refused here as `LimitExceeded` and
+/// there as `error.InvalidField` — and `raw` is untouched on every one of
+/// these errors, so the same buffers can be reused for the next document.
+///
+/// A `.protocol` side is `error.InvalidField`: neither schema gives a
+/// capability object to a side-independent method, and the refusal is made
+/// before a byte is read.
 pub fn decodeInitializeCapabilities(
     version: WireVersion,
     side: Side,
@@ -1678,14 +2475,47 @@ pub fn decodeInitializeCapabilities(
     return .{ .entries = out[0..0], .present = false };
 }
 
-/// Encode the capability member of an `initialize` request or response.
+/// Write the capability member of an `initialize` request or response as the
+/// whole `initialize` body, and nothing else.
 ///
-/// The inverse of [`decodeInitializeCapabilities`] over the value it returns:
-/// the body written here decodes back to `set`, under the member name this
-/// version gives `side`. It is not the inverse of the whole `initialize`
-/// body, which also carries a protocol version and an info object this
-/// module does not model, so a caller writing one composes the two around
-/// this rather than calling it alone.
+/// What it writes is the body `decodeInitializeCapabilities` reads: an
+/// object carrying `set` under the member name this version gives `side`, so a
+/// body this writes decodes back to `set` with `present` as it was given. The
+/// `present = false` case writes `{}`, which is a body with no member at all,
+/// and that is the spelling the decoder reads back as absent. It is not the
+/// inverse of a whole `initialize` body: that body also carries a protocol
+/// version and an info object this module does not model, so a caller writing
+/// one composes the two around this rather than calling it alone.
+///
+/// ## Errors, and what is left behind
+///
+/// `error.InvalidField` for a `.protocol` side, which neither version gives a
+/// capability object to, and for any entry `validateCapabilitySet` refuses.
+/// Both are decided before the first byte is written, so they leave `writer`
+/// untouched and the caller may reuse the buffer.
+///
+/// Nesting is one of those refusals, and it is a different answer here than
+/// [`encodeCapabilityObject`] gives for the same entries: this writes a whole
+/// `initialize` body and the capability object is a member of it, so the
+/// preflight runs at `initialize_body_depth` and a set carrying
+/// `json.max_depth - 2` presence objects below the member is the deepest this
+/// library can read back. One presence object more is `error.InvalidField`
+/// with the buffer untouched — the level `decodeInitializeCapabilities` spends
+/// on the body and the one it spends reading the member with `rawValue` are
+/// both already spent, and a caller composing a larger `initialize` body has
+/// to charge whatever it puts around this one.
+///
+/// `error.BufferTooSmall` is the one tag that can arrive after the brace and
+/// the member name are already in the buffer, and it is the caller's own
+/// shortage and nothing else: the nested capability object can be asked how
+/// many bytes a set needs, but nothing asks it, so a short buffer is
+/// discovered by running out of it. On that path `writer` holds a prefix
+/// ending in `{"<member>":`, or in as much of the nested object as fitted. The
+/// prefix is not a body, so a caller must discard it and retry with a larger
+/// buffer rather than append to it.
+///
+/// Nothing allocates; `set` is only read, and its entries continue to borrow
+/// whatever buffers they were decoded into.
 pub fn encodeInitializeCapabilities(
     version: WireVersion,
     side: Side,
@@ -1704,30 +2534,64 @@ pub fn encodeInitializeCapabilities(
         try writer.slice("{}");
         return;
     }
-    // Ahead of the member name rather than left to the nested call, so a set
+    // Ahead of the member name rather than left to the nested write, so a set
     // `validateCapabilitySet` refuses leaves the buffer untouched rather than
-    // holding `{"capabilities":`. A `BufferTooSmall` from the nested
-    // `encodeCapabilityObject` is the one error that still arrives after the
-    // brace and the member name are in the buffer: that call sizes nothing it
-    // can be asked about before it starts writing, so the guarantee is the
-    // validator's alone.
-    try validateCapabilitySet(version, side, set);
+    // holding `{"capabilities":`. That includes a set nested deeper than any
+    // decode can produce, which is a fact about the set rather than a shortage
+    // and is refused in the same place, before the member name, as a wrong
+    // form. The depth it is asked with is `initialize_body_depth` and not
+    // `capability_object_depth`, because this is a whole document with the
+    // capability object as one of its members and `json.max_depth` is a budget
+    // over the document: the same set that is the deepest thing
+    // `encodeCapabilityObject` can write is one level too deep here, and only
+    // here. The write below then writes the object without asking the same
+    // questions twice, because the second run would be a second depth and so
+    // a second answer.
+    try validateCapabilitySet(version, side, set, initialize_body_depth);
     try writer.byte('{');
     try writer.string(member);
     try writer.byte(':');
-    try encodeCapabilityObject(version, side, set, writer);
+    try writeCapabilityObject(version, set, writer);
     try writer.byte('}');
 }
 
 // --- 6.6 Permission options ----------------------------------------------------
 
 /// The `kind` of a permission option, verbatim from the specification.
+///
+/// The four tags are the wire spellings, and `string` and `fromString` are
+/// inverses over all four, so a value read off the wire and a value written
+/// from a hand-built option agree on the bytes. What this enum is not is the
+/// whole of what a `kind` can be at v2: an `anyOf` plus an `other` branch means
+/// a fifth string is a value the schema defines, and
+/// [`PermissionOptionKindValue`] is what a decoder returns so the two cannot
+/// be confused. At v1 the four are all of them, and a fifth is
+/// `error.UnknownTag`.
+///
+/// It carries no options, no state and no borrow, so a value is freely copied
+/// and shared across threads, and there is nothing to release. `allow_always`
+/// and `reject_always` say what the user chose for this prompt, not that the
+/// library will remember it next time: no state is stored here, so a peer that
+/// sent an `allow_always` has still to be asked again unless something above
+/// this module remembers the choice.
 pub const PermissionOptionKind = enum {
     allow_once,
     allow_always,
     reject_once,
     reject_always,
 
+    /// The tag whose wire spelling is `text`, or `null` for any other string.
+    ///
+    /// The comparison is exact and case-sensitive against the four tag names,
+    /// so `allow-once`, `allowOnce` and `ALLOW_ONCE` are all `null`. `null` is
+    /// not a default kind and never resolves to one: what an unrecognised
+    /// string means is the version's business, not this function's, so a caller
+    /// that has a string in hand asks [`unknownTagPolicy`] next — that is
+    /// exactly what `decodePermissionOptionKind` does. Nothing is retained;
+    /// `text` is read and dropped.
+    ///
+    /// Total and allocation-free. The scan is unrolled at compile time over
+    /// the four fields, so it costs at most four byte comparisons.
     pub fn fromString(text: []const u8) ?PermissionOptionKind {
         inline for (@typeInfo(PermissionOptionKind).@"enum".fields) |field| {
             if (std.mem.eql(u8, text, field.name)) {
@@ -1737,6 +2601,13 @@ pub const PermissionOptionKind = enum {
         return null;
     }
 
+    /// The wire spelling of this kind, which is also the tag name.
+    ///
+    /// The inverse of [`PermissionOptionKind.fromString`] over all four tags,
+    /// so `PermissionOptionKind.fromString(k.string())` is `k` for every `k`.
+    /// The result points at static storage inside this file and is never
+    /// released, so a caller may hold it for as long as it likes and needs no
+    /// copy to outlive anything.
     pub fn string(self: PermissionOptionKind) []const u8 {
         return @tagName(self);
     }
@@ -1755,20 +2626,54 @@ pub const PermissionOptionKind = enum {
 /// There is deliberately no catch-all variant. The specification requires that
 /// an unrecognised outcome never be treated as approval, and a `rejected` or
 /// `unknown` default would be a guess that could be read as consent.
+///
+/// The union is a tag and, on one arm, a borrow: no allocation, no owner and
+/// nothing to release. A copy is a copy of the tag and the slice, so both
+/// copies name the same borrowed bytes and neither may outlive them; sharing a
+/// value across threads is fine as long as the buffer behind it is not written
+/// while it is read. [`encodePermissionOutcome`] takes it by value, so it
+/// never retains the borrow past the call.
 pub const PermissionOutcome = union(enum) {
     /// The client cancelled. The v1 specification requires this response to
     /// every pending permission request when a `session/cancel` arrives.
     cancelled,
     /// The client chose the option named by `option_id`.
+    ///
+    /// Borrows the caller's `raw` or `scratch` buffer, whichever the decode put
+    /// it in, and is invalidated when that buffer is overwritten or released.
+    /// The id is whatever the peer spelled: nothing here checks it against the
+    /// option list of the request it answers, because this function never sees
+    /// that request. Matching it is the caller's obligation, and an id that is
+    /// not on the list is consent to nothing —
+    /// `acp_session.readOutcome` is where that check happens and where an
+    /// unmatched id is reported rather than read as a grant.
     selected: []const u8,
 };
 
-/// Decode a `RequestPermissionOutcome` object.
+/// Decode a `RequestPermissionOutcome` object out of `raw`, using `scratch`
+/// for escaped strings.
 ///
-/// An `outcome` the library does not know is `error.UnknownTag`. That is the
-/// whole point: PROTOCOLS.md section 6.6 requires an agent receiving an
-/// unrecognised outcome to refuse to treat it as approval, and the only safe
-/// surface for that is an error the caller must handle.
+/// The result borrows: `.{ .selected }`'s id points into `raw` when the string
+/// carried no escape and into `scratch` when it did, so both buffers must stay
+/// alive and unmodified for as long as the outcome is read. Nothing allocates
+/// and there is nothing to release. A caller that needs the id past either
+/// buffer has to copy it.
+///
+/// ## Failing closed
+///
+/// An `outcome` this library does not know is `error.UnknownTag`, and there is
+/// no variant for it. That is the whole point: PROTOCOLS.md section 6.6
+/// requires an agent receiving an unrecognised outcome to refuse to treat it
+/// as approval, and the only safe surface for that is an error the caller has
+/// to handle rather than a value it might match on. The same holds for the
+/// contradictions: `error.MissingField` when the `outcome` member is absent or
+/// when `selected` names no option, and `error.InvalidField` when `cancelled`
+/// carries one. Every one of those is a refusal to interpret the message, not
+/// a default and not a cancellation. The `cancelled` answer is reached only
+/// from an explicit `"outcome":"cancelled"`, so no input reaches it by
+/// omission.
+///
+/// ## A repeated member
 ///
 /// A repeated member resolves first-wins, as in every other walk in this
 /// library. This is the decoder behind the library's central safety rule, so
@@ -1776,6 +2681,12 @@ pub const PermissionOutcome = union(enum) {
 /// that answers `cancelled` and then appends the option it wanted would have
 /// the grant read and the user shown the refusal. The repeat is stepped over
 /// rather than read, so the first occurrence's text stays live.
+///
+/// `error.BufferTooSmall` is the caller's own buffer being too narrow for an
+/// escaped string, and nothing is decoded on that path. Every other error is a
+/// fact about the peer's document — `MalformedJson`, `Truncated`,
+/// `InvalidUtf8`, `MissingField`, `InvalidField`, `UnknownTag` — and `raw` is
+/// untouched either way, so a caller may fix the buffer and try again.
 pub fn decodePermissionOutcome(
     raw: []const u8,
     scratch: []u8,
@@ -1817,10 +2728,11 @@ pub fn decodePermissionOutcome(
     }
 
     // An outcome is one JSON value, and this is the one decoder in this file
-    // with a matching encoder. Bytes behind the closing brace would be
-    // dropped by `encodePermissionOutcome` on the way back out, so accepting
-    // them breaks `encode(decode(b)) == b` silently: the truncated bytes
-    // still decode. `jsonrpc.decode` refuses the same document for the same
+    // whose encoder can spell every value it returns. A tail behind the closing
+    // brace would be bytes no encoder writes, so accepting it would mean a
+    // document decoded successfully and then silently lost its tail on the way
+    // back out: the truncated bytes still decode, so nothing downstream would
+    // report it. `jsonrpc.decode` refuses the same document for the same
     // reason.
     if (!reader.atEnd()) return error.MalformedJson;
 
@@ -1841,14 +2753,38 @@ pub fn decodePermissionOutcome(
 /// `oneOf` with an `anyOf` and a free-`type` catch-all, so an unknown type is
 /// defined by the schema and lands in [`PermissionSubject.other`] rather than
 /// being an error.
+///
+/// Every arm borrows. The two string arms point into the caller's `raw` or
+/// `scratch`, and the `command` arm is a struct of borrows rather than owned
+/// bytes, so nothing here allocates, nothing needs releasing, and copying the
+/// value copies the handles rather than the text: both copies name the same
+/// bytes and both die with them. What invalidates a subject is writing or
+/// releasing the buffer behind any field, and reading it is safe from any
+/// thread as long as no one writes that buffer meanwhile. A subject read from
+/// a document is valid only as long as that document and its scratch buffer
+/// are.
+///
+/// There is no variant for a subject the schema does not define: `.{ .other }`
+/// is the schema's own catch-all, and it is a value the caller must decide
+/// what to do with rather than one this module interpreted. What a *user* was
+/// shown is not recorded here — no arm says whether the prompt was renderable —
+/// which is why `acp_session` refuses the catch-all outright when it writes a
+/// prompt rather than carrying it.
 pub const PermissionSubject = union(enum) {
     /// Carries a required `toolCall`, as borrowed JSON text.
     ///
     /// The library does not model `ToolCallUpdate`, so the object is carried
     /// verbatim instead of being flattened into fields this module would then
-    /// have to keep in step with the schema.
+    /// have to keep in step with the schema. The slice is exactly one JSON
+    /// object value and nothing more: the decoder takes it with `rawValue`,
+    /// which proves the value was complete, and the encoder refuses a lexeme
+    /// that is not one object, so a member this library splices in cannot hide
+    /// a second document. It is written out verbatim, whitespace and all.
     tool_call: []const u8,
     /// Carries a required `command` and a required **absolute** `cwd`.
+    ///
+    /// The struct is a value, so reading `.command.subject` copies four
+    /// borrows; see the type for what that does and does not buy.
     command: CommandSubject,
     /// Any other `type` string. The other members of the object are the peer's
     /// and this module reads none of them, so a subject read from a document
@@ -1860,30 +2796,68 @@ pub const PermissionSubject = union(enum) {
 };
 
 /// The `command` arm of a v2 permission subject.
+///
+/// Every field is a borrow out of the caller's decode buffers, so the struct
+/// owns nothing and a copy is a copy of the handles rather than of the text.
+/// `command` and `cwd` are the two the schema requires; the two optionals are
+/// the peer saying which tool call and which terminal this belongs to, and
+/// there is no third state for them here — a member the peer spelled `null`
+/// reads as `null` and re-encodes with the member absent, which
+/// [`encodePermissionSubject`] records as a decoder-side loss.
 pub const CommandSubject = struct {
-    /// The command line, required.
+    /// The command line, required. It is the text a user is approving, and
+    /// this module does not parse or rewrite it: what the peer spelled is what
+    /// the user was shown.
     command: []const u8,
     /// The working directory, required and **absolute**.
+    ///
+    /// A relative path is `error.InvalidField` on the way in and
+    /// `error.InvalidField` on the way out, because the schema types this
+    /// member as an `AbsolutePath` and because a relative path would resolve
+    /// against whatever working directory the process running the command
+    /// happens to have — so the user approving a command in one directory
+    /// would approve it in another. [`isAbsolutePath`] is the test, and
+    /// [`encodePermissionSubject`] is where a relative one is refused.
     cwd: []const u8,
-    /// The tool call this command belongs to, when the agent named one.
+    /// The tool call this command belongs to, when the agent named one. `null`
+    /// when the agent named none, and also when it named one as `null`; the
+    /// two are one state here, and the wire spelling of the second is not
+    /// reproduced on the way back out.
     tool_call_id: ?[]const u8 = null,
-    /// The terminal this command runs in, when the agent named one.
+    /// The terminal this command runs in, when the agent named one. `null`
+    /// carries the same two meanings as `tool_call_id`.
     terminal_id: ?[]const u8 = null,
 };
 
 /// The v2 permission subject discriminator strings.
+///
+/// These are the two arms [`PermissionSubject`] models, by the exact spelling
+/// a `type` member carries. A name-holder over static wire spellings: it owns
+/// nothing, allocates nothing and is never released. A `type` outside this pair
+/// is not an error — it is the schema's `other` branch, and
+/// [`PermissionSubject.other`] is where it lands.
 pub const permission_subject_type = struct {
     pub const tool_call = "tool_call";
     pub const command = "command";
 };
 
-/// Whether `path` is an absolute POSIX path.
+/// Whether `path` is an absolute POSIX path, by its first byte.
 ///
 /// The v2 `CommandPermissionSubject.cwd` is an `AbsolutePath`, so a relative
 /// `cwd` is a value the schema does not permit. It matters beyond the schema:
 /// a relative path would resolve against whatever working directory the
 /// process that runs the command happens to have, so the user approving a
 /// command in one directory would approve it in another.
+///
+/// This is the leading `/` and nothing more, so it is a shape test rather than
+/// a validation of the path: a leading `/` followed by `..` is absolute by this
+/// rule, a POSIX path with no leading slash is never absolute by it, and a
+/// Windows or UNC spelling is not one this function recognises. The schema
+/// types the member the same way this library checks it, so the two agree, and
+/// a caller that needs a resolved path has to resolve it — nothing here touches
+/// the file system.
+///
+/// Total, allocation-free, and an empty `path` is `false` rather than an error.
 pub fn isAbsolutePath(path: []const u8) bool {
     return path.len != 0 and path[0] == '/';
 }
@@ -1899,11 +2873,23 @@ fn nullableString(reader: *json.Reader, scratch: []u8) DecodeError!?[]const u8 {
     return value;
 }
 
-/// Decode a v2 `RequestPermissionSubject` object.
+/// Decode a v2 `RequestPermissionSubject` object out of `raw`, using `scratch`
+/// for escaped strings and for keys.
+///
+/// The result borrows. `.{ .tool_call }`'s lexeme and `.{ .other }`'s tag point
+/// into `raw`; a `.{ .command }` field points into `raw` where its string
+/// carried no escape and into `scratch` where it did. Both buffers must stay
+/// alive and unmodified while the subject is read, and nothing is allocated or
+/// released.
 ///
 /// The `type` member is required and selects the arm. A missing or malformed
-/// required member of a known arm is a decode error; an unknown `type` is not,
-/// because the v2 schema defines the catch-all that receives it.
+/// required member of a known arm is a decode error — `error.MissingField` for
+/// an absent one, `error.InvalidField` for a `toolCall` that is not an object or
+/// a `cwd` that is not absolute — while an unknown `type` is not an error,
+/// because the v2 schema defines the catch-all that receives it. That is the
+/// difference from [`decodePermissionOutcome`], whose union has no catch-all in
+/// either version: here an unrecognised discriminator is a value to carry, and
+/// there it is an error to surface.
 ///
 /// A repeated member resolves first-wins, as in every other walk in this
 /// library. `tool_call` and `command` are different requests to put in front of
@@ -1911,6 +2897,10 @@ fn nullableString(reader: *json.Reader, scratch: []u8) DecodeError!?[]const u8 {
 /// twice must not be able to choose which one the library shows. The repeat is
 /// stepped over rather than read, so the first occurrence's text stays live in
 /// the caller's scratch.
+///
+/// `error.BufferTooSmall` is the caller's own buffer being too narrow for a key
+/// or an escaped string; nothing is decoded on that path. Every other error is
+/// a fact about the peer's document, and `raw` is untouched either way.
 pub fn decodePermissionSubject(
     raw: []const u8,
     scratch: []u8,
@@ -2005,8 +2995,11 @@ pub fn decodePermissionSubject(
 /// and the arm's own test is that it is an object. Checking the opening byte
 /// alone would let `{"a":1} {"b":2}` through and splice a second document
 /// into the middle of the member, which the decoder then refuses.
-fn isJsonObject(text: []const u8) bool {
+/// `depth` charges enclosing objects: one for a standalone subject or v1
+/// request, two for a subject nested in a v2 request.
+fn isJsonObject(text: []const u8, depth: u32) bool {
     var reader = json.Reader.init(text);
+    reader.depth = depth;
     reader.skipWhitespace();
     if (reader.peek() != @as(?u8, '{')) return false;
     // `skipValue` is never written to and takes the scratch only so that one
@@ -2029,10 +3022,10 @@ fn isNamedSubjectType(tag: []const u8) bool {
 /// exception: `type` selects the arm, so a tag that names a modelled arm is
 /// a request for that arm without the members it needs, and it decodes as
 /// `error.MissingField`.
-fn validatePermissionSubject(subject: PermissionSubject) EncodeError!void {
+fn validatePermissionSubject(subject: PermissionSubject, depth: u32) EncodeError!void {
     switch (subject) {
         .tool_call => |call| {
-            if (!isJsonObject(call)) return error.InvalidField;
+            if (!isJsonObject(call, depth)) return error.InvalidField;
         },
         .command => |command| {
             // Refused before a byte is written, because
@@ -2052,33 +3045,75 @@ fn validatePermissionSubject(subject: PermissionSubject) EncodeError!void {
     }
 }
 
-/// Encode a v2 `RequestPermissionSubject` object.
+/// Write `subject` as a v2 `RequestPermissionSubject` object, with no
+/// leading or trailing bytes.
 ///
-/// The inverse of [`decodePermissionSubject`] over every value one of them can
-/// reach, and it refuses the three subjects its decoder refuses before it
-/// writes either.
+/// Every value [`decodePermissionSubject`] can return is written, and the three
+/// subjects that decoder refuses are refused here before the first byte
+/// lands: a `tool_call` lexeme that is not exactly one JSON object, a
+/// `command` whose `cwd` is not absolute, and an `other` tag naming a
+/// modelled arm.
 ///
-/// Two classes of byte sequence the pair does not agree on, and both are the
-/// decoder's to answer for. The catch-all arm carries the `type` and nothing
-/// else, so a subject read from a document with members of its own re-encodes
-/// to `{"type":"…"}`; and `nullableString` reads an explicit `null` on
-/// `toolCallId` or `terminalId` as the absent case, so a document that spelled
-/// one `null` re-encodes without the member. Refusing either value would not
-/// help, because what was lost is gone before any encoder sees the result;
-/// both have to be carried by [`PermissionSubject`] and [`CommandSubject`],
-/// which is a change to the shapes rather than to this function. Carrying them
-/// means a lexeme on the `.other` arm and a third state on the two optionals,
-/// and `src/acp_session.zig` and `src/testkit.zig` both construct and match on
-/// the arms that would move.
+/// ## What the round trip does not carry
+///
+/// The guarantee is over the subject, not over the document it arrived in, and
+/// there are two classes of input the pair reads differently. The catch-all arm
+/// carries the `type` and nothing else, so a subject read from a document with
+/// members of its own re-encodes to `{"type":"…"}`; and `nullableString` reads
+/// an explicit `null` on `toolCallId` or `terminalId` as the absent case, so a
+/// document that spelled one `null` re-encodes without the member. What is lost
+/// is gone before any encoder sees the result, so refusing those values would
+/// not help; both have to be carried by [`PermissionSubject`] and
+/// [`CommandSubject`], which is a change to the shapes rather than to this
+/// function. Carrying them means a lexeme on the `.other` arm and a third state
+/// on the two optionals, and `src/acp_session.zig` and `src/testkit.zig` both
+/// construct and match on the arms that would move.
+///
+/// Everything this writes is the same on both sides of that loss: the same
+/// arm, the same members, the same order, and the same `type`, so the bytes
+/// here decode back to the value that was written. They are not the source
+/// bytes in general — whitespace is dropped, a string is re-escaped, and a
+/// `toolCall` is the one member written verbatim — so only the canonical
+/// spellings the tests pin reproduce their source exactly.
+///
+/// ## The caller's UTF-8
+///
+/// The `.other` tag and every `CommandSubject` field are written through
+/// `json.Writer.string`, which requires valid UTF-8 and checks nothing in any
+/// optimize mode. Strings from [`decodePermissionSubject`] are valid, because
+/// `json.Reader.string` validated them; a `PermissionSubject` a caller built by
+/// hand carries its own obligation, and an invalid one is written rather than
+/// refused, leaving this library's own reader to reject the document with
+/// `error.InvalidUtf8`. The absolute-path check on `cwd` is not a UTF-8 check
+/// and does not become one. There is no assert on these paths, so nothing
+/// catches it in Debug either.
 ///
 /// `acp_session.writePermissionSubject` takes the opposite line again and
 /// refuses the catch-all outright, because there the missing members would be a
 /// request the agent never described.
+///
+/// ## Errors, and what is left behind
+///
+/// `error.InvalidField` for the three subjects above, and it is decided before
+/// the first write, so it leaves `writer` untouched. `error.BufferTooSmall` is
+/// the only tag that arrives mid-document: `writer` then holds a prefix of the
+/// subject, which is not an object, so a caller discards it and retries with a
+/// larger buffer. `subject` is only read here — nothing is allocated, nothing
+/// is retained, and the borrows behind it have to outlive the call, not the
+/// value.
+///
+/// The `tool_call` arm splices one complete JSON object verbatim. Its nesting
+/// is checked at the field's actual write position. A malformed lexeme,
+/// trailing value or excess nesting is `InvalidField` before writing.
 pub fn encodePermissionSubject(
     subject: PermissionSubject,
     writer: *json.Writer,
 ) EncodeError!void {
-    try validatePermissionSubject(subject);
+    try validatePermissionSubject(subject, 1);
+    try writePermissionSubject(subject, writer);
+}
+
+fn writePermissionSubject(subject: PermissionSubject, writer: *json.Writer) EncodeError!void {
     switch (subject) {
         .tool_call => |call| {
             try writer.slice(
@@ -2112,7 +3147,45 @@ pub fn encodePermissionSubject(
     }
 }
 
-/// Encode a permission outcome.
+/// Write `outcome` as a `RequestPermissionOutcome` object, with no leading or
+/// trailing bytes.
+///
+/// This is the one decoder/encoder pair in this module that carries every
+/// member its shape models: a value [`decodePermissionOutcome`] returned
+/// re-encodes to the same object, so what survives the round trip is the whole
+/// of what the shape holds. Members no schema models are still dropped, because
+/// a member the decoder stepped over has no field to land in — which is what
+/// makes `decodePermissionOutcome` refuse a tail behind the closing brace,
+/// since a document this could not write back whole is not one it should have
+/// accepted.
+///
+/// The bytes are not the source bytes in general: whitespace is dropped and
+/// `optionId` is re-escaped, so `{"outcome": "selected","optionId":"A"}` comes
+/// back as `{"outcome":"selected","optionId":"A"}`. Only the canonical
+/// spellings the tests pin reproduce their source exactly, and a caller must
+/// not compare bytes.
+///
+/// ## The caller's UTF-8
+///
+/// The `.selected` id is written through `json.Writer.string`, which requires
+/// valid UTF-8 and checks nothing in any optimize mode. An id from
+/// [`decodePermissionOutcome`] is valid, because `json.Reader.string` validated
+/// it; one a caller built by hand is its own to validate, and an invalid one
+/// is written rather than refused, leaving this library's own reader to reject
+/// the document with `error.InvalidUtf8`. There is no assert on this path, so
+/// nothing catches it in Debug either.
+///
+/// `outcome` is taken by value and only read: nothing is allocated, nothing is
+/// retained, and a `.selected` id has to outlive the call rather than the
+/// value.
+///
+/// There is no validation and so no `error.InvalidField` here — every value
+/// this function can be handed is one the decoder can read back, including an
+/// empty id, which is an option id and not a missing one.
+/// `error.BufferTooSmall` is the only error, and it comes from `writer` after
+/// the first bytes have landed: `writer` then holds a prefix of the object,
+/// which is not an outcome, so a caller discards it and retries with a larger
+/// buffer rather than appending to it.
 pub fn encodePermissionOutcome(outcome: PermissionOutcome, writer: *json.Writer) EncodeError!void {
     switch (outcome) {
         .cancelled => try writer.slice("{\"outcome\":\"cancelled\"}"),
@@ -2132,10 +3205,19 @@ pub fn encodePermissionOutcome(outcome: PermissionOutcome, writer: *json.Writer)
 /// `oneOf` and v2 an `anyOf` plus an `other` branch. One struct reports the
 /// unknown kind at v1 and carries it at v2, so a caller cannot read a v2
 /// extension as if it were one of the four.
+///
+/// It is a tag plus, on the `.other` arm, a borrow of the peer's own text. A
+/// copy is a copy of that handle rather than of the string, nothing is
+/// allocated or released, and the `.other` text stays valid exactly as long as
+/// the decode buffer behind it.
 pub const PermissionOptionKindValue = union(enum) {
     /// One of the four named kinds.
     known: PermissionOptionKind,
-    /// A kind the library does not name, which only v2 can deliver.
+    /// A kind the library does not name, which only v2 can deliver. Borrows
+    /// the caller's decode buffer and is written back out exactly as it
+    /// arrived; there is no arm to give it a meaning, so a caller that has to
+    /// decide whether the option grants asks [`PermissionOption.grants`],
+    /// which answers `null` here rather than guessing either way.
     other: []const u8,
 };
 
@@ -2145,9 +3227,24 @@ pub const PermissionOptionKindValue = union(enum) {
 /// request adds no member to it. These three are what the user reads and what
 /// an outcome names back, so the decoder keeps them apart instead of collapsing
 /// the option into its kind.
+///
+/// Every field is a borrow. `option_id` and `name` point into the caller's
+/// decode buffers, and `kind` may carry a borrow on its `.other` arm, so an
+/// option read from a document dies with the buffers that document was decoded
+/// into and a copy is a copy of the handles rather than of the text. An option
+/// array this module did not decode is a caller's own storage and outlives
+/// whatever the caller keeps it in.
 pub const PermissionOption = struct {
+    /// The id an outcome names back. What the peer spelled, neither
+    /// normalised nor checked: it is compared against the ids of the options
+    /// in the request it answers, and an id on no such list is a refusal
+    /// rather than a grant.
     option_id: []const u8,
+    /// The text the user is shown for this choice. This module does not render
+    /// it and does not inspect it, so what the peer spelled is what a UI above
+    /// this one displays.
     name: []const u8,
+    /// What choosing this option means, as the version's schema defines it.
     kind: PermissionOptionKindValue,
 
     /// Whether choosing this option grants the action, or null when the kind is
@@ -2155,7 +3252,12 @@ pub const PermissionOption = struct {
     ///
     /// Null rather than false, because v2's catch-all means a kind can arrive
     /// that the schema defines and this library does not, and answering "does
-    /// not grant" for it would be the same guess as answering "grants".
+    /// not grant" for it would be the same guess as answering "grants". A
+    /// caller that has to act on this cannot treat `null` as a refusal either:
+    /// the only safe reading of an uninterpretable kind is that this module
+    /// does not know, and `acp_session.readOutcome` reports it as
+    /// `error.UnknownTag` rather than deciding. Total and allocation-free, and
+    /// it reads nothing but the kind.
     pub fn grants(self: PermissionOption) ?bool {
         return switch (self.kind) {
             .known => |kind| kind.grants(),
@@ -2165,29 +3267,58 @@ pub const PermissionOption = struct {
 };
 
 /// The v1 `session/request_permission` request.
+///
+/// Every member is a borrow: `session_id` and `tool_call` point into the
+/// caller's decode buffers, and `options` borrows the array the caller passed to
+/// [`decodePermissionRequest`]. Nothing is allocated and nothing needs
+/// releasing; a copy is a copy of the handles.
 pub const PermissionRequestV1 = struct {
+    /// The session the request belongs to, named in the path of the call and
+    /// repeated in the body. The two are not compared by this module.
     session_id: []const u8,
     /// The `ToolCallUpdate`, carried as borrowed JSON text. This module does
     /// not model a tool call, so flattening the object would create a second
-    /// definition to keep in step with the schema.
+    /// definition to keep in step with the schema. The slice is exactly one
+    /// JSON object value: the decoder proves it with `rawValue` and a leading
+    /// `{`, and the encoder refuses a lexeme that is not one object, so
+    /// nothing spliced through this member can hide a second document.
     tool_call: []const u8,
     /// The offered choices. v1 puts no `minItems` on the array, so an empty one
     /// is well formed.
+    ///
+    /// Borrows `out_options[0..count]` from [`decodePermissionRequest`], so the
+    /// array a caller supplied outlives the request and the entries inside it
+    /// are valid only while that array is untouched. Options past the count
+    /// are never written and never reachable through this slice.
     options: []const PermissionOption,
 };
 
 /// The v2 `session/request_permission` request.
+///
+/// Every member is a borrow, on the same terms as [`PermissionRequestV1`]:
+/// nothing is allocated, nothing needs releasing, and the value is valid
+/// exactly as long as the buffers it was decoded into.
 pub const PermissionRequestV2 = struct {
+    /// The session the request belongs to.
     session_id: []const u8,
     /// Required in v2: the prompt the user reads before choosing. v1 has no
     /// such member, and the tool call moves out of the request root and into
     /// the subject.
     title: []const u8,
+    /// Free text below the title. `null` is the absent case: a peer that
+    /// spelled the member `null` and a peer that omitted it are one state
+    /// here, and the explicit spelling does not come back on the way out.
     description: ?[]const u8,
-    /// Omitted and `null` both mean no structured subject, so the two agree.
+    /// Omitted and `null` both mean no structured subject, so the two agree,
+    /// and the same loss applies: a `null` the peer spelled re-encodes with the
+    /// member absent. See [`PermissionSubject`] for what a subject borrows.
     subject: ?PermissionSubject,
     /// The offered choices. v2 adds `"minItems": 1`, so an empty array is a
-    /// request the user cannot answer.
+    /// request the user cannot answer: it is `error.InvalidField` on the way in
+    /// and on the way out.
+    ///
+    /// Borrows `out_options[0..count]` from [`decodePermissionRequest`], on the
+    /// same terms as [`PermissionRequestV1.options`].
     options: []const PermissionOption,
 };
 
@@ -2196,18 +3327,61 @@ pub const PermissionRequestV2 = struct {
 /// The tag is the wire version rather than a library enum, because the two
 /// requests share no required member: v1 requires `toolCall` and v2 requires
 /// `title`. One struct carrying both would invite a reader to accept a request
-/// the peer never sent.
+/// the peer never sent. The tag also names the version the request was
+/// decoded at, which is what lets [`encodePermissionRequest`] write it without
+/// being told a second time.
+///
+/// Both arms are pure borrows, so the union owns nothing, a copy is a copy of
+/// the handles rather than of the text, and nothing here needs releasing. The
+/// value is valid exactly as long as the buffers [`decodePermissionRequest`]
+/// decoded it into, and reading it from another thread is safe so long as no
+/// one writes those buffers meanwhile.
 pub const PermissionRequest = union(WireVersion) {
     stable: PermissionRequestV1,
     draft: PermissionRequestV2,
 };
 
-/// Decode `session/request_permission` for `version`.
+/// Decode the body of a `session/request_permission` for `version` out of
+/// `raw`, into `out_options`, using `scratch` for keys and escaped strings.
 ///
-/// `out_options` is the caller's array of options and `scratch` is the
-/// reader's escape buffer. Nothing allocates, and a request with more options
-/// than the caller reserved is reported rather than truncated: a truncated
-/// choice list would hide the option the user wanted to pick.
+/// Nothing allocates. The caller owns all three buffers and the result borrows
+/// them, so the request is valid exactly as long as they are unchanged:
+///
+/// - `out_options` receives one [`PermissionOption`] per element of the
+///   `options` array, and the result's `options` is `out_options[0..count]`
+///   over it. Slots past the count are never written, so a caller that sizes
+///   the array larger than the array on the wire keeps the remainder as it
+///   was rather than reading a stale entry.
+/// - `scratch` is the reader's escape buffer. A string carrying no escape is
+///   borrowed from `raw` instead and costs `scratch` nothing, which is why the
+///   result's slices may point into either buffer. The reader's high-water mark
+///   never rewinds, so two strings read from one document never alias, and a
+///   v2 `subject` is decoded into the unread tail so its fields cannot land on
+///   top of the ids, title and description already handed out.
+/// - `raw` is only read, and the lexemes a `toolCall` and a `subject` arrive
+///   as are slices of it.
+///
+/// ## Errors, and what is left behind
+///
+/// `error.BufferTooSmall` in two cases, both the caller's own shortage and both
+/// with the same rule: the options read so far stay in `out_options[0..count]`
+/// and must be discarded, because the returned count never arrives and a
+/// partially filled choice list is not a request. One is an `options` array
+/// longer than the caller's array; the other is a key or an escaped string
+/// wider than `scratch`. A request with more options than the caller reserved
+/// is reported rather than truncated, because a truncated choice list would
+/// hide the option the user wanted to pick.
+///
+/// Every other error is a fact about the peer's document, and `raw` and
+/// `out_options` are as the caller supplied them beyond the entries already
+/// written: `error.MissingField` for an absent `sessionId`, `options`, or a
+/// member a required arm needs, `error.InvalidField` for a v2 empty choice
+/// list, a `toolCall` that is not an object, a `cwd` that is not absolute or
+/// the contradictory member set the subject check rejects, and the JSON-level
+/// tags the reader raises. A member this module does not model is stepped over
+/// rather than refused, which is what the version's open objects allow.
+///
+/// ## A repeated member
 ///
 /// A repeated member resolves first-wins, as in every other walk in this
 /// library. The tool call is what the agent shows the user and what
@@ -2354,29 +3528,82 @@ fn encodePermissionOption(option: PermissionOption, writer: *json.Writer) Encode
     try writer.byte('}');
 }
 
-/// Encode `session/request_permission` for the version the value's own tag names.
+/// Write `request` as the body of a `session/request_permission`, for the
+/// version its own tag names and with no leading or trailing bytes.
 ///
-/// The inverse of [`decodePermissionRequest`] over every value one of them can
-/// reach, and every value this refuses is one the decoder could not have
-/// returned.
+/// Every value [`decodePermissionRequest`] can return is written, and every
+/// value this refuses is one that decoder could not have returned: a v2
+/// request with no option to choose from, a `toolCall` that is not one JSON
+/// object, a subject the subject check refuses, and an option `kind` that the
+/// version's schema does not define. The version is not a parameter because
+/// the tag already is one, so a caller cannot write a v1 body under a v2 tag
+/// or the other way round.
 ///
-/// Two classes of byte sequence the pair does not agree on, and both are the
-/// decoder's to answer for. An omitted member and an explicit `null` are read
-/// as one, so a `description` or a `subject` the peer spelled `null` re-encodes
-/// with the member absent; and the other version's member is stepped over
-/// rather than read, so a v1 request carrying `title`, `description` or
-/// `subject`, or a v2 one carrying `toolCall`, re-encodes without it. Refusing
-/// either would not help, because what was lost is gone before any encoder
-/// sees the result. The first has to be carried by
+/// ## What the round trip does not carry
+///
+/// The guarantee is over the request, not over the document it arrived in, and
+/// there are two classes of input the pair reads differently. An omitted member
+/// and an explicit `null` are read as one, so a `description` or a `subject`
+/// the peer spelled `null` re-encodes with the member absent; and the other
+/// version's member is stepped over rather than read, so a v1 request carrying
+/// `title`, `description` or `subject`, or a v2 one carrying `toolCall`,
+/// re-encodes without it. What was lost is gone before any encoder sees the
+/// result, so refusing either would not help; the first has to be carried by
 /// [`PermissionRequestV2`], which would need a third state on two members, and
-/// the second by both arms; `src/acp_session.zig` and `src/testkit.zig` build
-/// and compare both, so the shape change is theirs to make with this one.
+/// the second by both arms. `src/acp_session.zig` and `src/testkit.zig` build
+/// and compare both, so that shape change is theirs to make with this one.
+///
+/// Everything this writes is the same on both sides of that loss: the same
+/// tag, the same members, the same presence, and the same option list in the
+/// same order, so the bytes here decode back to the value that was written.
+///
+/// They are not the source bytes in general, and the reasons are three
+/// separate ones. Whitespace is dropped and a string is re-escaped, so
+/// `{"sessionId": "s1", …}` comes back without the space. Member order inside
+/// the request is this function's, not the peer's, so a document whose members
+/// arrived in another order comes back in the order here — the same order the
+/// decoder reads in either. And a `toolCall` is written verbatim, so it alone
+/// keeps whatever whitespace its own object carried. Only the canonical
+/// spellings the tests pin reproduce their source exactly, and a caller must
+/// not compare bytes.
+///
+/// ## The caller's UTF-8
+///
+/// `sessionId`, `title`, `description`, an option's `optionId`, `name` and
+/// `kind` text are written through `json.Writer.string`, which requires valid
+/// UTF-8 and checks nothing in any optimize mode. Every one of them from
+/// [`decodePermissionRequest`] is valid, because `json.Reader.string` validated
+/// it; a `PermissionRequest` a caller built by hand carries its own
+/// obligation, and an invalid one is written rather than refused, leaving this
+/// library's own reader to reject the document with `error.InvalidUtf8`. There
+/// is no assert on these paths, so nothing catches it in Debug either. The
+/// `toolCall` and `subject` members are the exception: they are written
+/// verbatim and what they must be is one complete JSON value, which the check
+/// below establishes.
+///
+/// ## Errors, and what is left behind
 ///
 /// The whole request is checked before the first byte is written. A refusal
 /// halfway through would leave `{"sessionId":"s1","title":"t` in the caller's
 /// buffer, which is neither a request nor nothing, so a caller that sized the
 /// buffer for the refusal would have to discard what it holds rather than
-/// read it.
+/// read it. `error.InvalidField` for a request shape the decoder refuses and
+/// `error.UnknownTag` for a v1 option `kind` outside the closed union both
+/// therefore leave `writer` untouched and the buffer reusable.
+///
+/// `error.BufferTooSmall` is the one tag that arrives mid-document: `writer`
+/// then holds a prefix of the request, which is not an object, so a caller
+/// discards it and retries with a larger buffer rather than appending to it.
+///
+/// The request is only read here. Nothing is allocated, nothing is retained,
+/// and the borrows behind its fields — the option array included — have to
+/// outlive the call rather than the value.
+///
+/// The `toolCall` member is spliced in verbatim rather than re-encoded, so the
+/// validity of the whole document rests on that lexeme being one complete JSON
+/// object. That is the check above, and it is why a lexeme carrying a second
+/// value behind it, or one the reader never finished, is refused rather than
+/// written.
 pub fn encodePermissionRequest(
     request: PermissionRequest,
     writer: *json.Writer,
@@ -2393,14 +3620,14 @@ pub fn encodePermissionRequest(
         .stable => |value| {
             // `ToolCallUpdate` is an object, and `null` here is a missing
             // tool call wearing a key.
-            if (!isJsonObject(value.tool_call)) return error.InvalidField;
+            if (!isJsonObject(value.tool_call, 1)) return error.InvalidField;
             for (value.options) |option| try validatePermissionOption(.stable, option);
         },
         .draft => |value| {
             // v2 names `minItems: 1`, so a request the user cannot answer is
             // not a request at all.
             if (options.len == 0) return error.InvalidField;
-            if (value.subject) |subject| try validatePermissionSubject(subject);
+            if (value.subject) |subject| try validatePermissionSubject(subject, 2);
             for (value.options) |option| try validatePermissionOption(.draft, option);
         },
     }
@@ -2427,7 +3654,7 @@ pub fn encodePermissionRequest(
             }
             if (value.subject) |subject| {
                 try writer.slice(",\"subject\":");
-                try encodePermissionSubject(subject, writer);
+                try writePermissionSubject(subject, writer);
             }
         },
     }
@@ -2561,11 +3788,31 @@ pub const elicitation_modes = [_][]const u8{ "form", "url" };
 /// ACP deliberately diverges from MCP: each supported mode must be advertised
 /// explicitly, and `{}` is **not** form-only support. An adapter translating
 /// between them must not pass an empty ACP capability set through as an MCP
-/// form-only capability.
+/// form-only capability. The two tags are also the two halves of the gate on
+/// `elicitation/create` — see [`isMethodSupported`], where either one enables
+/// the method — so a caller cannot treat an unknown mode as form: there is no
+/// third value, and `null` from `fromString` is the answer to give.
+///
+/// Carries no options and no borrow, so a value is freely copied, shared
+/// across threads and stored anywhere; there is nothing to release. The tag
+/// names are the wire spellings, so `string` and `fromString` are inverses over
+/// both.
 pub const ElicitationMode = enum {
     form,
     url,
 
+    /// The mode whose wire spelling is `text`, or `null` for any other string.
+    ///
+    /// The comparison is exact and case-sensitive against
+    /// [`elicitation_modes`], so `Form`, `FORM` and `form-url` are all `null`.
+    /// `null` is not a default mode and never resolves to one: the table holds
+    /// exactly the two the schema names, and a string outside it is a mode this
+    /// library does not know — at v2 it lands in the schema's catch-all through
+    /// [`classifyElicitationMode`], and that answer is the caller's to carry,
+    /// not this function's to invent.
+    ///
+    /// Total and allocation-free, and nothing is retained: `text` is read
+    /// against a comptime table of static strings and dropped.
     pub fn fromString(text: []const u8) ?ElicitationMode {
         for (elicitation_modes, 0..) |name, index| {
             if (std.mem.eql(u8, text, name)) return @enumFromInt(index);
@@ -2573,6 +3820,14 @@ pub const ElicitationMode = enum {
         return null;
     }
 
+    /// The wire spelling of this mode, read out of [`elicitation_modes`].
+    ///
+    /// The inverse of [`ElicitationMode.fromString`] over both tags. The
+    /// comptime check after this enum is what makes the indexing sound: it
+    /// fails the build when the table and the enum name different modes, rather
+    /// than letting `string` read past the end of the table or silently
+    /// mis-spell a tag. The result points at static storage inside this file,
+    /// so it is never released and outlives anything the caller holds.
     pub fn string(self: ElicitationMode) []const u8 {
         return elicitation_modes[@intFromEnum(self)];
     }
@@ -2584,12 +3839,39 @@ comptime {
     }
 }
 
-/// The elicitation response actions.
+/// The elicitation response actions, in the spelling the schema names them.
+///
+/// The three tags are the wire spellings, so `string` and `fromString` are
+/// inverses over all of them. `decline` and `cancel` are different answers and
+/// the wire keeps them apart: a decline is the user saying no to the question
+/// that was asked, and a cancel is the user abandoning the elicitation. A
+/// caller that collapses them changes what a session records about why a turn
+/// ended, so this type does not offer a way to.
+///
+/// Carries no options and no borrow, so a value is freely copied, shared
+/// across threads and stored anywhere; there is nothing to release.
+///
+/// There is no fourth arm, and that is deliberate. The specification requires
+/// that an unrecognised action never be treated as acceptance — the same rule
+/// PROTOCOLS.md section 6.6 states for a permission outcome — so `fromString`
+/// answers `null` and a caller that has to act on it must report what it could
+/// not read rather than substituting `.accept`.
 pub const ElicitationAction = enum {
     accept,
     decline,
     cancel,
 
+    /// The action whose wire spelling is `text`, or `null` for any other
+    /// string.
+    ///
+    /// The comparison is exact and case-sensitive against the three tag names,
+    /// so `Accept` and `ACCEPT` are `null` as well. `null` means "not one of
+    /// the three", never "the nearest of the three": an action this library
+    /// does not name is a value the schema may still define at v2, and reading
+    /// it as `.accept` is the guess section 6.6 forbids. Nothing is retained;
+    /// `text` is read and dropped.
+    ///
+    /// Total and allocation-free.
     pub fn fromString(text: []const u8) ?ElicitationAction {
         if (std.mem.eql(u8, text, "accept")) return .accept;
         if (std.mem.eql(u8, text, "decline")) return .decline;
@@ -2597,6 +3879,13 @@ pub const ElicitationAction = enum {
         return null;
     }
 
+    /// The wire spelling of this action, which is also the tag name.
+    ///
+    /// The inverse of [`ElicitationAction.fromString`] over all three tags, so
+    /// `ElicitationAction.fromString(a.string())` is `a` for every `a`. The
+    /// result points at static storage inside this file and is never released,
+    /// so a caller may hold it for as long as it likes and needs no copy to
+    /// outlive anything.
     pub fn string(self: ElicitationAction) []const u8 {
         return @tagName(self);
     }
@@ -2669,7 +3958,7 @@ pub const v1_stop_reasons = [_][]const u8{
     "cancelled",
 };
 
-/// Whether a version admits a batch array on the wire.
+/// Whether `version` admits a batch array on the wire.
 ///
 /// v2 permits batch arrays and v1 does not. The one-entry minimum a v2 batch
 /// carries is a fact about a batch decoder, and this module has none: it does
@@ -2677,11 +3966,33 @@ pub const v1_stop_reasons = [_][]const u8{
 /// empty array answers, so a constant here would bound nothing. The only batch
 /// decision this module makes is the one below, and [`no_batch_methods`] is
 /// advice to a caller rather than a rule anything here applies.
+///
+/// Total, allocation-free, and it says nothing beyond the version. A `true`
+/// is the schema's permission to put several JSON-RPC values in one frame; what
+/// may go in them is [`advisesAgainstBatching`] and the caller's own policy.
 pub fn permitsBatch(version: WireVersion) bool {
     return version == .draft;
 }
 
-/// The state-changing methods the specification says not to batch.
+/// The methods the specification says should not go inside a batch array.
+///
+/// The list is the source's own, and it is a `SHOULD NOT`: clients and agents
+/// are advised against batching these because each one changes session state
+/// in a way whose result a later entry in the same array depends on. Nothing
+/// here enforces it, and this library does not refuse a batch.
+///
+/// PROTOCOLS.md section 6.1 records only that v2 additionally permits batch
+/// arrays; the method list comes from the deeper source the table at
+/// `research/normative/acp-v1-v2.md` line 723 cites. That list names
+/// `initialize`, `auth/login`, `session/new`, `session/resume` and
+/// `session/prompt`. `authenticate` is here because it is the v1 spelling of
+/// `auth/login` and this table is consulted without a version, so a caller
+/// holding either name gets the same answer. Neither logout method is here:
+/// the source names none, and adding one would be this library's judgment
+/// rather than the specification's.
+///
+/// The entries are comptime static strings and the table owns nothing, so
+/// nothing is released and a caller may hold a slice of it indefinitely.
 pub const no_batch_methods = [_][]const u8{
     "initialize",
     "auth/login",
@@ -2691,6 +4002,23 @@ pub const no_batch_methods = [_][]const u8{
     "session/prompt",
 };
 
+/// Whether the specification advises against putting `name` inside a batch
+/// array. An advisory, not a gate.
+///
+/// The comparison is exact and case-sensitive against [`no_batch_methods`], so
+/// a name the peer invented is `false` rather than an error, and a name this
+/// library knows under a different spelling at the other version is `false`
+/// too — which is why the table carries both spellings of the login method.
+///
+/// `true` means the source lists this method and nothing more: it is not a
+/// refusal, and no decoder in this library acts on it. `false` does not mean
+/// the method is safe to batch either — it means the specification is silent
+/// about it, and a caller that wants a stricter rule than the source states
+/// applies its own. Neither answer consults a [`WireVersion`], because the
+/// table already spans both.
+///
+/// Total and allocation-free, over a comptime table of static strings, and
+/// `name` is only read.
 pub fn advisesAgainstBatching(name: []const u8) bool {
     for (no_batch_methods) |method| {
         if (std.mem.eql(u8, method, name)) return true;
@@ -2758,6 +4086,82 @@ test "framing splits on newline and rejects invalid UTF-8" {
     try testing.expectEqualStrings("", second.rest);
 
     try testing.expectError(error.InvalidUtf8, nextFrame("\xff\xfe\n"));
+}
+
+test "a frame split off the input borrows it and a partial arrival is not a refusal" {
+    const input = "{\"a\":1}\n";
+    const first = try nextFrame(input);
+    // `bytes` and `rest` are two views of one buffer: `rest` starts one byte
+    // past the delimiter that ended `bytes`, and neither is a copy.
+    try testing.expectEqual(@intFromPtr(input.ptr), @intFromPtr(first.bytes.ptr));
+    try testing.expectEqual(@intFromPtr(input.ptr) + first.bytes.len + 1, @intFromPtr(first.rest.ptr));
+    try testing.expectEqual(@as(usize, input.len), first.bytes.len + first.rest.len + 1);
+
+    // No delimiter at all is a partial arrival, not a malformed frame: the whole
+    // input is the bytes, `rest` is empty and the flag says the frame is not
+    // finished yet. Nothing was consumed and nothing was refused.
+    const partial = try nextFrame("{\"a\":");
+    try testing.expectEqualStrings("{\"a\":", partial.bytes);
+    try testing.expectEqualStrings("", partial.rest);
+    try testing.expect(partial.unterminated);
+
+    // An empty input is the same case at zero bytes, and so is a blank line:
+    // both are reported, neither is a refusal.
+    const none = try nextFrame("");
+    try testing.expectEqualStrings("", none.bytes);
+    try testing.expect(none.unterminated);
+    const blank = try nextFrame("\n");
+    try testing.expectEqualStrings("", blank.bytes);
+    try testing.expect(!blank.unterminated);
+    try testing.expectEqualStrings("", blank.rest);
+}
+
+test "a carriage return is message text here and is passed through both ways" {
+    // The split is on `'\n'` and on nothing else, so a peer sending CRLF keeps
+    // its `'\r'` at the end of the frame. JSON calls that insignificant
+    // whitespace, so the message still decodes — which is what makes leaving it
+    // there safe and what `framing.Framer.next` differs on by stripping it.
+    const from_peer = try nextFrame("{}\r\n");
+    try testing.expectEqualStrings("{}\r", from_peer.bytes);
+    try testing.expect(!from_peer.unterminated);
+
+    var buffer: [16]u8 = undefined;
+    var writer = json.Writer.init(&buffer);
+    // And writing it back appends only the delimiter this module names, with no
+    // carriage return of its own: what a caller sends is the frame plus one
+    // `'\n'`, and the `'\r'` the peer sent is the caller's byte to pass on.
+    try writeFrame(from_peer.bytes, &writer);
+    try testing.expectEqualStrings("{}\r\n", writer.written());
+    const again = try nextFrame(writer.written());
+    try testing.expectEqualStrings(from_peer.bytes, again.bytes);
+}
+
+test "a frame the writer could not fit leaves an incomplete frame, and a refusal leaves nothing" {
+    var buffer: [64]u8 = undefined;
+
+    // Both refusals are decided before the first write, so the writer is exactly
+    // as the caller left it and the same buffer can be reused.
+    var refuser = json.Writer.init(&buffer);
+    try testing.expectError(error.InvalidField, writeFrame("{\"a\":1}\n", &refuser));
+    try testing.expectEqual(@as(usize, 0), refuser.written().len);
+    try writeFrame("{}", &refuser);
+    try testing.expectEqualStrings("{}\n", refuser.written());
+
+    // `json.Writer.slice` is all-or-nothing, so a buffer too small for the
+    // message receives none of it. What is left is not a frame, not a message,
+    // and nothing a caller may send or parse.
+    var small: [3]u8 = undefined;
+    var short = json.Writer.init(&small);
+    try testing.expectError(error.BufferTooSmall, writeFrame("{\"a\":1}", &short));
+    try testing.expectEqual(@as(usize, 0), short.written().len);
+
+    // Long enough for the message and not for its delimiter: the whole message
+    // is there and the frame is still not complete, because the byte that did
+    // not fit was the one that ends it.
+    var no_delimiter: [7]u8 = undefined;
+    var nearly = json.Writer.init(&no_delimiter);
+    try testing.expectError(error.BufferTooSmall, writeFrame("{\"a\":1}", &nearly));
+    try testing.expectEqualStrings("{\"a\":1}", nearly.written());
 }
 
 test "a trailing frame without a delimiter is reported as unterminated" {
@@ -3254,9 +4658,10 @@ test "a permission outcome with a second document behind it is refused" {
         \\{"outcome":"cancelled"} trailing
     , &scratch));
 
-    // The accepted document round-trips byte for byte, and the encoder cannot
-    // reach the tail, which is what makes refusing it the only way to keep
-    // `encode(decode(b)) == b` for every accepted input.
+    // The accepted document carries nothing but the two members the shape
+    // models, so the encoder writes it back whole; it cannot reach the tail, and
+    // refusing that tail is what keeps a document this accepts from carrying
+    // bytes no encoder will ever write.
     const source = "{\"outcome\":\"selected\",\"optionId\":\"opt-1\"}";
     var buffer: [128]u8 = undefined;
     var writer = json.Writer.init(&buffer);
@@ -4631,8 +6036,8 @@ test "trailing whitespace is not a second document" {
 test "a replay point round-trips through the encoder" {
     var scratch: [64]u8 = undefined;
     var buffer: [64]u8 = undefined;
-    // The discriminator is the only member this shape models, so a document
-    // carrying only that is one the pair reproduces byte for byte.
+    // The discriminator is the only member this shape models and the document
+    // carries no other, so the pair reproduces it exactly.
     const source = "{\"type\":\"start\"}";
     var writer = json.Writer.init(&buffer);
     try encodeReplayFrom(try decodeReplayFrom(source, &scratch), &writer);
@@ -4846,6 +6251,421 @@ test "a capability member the decoder would refuse is not written" {
     );
     try testing.expectEqual(@as(usize, 1), flat_set.entries.len);
     try testing.expectEqualStrings("vendor.flag", flat_set.entries[0].path);
+}
+
+test "a v2 capability path with no capabilities root is refused, not mis-spelt" {
+    var buffer: [256]u8 = undefined;
+    var writer = json.Writer.init(&buffer);
+    // The walk writes the `capabilities` root into `paths` ahead of its first
+    // member, so every path it records carries it, and the encoder writes the
+    // contents of that member rather than the member itself. A hand-built path
+    // without the root has no member name to write, so writing it would put
+    // the dots inside one name instead.
+    try testing.expectError(error.InvalidField, encodeCapabilityObject(.draft, .agent, .{
+        .entries = &.{
+            .{ .path = "session.delete", .known = true, .form = .presence_object, .value = null },
+        },
+        .present = true,
+    }, &writer));
+    // Nothing reached the buffer, so a caller that sized it for the refusal is
+    // not holding the prefix of a document.
+    try testing.expectEqual(@as(usize, 0), writer.written().len);
+
+    // The comparison is against `capabilities.` with the dot, so it is a whole
+    // leading path component rather than a prefix match: a path that merely
+    // starts with the letters is refused too, and so is a bare `capabilities`
+    // and an empty one. The v2 walk would record each of them with the root
+    // prepended, so none of them is a path it could have produced.
+    for ([_][]const u8{
+        "capabilitiesFoo.bar",
+        "capabilitiesX",
+        "capabilities",
+        "",
+    }) |not_a_root| {
+        var collide = json.Writer.init(&buffer);
+        try testing.expectError(error.InvalidField, encodeCapabilityObject(.draft, .agent, .{
+            .entries = &.{
+                .{ .path = not_a_root, .known = false, .form = .presence_object, .value = null },
+            },
+            .present = true,
+        }, &collide));
+        try testing.expectEqual(@as(usize, 0), collide.written().len);
+    }
+
+    // The document that path would have produced, and what a v2 walk reads back
+    // out of it. The root is prepended on the way in, so the entry is a path
+    // this library never recorded: the encoder accepted a value and the decoder
+    // answered a different one, with no error on either side to report it.
+    var scratch: [64]u8 = undefined;
+    var paths: [64]u8 = undefined;
+    var out: [4]Capability = undefined;
+    const misread = try decodeCapabilityObject(
+        .draft,
+        .agent,
+        "{\"session.delete\":{}}",
+        &out,
+        &paths,
+        &scratch,
+    );
+    try testing.expectEqual(@as(usize, 1), misread.entries.len);
+    try testing.expectEqualStrings("capabilities.session.delete", misread.entries[0].path);
+    try testing.expect(findCapability(misread, "session.delete") == null);
+
+    // The same capability with the root the walk puts there is written, and what
+    // it writes decodes back to the path it was given — the member name is the
+    // root's tail, and the path is the whole of it.
+    var rooted = json.Writer.init(&buffer);
+    try encodeCapabilityObject(.draft, .agent, .{
+        .entries = &.{
+            .{ .path = "capabilities.session.delete", .known = true, .form = .presence_object, .value = null },
+        },
+        .present = true,
+    }, &rooted);
+    try testing.expectEqualStrings("{\"session.delete\":{}}", rooted.written());
+
+    var again_paths: [64]u8 = undefined;
+    var again_out: [4]Capability = undefined;
+    const again = try decodeCapabilityObject(
+        .draft,
+        .agent,
+        rooted.written(),
+        &again_out,
+        &again_paths,
+        &scratch,
+    );
+    try testing.expectEqual(@as(usize, 1), again.entries.len);
+    try testing.expectEqualStrings("capabilities.session.delete", again.entries[0].path);
+    try testing.expect(again.entries[0].known);
+
+    // The same path on a client object is refused the same way, and so is the
+    // initialize member that carries it — before the member name is written,
+    // which is what keeps a refusal off the caller's buffer entirely.
+    var client = json.Writer.init(&buffer);
+    try testing.expectError(error.InvalidField, encodeCapabilityObject(.draft, .client, .{
+        .entries = &.{
+            .{ .path = "elicitation.form", .known = false, .form = .presence_object, .value = null },
+        },
+        .present = true,
+    }, &client));
+    try testing.expectEqual(@as(usize, 0), client.written().len);
+
+    var body = json.Writer.init(&buffer);
+    try testing.expectError(error.InvalidField, encodeInitializeCapabilities(.draft, .agent, .{
+        .entries = &.{
+            .{ .path = "session.delete", .known = true, .form = .presence_object, .value = null },
+        },
+        .present = true,
+    }, &body));
+    try testing.expectEqual(@as(usize, 0), body.written().len);
+}
+
+test "a capability set is bounded by the deepest nesting a decode admits" {
+    // `json.max_depth` is a budget over the whole document, and the capability
+    // object is a container in it: `decodeCapabilityObject` opens the object
+    // before it reads a member of it, so the members of the
+    // `json.max_depth - 1`st object nested below it are the deepest a peer can
+    // spell. One object more is what the encoder has to refuse, and refusing
+    // it is a fact about the set rather than a shortage. The `initialize` body
+    // is a container *around* that object, so the same budget answers a
+    // different number there — one level shallower — and both numbers are one
+    // contract rather than two.
+    const deepest = json.max_depth - 1;
+    const source = "{\"v\":" ** (deepest + 1) ++ "true" ++ "}" ** (deepest + 1);
+    const too_deep_document = "{\"v\":" ** (deepest + 2) ++ "true" ++ "}" ** (deepest + 2);
+
+    // A path at nesting level `k` is `2k + 1` bytes and every one owns its own
+    // region of `paths`, so the sum over `deepest` objects and one boolean leaf
+    // is `(deepest + 1) * (deepest + 1)`, and one object more needs a level
+    // more again.
+    // A short buffer here would answer `BufferTooSmall` and hide the bound
+    // this is about, so both are sized from the paths themselves.
+    var scratch: [16]u8 = undefined;
+    var paths: [(deepest + 1) * (deepest + 1) + 8]u8 = undefined;
+    var out: [72]Capability = undefined;
+    var buffer: [512]u8 = undefined;
+    const set = try decodeCapabilityObject(.stable, .client, source, &out, &paths, &scratch);
+    try testing.expectEqual(@as(usize, deepest + 1), set.entries.len);
+    try testing.expectEqual(CapabilityForm.presence_object, set.entries[deepest - 1].form);
+    try testing.expectEqual(CapabilityForm.boolean, set.entries[deepest].form);
+
+    // The deepest set this library reads is a set this library writes, and the
+    // bytes it writes decode back to the same paths in the same forms.
+    var writer = json.Writer.init(&buffer);
+    try encodeCapabilityObject(.stable, .client, set, &writer);
+    try testing.expectEqualStrings(source, writer.written());
+
+    var again_paths: [(deepest + 1) * (deepest + 1) + 8]u8 = undefined;
+    var again_out: [72]Capability = undefined;
+    const again = try decodeCapabilityObject(
+        .stable,
+        .client,
+        writer.written(),
+        &again_out,
+        &again_paths,
+        &scratch,
+    );
+    try testing.expectEqual(set.entries.len, again.entries.len);
+    for (set.entries, again.entries) |first, second| {
+        try testing.expectEqualStrings(first.path, second.path);
+        try testing.expectEqual(first.form, second.form);
+        try testing.expectEqual(first.value, second.value);
+    }
+
+    // The same set and then a sibling at the root. The branch closes before
+    // the sibling's member is written, so the two sit at their own depths
+    // rather than summing, and the whole set is no deeper than the branch
+    // alone: a bound that added the two up would refuse this, and a real
+    // capability object carries many members rather than one chain.
+    var with_sibling: [73]Capability = undefined;
+    @memcpy(with_sibling[0..set.entries.len], set.entries);
+    with_sibling[set.entries.len] = .{
+        .path = "z",
+        .known = false,
+        .form = .boolean,
+        .value = true,
+    };
+    var sibling_writer = json.Writer.init(&buffer);
+    try encodeCapabilityObject(.stable, .client, .{
+        .entries = with_sibling[0 .. set.entries.len + 1],
+        .present = true,
+    }, &sibling_writer);
+    try testing.expectEqualStrings(
+        source[0 .. source.len - 1] ++ ",\"z\":true}",
+        sibling_writer.written(),
+    );
+
+    // One object more is not a set a decode can return, so it is built here
+    // rather than decoded: the walk refuses the member inside it at walk depth
+    // `json.max_depth + 1`, and the reader refuses to open the object at all.
+    const too_deep_entries = comptime blk: {
+        var built: [deepest + 2]Capability = undefined;
+        // The same spelling the documents above are built from, one level per
+        // step: `v`, `v.v`, `v.v.v`, and so on.
+        var path: []const u8 = "v";
+        for (0..deepest + 2) |level| {
+            const leaf = level == deepest + 1;
+            built[level] = .{
+                .path = path,
+                .known = false,
+                .form = if (leaf) .boolean else .presence_object,
+                .value = if (leaf) @as(?bool, true) else @as(?bool, null),
+            };
+            path = path ++ ".v";
+        }
+        break :blk built;
+    };
+    const too_deep: CapabilitySet = .{ .entries = &too_deep_entries, .present = true };
+
+    var unreachable_paths: [(deepest + 2) * (deepest + 2) + 8]u8 = undefined;
+    var unreachable_out: [80]Capability = undefined;
+    try testing.expectError(
+        error.LimitExceeded,
+        decodeCapabilityObject(
+            .stable,
+            .client,
+            too_deep_document,
+            &unreachable_out,
+            &unreachable_paths,
+            &scratch,
+        ),
+    );
+
+    // The refusal is about the set, so nothing reaches the buffer: not the
+    // member name, not a brace, not one byte over what the caller had.
+    var marked: [512]u8 = undefined;
+    @memset(&marked, 0xa5);
+    var refuser = json.Writer.init(&marked);
+    try testing.expectError(
+        error.InvalidField,
+        encodeCapabilityObject(.stable, .client, too_deep, &refuser),
+    );
+    try testing.expectEqual(@as(usize, 0), refuser.written().len);
+    for (marked) |byte| try testing.expectEqual(@as(u8, 0xa5), byte);
+
+    // The `initialize` member runs the preflight ahead of the member name as
+    // well, at the depth of the body it is writing rather than the depth of
+    // the object alone, so a set the body cannot hold is never left half
+    // written in one either.
+    var marked_body: [1024]u8 = undefined;
+    @memset(&marked_body, 0xa5);
+    var body_refuser = json.Writer.init(&marked_body);
+    try testing.expectError(
+        error.InvalidField,
+        encodeInitializeCapabilities(.stable, .client, too_deep, &body_refuser),
+    );
+    try testing.expectEqual(@as(usize, 0), body_refuser.written().len);
+    for (marked_body) |byte| try testing.expectEqual(@as(u8, 0xa5), byte);
+
+    // The same budget is a different number for that body, and it is the
+    // number the wrapper has to answer with: the body spends a level on
+    // `beginObject` and the member is read with `rawValue`, which spends
+    // another on the object it carries, so the deepest body this library reads
+    // carries `json.max_depth - 2` presence objects below the member rather
+    // than the `json.max_depth - 1` above. That body decodes, re-encodes to
+    // the same bytes, and decodes back to the same entries.
+    const body_deepest = json.max_depth - 2;
+    const body_object = "{\"v\":" ** (body_deepest + 1) ++ "true" ++ "}" ** (body_deepest + 1);
+    const body_source = "{\"" ++ v2_renames.client_capabilities_v1 ++ "\":" ++ body_object ++ "}";
+
+    // Sized the same way as the paths above, so a short buffer here would
+    // answer `BufferTooSmall` and hide the bound this is about.
+    var body_paths: [(body_deepest + 2) * (body_deepest + 2) + 8]u8 = undefined;
+    var body_out: [72]Capability = undefined;
+    const body_set = try decodeInitializeCapabilities(
+        .stable,
+        .client,
+        body_source,
+        &body_out,
+        &body_paths,
+        &scratch,
+    );
+    try testing.expectEqual(@as(usize, body_deepest + 1), body_set.entries.len);
+    try testing.expectEqual(
+        CapabilityForm.presence_object,
+        body_set.entries[body_deepest - 1].form,
+    );
+    try testing.expectEqual(CapabilityForm.boolean, body_set.entries[body_deepest].form);
+
+    var body_buffer: [512]u8 = undefined;
+    var body_writer = json.Writer.init(&body_buffer);
+    try encodeInitializeCapabilities(.stable, .client, body_set, &body_writer);
+    try testing.expectEqualStrings(body_source, body_writer.written());
+
+    var body_again_paths: [(body_deepest + 2) * (body_deepest + 2) + 8]u8 = undefined;
+    var body_again_out: [72]Capability = undefined;
+    const body_again = try decodeInitializeCapabilities(
+        .stable,
+        .client,
+        body_writer.written(),
+        &body_again_out,
+        &body_again_paths,
+        &scratch,
+    );
+    try testing.expectEqual(body_set.entries.len, body_again.entries.len);
+    for (body_set.entries, body_again.entries) |first, second| {
+        try testing.expectEqualStrings(first.path, second.path);
+        try testing.expectEqual(first.form, second.form);
+        try testing.expectEqual(first.value, second.value);
+    }
+
+    // `set` above is the deepest thing `encodeCapabilityObject` writes and is
+    // one presence object too deep for the body, so the two writers disagree
+    // about one set and nothing else. That is the whole point of charging the
+    // body for itself: the same entries are legal at one depth and not at the
+    // other, and the extra level belongs to the document the caller gets
+    // rather than to the object inside it. Both refusals are about the set —
+    // `error.InvalidField` on the way out, `error.LimitExceeded` on the way
+    // in — and neither is a shortage, so the wrapper's arrives with the
+    // buffer untouched: not the brace, not the member name, not one byte over
+    // what the caller had.
+    var one_deeper_paths: [(deepest + 2) * (deepest + 2) + 8]u8 = undefined;
+    var one_deeper_out: [80]Capability = undefined;
+    try testing.expectError(
+        error.LimitExceeded,
+        decodeInitializeCapabilities(
+            .stable,
+            .client,
+            "{\"" ++ v2_renames.client_capabilities_v1 ++ "\":" ++ source ++ "}",
+            &one_deeper_out,
+            &one_deeper_paths,
+            &scratch,
+        ),
+    );
+
+    var one_deeper_marked: [1024]u8 = undefined;
+    @memset(&one_deeper_marked, 0xa5);
+    var one_deeper_refuser = json.Writer.init(&one_deeper_marked);
+    try testing.expectError(
+        error.InvalidField,
+        encodeInitializeCapabilities(.stable, .client, set, &one_deeper_refuser),
+    );
+    try testing.expectEqual(@as(usize, 0), one_deeper_refuser.written().len);
+    for (one_deeper_marked) |byte| try testing.expectEqual(@as(u8, 0xa5), byte);
+
+    // The same bound at v2, where every member name has the `capabilities`
+    // root taken off it on the way out and put back on the way in, and with a
+    // sibling at the root after the deepest branch. The branch closes before
+    // the sibling's member is written, so the body is no deeper than the
+    // branch alone: a bound that added the two up would refuse this, and the
+    // root that comes off the names is a name rather than a level.
+    const v2_branch = comptime blk: {
+        var built: [body_deepest]Capability = undefined;
+        // The same spelling the documents above are built from, one level per
+        // step, behind the root this version writes as the member name.
+        var path: []const u8 = v2_capabilities_root ++ "v";
+        for (0..body_deepest) |level| {
+            built[level] = .{
+                .path = path,
+                .known = false,
+                .form = .presence_object,
+                .value = null,
+            };
+            path = path ++ ".v";
+        }
+        break :blk built;
+    };
+    var v2_sibling: [body_deepest + 1]Capability = undefined;
+    @memcpy(v2_sibling[0..body_deepest], &v2_branch);
+    v2_sibling[body_deepest] = .{
+        .path = v2_capabilities_root ++ "z",
+        .known = false,
+        .form = .presence_object,
+        .value = null,
+    };
+    const v2_body = "{\"" ++ v2_renames.client_capabilities_v2 ++ "\":" ++
+        "{" ++ "\"v\":{" ** body_deepest ++ "}" ** body_deepest ++ ",\"z\":{}}" ++ "}";
+
+    var v2_buffer: [512]u8 = undefined;
+    var v2_writer = json.Writer.init(&v2_buffer);
+    try encodeInitializeCapabilities(.draft, .agent, .{
+        .entries = &v2_sibling,
+        .present = true,
+    }, &v2_writer);
+    try testing.expectEqualStrings(v2_body, v2_writer.written());
+
+    // A path at level `k` here is `13 + 2k` bytes behind the root, so the
+    // branch and the sibling together own `4601` of `paths`.
+    var v2_paths: [4736]u8 = undefined;
+    var v2_out: [72]Capability = undefined;
+    const v2_read = try decodeInitializeCapabilities(
+        .draft,
+        .agent,
+        v2_body,
+        &v2_out,
+        &v2_paths,
+        &scratch,
+    );
+    try testing.expectEqual(@as(usize, body_deepest + 1), v2_read.entries.len);
+    for (v2_sibling[0..v2_read.entries.len], v2_read.entries) |first, second| {
+        try testing.expectEqualStrings(first.path, second.path);
+        try testing.expectEqual(first.form, second.form);
+    }
+
+    // One object more under the same root, refused at the same bound, so the
+    // level is counted on the levels rather than on the spelling of the paths.
+    const v2_too_deep = comptime blk: {
+        var built: [body_deepest + 1]Capability = undefined;
+        var path: []const u8 = v2_capabilities_root ++ "v";
+        for (0..body_deepest + 1) |level| {
+            built[level] = .{
+                .path = path,
+                .known = false,
+                .form = .presence_object,
+                .value = null,
+            };
+            path = path ++ ".v";
+        }
+        break :blk built;
+    };
+    var v2_marked: [1024]u8 = undefined;
+    @memset(&v2_marked, 0xa5);
+    var v2_refuser = json.Writer.init(&v2_marked);
+    try testing.expectError(error.InvalidField, encodeInitializeCapabilities(.draft, .agent, .{
+        .entries = &v2_too_deep,
+        .present = true,
+    }, &v2_refuser));
+    try testing.expectEqual(@as(usize, 0), v2_refuser.written().len);
+    for (v2_marked) |byte| try testing.expectEqual(@as(u8, 0xa5), byte);
 }
 
 test "a capability the decoder let through is written for the side that let it" {
@@ -5281,4 +7101,47 @@ fn findCapability(set: CapabilitySet, path: []const u8) ?Capability {
         if (std.mem.eql(u8, entry.path, path)) return entry;
     }
     return null;
+}
+
+test "permission tool calls spend subject and request containers" {
+    const call = "{\"k\":" ++ "[" ** (json.max_depth - 2) ++ "0" ++ "]" ** (json.max_depth - 2) ++ "}";
+    const too_deep = "{\"k\":" ++ "[" ** (json.max_depth - 1) ++ "0" ++ "]" ** (json.max_depth - 1) ++ "}";
+    const nested_call = "{\"k\":" ++ "[" ** (json.max_depth - 3) ++ "0" ++ "]" ** (json.max_depth - 3) ++ "}";
+    const options = [_]PermissionOption{.{
+        .option_id = "a",
+        .name = "Allow",
+        .kind = .{ .known = .allow_once },
+    }};
+    var out: [1024]u8 = undefined;
+    var scratch: [256]u8 = undefined;
+    var options_out: [1]PermissionOption = undefined;
+    var writer = json.Writer.init(&out);
+    try encodePermissionSubject(.{ .tool_call = call }, &writer);
+    const subject = try decodePermissionSubject(writer.written(), &scratch);
+    try testing.expectEqualStrings(call, subject.tool_call);
+    @memset(&out, 0xa5);
+    writer = json.Writer.init(&out);
+    try testing.expectError(error.InvalidField, encodePermissionSubject(.{ .tool_call = too_deep }, &writer));
+    try testing.expectEqualSlices(u8, &([_]u8{0xa5} ** out.len), &out);
+
+    writer = json.Writer.init(&out);
+    try encodePermissionRequest(.{ .draft = .{
+        .session_id = "s",
+        .title = "Run",
+        .description = null,
+        .subject = .{ .tool_call = nested_call },
+        .options = &options,
+    } }, &writer);
+    const request = try decodePermissionRequest(.draft, writer.written(), &options_out, &scratch);
+    try testing.expectEqualStrings(nested_call, request.draft.subject.?.tool_call);
+    @memset(&out, 0xa5);
+    writer = json.Writer.init(&out);
+    try testing.expectError(error.InvalidField, encodePermissionRequest(.{ .draft = .{
+        .session_id = "s",
+        .title = "Run",
+        .description = null,
+        .subject = .{ .tool_call = call },
+        .options = &options,
+    } }, &writer));
+    try testing.expectEqualSlices(u8, &([_]u8{0xa5} ** out.len), &out);
 }

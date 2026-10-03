@@ -32,13 +32,14 @@ its serial console and has no network device at all.
 from __future__ import annotations
 
 import fcntl
+import guest_process
 import hashlib
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
-import tempfile
+import guest_storage
 import time
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
@@ -161,7 +162,7 @@ def prepared_image() -> Path:
         fcntl.flock(held, fcntl.LOCK_EX)
         if image.is_file():
             return image
-        with tempfile.TemporaryDirectory(prefix="prepare-", dir=cache) as raw:
+        with guest_storage.temporary_directory(prefix="prepare-", dir=cache) as raw:
             work = Path(raw)
             decompressed = work / "sd.raw"
             converted = work / "sd.qcow2"
@@ -170,7 +171,7 @@ def prepared_image() -> Path:
                                stdout=output, check=True)
             subprocess.run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2",
                             str(decompressed), str(converted)], check=True)
-            os.replace(converted, image)
+            guest_storage.publish(converted, image)
     return image
 
 
@@ -273,14 +274,38 @@ def load_loader(child: pexpect.spawn, deadline: float) -> None:
 
 
 def drive(command: list[str]) -> bytes:
-    """Boot the guest, run the suite, and return every byte of its console."""
+    """Boot the guest, run the suite, and return every byte of its console.
+
+    The emulator is held from the moment it is started. `pexpect.spawn` forks it
+    into a session of its own, so the process group a supervisor would put it in
+    is a group this run did not choose and the guard refuses to signal; the only
+    way to hold a pty child is by pid, which is what `guest_process` does. It
+    adopts the console the terminal library opened — proving from `/proc` that
+    this pid is running this command line before it records anything — and it
+    takes the library's own `close(force=True)`, `terminate()` and finaliser
+    away, so that the polite stop and the kill that may follow it are the only
+    signals this emulator can receive, and both are authorised by the same
+    reading taken again immediately before each.
+
+    Every exit runs the same teardown, including the ones that already failed,
+    and a teardown that refused is raised in place of the run's own verdict
+    rather than left for the next reader to find.
+    """
     import pexpect
 
     console = Console()
-    child = pexpect.spawn(command[0], command[1:], timeout=FIRMWARE_TIMEOUT,
-                          encoding=None)
+    label = f"{EMULATOR} for arm-freebsd"
+    guard = guest_process.Guard()
+    handlers = guest_process.install_cancellation()
+    try:
+        guest = guest_process.spawn(guard, command, label, timeout=FIRMWARE_TIMEOUT)
+    except BaseException:
+        guest_process.restore_cancellation(handlers)
+        raise
+    child = guest.console
     child.logfile_read = console
     deadline = time.monotonic() + RUN_TIMEOUT
+    failure: BaseException | None = None
     try:
         stop_autoboot(child, deadline)
         load_loader(child, deadline)
@@ -301,11 +326,33 @@ def drive(command: list[str]) -> bytes:
         child.sendline(guest_script().encode())
         child.expect(pexpect.EOF, timeout=remaining(deadline))
     except pexpect.ExceptionPexpect as error:
-        raise GuestFailure(
-            f"the arm-freebsd console did not complete: {error}: {console.tail()}"
-        ) from error
+        # Ahead of the broad handler below, and not replaced by it: a console
+        # that timed out or hung up is a guest failure this run has to report,
+        # and the tail is the one thing that makes a cross-run failure
+        # readable. `Cancelled` is not one of these and falls through.
+        failure = GuestFailure(
+            f"the arm-freebsd console did not complete: {error}: {console.tail()}")
+    except BaseException as error:
+        failure = error
     finally:
-        child.close(force=True)
+        try:
+            stop = guest_process.finish(guest, guest_process.SHUTDOWN_GRACE)
+        except BaseException as teardown:
+            # A refusal outranks whatever the run was already failing on, so
+            # the teardown's own error is what propagates — with the run's
+            # failure chained behind it rather than dropped.
+            if failure is None:
+                raise
+            raise teardown from failure
+        finally:
+            # Restored whatever the stop did, including when a cancellation
+            # arrives inside it: a handler left installed over this report is
+            # one that would answer the next signal by unwinding a run that
+            # has already torn its guest down.
+            guest_process.restore_cancellation(handlers)
+    guest_process.require_stopped(stop, label, failure)
+    if failure is not None:
+        raise failure
     if child.exitstatus != 0:
         raise GuestFailure(f"{EMULATOR} exited {child.exitstatus} for arm-freebsd; "
                            f"the guest did not power off: {console.tail()}")
@@ -320,7 +367,7 @@ def run_guest(target: str, artifact: Path) -> bytes:
     if not payload.is_file():
         raise GuestFailure(f"payload {payload} is not a file")
     image = prepared_image()
-    with tempfile.TemporaryDirectory(prefix="arm-freebsd-", dir=cache_root()) as raw:
+    with guest_storage.temporary_directory(prefix="arm-freebsd-", dir=cache_root()) as raw:
         work = Path(raw)
         command = guest_command(root_overlay(image, work), payload,
                                 device_tree(work))
@@ -340,10 +387,17 @@ def _main(argv: Sequence[str]) -> int:
     run.add_argument("target", choices=TARGETS)
     run.add_argument("artifact", type=Path)
     args = parser.parse_args(argv)
-    if args.operation == "prepare":
-        print(prepared_image())
-    else:
-        run_guest(args.target, args.artifact)
+    try:
+        if args.operation == "prepare":
+            print(prepared_image())
+        else:
+            run_guest(args.target, args.artifact)
+    except guest_process.Cancelled as cancelled:
+        print(f"cross-freebsd-arm: {cancelled}", file=sys.stderr)
+        return 128 + cancelled.signum
+    except (GuestFailure, RuntimeError, OSError) as error:
+        print(f"cross-freebsd-arm: {error}", file=sys.stderr)
+        return 1
     return 0
 
 

@@ -57,13 +57,13 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import guest_process
 import lzma
 import os
 from pathlib import Path
 import shutil
-import signal
 import sys
-import tempfile
+import guest_storage
 from types import ModuleType
 
 RELEASE = "15.1"
@@ -177,10 +177,6 @@ SUITE_STATUS = rb"(?m)^ZAP_SUITE_STATUS ([0-9]+)"
 KEEPALIVE = (rb"(?m)^ZAP_GUEST_BEGIN ", rb"(?m)^All [0-9]+ tests passed\.",
              rb"(?m)^[0-9]+ passed; [0-9]+ skipped; [0-9]+ failed\.")
 
-# The guest of the run in progress, so a cancelled run stops the machine
-# before this process goes away.
-_LIVE: list = []
-
 
 class GuestFailure(RuntimeError):
     """A FreeBSD POWER guest did not boot, or did not deliver a runnable suite."""
@@ -255,7 +251,7 @@ def published_iso(variable: str) -> Path:
 
 def _decompress(source: Path, image: Path) -> None:
     """Write the pinned xz out as an immutable ISO, atomically."""
-    with tempfile.TemporaryDirectory(prefix="freebsd-power-", dir=image.parent) as scratch:
+    with guest_storage.temporary_directory(prefix="freebsd-power-", dir=image.parent) as scratch:
         staged = Path(scratch) / image.name
         try:
             with lzma.open(source, "rb", format=lzma.FORMAT_XZ) as packed, \
@@ -266,7 +262,7 @@ def _decompress(source: Path, image: Path) -> None:
         if not _is_iso9660(staged):
             raise GuestFailure(f"{source} did not decompress into an ISO 9660 image")
         staged.chmod(0o444)
-        os.replace(staged, image)
+        guest_storage.publish(staged, image)
 
 
 def media_command(media: Path, payload: Path) -> list[str]:
@@ -362,17 +358,6 @@ def _run_suite(child, pexpect: ModuleType) -> None:
     child.expect(pexpect.EOF, timeout=SHUTDOWN_TIMEOUT)
 
 
-def _cancel(signum: int, frame: object) -> None:
-    """Stop the guest when the caller cancels, then die as asked."""
-    for child in _LIVE:
-        try:
-            child.close(force=True)
-        except Exception:
-            pass
-    signal.signal(signum, signal.SIG_DFL)
-    os.kill(os.getpid(), signum)
-
-
 def run_guest(target: str, artifact: Path) -> bytes:
     """Boot ``target``, run the suite from ``artifact``, return the console.
 
@@ -381,6 +366,21 @@ def run_guest(target: str, artifact: Path) -> bytes:
     declared test root. A guest that cannot boot, cannot mount the payload, or
     whose suite exits nonzero raises instead of returning a receipt; the
     console it produced has been written to stdout either way.
+
+    The emulator is held from the moment it is started, by the same rules as
+    every other driver here: a pty child leads a session of its own, so it is
+    adopted by pid from `/proc` and stopped only through the guard, and the
+    terminal library's own `close(force=True)`, `terminate()` and finaliser are
+    taken away so that no path out of this function signals a pid that nothing
+    has proved.
+
+    A cancellation is an exception rather than a signal this process sends to
+    itself. The old handler closed every console it had and then re-raised its
+    own signal, which stopped the machine twice over: once on whatever the pid
+    looked like inside the handler and once through the interpreter's default
+    disposition, where no guard had been read at all. Raising unwinds into the
+    same `finally` every other exit takes, so the machine is stopped once and
+    through the guard, and `main` reports the cancellation as an exit status.
     """
     if target not in MEDIA:
         raise GuestFailure(f"{target} is not a FreeBSD POWER target this driver "
@@ -394,26 +394,36 @@ def run_guest(target: str, artifact: Path) -> bytes:
 
     command = media_command(published_iso(MEDIA[target]), payload)
     console = Console()
-    child = pexpect.spawn(command[0], command[1:], timeout=FIRMWARE_TIMEOUT,
-                          encoding=None)
+    label = f"{EMULATOR} for {target}"
+    guard = guest_process.Guard()
+    handlers = guest_process.install_cancellation()
+    try:
+        guest = guest_process.spawn(guard, command, label, timeout=FIRMWARE_TIMEOUT)
+    except BaseException:
+        guest_process.restore_cancellation(handlers)
+        raise
+    child = guest.console
     child.logfile_read = console
-    _LIVE.append(child)
-    handlers = {number: signal.signal(number, _cancel)
-                for number in (signal.SIGINT, signal.SIGTERM)}
+    failure: BaseException | None = None
     try:
         _loader_prompt(child, pexpect)
         _boot_single_user(child, pexpect)
         _prepare(child, pexpect)
         _run_suite(child, pexpect)
     except pexpect.ExceptionPexpect as error:
-        raise GuestFailure(
+        failure = GuestFailure(
             f"{target}: the guest console stopped responding: {error}"
-        ) from error
+        )
+    except BaseException as error:
+        failure = error
     finally:
-        child.close(force=True)
-        for number, handler in handlers.items():
-            signal.signal(number, handler)
-        _LIVE.clear()
+        try:
+            stop = guest_process.finish(guest, guest_process.SHUTDOWN_GRACE)
+        finally:
+            guest_process.restore_cancellation(handlers)
+    guest_process.require_stopped(stop, label, failure)
+    if failure is not None:
+        raise failure
 
     if child.exitstatus:
         raise GuestFailure(f"{EMULATOR} exited {child.exitstatus} for {target}; "
@@ -435,7 +445,10 @@ def main() -> int:
             run_guest(args.target, args.artifact)
         else:
             print(published_iso(MEDIA[args.target]))
-    except (GuestFailure, OSError) as error:
+    except guest_process.Cancelled as cancelled:
+        print(f"cross-freebsd-power: {cancelled}", file=sys.stderr)
+        return 128 + cancelled.signum
+    except (GuestFailure, RuntimeError, OSError) as error:
         print(f"cross-freebsd-power: {error}", file=sys.stderr)
         return 1
     return 0

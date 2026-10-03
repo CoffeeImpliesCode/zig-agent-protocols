@@ -97,8 +97,6 @@ import asyncio
 import json
 import os
 import selectors
-import shutil
-import signal
 import socket
 import subprocess
 import sys
@@ -110,6 +108,18 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urljoin, urlsplit
+
+# The teardown of every child this file starts is shared with the other
+# supervisors: one module decides which pids this run is allowed to signal
+# and in what order, because four copies of that decision drift apart.
+from process_guard import (Child, Guard, ProcessGuardError, Stop, refusals)
+
+# Where a run's work directory comes from and who may take it away, shared for
+# the same reason as the guard above: one place decides whether a directory may
+# be written into and whether it may be removed, because four copies of that
+# decision drift apart — and this one had drifted into four `rmtree` calls.
+from workdir import (WorkDirRefused, approved_scratch_root, remove_directory,
+                     require_named_directory, require_private_directory)
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_PINS = HERE / "sdk-pins.json"
@@ -245,39 +255,36 @@ def is_system_temporary(path: Path) -> bool:
 
 
 def scratch_root() -> Path:
-    """The only directory a generated work directory may be created in."""
-    raw = os.environ.get("TMPDIR")
-    require(
-        raw is not None and raw.strip() != "",
-        "TMPDIR is not set. This peer keeps a run's work on the scratch the environment "
-        "provides and never falls back to a system temporary directory: export "
-        "TMPDIR=<scratch>, or pass --work-dir <dir> to name the place yourself.",
-    )
-    require(Path(raw).is_absolute(), f"TMPDIR={raw!r} is not an absolute path")
-    root = Path(raw)
-    require(
-        not is_system_temporary(root),
-        f"TMPDIR={raw!r} is a system temporary directory, which is shared with every process "
-        f"on the host. Point TMPDIR at this machine's own scratch instead.",
-    )
-    root.mkdir(parents=True, exist_ok=True)
-    require(os.access(root, os.W_OK | os.X_OK), f"TMPDIR={raw!r} is not writable")
-    return root
+    """The only directory a generated work directory may be created in.
+
+    The rule itself lives in `workdir`, because the repository's remover
+    enforces the same one: a directory created anywhere it would refuse to
+    remove is a directory this run could only ever leave behind.
+    """
+    try:
+        return approved_scratch_root()
+    except WorkDirRefused as refusal:
+        raise InteropFailure(str(refusal)) from None
 
 
 class WorkDir:
-    """Where one run's evidence goes, and who takes it away afterwards.
+    """Where one run's evidence goes, and who may take it away afterwards.
 
-    Generated or named, the only difference is who may keep it: a generated
-    directory is removed when the run ends, on every path out, and the run
-    says which of the two happened rather than printing a path that is no
-    longer there.
+    Generated or named, the only difference is who may keep it. A generated
+    directory is removed when the run ends, on every path out, through the
+    repository's own remover, which checks ownership, mode, volume, mount
+    points and liveness before it removes anything. A named directory is a
+    deliverable and is never removed by this run at all.
     """
 
     def __init__(self, requested: str | None, prefix: str) -> None:
         if requested is None:
             self.path = Path(tempfile.mkdtemp(prefix=prefix, dir=os.fspath(scratch_root())))
             self.temporary = True
+            try:
+                require_private_directory(self.path)
+            except WorkDirRefused as refusal:
+                raise InteropFailure(str(refusal)) from None
             return
         named = Path(requested)
         require(named.is_absolute(), f"--work-dir {requested!r} is not an absolute path")
@@ -287,8 +294,15 @@ class WorkDir:
             f"every process on the host. If you want the expected interface kept, name a "
             f"directory on this machine's own storage.",
         )
-        require(not named.exists() or named.is_dir(),
-                f"--work-dir {named} exists and is not a directory")
+        # Checked before anything is written, not after: the expected
+        # interface and the reports go into this directory, so a directory
+        # this account does not own is a write into somebody else's storage
+        # whatever happens to it afterwards, and a symlink means the bytes
+        # land somewhere the name does not describe.
+        try:
+            require_named_directory(named)
+        except WorkDirRefused as refusal:
+            raise InteropFailure(str(refusal)) from None
         self.path = named
         self.temporary = False
         self.path.mkdir(parents=True, exist_ok=True)
@@ -297,24 +311,55 @@ class WorkDir:
         return self.path / name
 
     def notice(self) -> str:
+        """What to print about this directory: a policy, not an outcome.
+
+        Deliberately silent about removal, because this one is printed both
+        before and after the removal runs and on a refusal only one of those
+        happens. Saying the directory is gone here would claim an outcome the
+        run has not established; `remove_temporary` is what says whether it
+        was.
+        """
         if self.temporary:
-            return (f"  temporary work removed: {self.path}\n"
+            return (f"  temporary work directory, removed when the run ends: {self.path}\n"
                     f"  pass --work-dir <dir> to keep the expected interface and the reports")
         return f"  expected interface and reports: {self.path}"
 
     def discard(self) -> None:
-        shutil.rmtree(self.path)
+        """Remove this generated directory through the repository's remover."""
+        try:
+            remove_directory(self.path)
+        except WorkDirRefused as refusal:
+            raise InteropFailure(str(refusal)) from None
 
 
 def remove_temporary(work: WorkDir) -> None:
-    """Take a generated work directory away, or say where it still is."""
+    """Take a generated work directory away, without ever hiding why a run failed.
+
+    A refusal raises when the run was otherwise succeeding, because a directory
+    this run could not take away means the run did not do what it says it did.
+    It does not raise when the run was already failing: there it is a second
+    finding rather than the reason the exchange failed, and it is printed
+    beside the original instead of replacing it. That distinction is the whole
+    point of this function — `main` catches `InteropFailure` and prints one
+    line without a traceback, so raising from here during a failure would
+    replace the line naming what actually went wrong with a line about a
+    directory, and the real cause would survive only as context nothing prints.
+
+    A named directory is a deliverable and is left alone whatever else is true.
+    """
     if not work.temporary:
         return
+    # Read before the attempt: inside the handler below, `sys.exc_info()`
+    # reports this refusal rather than whatever the run is unwinding from.
+    already_failing = sys.exc_info()[0] is not None
     try:
         work.discard()
-    except OSError as exc:  # pragma: no cover - the filesystem refused
-        print(f"  the temporary work directory could not be removed and is still at "
-              f"{work.path}: {exc}", file=sys.stderr)
+    except InteropFailure as refusal:
+        if not already_failing:
+            raise
+        print(f"  cleanup, reported beside the failure above: {refusal}", file=sys.stderr)
+        return
+    print(f"  temporary work removed: {work.path}")
 
 
 class BoundedLog:
@@ -896,20 +941,6 @@ def free_port() -> int:
         return int(probe_socket.getsockname()[1])
 
 
-def terminate(process: subprocess.Popen[str], grace: float) -> int | None:
-    """Kill a child's whole process group, then reap it. Never leaves an orphan."""
-    if process.poll() is not None:
-        return process.returncode
-    try:
-        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):  # pragma: no cover - already gone
-        process.kill()
-    try:
-        return process.wait(timeout=grace)
-    except subprocess.TimeoutExpired:  # pragma: no cover - SIGKILL is not refusable
-        return None
-
-
 # A readiness line is one JSON object, so a pipe carrying more than this
 # without one in it is a child that is not reporting readiness. The cap is
 # what keeps the wait bounded in memory as well as in time.
@@ -917,7 +948,7 @@ READINESS_LIMIT_BYTES = 64 * 1024
 READINESS_CHUNK_BYTES = 4096
 
 
-def wait_for_line(process: subprocess.Popen[str], deadline: float,
+def wait_for_line(guard: Guard, child: Child, deadline: float,
                   note: Callable[[], str] | None = None) -> dict[str, Any]:
     """The child's one line of readiness, or a failure naming why it never came.
 
@@ -932,6 +963,7 @@ def wait_for_line(process: subprocess.Popen[str], deadline: float,
     line the child never finishes is a line this run cannot use, so the rest of
     it is waited for rather than the partial line being taken as readiness.
     """
+    process = child.process
     assert process.stdout is not None
     # The agent's own stderr is what explains a child that never got this far,
     # and a generated work directory is about to be removed, so the note is
@@ -955,7 +987,7 @@ def wait_for_line(process: subprocess.Popen[str], deadline: float,
                 # The child closed its readiness pipe, which is not the same as
                 # the child being gone, so it is taken down here rather than
                 # left for the caller's teardown to find.
-                terminate(process, 5.0)
+                guard.stop(child, 5.0)
                 raise InteropFailure(
                     f"the agent exited with {process.poll()} before it was ready{where}")
             carry += chunk
@@ -963,7 +995,7 @@ def wait_for_line(process: subprocess.Popen[str], deadline: float,
                 # A child that floods its pipe is not reporting readiness
                 # either, and it is a child that would keep writing into a run
                 # that has already failed.
-                terminate(process, 5.0)
+                guard.stop(child, 5.0)
                 raise InteropFailure(
                     f"the agent wrote more than {READINESS_LIMIT_BYTES} bytes to standard "
                     f"output without a line of readiness in it{where}")
@@ -977,7 +1009,7 @@ def wait_for_line(process: subprocess.Popen[str], deadline: float,
         selector.close()
     # The deadline is the answer, so the child that missed it is taken down
     # here rather than left for the caller's teardown to find.
-    terminate(process, 5.0)
+    guard.stop(child, 5.0)
     raise InteropFailure(f"the agent did not report itself ready within the deadline{where}")
 
 
@@ -1283,32 +1315,53 @@ def supervise_run(args: argparse.Namespace, pins: dict[str, Any], record: dict[s
     # instant on the same clock. Converted once, here.
     deadline = time.monotonic() + args.deadline
 
-    agent: subprocess.Popen[str] | None = None
+    # The guard is built before the child exists, so a system where the target
+    # checks cannot be read fails this run with nothing running rather than half
+    # a teardown away.
+    guard = Guard()
+    agent_argv = [sys.executable, str(Path(__file__).resolve()),
+                  "--role", "serve", "--pins", str(args.pins), "--port", str(port),
+                  "--rpc-path", args.rpc_path]
+
+    agent: Child | None = None
     drain: threading.Thread | None = None
+    # How the child left, kept as evidence beside the facts it answered with.
+    stops: list[Stop] = []
     started = time.monotonic()
     try:
-        agent = subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()),
-             "--role", "serve", "--pins", str(args.pins), "--port", str(port),
-             "--rpc-path", args.rpc_path],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            start_new_session=True,
+        agent = guard.spawn(
+            agent_argv, "the agent",
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True,
         )
-        drain = pump(agent.stderr, agent_log)
-        ready = wait_for_line(agent, deadline, lambda: stderr_note(agent_log, work, "the agent"))
+        drain = pump(agent.process.stderr, agent_log)
+        ready = wait_for_line(guard, agent, deadline,
+                              lambda: stderr_note(agent_log, work, "the agent"))
         require(ready.get("rpc_path") == args.rpc_path,
                 f"the agent came up on {ready.get('rpc_path')!r}, not {args.rpc_path!r}; "
                 f"{stderr_note(agent_log, work, 'the agent')}")
         facts = asyncio.run(probe(base_url, emit, record))
     finally:
-        if agent is not None and agent.poll() is None:
-            terminate(agent, 5.0)
+        # Unconditional, with no `poll()` in front of it: a child that has
+        # already left is the case the guard records as an exit status and no
+        # signal, so there is no window here for a reap to race.
+        if agent is not None:
+            stops.append(guard.stop(agent, 5.0))
         if drain is not None:
             # End of file arrives when the child the pipe belongs to is gone.
             # The join is bounded so a pipe that somehow outlives its child
             # cannot hold the run open, and the log is capped either way.
             drain.join(timeout=2.0)
         agent_log.close()
+
+    # A guard that refused left behind a process this run could not prove it
+    # started, and reported it as such. Said here, before anything about the
+    # capture or the findings, because a refusal is about what is still
+    # running and nothing else this file checks can say about that.
+    require(not refusals(stops),
+            "this run could not prove a pid was the child it started, so it did not signal that "
+            "process and cannot say the exchange ended: "
+            + "; ".join(refusals(stops)))
 
     elapsed = round(time.monotonic() - started, 3)
     require(
@@ -1329,6 +1382,12 @@ def supervise_run(args: argparse.Namespace, pins: dict[str, Any], record: dict[s
         "expected_interface": str(emit),
         "findings": findings,
         "facts": facts,
+        # How the child left, kept beside the facts it answered with: the
+        # signals that were sent, the status `waitpid` reported, and any
+        # refusal from the target guards. A teardown that refused is evidence
+        # too, and a run that hid one would be a run whose ending nobody could
+        # account for.
+        "child_stops": [stop._asdict() for stop in stops],
     }
     (work / "summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -1390,15 +1449,20 @@ class Direction:
     never produce.
     """
 
-    def __init__(self, name: str, work: WorkDir, limit: int) -> None:
+    def __init__(self, name: str, work: WorkDir, limit: int, guard: Guard) -> None:
         self.name = name
         self.work = work
         self.limit = limit
+        self.guard = guard
         self.to_server = Capture(work / f"{name}-wire-client-to-server.log", limit)
         self.to_client = Capture(work / f"{name}-wire-server-to-client.log", limit)
         self.logs: dict[str, BoundedLog] = {}
         self.drains: list[threading.Thread] = []
-        self.children: list[subprocess.Popen[Any]] = []
+        self.children: list[Child] = []
+        # How each child left, read by the run once every direction has been
+        # torn down: the signals that were sent, the status `waitpid` reported,
+        # and any refusal from the target guards.
+        self.stops: list[Stop] = []
         self.relay: Relay | None = None
         self.ports: list[int] = []
         self.facts: dict[str, Any] = {}
@@ -1410,23 +1474,26 @@ class Direction:
         return entry
 
     def spawn(self, argv: list[str], label: str, text: bool, *,
-              keep_stdout: bool = True) -> subprocess.Popen[Any]:
-        entry = subprocess.Popen(
-            argv, stdin=subprocess.DEVNULL,
+              keep_stdout: bool = True) -> Child:
+        entry = self.guard.spawn(
+            argv, label,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE if keep_stdout else subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=text, start_new_session=True,
         )
         self.children.append(entry)
-        self.drains.append(pump(entry.stderr, self.log(label)))
+        self.drains.append(pump(entry.process.stderr, self.log(label)))
         return entry
 
     def finish(self) -> None:
         if self.relay is not None:
             self.relay.stop()
         for child in self.children:
-            if child.poll() is None:
-                terminate(child, 5.0)
+            # Unconditional, with no `poll()` in front of it: a child that has
+            # already left is the case the guard records as an exit status and
+            # no signal, so there is no window here for a reap to race.
+            self.stops.append(self.guard.stop(child, 5.0))
         for drain in self.drains:
             # End of file arrives when the child the pipe belongs to is gone.
             # The join is bounded so a pipe that somehow outlives its child
@@ -1479,7 +1546,7 @@ def zig_client_direction(direction: Direction, args: argparse.Namespace, record:
         "--rpc-path", args.rpc_path, "--rpc-query", args.rpc_query,
         "--advertise-base", f"http://127.0.0.1:{relay.port}",
     ], "sdk-agent", text=True)
-    ready = wait_for_line(agent, time.monotonic() + deadline_seconds,
+    ready = wait_for_line(direction.guard, agent, time.monotonic() + deadline_seconds,
                           lambda: direction.note("sdk-agent"))
     require(ready.get("rpc_path") == args.rpc_path,
             f"the SDK agent came up on {ready.get('rpc_path')!r}, not {args.rpc_path!r}; "
@@ -1549,7 +1616,7 @@ def zig_server_direction(direction: Direction, args: argparse.Namespace, record:
         "--requests", str(args.zig_requests),
         "--report-file", str(work / "zig-server-report.json"),
     ], "zig-server", text=True)
-    ready = wait_for_line(server, time.monotonic() + deadline_seconds,
+    ready = wait_for_line(direction.guard, server, time.monotonic() + deadline_seconds,
                           lambda: direction.note("zig-server"))
     require(ready.get("port") == listen_port,
             f"the Zig server reported port {ready.get('port')!r}, not the {listen_port} it was "
@@ -1583,11 +1650,16 @@ def zig_server_direction(direction: Direction, args: argparse.Namespace, record:
     require(relay.failure is None, f"{direction.name}: {relay.failure}")
 
 
-def wait_for(process: subprocess.Popen[Any], deadline: float) -> int | None:
-    """A child's exit status, or a failure naming the deadline it missed."""
+def wait_for(child: Child, deadline: float) -> int | None:
+    """A child's exit status, or a failure naming the deadline it missed.
+
+    Nothing is signalled here: the direction that owns this child tears it down
+    in its own `finish`, through the guard, on every path out including this
+    one, and the `Stop` it records is what that run reports.
+    """
     budget = max(deadline - time.monotonic(), 0.0)
     try:
-        return process.wait(timeout=budget)
+        return child.process.wait(timeout=budget)
     except subprocess.TimeoutExpired:
         raise InteropFailure(
             f"the child did not exit within {budget:.0f}s of the deadline"
@@ -1886,11 +1958,16 @@ def zig_interop_run(args: argparse.Namespace, pins: dict[str, Any], record: dict
                     zig_binary: Path, work: WorkDir) -> None:
     limit = int(pins.get("limits", {}).get("capture_bytes_per_direction", 262144))
     started = time.monotonic()
+    # The guard is built before either direction exists, so a system where the
+    # target checks cannot be read fails this run with nothing running rather
+    # than half a teardown away.
+    guard = Guard()
     # Both directions are registered before either runs, so a failure inside
     # the first one still finds a teardown that closes the captures and reaps
     # whatever it had already started. A direction that is only registered once
     # it succeeds is a direction whose sockets and children outlive the failure.
-    directions = [Direction("zig-client", work, limit), Direction("zig-server", work, limit)]
+    directions = [Direction("zig-client", work, limit, guard),
+                  Direction("zig-server", work, limit, guard)]
     try:
         zig_client_direction(directions[0], args, record, zig_binary, work, args.deadline)
         zig_server_direction(directions[1], args, record, zig_binary, work, args.deadline)
@@ -1899,6 +1976,16 @@ def zig_interop_run(args: argparse.Namespace, pins: dict[str, Any], record: dict
         # processes and sockets, and neither may outlive the run that made it.
         for direction in directions:
             direction.finish()
+
+    # A guard that refused left behind a process this run could not prove it
+    # started, and reported it as such. Said here, before anything about the
+    # captures or the findings, because a refusal is about what is still
+    # running and nothing else this file checks can say about that.
+    stopped = [stop for direction in directions for stop in direction.stops]
+    require(not refusals(stopped),
+            "this run could not prove a pid was the child it started, so it did not signal that "
+            "process and cannot say the exchange ended: "
+            + "; ".join(refusals(stopped)))
 
     elapsed = round(time.monotonic() - started, 3)
     for direction in directions:
@@ -1925,6 +2012,10 @@ def zig_interop_run(args: argparse.Namespace, pins: dict[str, Any], record: dict
                 "bytes_captured": direction.captured,
                 "findings": findings,
                 "facts": direction.facts,
+                # How each child left, kept beside the capture it left with: the
+                # signals that were sent, the status `waitpid` reported, and any
+                # refusal from the target guards.
+                "child_stops": [stop._asdict() for stop in direction.stops],
                 "capture": {
                     "client_to_server": str(direction.work /
                                             f"{direction.name}-wire-client-to-server.log"),
@@ -2004,9 +2095,10 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument("--base-url", default=None, help="probe only")
     parser.add_argument("--emit", type=Path, default=None, help="probe only")
     parser.add_argument("--work-dir", default=None,
-                        help="an absolute path outside /tmp and /var/tmp where the expected "
-                             "interface and the reports are kept; a generated directory under "
-                             "TMPDIR otherwise, removed when the run ends either way it went")
+                        help="an absolute path outside /tmp and /var/tmp, owned by this account "
+                             "and not a symlink, where the expected interface and the reports are "
+                             "kept and never removed by this run; a generated directory under "
+                             "TMPDIR otherwise, removed when the run ends")
     parser.add_argument("--preflight", action="store_true",
                         help="check TMPDIR and the work-directory policy and exit, with no SDK, "
                              "no pins and no child process")
@@ -2048,7 +2140,7 @@ def main(argv: Iterable[str]) -> int:
         if args.role == "zig-interop":
             return run_zig_interop(args)
         return run_supervise(args)
-    except InteropFailure as failure:
+    except (InteropFailure, ProcessGuardError) as failure:
         print(f"a2a interop FAILED: {failure}", file=sys.stderr)
         return 1
 

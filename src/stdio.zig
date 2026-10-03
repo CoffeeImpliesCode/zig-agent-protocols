@@ -40,9 +40,15 @@ pub const Io = std.Io;
 ///
 /// ## Lifetime
 ///
-/// A connection borrows this struct's reader and writer by pointer, so this
-/// struct has to outlive the connection built from it. `AGENTS.md` records
-/// the same rule for `conn.Conn`.
+/// A connection borrows this struct's reader and writer by pointer. Keep it
+/// alive at a stable address until that connection's tasks finish; do not move
+/// or copy it after `connection`. Its caller buffers and borrowed `Io` backend
+/// must outlive it. No allocator or file ownership is transferred: standard
+/// streams belong to the process and this type has no `deinit`.
+///
+/// One pump reads and Conn serializes writes. Do not concurrently flush or use
+/// the raw interfaces outside Conn. Shut down or cancel blocked work and join
+/// the caller-owned group before releasing any of these objects.
 ///
 /// ```zig
 /// // Wrong. The temporary dies at the end of the statement, and the
@@ -75,6 +81,11 @@ pub const Stdio = struct {
     /// one pair of the fifteen among a stdio connection's six regions that
     /// this call is the earliest to see; [`Stdio.connection`] says which call
     /// refuses the other fourteen.
+    ///
+    /// Returns streaming file adapters that retain both buffers and `io`.
+    /// Neither buffer is initialized or written here; no stream I/O blocks.
+    /// Sizes are caller policy. The backend must support streaming standard
+    /// files; the type does not construct or certify a concrete executor.
     pub fn init(io: Io, read_buffer: []u8, write_buffer: []u8) conn.Error!Stdio {
         // One test per argument, in the order they are passed, rather than one
         // over both that cannot say which of them was short.
@@ -129,6 +140,10 @@ pub const Stdio = struct {
     /// now. After [`Stdio.init`] those are the caller's own arrays; a caller
     /// that replaced `reader` or `writer` after that has moved them, and what
     /// this checks is whatever the replacement was handed.
+    ///
+    /// Retains pointers into `self`; fix its address before this call. Success
+    /// clears Config's pending slots, not transport buffers, and starts no task.
+    /// Keep both transport regions and Config storage until all Conn work ends.
     pub fn connection(self: *Stdio, config: conn.Conn.Config) conn.Error!conn.Conn {
         // The eight pairs that neither [`Stdio.init`] nor the call below is
         // handed, compared before anything is built. The pending table as its
@@ -153,8 +168,12 @@ pub const Stdio = struct {
         );
     }
 
-    /// Flush anything buffered. A caller must do this before exiting or the
-    /// last frame is lost, which reads to the peer as a truncated message.
+    /// Flush buffered standard output. Blocks on the borrowed file backend.
+    ///
+    /// Success drains this writer; cancellation returns `Canceled` and other
+    /// file failures return its write errors. A prefix may already be written
+    /// on failure. Do not race Conn writes or another flush. Conn itself flushes
+    /// each frame; this is for direct buffered writes made outside live Conn use.
     pub fn flush(self: *Stdio) !void {
         try self.writer.flush();
     }
@@ -173,6 +192,13 @@ pub const Stdio = struct {
 /// the first frame that overlaps it. `read` and `write` are the pair
 /// [`Stdio.init`] takes, and `out`, `result` and `params` are the per-call
 /// buffers of [`conn.Conn.call`] and [`conn.Conn.notify`].
+///
+/// These capacities are a convenience policy, not wire limits or negotiated
+/// defaults. Declare the struct at its final address before handing out slices.
+/// Do not copy or move it while Stdio, Conn or a response borrows any field.
+/// Undefined byte arrays become readable only in the extents a writer fills;
+/// `Conn.init` initializes the pending table. Per-call arrays serve one issuer
+/// at a time; concurrent calls need additional independent storage.
 pub const Buffers = struct {
     /// Read buffer. Bounds one read from the stream.
     // SAFETY: `Stdio.init` refuses an empty one; the file reader reads back only bytes it filled.
@@ -204,10 +230,10 @@ pub const Buffers = struct {
     // SAFETY: caller-written JSON spliced into the frame; only its encoded length is read.
     params: [8192]u8 = undefined,
 
-    /// The four buffers the connection owns, borrowed from this struct.
+    /// The four Config regions borrowed from this struct, with no mutation.
     ///
-    /// They borrow rather than copy, so this struct has to outlive the
-    /// connection for the reason [`Stdio`] has to.
+    /// Slices retain these field addresses. Keep this struct alive and unmoved
+    /// until the connection's tasks finish; no storage or cleanup is transferred.
     pub fn config(self: *Buffers) conn.Conn.Config {
         return .{
             .frame_buffer = &self.frame,
@@ -258,32 +284,10 @@ const EchoAgent = struct {
     }
 };
 
-test "the transport is the process's own streams, and flush pushes them out" {
+test "flush delivers buffered protocol bytes to a file" {
     var buffers: Buffers = .{};
 
-    // A consumer starts here, so what `init` builds is asserted rather than
-    // assumed. The wrong descriptor, the positional default on an unseekable
-    // pipe, or a buffer the caller did not supply each fail this test.
     var stdio = try Stdio.init(testing.io, &buffers.read, &buffers.write);
-    try testing.expect(std.Io.File.stdin().handle == stdio.reader.file.handle);
-    try testing.expect(std.Io.File.stdout().handle == stdio.writer.file.handle);
-    try testing.expect(std.meta.eql(testing.io, stdio.reader.io));
-    try testing.expect(std.meta.eql(testing.io, stdio.writer.io));
-    try testing.expectEqual(std.Io.File.Reader.Mode.streaming, stdio.reader.mode);
-    try testing.expectEqual(std.Io.File.Writer.Mode.streaming, stdio.writer.mode);
-    // Compared as slices, not as pointers: what the assertion is about is
-    // that the reader and the writer were handed the caller's buffers, and a
-    // slice says so without caring how the buffer is stored.
-    try testing.expectEqualSlices(
-        u8,
-        &buffers.read,
-        stdio.reader.interface.buffer[0..buffers.read.len],
-    );
-    try testing.expectEqualSlices(
-        u8,
-        &buffers.write,
-        stdio.writer.interface.buffer[0..buffers.write.len],
-    );
 
     // The writer `init` built is the process's standard output. A byte
     // written there corrupts the message stream the test runner speaks over

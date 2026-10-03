@@ -279,21 +279,24 @@ const Endpoint = struct {
     reader: Io.net.Stream.Reader = undefined,
     // SAFETY: `open` assigns it from `Stream.Writer.init` before it lends `writer.interface` to `Conn.init`.
     writer: Io.net.Stream.Writer = undefined,
-    // SAFETY: `open` stores it before `Conn.init` can refuse, so a refused `open` still holds a descriptor.
-    stream: Io.net.Stream = undefined,
-    // SAFETY: `open` assigns it before it sets `pumping`, and only a pumping endpoint reads it.
+    /// The descriptor this endpoint owns, and the proof that it owns one.
+    ///
+    /// `open` stores it before `Conn.init` can refuse, so a caller that gives
+    /// up here still holds the descriptor it has to hang up, and `release`
+    /// stores `null` before it closes, so neither end of the example can close
+    /// the same number twice. An option rather than an `undefined` field
+    /// because the owner releases both endpoints after the join, and one whose
+    /// `open` never ran owns no descriptor at all.
+    stream: ?Io.net.Stream = null,
+    // SAFETY: `open` assigns it before it sets `connected`, and only a connected endpoint reads it.
     connection: conn.Conn = undefined,
-
+    /// Whether `open` built a connection over `stream`, which it sets once
+    /// `conn.Conn.init` hands one back. A hang-up reads the connection through
+    /// it, so a refused `init` leaves the field alone rather than calling into
+    /// a `Conn` that was never initialised.
+    connected: bool = false,
     /// Whether this endpoint has been hung up already.
     closed: bool = false,
-    /// Whether a task reads this endpoint's stream, which [`open`] sets before
-    /// it spawns the pump.
-    ///
-    /// It decides who releases the descriptor: the pump, because it is the only
-    /// task that reads it, whenever there is one. See [`hangUp`].
-    pumping: bool = false,
-    /// Whether the descriptor has been released.
-    released: bool = false,
 
     /// Open an endpoint over `stream`, or report why there is no connection to
     /// open. `conn.Conn.init` refuses a region with no room and a pair that
@@ -318,92 +321,80 @@ const Endpoint = struct {
             .decode_scratch = &self.side.decode_scratch,
             .answer = &self.side.answer,
         });
+        self.connected = true;
         if (handler) |h| self.connection.setHandler(h);
-        // A blocking reader needs concurrency; `async` may run it inline.
-        // Publish ownership before spawning, but give it back on refusal.
-        self.pumping = true;
-        group.concurrent(io, pump, .{ self, io }) catch |err| {
-            self.pumping = false;
-            return err;
-        };
+        // A blocking reader needs concurrency; `async` may run it inline. A
+        // refused spawn leaves the descriptor with this endpoint and no reader
+        // on it, which the owner releases after the join like any other one.
+        try group.concurrent(io, pump, .{self});
     }
 
-    /// Hang up: stop the reader, wake it, and let the descriptor go once.
+    /// Hang up: tell the reader to stop, wake it, and leave the descriptor to
+    /// the owner.
     ///
-    /// `shutdown` before `close`: closing a descriptor does not interrupt a read
-    /// already blocked on it, so the peer's pump would sit on an open
-    /// description and the group would never finish.
+    /// `shutdown` before anything else, and no `close` here at all. Closing a
+    /// descriptor does not interrupt a read already blocked on it, so a hang-up
+    /// that only closed would leave the pump sitting on an open description and
+    /// the group would never finish; `shutdown` is what makes the next read
+    /// return zero bytes and the loop leave.
     ///
-    /// The pump releases the descriptor, not this call, and it is the only task
-    /// that may. `conn.pump` asks again after a read of zero bytes, and a local
-    /// `shutdown` makes the next read return exactly that, so a caller that
-    /// released the descriptor under a live pump would have that pump read a
-    /// freed descriptor: the standard library aborts on `EBADF` inside
-    /// `netReadPosix`, before the pump's own `catch` can see an error, and the
-    /// whole binary dies instead of the exchange failing. Telling the
-    /// connection first is what makes the loop stop — the pump leaves at its
-    /// next turn and closes the stream on its way out, after the last read that
-    /// can touch it.
+    /// This side's own reader is the one this is for, and it is not the only
+    /// task on this socket: `ClientTask.run` is a task of its own and writes
+    /// every request on it, and `Agent.handle` answers on the very task that is
+    /// reading. A reader that released the descriptor on its way out would take
+    /// it away from a write in flight, and the standard library aborts the
+    /// process on the `EBADF` that follows rather than returning an error the
+    /// pump's own `catch` could see. [`release`] is the owner's, and runs once
+    /// every task has joined.
     ///
-    /// The client's own pump is the one this is for. It runs on the same group
-    /// and `ClientTask.run` is a different task from it, so `shutdown` followed
-    /// by `close` here closes a descriptor another task is reading: that read
-    /// wakes with zero bytes, `conn.pump` reads zero as "ask again", and the
-    /// next read lands on the number `close` returned.
-    ///
-    /// The guards are what make the callers safe: `abandon` reaches this from
-    /// every arm that gave the exchange up, the last line of the exchange
-    /// reaches it too, and the pump reaches `release` on the way out of all of
-    /// them. Releasing the same descriptor twice would close an unrelated one
-    /// the process had opened in the meantime, and every call below is a
-    /// syscall on it.
+    /// Best effort, and nothing is lost by it: the reader has already been told
+    /// to stop, and a `shutdown` that cannot be sent means the peer is already
+    /// gone. This call returns nothing and its caller is a task, so a failure
+    /// has nowhere to propagate.
     fn hangUp(self: *Endpoint, io: Io) void {
         if (self.closed) return;
         self.closed = true;
-        if (self.released) return;
-        if (self.pumping) {
-            self.connection.close();
-            // Best effort, and nothing is lost by it: the reader has already
-            // been told to stop, the pump closes the descriptor on its way
-            // out, and a `shutdown` here has nothing left to interrupt. There
-            // is also nowhere to report a failure to, because this call is
-            // already returning and `close` below is not reachable from here.
-            // gate-reviewed-zlint-next-statement: suppressed-errors
-            // ziglint-ignore: Z026
-            // zwanzig-disable-next-line: empty-catch-engine
-            self.stream.shutdown(io, .both) catch {};
-            return;
-        }
-        self.release(io);
-    }
-
-    /// Release the descriptor once, and only on a stream that still has one.
-    fn release(self: *Endpoint, io: Io) void {
-        if (self.released) return;
-        self.released = true;
-        // Best effort for the same reason as in `hangUp`: the descriptor is
-        // closed on the next line whatever this returns, and the only caller
-        // that reaches here through a pump has already seen the end of the
-        // stream.
+        const stream = self.stream orelse return;
+        if (self.connected) self.connection.close();
         // gate-reviewed-zlint-next-statement: suppressed-errors
         // ziglint-ignore: Z026
         // zwanzig-disable-next-line: empty-catch-engine
-        self.stream.shutdown(io, .both) catch {};
-        self.stream.close(io);
+        stream.shutdown(io, .both) catch {};
+    }
+
+    /// Release the descriptor once, and only on a stream this endpoint still
+    /// owns.
+    ///
+    /// The owner calls this after the group has been joined or cancelled, never
+    /// before and never from a task a live reader runs beside. By then every
+    /// task that could read or write the socket has returned, and the two
+    /// syscalls below are the last any of them will see of it.
+    ///
+    /// `shutdown` before `close`, and best effort before both. Nothing is
+    /// blocked on the descriptor any more, so the shutdown only tells the peer
+    /// the exchange is over; the close releases the number whether or not that
+    /// reached it.
+    fn release(self: *Endpoint, io: Io) void {
+        const stream = self.stream orelse return;
+        self.stream = null;
+        // gate-reviewed-zlint-next-statement: suppressed-errors
+        // ziglint-ignore: Z026
+        // zwanzig-disable-next-line: empty-catch-engine
+        stream.shutdown(io, .both) catch {};
+        stream.close(io);
     }
 };
 
-/// The connection pump, and the descriptor release that goes with it.
+/// Drive the connection until it is told to stop, and stop there.
 ///
-/// The pump takes the endpoint rather than the connection because it is the one
-/// task that reads the descriptor and therefore the one that closes it: a
-/// caller that closed it first would have this loop read a freed descriptor
-/// and the process would abort inside the read. It releases on the way out of
-/// every exchange, which is why no endpoint needs a flag saying which side
-/// closes.
-fn pump(endpoint: *Endpoint, io: Io) void {
+/// It takes the endpoint rather than the connection because that is what
+/// `open` spawns it with, and because what it does *not* do is the point: the
+/// descriptor is the owner's to release. This task is the only one that reads
+/// the stream, but it is not the only one that uses it — `Agent.handle` answers
+/// on this very task — so it leaves the release to an owner that has joined
+/// this task and every other one first.
+fn pump(endpoint: *Endpoint) void {
     endpoint.connection.pump();
-    endpoint.release(io);
 }
 
 /// One carried call's inner outcome.
@@ -489,10 +480,10 @@ const ServerTask = struct {
             self.report.failed = true;
             return;
         };
-        // A refused `open` spawned no pump, so nothing else releases the
-        // accepted stream and this task hangs its end up itself. The pump that
-        // did start needs no flag to say it releases the stream: it releases
-        // every stream it reads, and `hangUp` is the one that waits for it.
+        // A refused `open` started no reader, so nothing is on the accepted
+        // stream but this task, and it hangs its end up itself. A reader that
+        // did start closes nothing: `hangUp` tells it to stop, and the owner
+        // closes the stream once this group has been joined.
         self.endpoint.open(self.io, self.group, stream, .{
             .ctx = self.agent,
             .call = Agent.handle,
@@ -514,10 +505,10 @@ const ClientTask = struct {
 
     /// Give up on the exchange. Every arm that reaches here has an endpoint
     /// holding this side's stream — `open` stores it before it can refuse —
-    /// so there is a descriptor to hang up, and the peer's pump ends on it.
-    /// What hangs up is this side's own reader: it closes this endpoint's
-    /// descriptor on its way out rather than here, where a task other than the
-    /// reader would be closing a descriptor that reader may still be using.
+    /// so there is a descriptor to hang up, and the peer's reader ends on it.
+    /// What that hang-up does not do is close: this task shares the stream with
+    /// its own reader, so the close belongs to the owner and happens after the
+    /// join.
     fn abandon(self: *ClientTask) void {
         self.report.failed = true;
         self.endpoint.hangUp(self.io);
@@ -525,10 +516,9 @@ const ClientTask = struct {
 
     fn run(self: *ClientTask) void {
         const stream = self.address.connect(self.io) catch {
-            // Not `abandon`, because `Endpoint.stream` is undefined until
-            // `open` assigns it and a hang up here would close whatever
-            // descriptor the stack held. There is nothing of this side's to
-            // hang up: `connect` failed, so no descriptor was ever assigned.
+            // Not `abandon`, because there is nothing of this side's to hang up:
+            // `connect` failed, so `Endpoint.open` never took a stream and no
+            // descriptor was ever assigned.
 
             // What this arm cannot reach is the agent's task, which is still
             // parked in `accept`. `main` listens before it spawns either task,
@@ -662,9 +652,8 @@ const ClientTask = struct {
         record(&report.second, second);
 
         // The client hangs up. The agent's reader sees end of file and returns,
-        // and this side's own pump returns with it — releasing this endpoint's
-        // descriptor on its way out, which is the last read's own task and so
-        // the only one that may close it.
+        // and this side's own reader returns with it — which is the point at
+        // which `main` owns both descriptors and may close them.
         self.endpoint.hangUp(self.io);
     }
 };
@@ -778,6 +767,10 @@ pub fn main(init: std.process.Init) !void {
     // One group drives both ends. Two would deadlock: the client blocks waiting
     // for an answer only the peer's task can produce.
     var group: Io.Group = .init;
+    defer {
+        server_side.release(io);
+        client_side.release(io);
+    }
     defer group.cancel(io);
     var server_task: ServerTask = .{
         .io = io,
@@ -797,10 +790,11 @@ pub fn main(init: std.process.Init) !void {
     try group.concurrent(io, ServerTask.run, .{&server_task});
     try group.concurrent(io, ClientTask.run, .{&client_task});
     // Await normal completion; the defer cancels only on an early exit.
-    // The client hangs up when done; both pumps then return.
+    // The client hangs up when done; both readers then return.
     //
-    // Joined with `try` because a join that reported a fault is this step's own
-    // fault, and the check below reads the report rather than the join.
+    // `await` also joins on cancellation. On a refused spawn the cancel defer
+    // runs before the release defer, so neither descriptor is closed while a
+    // task can still use it.
     try group.await(io);
 
     // The step fails rather than returning quietly. `http_demo` answers the

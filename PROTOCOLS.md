@@ -41,19 +41,40 @@ wires is attacker-controlled input. They are not negotiable per protocol.
 - **Decoding is total.** It returns a `DecodeError` and never `unreachable`. A peer
   speaking a newer version, or a peer sending a tag this library has never heard
   of, gets an error, not a panic.
-- **Encoding is the exact inverse.** `decode(encode(x)) == x` and
-  `encode(decode(b)) == b` for every accepted input. Both directions are tested.
+- **Wire values round-trip; source spelling does not.** For valid constructed
+  values, decoding an encoding preserves the modeled wire values and the
+  presence states the type represents. Encoding a decoded document normalizes
+  modeled member order, insignificant whitespace and string escapes. Repeating
+  that decode/encode cycle produces the same bytes after the first encoding.
+  Recognized duplicate members resolve first-wins; later duplicates are not
+  replayed. Protocol-specific default/null normalization is documented on the
+  owning type. No decoder promises to retain unmodeled members unless its
+  carrier explicitly holds their raw JSON.
+- **Opaque carried JSON stays opaque.** Raw lexemes represented by the model,
+  including open MCP result and metadata members, are spliced back without
+  rewriting their contents. Their bytes and presence must not be lost through
+  a typed projection. This is not lexical provenance for the surrounding message.
 - **No allocation in a decode or encode path.** The caller supplies every buffer.
-  Slices borrow from the caller's arena; nothing is retained past the call.
+  Decoded strings borrow input or scratch; arrays and objects may also borrow a
+  caller arena. Returned values remain valid only while that storage is alive
+  and unchanged. Runtime objects retain buffers and backend capabilities under
+  their own documented lifetime rules.
 - **Every wire integer is explicitly sized.** `i64` for JSON-RPC `id`, `i32` for
   error codes, `u8` for status enums, `i32` for protobuf field numbers' domain.
   A struct is `extern` only where a C ABI genuinely requires the layout; nothing
   here is `packed`.
-- **Unknown enum tags and unknown method names are errors**, not `unreachable`
-  arms and not silently mapped to a default.
+- **Closed enum decoders and protocol method lookups reject unknown values**,
+  not `unreachable` arms or silent defaults. The generic JSON-RPC codec carries
+  method text; revision registries decide whether a protocol supports that name.
 - **Optionality is explicit.** A field that the spec marks optional is
   `?T` in Zig and its presence is preserved through a round trip. A field the spec
   marks required but omits on the wire is a decode error.
+- **Caller storage must satisfy the API preconditions.** Decode input cannot
+  alias writable scratch or arena storage. Encoding sources cannot alias the
+  writer's destination. Where an encoder uses unchecked string primitives,
+  caller-supplied text must already be valid UTF-8. Decoded strings satisfy that
+  precondition. Attached API docs distinguish checked refusals from caller duties
+  and describe logical rollback separately from dirty backing bytes.
 
 ### 2.1 The shared decode error set
 
@@ -729,15 +750,12 @@ commit-pinned artifacts in
 | Members of `ClientCapabilities` and `ServerCapabilities` | **Open** — by prose, not by signature | Neither interface declares an index signature, and both carry the *"not a closed set"* sentence. 4.8.3 |
 | Nested objects inside a capability — `sampling`, `elicitation`, `prompts`, `resources`, `tools` | **Declared** member sets, **open** `JSONObject` values; closing **NOT ESTABLISHED** | Each declares exactly the members 4.8.1 and 4.8.2 tabulate and no index signature; `experimental`, `extensions` and the `JSONObject`-typed members are open maps by type. As above, declaring is not closing, and none of the five carries `additionalProperties` either. 4.8.3 |
 
-The first row is the one that decides the encoding. A `tools/call` result the
-library accepts may carry a key the shape does not name, because the source
-says a result may follow any object structure, and 2 says
-`encode(decode(b)) == b` for every accepted input. So a key a result type does
-not model is carried as the borrowed lexeme it arrived as, which is what
-`bridge.Envelope.meta` and `bridge.OutcomePayload` already do. This is the
-mistake that re-opened a loss that had been closed for the life of the
-repository, and it is the reason no result payload in 4.10.3 is transcribed as
-a closed struct.
+An open result may carry a key no closed typed shape can hold. Section 2 requires
+modeled opaque JSON and its presence to survive, so that result is carried as
+the borrowed lexeme it arrived as. `bridge.Envelope.meta` and
+`bridge.OutcomePayload` follow this rule. It preserves open wire data without
+promising byte identity for the surrounding JSON-RPC document; no result payload
+in 4.10.3 is transcribed as a closed struct.
 
 The member-set rows say **declared**, not closed, and that is the whole difference
 between them and the first row. The first row rests on a positive statement — a
@@ -1396,15 +1414,28 @@ mechanism, and it is why an unknown capability is not a decode error.
 | `session.delete` | `session/delete` |
 | `session.additionalDirectories` | additional workspace roots |
 
-#### 6.5.1 The `acp` capability — RFD only, in no published schema
+#### 6.5.1 The `acp` capability — RFD-only in the pinned schema artifacts
 
 The mcp-over-acp binding advertises itself with an `acp` capability. This
 library does **not** invent it, and the distinction below is the reason: the
-`acp` key appears in **neither** released ACP schema. Verified on the published
+`acp` key appears in **neither** pinned ACP schema. Verified on those published
 artifacts: the literal `"acp"` occurs **zero** times in `schema/v1/schema.json`
 and **zero** times in `schema/v2/schema.json`, and neither `meta.json` lists any
 `mcp/*` method. Full transcription and the RFD fragments:
 [`research/normative/acp-v1-v2.md`](research/normative/acp-v1-v2.md) §10e.
+
+Re-verified 2026-10-03 against the immutable tags, not a moving `main`:
+`schema-v1.23.0` and `schema-v2.0.0-alpha.5` are annotated tags on the same
+commit,
+[`6d08f412a7a1370d3cc9a124e3be3d6acf92641e`](https://github.com/agentclientprotocol/agent-client-protocol/tree/6d08f412a7a1370d3cc9a124e3be3d6acf92641e/schema).
+Their tag objects are
+[`b410d434`](https://api.github.com/repos/agentclientprotocol/agent-client-protocol/git/tags/b410d434fc5cbf1bad5d82c817c435846f1e5bda)
+and
+[`d9375e42`](https://api.github.com/repos/agentclientprotocol/agent-client-protocol/git/tags/d9375e42df9caf82d41a7bc67eec546ba679f1b7).
+At that commit each `schema.json` holds zero occurrences of `"acp"` and
+`mcp/message`. v1 `McpCapabilities` carries `http`, `sse` and `_meta`;
+its default is `{"http": false, "sse": false}`. v2 carries `stdio`, `http`
+and `_meta`. These claims cover the pinned artifacts, not all schema releases.
 
 | | Published v1 | Published v2 draft | RFD proposal |
 | --- | --- | --- | --- |
@@ -1432,9 +1463,26 @@ declared arm. And v2 renamed `mcpCapabilities` wholesale to
 `capabilities.session.mcp`; the v1 string does not occur in `schema/v2/schema.json`
 at all.
 
+**A released SDK declares both, and calls them unstable.** The official Python
+SDK this repository pins for `interop-acp`, `agent-client-protocol` `1.0.0rc2`
+(tag commit
+[`9d07d7871ef4b220b8507e15fc4b1560f0950a64`](https://github.com/agentclientprotocol/python-sdk/tree/9d07d7871ef4b220b8507e15fc4b1560f0950a64/schema)),
+generates `McpCapabilities.acp` and the
+`MessageMcpRequest`, `MessageMcpResponse` and `MessageMcpNotification` models.
+It does not read the artifact pinned above. Its vendored `schema/schema.json`
+sits beside `schema/VERSION` = `refs/tags/schema-v1.23.0` but is a different
+revision — 389 552 bytes and 268 `$defs` against the released 247 168 and 170,
+and the literal `"acp"` occurs in it four times. The `acp` property's own
+description there reads, verbatim, *"This capability is not part of the spec
+yet, and may be removed or changed at any point."*, under an `**UNSTABLE**`
+heading. That is the author's position, and it agrees with the tables above.
+PROTOCOLS keeps the key RFD-only: neither pinned published schema declares it.
+
 **Source conflict, both values stated.** The RFD specifies the `acp` capability
-key and the `{"type":"acp"}` server declaration; the released schemas declare
-neither. These are a draft RFD and released schemas, and they disagree today.
+key and the `{"type":"acp"}` server declaration; the pinned schema artifacts
+declare neither, while the SDK's vendored snapshot declares both as
+unstable. Both positions are recorded, and neither is presented as the other's
+correction.
 
 ### 6.6 Permission options
 
@@ -1493,7 +1541,7 @@ a session setup request. `session/new` parameters are the RFD's example:
 
 | Field | Type | In the RFD example | Obligation the RFD states |
 | --- | --- | --- | --- |
-| `type` | `"acp"` | yes | The discriminator. Declared in no published schema — see the limitation below |
+| `type` | `"acp"` | yes | The discriminator. Declared in neither pinned ACP schema — see the limitation below |
 | `name` | string | yes | None stated in prose |
 | `serverId` | string | yes | Provider-generated and opaque. *"A server ID identifies one registration for the lifetime of the ACP connection and must not be rebound to a different registration, including after removal."* Distinct offerings use distinct ids |
 
@@ -1511,20 +1559,28 @@ registration may be offered to several ACP sessions, and omitting a
 previously-declared server from a later setup request does not revoke a
 registration another session is using.
 
-**Published-schema limitation.** `type: "acp"` is in **no released ACP
-schema**. The literal `"acp"` occurs zero times in both `schema/v1/schema.json`
-and `schema/v2/schema.json`. Concretely, in the published v2 schema the
-`McpServer` union has exactly three branches — `http`, `stdio` and an `other`
-catch-all — and no `acp` branch, so this declaration currently validates only
-by falling through to `other`. A peer built against the released schemas will
-accept the object and will not give it ACP transport semantics. This library
-encodes the declaration and says so; it does not claim the released schema
-declares it.
+**Pinned-schema limitation.** `type: "acp"` is in neither pinned ACP schema
+artifact. The literal `"acp"` occurs zero times in both `schema/v1/schema.json`
+and `schema/v2/schema.json` at their shared commit `6d08f412`
+(6.5.1). Concretely, in the published v2 schema the `McpServer` union has
+exactly three branches — `http`, `stdio` and an `other` catch-all — and no
+`acp` branch, so this declaration currently validates only by falling through
+to `other`. A peer built against the released schemas will accept the object
+and will not give it ACP transport semantics. A peer built from the official SDK
+does know a `{"type": "acp"}` variant because its generated model differs from
+the pinned schema artifacts (6.5.1). It round-trips the declaration under a
+discriminator those artifacts do not define. This
+library encodes the declaration and says so; it does not claim the released
+schema declares it.
 
 ### 7.2 Capability advertisement
 
 A peer accepts `mcp/message` only if it has advertised the `acp` capability,
-and the advertisement is **RFD-only**: it is in neither released ACP schema.
+and the advertisement is **RFD-only** in the two pinned ACP schema artifacts.
+The official SDK declares the key and registers `mcp/message` on both sides
+from a different snapshot that labels the capability `**UNSTABLE**`,
+not part of the spec yet (6.5.1). The rule
+below is therefore this library's, not a claim about what that SDK accepts.
 The two paths and their shapes, and the verbatim rules for what an absent value
 means, are in **6.5.1**. In short: v1 `mcpCapabilities.acp` is a `boolean` where
 omission means `false`; v2 `capabilities.session.mcp.acp` is a **presence

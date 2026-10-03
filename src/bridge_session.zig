@@ -141,6 +141,21 @@ pub const Refusal = struct {
 pub const method = "mcp/message";
 
 /// A client that carries MCP calls over an ACP connection.
+///
+/// Holds the connection every call travels on, the MCP revision carried inside
+/// each envelope, and the last refusal when there was one. It allocates
+/// nothing, retains nothing past a call and releases nothing: the caller keeps
+/// the connection, the `std.Io` backend behind it and every region it hands over,
+/// alive for as long as this client is used.
+///
+/// Copying one copies the connection pointer, the revision and whatever
+/// [`Client.refusal`] the copy is holding at the moment — and `refusal` is
+/// per-client state that the next `call` overwrites. Two copies sharing one
+/// connection therefore share nothing to synchronise, but two tasks calling on
+/// one client would race over `refusal`; a caller that serves from several tasks
+/// gives each its own client, or reads [`Client.refusal`] on the task whose call
+/// reported the refusal. Outbound calls themselves follow the connection's own
+/// rule: two tasks may call at once, each with its own regions.
 pub const Client = struct {
     /// The connection the call goes out on, which the caller owns and keeps
     /// alive. Every call this client makes travels over it.
@@ -151,8 +166,23 @@ pub const Client = struct {
     /// The peer's answer to the last call, when it refused. Set before `call`
     /// returns `error.PeerRefused` and cleared by every other outcome, so a
     /// caller reads it only after that error and never sees a stale refusal.
+    ///
+    /// `body` borrows the `inner` region the refused call was given, so it is
+    /// invalidated by the next call that writes there — and by a call on any
+    /// other client sharing that region. A copy of the client carries the same
+    /// borrow, not a copy of the bytes.
     refusal: ?Refusal = null,
 
+    /// A client that carries MCP `2026-07-28` calls over `connection`.
+    ///
+    /// `connection` is borrowed rather than owned and nothing here reaches
+    /// through it: nothing is allocated, nothing is registered, and this cannot
+    /// fail. The caller keeps the connection, the backend behind it and every
+    /// region it later hands over.
+    ///
+    /// `revision` is already the only revision this binding carries and
+    /// `refusal` is null, so a client from this constructor sends what
+    /// [`Client.setRevision`] would accept and has nothing stale to read.
     pub fn init(connection: *conn.Conn) Client {
         return .{ .connection = connection };
     }
@@ -369,7 +399,34 @@ pub fn classifyOutcome(outer_result: []const u8, scratch: []u8) Error!Outcome {
 /// payload goes into. A resolver is handed no frame and no id, so nothing it
 /// writes can land on a value the connection is still reading.
 pub const Resolver = struct {
+    /// Passed to `call` unchanged, or null. The caller owns whatever it points
+    /// at and keeps it alive across every [`Provider.serve`] that can reach
+    /// this resolver; null reaches the callback as null, which is a context the
+    /// caller chose rather than a missing owner.
     ctx: ?*anyopaque = null,
+    /// The MCP operation this provider carries. Runs synchronously inside
+    /// [`Provider.serve`], on the thread that called it — the reader task, when
+    /// `serve` is called from a handler — before that call returns.
+    ///
+    /// `envelope` is already decoded and borrows the region the transport
+    /// decoded it from; `out` is the caller's own region for the payload, and it
+    /// may be as small as the caller made it. Both stay live for exactly this
+    /// call and neither may be kept. The returned outcome's `text` must borrow
+    /// `out` or be a literal: it is spliced into the outer frame while `serve`
+    /// is still on the stack, and nothing copies it afterwards.
+    ///
+    /// The callback may reenter [`Provider.serve`] on the same provider with
+    /// regions of its own — the slot discipline is a stack, so a nested serve
+    /// that reaches the claim takes the next slot and gives it back first — and
+    /// it may not touch the regions of the serve it is inside. It must not write
+    /// to the connection it is answering on: the reader that would deliver that
+    /// call's answer is the task this one is running on.
+    ///
+    /// Null from the callback means this provider carries no such MCP method,
+    /// which `serve` answers as an inner `-32601` inside a successful outer
+    /// response. An error from it propagates out of `serve` with no frame
+    /// written, which is the caller's own condition rather than a protocol
+    /// answer.
     call: ?*const fn (
         ctx: ?*anyopaque,
         envelope: bridge.Envelope,
@@ -383,6 +440,12 @@ pub const Resolver = struct {
 /// hop and a proxy is free to renumber it. A provider therefore refuses a
 /// second call for a pair it is still holding, and serves the same pair once
 /// it has answered.
+///
+/// An entry is the caller's storage and the provider's to write: `serve` fills
+/// one, holds it for the length of that call, and clears it on the way out on
+/// every path. The two id slices borrow the decoded envelope, so they are valid
+/// only while that `serve` call is on the stack, and an entry the provider has
+/// released names no ids any more.
 pub const Active = struct {
     /// The server the call went to, so two servers may carry the same
     /// `requestId` at once.
@@ -419,29 +482,74 @@ pub const Active = struct {
 /// - Anything else is a successful outer response carrying exactly one inner
 ///   outcome, which is what [`Client.call`] reads back.
 ///
+/// ## Admission is the caller's
+///
+/// `serve` decides the binding's own failures and nothing else. It never checks
+/// whether the calling agent advertised the MCP transport, never reads the MCP
+/// capabilities an envelope carries, and never admits a `serverId` this
+/// provider did not publish: PROTOCOLS.md 7.2 makes that advertisement an ACP
+/// capability — `mcpCapabilities.acp` at v1, `capabilities.session.mcp.acp` at
+/// v2 — and this binding holds no capability paths of its own to check it
+/// against. A `serverId` in the list means this provider published that server;
+/// it says nothing about who may call it.
+///
+/// The admission decision is therefore the caller's, taken before `serve` with
+/// `acp_session.checkCall` against the paths the agent advertised in its own
+/// `initialize`. The MCP capabilities an envelope carries are informative and
+/// not a gate: they describe the features behind the transport, and reading one
+/// as a permission to act would be this library inventing a consent nobody gave.
+///
 /// ## Concurrency
 ///
-/// `serve` runs inline on the reader task, so one connection carries one
-/// served carried request at a time and `active` needs no mutex. A caller
-/// that serves from several tasks at once owns that with whatever it already
-/// uses to share its buffers.
+/// `serve` runs inline on the reader task, so one connection carries one served
+/// carried request at a time and `active` needs no mutex. A caller that serves
+/// from several tasks at once owns that with whatever it already uses to share
+/// its buffers.
+///
+/// Copying a provider copies the `servers` handle, the `active` slice and the
+/// `free` counter, so both copies then name one table and one counter: they are
+/// not two independent slot managers, and a copy served from releases slots in
+/// the original's array. A caller that wants a second independent provider
+/// gives it a second `active` array of its own — which is also why a copied
+/// counter cannot be reasoned about apart from the table it indexes.
 pub const Provider = struct {
     /// The connection this provider answers on. Nothing in `serve` reads it,
     /// and it is carried so one value holds both the transport and the
     /// binding rules that apply over it.
     connection: *conn.Conn,
-    /// The server ids this provider declared. An envelope naming anything
-    /// else is a `server_registration_unavailable` refusal, because only the
-    /// provider's own declaration says a `serverId` names a server.
+    /// The server ids this provider declared. Borrowed for the provider's life
+    /// and read on every `serve`, so each id must stay alive and unmodified as
+    /// long as this provider is used.
+    ///
+    /// This is a registration list and nothing more: it answers "does this
+    /// `serverId` name a server this provider published", and a `no` is the
+    /// `server_registration_unavailable` refusal. It is not an admission check,
+    /// and it cannot be one — whether the calling agent may carry MCP traffic
+    /// at all is a capability question, and this binding performs no ACP gate.
+    /// The caller owns that decision and takes it with
+    /// `acp_session.checkCall` before calling [`Provider.serve`], against the
+    /// capability paths the agent advertised: at v1 the key is
+    /// `mcpCapabilities.acp` and at v2 `capabilities.session.mcp.acp`.
+    ///
+    /// Empty is a value and not a default to rely on: with no ids declared every
+    /// carried request is refused with `server_registration_unavailable`, and a
+    /// provider that is constructed with `init` and never given a list serves
+    /// nothing at all.
     servers: []const []const u8 = &.{},
     /// Storage for the carried requests this provider is serving at once.
     /// The caller hands it over because its length is the bound, so a peer
     /// that opens requests faster than the caller sized for is refused rather
     /// than given a slot another call is holding.
     ///
-    /// The provider owns the entries. It clears the one it takes before it
-    /// returns and never reads an entry it has not taken, so the array needs
-    /// no initialising where the caller declares it.
+    /// The provider owns the entries: it clears the one it takes before it
+    /// returns and never reads an entry it has not taken, so the array needs no
+    /// initialising where the caller declares it.
+    ///
+    /// Empty is a bound of zero rather than an unlimited table: every carried
+    /// request is then the `resource_limit_exceeded` refusal, because there is
+    /// no slot to claim. A provider that is constructed with `init` and never
+    /// given an array therefore serves nothing, and the caller sizes this from
+    /// how many carried requests it expects to hold at once.
     active: []Active = &.{},
     /// Where the next slot is: the index `serve` claims, and the count of the
     /// entries below it the provider owns.
@@ -449,8 +557,26 @@ pub const Provider = struct {
     /// Zero on a provider `init` returned and zero on one the caller gave an
     /// `active` array, so the same value is right for both, and every claim
     /// and every release moves it by one.
+    ///
+    /// The counter belongs to the table beside it and not to this value alone:
+    /// a copy of the provider carries a copy of the number and a copy of the
+    /// handle, so both name one table, and a caller writing this field by hand
+    /// moves where the next slot is claimed for every copy.
     free: usize = 0,
 
+    /// A provider that answers carried MCP requests on `connection`.
+    ///
+    /// `connection` is borrowed rather than owned, and nothing in this type
+    /// reaches through it: `serve` writes the frame it returns into the region
+    /// the caller hands it, and the caller's handler is what writes it to the
+    /// wire. Nothing is allocated or registered, so this cannot fail.
+    ///
+    /// Every other field keeps its default, and both defaults refuse: with no
+    /// declared server and no slot to claim, every carried request this provider
+    /// is asked to serve comes back as an outer refusal. A caller that wants a
+    /// serving provider sets [`Provider.servers`] and [`Provider.active`] before
+    /// the first request, and takes the admission decision this type does not
+    /// take for itself.
     pub fn init(connection: *conn.Conn) Provider {
         return .{ .connection = connection };
     }
@@ -502,11 +628,17 @@ pub const Provider = struct {
     /// branches, because the branches differ in the payload and in nothing
     /// else.
     ///
-    /// Every failure `serve` has of its own is a `conn.Error` member, and an
-    /// answer that does not fit is `ResponseTooLarge` whichever of the four
-    /// buffers was short, because one answer for a short answer is the only
-    /// one a caller can act on. A resolver that returns an error propagates
-    /// here unchanged and writes no frame.
+    /// Every failure `serve` has of its own is a `conn.Error` member, and the
+    /// two encode failures are told apart rather than collapsed: a region too
+    /// small for the answer is `error.EncodeBufferTooSmall`, where one answer
+    /// for a short answer is the only one a caller can act on, and a payload
+    /// this file's own encoder refuses is `error.InvalidMessage`, where no
+    /// size makes it fit and a caller told to grow a buffer would grow it
+    /// forever. `error.ResponseTooLarge` is the inbound direction and is not
+    /// reachable from here: nothing is read but the envelope.
+    ///
+    /// A resolver that returns an error propagates here unchanged and writes no
+    /// frame.
     pub fn serve(
         self: *Provider,
         request: jsonrpc.Request,
@@ -519,6 +651,15 @@ pub const Provider = struct {
         // Another method is not this binding's, and answering it here would
         // put a `mcp/message` result on a call this provider never read.
         if (!std.mem.eql(u8, request.method.text, method)) return null;
+
+        // Every frame below echoes the id after writing the envelope's opening
+        // bytes into `out`, and `jsonrpc.Id` has a string arm that borrows the
+        // frame or the region the transport decoded it from. An id inside `out`
+        // is therefore echoed from bytes the writer has already moved, so it is
+        // refused here — once, before any of the five answers below — rather
+        // than at each of them. An integer id is a value and reaches none of
+        // this.
+        if (idOverlaps(request.id, out)) return error.OverlappingBuffers;
 
         // An envelope is a params object, so a message carrying none, or one
         // carrying an explicit `null`, is a malformed envelope rather than a
@@ -622,14 +763,14 @@ pub const Provider = struct {
         // keep readable was the one a hand-written shape broke.
         var writer = json.Writer.init(outcome_scratch);
         if (outcome) |carried| {
-            bridge.encodeOutcome(carried, &writer) catch return error.ResponseTooLarge;
+            bridge.encodeOutcome(carried, &writer) catch |err| return encodeFailure(err);
         } else {
             // `inner` is the resolver's buffer and the resolver wrote nothing,
             // so it backs the payload here and nothing reads it afterwards.
-            const payload = methodNotCarried(envelope.inner_method, inner) catch
-                return error.ResponseTooLarge;
-            bridge.encodeOutcome(.{ .@"error" = .{ .text = payload } }, &writer) catch
-                return error.ResponseTooLarge;
+            const payload = methodNotCarried(envelope.inner_method, inner) catch |err|
+                return encodeFailure(err);
+            bridge.encodeOutcome(.{ .@"error" = .{ .text = payload } }, &writer) catch |err|
+                return encodeFailure(err);
         }
         const answered = try conn.respond(request, writer.written(), out);
         return answered;
@@ -650,12 +791,27 @@ pub const Provider = struct {
     /// That is the whole difference between this `-32602` and the `-32602` a
     /// tool returns inside a successful outer response: the level, and only
     /// the level, tells them apart.
+    ///
+    /// `out` must not share a byte with a string `request.id`: the builder
+    /// writes the envelope's opening bytes before it echoes the id, so an id
+    /// inside the region is echoed from bytes the writer has moved. That one
+    /// overlap is `error.OverlappingBuffers`, refused before a byte is written;
+    /// an integer id is a value and imposes nothing, and nothing else about the
+    /// request is read by this frame. `message` is this caller's own text and is
+    /// spliced while `out` is written, so it must stay clear of `out` too — a
+    /// caller passing a literal is always fine, and a caller that passes its own
+    /// region finds the same refusal.
+    ///
+    /// A frame that does not fit is `error.EncodeBufferTooSmall` with a prefix
+    /// left in `out`, which is not a frame. The result borrows `out`.
     pub fn bindingError(
         request: jsonrpc.Request,
         binding: bridge.BindingError,
         message: []const u8,
         out: []u8,
     ) conn.Error![]const u8 {
+        if (idOverlaps(request.id, out)) return error.OverlappingBuffers;
+        if (conn.overlaps(out, message)) return error.OverlappingBuffers;
         return conn.errorResponse(request, .{
             .code = @intFromEnum(binding),
             .message = message,
@@ -691,7 +847,120 @@ fn methodNotCarried(
     return writer.written();
 }
 
+/// How one of this file's own encode failures becomes a [`conn.Error`].
+///
+/// Two failures reach this, and a caller repairs them in opposite ways. A
+/// region that could not hold the answer is `error.EncodeBufferTooSmall`, and
+/// a larger region is the whole repair. A value the encoder refuses is
+/// `error.InvalidMessage`, and no size makes it fit — a caller told to grow a
+/// buffer would grow it forever against a body this file cannot write.
+///
+/// `conn.Error` carries the same split for the frames the connection composes,
+/// so the two boundaries answer one question with one vocabulary. Collapsing
+/// both into a single "grow the buffer" tag is what made a malformed resolver
+/// outcome look like a sizing fault.
+///
+/// `bridge.encodeOutcome` refuses the one-of rule before it writes anything and
+/// `json.Writer` fails on bounds alone, so today only the first arm is
+/// reachable; the second stays because the difference is the whole reason this
+/// function exists.
+fn encodeFailure(err: root.EncodeError) conn.Error {
+    return switch (err) {
+        error.BufferTooSmall => error.EncodeBufferTooSmall,
+        error.InvalidField, error.UnknownTag => error.InvalidMessage,
+    };
+}
+
+/// Whether `id` borrows a byte of the region a frame is written into.
+///
+/// [`jsonrpc.Id`] has two arms and they are not alike here. An integer id is a
+/// value, so a frame may echo it from anywhere — which is every id this
+/// library's own connection allocates. A string id is legal on the wire and
+/// borrows the frame or the region the transport decoded it from, and every
+/// builder here writes the envelope's opening bytes before it echoes the id, so
+/// a string id inside the output region is echoed from bytes the writer has
+/// already moved.
+fn idOverlaps(id: jsonrpc.Id, out: []const u8) bool {
+    return switch (id) {
+        .integer => false,
+        .string => |text| conn.overlaps(text, out),
+    };
+}
+
 // --- Tests ----------------------------------------------------------------------
+
+test "a string id inside the answer region is refused before a frame is written" {
+    // JSON-RPC 2.0 allows a string id and this library's own connection never
+    // allocates one, so only a caller that decoded an inbound frame with a
+    // string id can reach this. Every frame the provider writes echoes the id
+    // after writing the envelope's opening bytes, so an id borrowed from the
+    // answer region is echoed from bytes the writer has already moved and the
+    // agent reads punctuation where its own id was.
+    var provider = Provider.init(undefined);
+    var active: [1]Active = undefined;
+    provider.active = &active;
+    const servers = [_][]const u8{bridge.server_declaration.server_id};
+    provider.servers = &servers;
+
+    var params: [256]u8 = undefined;
+    var envelope_writer = json.Writer.init(&params);
+    try bridge.encodeEnvelope(.{
+        .server_id = bridge.server_declaration.server_id,
+        .request_id = "req-1",
+        .inner_method = "tools/list",
+        .inner_params = null,
+        .direction = .agent_to_provider,
+    }, &envelope_writer);
+    var out: [512]u8 = undefined;
+    const id = "req-1";
+    @memcpy(out[0..id.len], id);
+    const request: jsonrpc.Request = .{
+        .id = .{ .string = out[0..id.len] },
+        .method = jsonrpc.Method.split(method),
+        .params = .{ .value = envelope_writer.written() },
+    };
+
+    var envelope_scratch: [256]u8 = undefined;
+    var outcome_scratch: [512]u8 = undefined;
+    var inner: [512]u8 = undefined;
+    try testing.expectError(
+        error.OverlappingBuffers,
+        provider.serve(
+            request,
+            .{ .call = refuseAll },
+            &envelope_scratch,
+            &outcome_scratch,
+            &inner,
+            &out,
+        ),
+    );
+    // And the refusal this provider writes for itself carries the same rule,
+    // because a caller reaches it directly for the two codes `serve` has no
+    // cause for.
+    try testing.expectError(
+        error.OverlappingBuffers,
+        Provider.bindingError(request, .operation_cancelled, "cancelled", &out),
+    );
+
+    // The same id outside the region is fine: an integer id is a value, and a
+    // string id the answer region does not touch is echoed from the bytes the
+    // transport decoded.
+    const clean: jsonrpc.Request = .{
+        .id = .{ .integer = 7 },
+        .method = jsonrpc.Method.split(method),
+        .params = .{ .value = envelope_writer.written() },
+    };
+    const frame = (try provider.serve(
+        clean,
+        .{ .call = refuseAll },
+        &envelope_scratch,
+        &outcome_scratch,
+        &inner,
+        &out,
+    )) orelse return error.DeclinedARequest;
+    try testing.expect(std.mem.indexOf(u8, frame, "\"id\":7") != null);
+    try testing.expect(std.mem.indexOf(u8, frame, "req-1") == null);
+}
 
 const testing = std.testing;
 
@@ -1044,21 +1313,6 @@ test "an outer result with no inner outcome is refused" {
     );
 }
 
-test "a scratch too short for the inner message is BufferTooSmall" {
-    // The message carries a JSON escape, so it has to be unescaped into the
-    // caller's scratch and one byte cannot hold it. The peer did send an inner
-    // outcome, so `NoInnerOutcome` here would send the caller hunting a
-    // protocol bug that is in its own buffer sizing.
-    var scratch: [1]u8 = undefined;
-    try testing.expectError(
-        error.BufferTooSmall,
-        classifyOutcome(
-            "{\"error\":{\"code\":-32602,\"message\":\"unknown\\ntool\"}}",
-            &scratch,
-        ),
-    );
-}
-
 test "the binding refuses an MCP revision it cannot carry" {
     // The binding performs no MCP handshake, so emulating 2025-11-25 would
     // fail somewhere far less obvious than at the call that asked for it.
@@ -1149,6 +1403,61 @@ test "the refusal for a method this provider does not carry is a readable outcom
     try testing.expectEqual(@as(usize, 0), provider.free);
 }
 
+test "an answer that does not fit the caller's region is an outbound size fault" {
+    // The tag says which direction the size went wrong in, and only this one
+    // has a repair: `serve` composed the frame, so the frame that did not fit is
+    // `EncodeBufferTooSmall` and a larger region is the whole fix.
+    // `ResponseTooLarge` would claim the peer's answer was too big — the other
+    // direction, on a frame that was never sent — and a caller growing a buffer
+    // for that would be chasing the wrong side of the boundary.
+    var provider = Provider.init(undefined);
+    var active: [1]Active = undefined;
+    provider.active = &active;
+    // The declared server is the precondition this test shares with the one
+    // above: an undeclared id takes the `server_registration_unavailable` path
+    // and never reaches the encoder.
+    const servers = [_][]const u8{bridge.server_declaration.server_id};
+    provider.servers = &servers;
+
+    var params: [256]u8 = undefined;
+    var envelope_writer = json.Writer.init(&params);
+    try bridge.encodeEnvelope(.{
+        .server_id = bridge.server_declaration.server_id,
+        .request_id = "req-1",
+        .inner_method = "resources/list",
+        .inner_params = null,
+        .direction = .agent_to_provider,
+    }, &envelope_writer);
+    const request: jsonrpc.Request = .{
+        .id = .{ .integer = 3 },
+        .method = jsonrpc.Method.split(method),
+        .params = .{ .value = envelope_writer.written() },
+    };
+
+    var envelope_scratch: [256]u8 = undefined;
+    var outcome_scratch: [8]u8 = undefined;
+    var inner: [512]u8 = undefined;
+    var out: [512]u8 = undefined;
+    try testing.expectError(
+        error.EncodeBufferTooSmall,
+        provider.serve(
+            request,
+            .{ .call = refuseAll },
+            &envelope_scratch,
+            &outcome_scratch,
+            &inner,
+            &out,
+        ),
+    );
+
+    // The slot came back with it. A call that could not be answered holds no
+    // pair afterwards, so the caller's next attempt at the same
+    // `(serverId, requestId)` is served rather than refused as a duplicate of a
+    // request nobody answered.
+    try testing.expectEqual(@as(usize, 0), provider.free);
+    try testing.expect(!provider.active[0].used);
+}
+
 test "the binding carries both outcomes and two refusals over a real socket" {
     // The tests above decide what a carried answer means. Only a real socket
     // shows that an inner MCP error arrives inside a successful outer
@@ -1200,7 +1509,13 @@ test "the binding carries both outcomes and two refusals over a real socket" {
     // A join that reported a fault is this exchange's fault too: neither task
     // returns anything, so nothing else would put it in front of the assertion
     // below and a fault would read as a clean exchange.
-    group.await(io) catch {
+    const joined = group.await(io);
+    // Every task has returned, so both endpoints may let go of their streams.
+    // A release before this point would take a socket away from a pump still
+    // reading it or a caller still writing its next carried call on it.
+    provider_endpoint.release(io);
+    caller_endpoint.release(io);
+    joined catch {
         state.failed = true;
     };
 
@@ -1302,7 +1617,12 @@ test "a provider answers each carried request on the side its failure belongs to
     try group.concurrent(io, ServedCaller.run, .{&calling});
     // As above: the join's own failure belongs in the diagnosis printed below,
     // which is the only place a stopped step says why it stopped.
-    group.await(io) catch {
+    const joined = group.await(io);
+    // As above: the join is what makes this owner the only task left on either
+    // descriptor, and the releases are what hand them back.
+    provider_endpoint.release(io);
+    caller_endpoint.release(io);
+    joined catch {
         state.failed = true;
     };
 
@@ -1627,8 +1947,8 @@ const ProviderTask = struct {
             .ctx = self.provider,
             .call = CarriedPeer.handle,
         }) catch {
-            // The descriptor is released on that path, so the caller's next
-            // call comes back instead of waiting for a reader that was never
+            // The socket is hung up on that path, so the caller's next call
+            // comes back instead of waiting for a reader that was never
             // started.
             self.provider.state.failed = true;
             return;
@@ -1840,13 +2160,14 @@ const ServedPeer = struct {
                 &self.inner,
                 &self.out,
             ) catch |err| {
-                // `serve` reports a short answer as `ResponseTooLarge`, and it
-                // writes every frame through `conn.respond` and
-                // `conn.errorResponse`, so that is the only fault of its own
-                // that reaches here. A resolver that returns an error
-                // propagates out of `serve` instead, and this peer has none.
+                // `serve` writes every frame through `conn.respond` and
+                // `conn.errorResponse`, so those are the faults of its own that
+                // reach here, and a short answer is the outbound tag rather than
+                // the inbound one. A resolver that returns an error propagates
+                // out of `serve` instead, and this peer has none.
                 if (err == error.Transport) return error.Transport;
-                if (err == error.ResponseTooLarge) return error.ResponseTooLarge;
+                if (err == error.EncodeBufferTooSmall) return error.EncodeBufferTooSmall;
+                if (err == error.InvalidMessage) return error.InvalidMessage;
                 if (err == error.Framing) return error.Framing;
                 // Record it and answer rather than declining. A handler that
                 // declines writes no frame, so the caller waits for an answer
@@ -1942,8 +2263,8 @@ const ServedTask = struct {
             .ctx = self.peer,
             .call = ServedPeer.handle,
         }) catch {
-            // As above: no connection means no pump to notice the peer hanging
-            // up, so `open` released the descriptor itself.
+            // As above: no connection means no reader to notice the peer hanging
+            // up, so `open` hung the socket up itself.
             self.peer.state.failed = true;
             return;
         };
@@ -2323,30 +2644,34 @@ const Endpoint = struct {
     reader: Io.net.Stream.Reader = undefined,
     // SAFETY: `open` assigns it before it lends `writer.interface` to `Conn.init`.
     writer: Io.net.Stream.Writer = undefined,
-    // SAFETY: `open` assigns it before the pump and `hangUp` that read the descriptor.
-    stream: Io.net.Stream = undefined,
-    // SAFETY: `open` assigns it before it sets `pumping`, and only a pumping endpoint reads it.
+    /// The descriptor this endpoint owns, and the proof that it owns one.
+    ///
+    /// `open` stores the stream before it can refuse, so a caller that gives up
+    /// on a refusal still holds the descriptor it has to hang up, and `release`
+    /// stores `null` before it closes, so neither side of a test can close the
+    /// same number twice. An option rather than an `undefined` field because
+    /// the owner releases every endpoint after the join, and one whose `open`
+    /// never ran owns no descriptor at all.
+    stream: ?Io.net.Stream = null,
+    // SAFETY: `open` assigns it before it sets `connected`, and only a connected endpoint reads it.
     connection: conn.Conn = undefined,
-    /// Set once this side's descriptor is closed, whichever path reaches
-    /// `release` first, so neither closes it twice.
-    released: bool = false,
+    /// Whether `open` built a connection over `stream`, which it sets once
+    /// `conn.Conn.init` hands one back. A hang-up reads the connection through
+    /// it, so a refused `init` leaves the field alone rather than calling into
+    /// a `Conn` that was never initialised.
+    connected: bool = false,
     /// Whether this endpoint has been hung up already.
     closed: bool = false,
-    /// Whether a task reads this endpoint, which `open` sets before it spawns
-    /// the pump.
-    ///
-    /// It decides who releases the descriptor: the pump when there is one,
-    /// because it is the only task that reads it. See `hangUp`.
-    pumping: bool = false,
 
     /// Open a side over `stream`, or report why there is no connection to
     /// open.
     ///
     /// `init` refuses a region with no room and a pair that shares a byte, and
     /// both are wiring faults in this file rather than conditions a run can
-    /// hit. The descriptor is released on that path, because no pump runs
+    /// hit. `open` hangs the socket up on that path, because no reader runs
     /// without a connection and the peer would otherwise sit on a read that
-    /// never returns.
+    /// never returns; the owner releases the descriptor after the join with
+    /// every other one.
     fn open(
         self: *Endpoint,
         io: Io,
@@ -2366,83 +2691,81 @@ const Endpoint = struct {
             self.hangUp(io);
             return err;
         };
+        self.connected = true;
         if (handler) |h| self.connection.setHandler(h);
-        // A blocking reader needs concurrency; `async` may run it inline.
-        // Publish ownership before spawning, but give it back on refusal.
-        self.pumping = true;
+        // A blocking reader needs concurrency; `async` may run it inline. A
+        // refused spawn leaves the descriptor with this endpoint and no reader
+        // on it, which is the same state a refused `init` leaves and is hung up
+        // the same way.
         group.concurrent(io, Endpoint.pump, .{self}) catch |err| {
-            self.pumping = false;
             self.hangUp(io);
             return err;
         };
     }
 
-    /// Hang up: stop the reader, wake it, and let the descriptor go once.
+    /// Hang up: tell the reader to stop, wake it, and leave the descriptor to
+    /// the owner.
     ///
-    /// `shutdown` before `close`: closing a descriptor does not interrupt a read
-    /// already blocked on it, so the peer's pump would sit on an open
-    /// description and the group would never finish.
+    /// `shutdown` before anything else, and no `close` here at all. Closing a
+    /// descriptor does not interrupt a read already blocked on it, so a hang-up
+    /// that only closed would leave the pump sitting on an open description and
+    /// the group would never finish; `shutdown` is what makes the next read
+    /// return zero bytes and the loop leave.
     ///
-    /// Who closes the descriptor depends on whether anything reads it, and the
-    /// pump is the only task that may when there is one. `conn.pump` asks again
-    /// after a read of zero bytes, and a local `shutdown` makes the next read
-    /// return exactly that, so a caller that released the descriptor under a
-    /// live pump would have that pump read a freed descriptor: the standard
-    /// library aborts on `EBADF` inside `netReadPosix`, before the pump's own
-    /// `catch` can see an error, and the whole test binary dies instead of the
-    /// test failing. Telling the connection first is what makes the loop stop —
-    /// the pump leaves at its next turn and closes the stream on its way out,
-    /// after the last read that can touch it.
+    /// The pump is not the only task on this socket, and never was.
+    /// [`Caller.run`] writes every carried call on it from a task of its own,
+    /// and a handler answers on the very task that is reading. A reader that
+    /// released the descriptor on its way out would take it away from a write in
+    /// flight, and the standard library aborts the process on the `EBADF` that
+    /// follows rather than returning an error the pump's own `catch` could see.
+    /// [`release`] is the owner's, and runs once every task has joined.
     ///
-    /// The guards are what make the several callers safe: a task hangs up, the
-    /// pump releases on its way out, and a failed `init` hangs up on a stream
-    /// that has no connection at all. Releasing the same descriptor twice would
-    /// close an unrelated one the process had opened in the meantime, and every
-    /// call below is a syscall on it.
+    /// Best effort, and nothing is lost by it: the reader has already been told
+    /// to stop, and a `shutdown` that cannot be sent means the peer is already
+    /// gone. This call returns nothing and its caller is a task, so a failure
+    /// has nowhere to propagate.
     fn hangUp(self: *Endpoint, io: Io) void {
         if (self.closed) return;
         self.closed = true;
-        if (self.released) return;
-        if (self.pumping) {
-            self.connection.close();
-            // Best effort, and nothing is lost by it: the reader has already
-            // been told to stop, the pump closes the descriptor on its way
-            // out, and a `shutdown` here has nothing left to interrupt. There
-            // is also nowhere to report a failure to, because this call is
-            // already returning and `close` below is not reachable from here.
-            // gate-reviewed-zlint-next-statement: suppressed-errors
-            // ziglint-ignore: Z026
-            // zwanzig-disable-next-line: empty-catch-engine
-            self.stream.shutdown(io, .both) catch {};
-            return;
-        }
-        self.release(io);
-    }
-
-    /// Release the descriptor once, and only on a stream that still has one.
-    fn release(self: *Endpoint, io: Io) void {
-        if (self.released) return;
-        self.released = true;
-        // Best effort for the same reason as in `hangUp`: the descriptor is
-        // closed on the next line whatever this returns, and the only caller
-        // that reaches here through a pump has already seen the end of the
-        // stream.
+        const stream = self.stream orelse return;
+        if (self.connected) self.connection.close();
         // gate-reviewed-zlint-next-statement: suppressed-errors
         // ziglint-ignore: Z026
         // zwanzig-disable-next-line: empty-catch-engine
-        self.stream.shutdown(io, .both) catch {};
-        self.stream.close(io);
+        stream.shutdown(io, .both) catch {};
     }
 
-    /// Pump until the peer hangs up, then release the descriptor.
+    /// Release the descriptor once, and only on a stream this endpoint still
+    /// owns.
     ///
-    /// The accepted side has no caller to hang up on its behalf, so nothing
-    /// else closes it and the process would release it at exit instead. This
-    /// is the only caller that closes a descriptor after the last read that
-    /// could touch it; a descriptor `hangUp` released is left alone, because
-    /// that path let it go already.
+    /// The owner calls this after the group has been joined or cancelled, never
+    /// before and never from a task a live reader runs beside. By then every
+    /// task that could read or write the socket has returned, and the two
+    /// syscalls below are the last any of them will see of it.
+    ///
+    /// `shutdown` before `close`, and best effort before both. Nothing is
+    /// blocked on the descriptor any more, so the shutdown only tells the peer
+    /// the exchange is over; the close releases the number whether or not that
+    /// reached it.
+    fn release(self: *Endpoint, io: Io) void {
+        const stream = self.stream orelse return;
+        self.stream = null;
+        // gate-reviewed-zlint-next-statement: suppressed-errors
+        // ziglint-ignore: Z026
+        // zwanzig-disable-next-line: empty-catch-engine
+        stream.shutdown(io, .both) catch {};
+        stream.close(io);
+    }
+
+    /// Drive the connection until it is told to stop, and stop there.
+    ///
+    /// It takes the endpoint rather than the connection because that is what
+    /// `open` spawns it with, and because what it does *not* do is the point:
+    /// the descriptor is the owner's to release. This task is the only one that
+    /// reads the stream, but it is not the only one that uses it, so it leaves
+    /// the release to an owner that has joined this task and every other one
+    /// first.
     fn pump(self: *Endpoint) void {
         self.connection.pump();
-        self.release(self.connection.io);
     }
 };

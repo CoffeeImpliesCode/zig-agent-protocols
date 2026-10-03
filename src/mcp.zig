@@ -15,6 +15,60 @@
 //! is resolved against an explicit `Revision`, and a method removed at the
 //! current revision decodes to `error.UnknownMethod` rather than to a value that
 //! a caller might then send.
+//!
+//! ## The three kinds of borrowed member in section 4.10
+//!
+//! Every payload type below carries members of three kinds, and which kind a
+//! field is decides what a caller has to keep alive for it and what an
+//! encoder checks. Each type's own comment names the kind for each of its
+//! fields; this is the rule they all defer to.
+//!
+//! A **JSON lexeme** — the `_meta`, `annotations`, `icons`, `structuredContent`,
+//! `inputSchema`, `outputSchema`, `inputRequests`, `capabilities` and every
+//! other member this module carries rather than models — is [`json.Reader`]
+//! `rawValue` output: exactly one JSON value of any type, borrowed from the
+//! document the decoder was handed and never from the escape scratch. Every
+//! encoder checks each lexeme at its actual container depth and reports
+//! `error.InvalidField` before the first byte. The outer object, array elements
+//! and embedded resource objects spend the same depth budget as the decoder.
+//!
+//! A **decoded string** — `uri`, `text`, `data`, `mime_type`, `title`, `name`,
+//! `blob`, `next_cursor`, `description`, `instructions`, `request_state` and
+//! `ResultType.value` — is `string` output: the JSON escapes resolved, so a
+//! peer that wrote `"a\nb"` is read as `a<LF>b`. It borrows the document when
+//! the peer wrote no escape and the caller's escape scratch when it wrote one,
+//! and both of those have to outlive the value.
+//!
+//! A **carried member** — every `verbatim` field — is a [`VerbatimMember`]:
+//! its slice aliases the caller's store array rather than copying it, and its
+//! two halves borrow one region each. That type states both.
+//!
+//! Nothing here allocates and no decode copies any of the three, so the whole
+//! of what a caller must keep alive for one decoded document is the document
+//! itself, the escape scratch it supplied and the store array it supplied. A
+//! decode that fails returns no value at all: the out-arrays may hold
+//! partially filled elements and the store may hold entries the failed
+//! attempt recorded, and neither is readable as part of a result. Each public
+//! decoder says so on its own.
+//!
+//! ## The one caller obligation the encoders do not check
+//!
+//! Every encoder below quotes caller strings through [`json.Writer.string`],
+//! which states that valid UTF-8 is the caller's obligation and enforces it in
+//! no optimize mode: it escapes every byte JSON names and passes every other
+//! one through. A string that arrived through [`json.Reader.string`] is valid
+//! by construction, because that reader refuses anything else, so re-encoding
+//! what a decoder produced needs no check at all. A caller building a result
+//! from strings it wrote itself holds the obligation, and a stray byte
+//! produces a literal this library's own reader then refuses with
+//! `error.InvalidUtf8` — a body the sending side reported as written and the
+//! receiving side rejected.
+//!
+//! So the inverse each encoder documents is an inverse **for the values its
+//! decoder produces**, and not for any value handed to it, and each says so.
+//! [`inputRequired`] is the one entry point here that checks rather than
+//! asserts, because it is the only one whose whole job is to build a result
+//! out of values the caller wrote rather than decoded.
 
 const std = @import("std");
 const root = @import("root.zig");
@@ -105,6 +159,12 @@ pub const param_header_prefix = "Mcp-Param-";
 /// Section 4.2: the `=?base64?` prefix and the `?=` suffix are case-sensitive
 /// and MUST appear exactly as written when present.
 pub const sentinel_prefix = "=?base64?";
+/// The closing marker of the sentinel, the other half of
+/// [`sentinel_prefix`].
+///
+/// Case-sensitive and required wherever the prefix is present, for the reason
+/// that marker states: a reader that accepted a differently spelled closing
+/// marker would be reading a value the peer never sent.
 pub const sentinel_suffix = "?=";
 
 /// The JSON Schema extension keyword inside `Tool.inputSchema` properties.
@@ -558,6 +618,12 @@ pub fn paramHeaderNameLen(name_len: usize) usize {
 /// The name is validated first: an annotation that is not a field-name token
 /// cannot appear in a header name, and a header the peer classifies as
 /// [`HeaderKind.other`] is a header it ignores.
+///
+/// The result borrows `out` and `annotation` is only read, so the caller keeps
+/// `out` alive and unwritten for as long as it holds the name. Both refusals
+/// land before a byte is written: `error.InvalidField` for a name that is not
+/// an RFC 9110 field-name token, `error.BufferTooSmall` for an `out` shorter
+/// than [`paramHeaderNameLen`]. Allocates nothing.
 pub fn deriveParamHeaderName(annotation: []const u8, out: []u8) EncodeError![]const u8 {
     if (!isValidSchemaHeaderName(annotation)) return error.InvalidField;
     const needed = paramHeaderNameLen(annotation.len);
@@ -804,6 +870,21 @@ pub const MethodInfo = struct {
     /// Whether the result carries caching hints. Only a `complete` result does.
     cacheable: bool = false,
     /// Whether the method is retired rather than active.
+    ///
+    /// The flag is a fact about the **message** this row describes, not about
+    /// the name and not about a payload. `roots/list` carries it on
+    /// [`previous_top_level_requests`] and on the row [`lookupMethod`]
+    /// synthesizes at `.previous`, and leaves it at `false` in
+    /// [`input_requests`] — because what `2026-07-28` retired there was the
+    /// top-level request, while the same name is a value a server still sends
+    /// inside `InputRequiredResult.inputRequests`. A caller that read the flag
+    /// off `input_requests` would refuse a request the revision still requires
+    /// a server to be able to make.
+    ///
+    /// It says nothing about the shapes the method carries either.
+    /// `notifications/message` is marked because section 4.9 lists Logging as
+    /// deprecated, and the notification a peer still sends is unchanged. The
+    /// flag marks the method; the `direction` on the row marks who may send it.
     deprecated: bool = false,
 
     /// Whether a result for this method, arrived on `leg`, may be cached.
@@ -1258,6 +1339,12 @@ pub const ResultType = struct {
 /// as one. An unrecognised value is carried through unvalidated for the same
 /// reason: the specification requires the client to consider it invalid, and
 /// [`ResultType.known`] is where a caller makes that decision.
+///
+/// The returned value keeps a slice: `ResultType.value` borrows `raw` when the
+/// peer wrote no escape in the member and `scratch` when it wrote one, so both
+/// must outlive it, and the member name it walked over drew from the same two.
+/// Every other member is skipped and nothing is written outside `scratch`, so
+/// an absent `resultType` is `ResultType{}` and not a fault.
 pub fn decodeResultType(raw: []const u8, scratch: []u8) DecodeError!ResultType {
     var reader = json.Reader.init(raw);
     var result: ResultType = .{};
@@ -1290,10 +1377,17 @@ pub fn decodeResultType(raw: []const u8, scratch: []u8) DecodeError!ResultType {
 /// one line wide. It writes the members the type carries and nothing else — a
 /// member [`decodeResultType`] does not govern is skipped by design, because
 /// it is the rule [`checkResult`] applies to a body it did not build, and no
-/// writer built from the decoded value could put it back. A result object a
-/// caller round-trips byte-for-byte is one carrying only the members the type
-/// keeps, or one decoded by one of the typed results in section 4.10, which
-/// carry what they skip.
+/// writer built from the decoded value could put it back. So this is the
+/// narrowest encoder in the section: it reproduces the one member the type
+/// holds, and a caller that wants the rest of a body preserved reaches for one
+/// of the typed results in section 4.10, which carry what they skip.
+/// [`VerbatimMember`] states the rule every one of them follows.
+///
+/// The one obligation this leaves open is the module rule at the top of this
+/// file states: [`json.Writer.string`] does not check UTF-8, so this is an
+/// inverse for the values [`decodeResultType`] produces and not for any value
+/// handed to it. A caller building a `ResultType` from its own text must have
+/// it valid.
 pub fn encodeResultType(result: ResultType, writer: *json.Writer) EncodeError!void {
     try writer.byte('{');
     if (result.value) |value| {
@@ -1354,6 +1448,11 @@ pub const ResultError = DecodeError || error{
 /// rule is read, passed in rather than looked up. A consumer holding the bytes
 /// and no session is the caller this is for, and a reader that needed a
 /// session would refuse the very answer PROTOCOLS.md 4.6 tells it to accept.
+///
+/// The returned [`ResultType`] keeps a slice of `body` or of `scratch` under
+/// the rule [`decodeResultType`] states, and both must outlive it. A caller
+/// that only wants the verdict uses [`ResultType.isComplete`] and lets it go
+/// at once.
 pub fn classifyResult(body: []const u8, scratch: []u8) ResultError!ResultType {
     return decodeResultType(body, scratch) catch |err| switch (err) {
         error.BufferTooSmall => error.BufferTooSmall,
@@ -1383,6 +1482,11 @@ pub fn classifyResult(body: []const u8, scratch: []u8) ResultError!ResultType {
 /// it resolves, so a revision threaded in here could not change one outcome. A
 /// caller already holding `info` from `mcp_session.Server.gate` passes it on
 /// unchanged, and a caller holding none reads it here with no session in hand.
+///
+/// Nothing is returned and nothing is written outside `scratch`, so a refusal
+/// leaves the body and the scratch as the caller passed them apart from the
+/// escape regions this call consumed; a caller that fixes the fault and asks
+/// again gets a whole answer.
 pub fn checkResult(info: MethodInfo, result: []const u8, scratch: []u8) ResultError!void {
     const kind = decodeResultType(result, scratch) catch |err| switch (err) {
         error.BufferTooSmall => return error.BufferTooSmall,
@@ -1425,10 +1529,23 @@ pub const Cacheable = struct {
     /// value is representable, and honouring it here would mean fabricating a
     /// number the server did not send.
     ttl_ms: u64,
+    /// Who may share a cache entry across this result.
+    ///
+    /// Required beside [`Cacheable.ttl_ms`], and not an optional with a
+    /// default: collapsing an absent member into a tag would turn a document
+    /// missing it into the widest scope there is. Only the two literals the
+    /// schema defines are answers — anything else is `error.UnknownTag` at
+    /// [`decodeCacheable`] and [`parseCacheScope`], and a peer that sent an
+    /// extension's value gets no guess.
     cache_scope: CacheScope,
 };
 
-/// Decode the `cacheScope` literal.
+/// The tag a `cacheScope` string names, or `error.UnknownTag` for anything else.
+///
+/// The comparison is exact and case-sensitive: the two literals are the only
+/// values the schema defines, and an extension's value is a caller's decision
+/// rather than a third tag here. `text` is only read, so the result borrows
+/// nothing.
 pub fn parseCacheScope(text: []const u8) DecodeError!CacheScope {
     if (std.mem.eql(u8, text, "public")) return .public;
     if (std.mem.eql(u8, text, "private")) return .private;
@@ -1437,9 +1554,19 @@ pub fn parseCacheScope(text: []const u8) DecodeError!CacheScope {
 
 /// Decode the two fields a cacheable result adds; both are required.
 ///
-/// `raw` is the `result` object as borrowed JSON text. Members the caching
-/// rules do not govern are skipped rather than rejected, so this composes with
-/// [`decodeResultType`] rather than replacing it.
+/// `raw` is the `result` object as borrowed JSON text, and the returned pair
+/// borrows nothing from it: `ttl_ms` is a number and `cache_scope` a tag. The
+/// members the caching rules do not govern are skipped rather than rejected, so
+/// this composes with [`decodeResultType`] rather than replacing it.
+///
+/// Every fault but a short scratch is named: `MissingField` for an absent
+/// member, `UnknownTag` for a `cacheScope` outside the two literals,
+/// `InvalidField` for a `ttlMs` that is not a whole number of milliseconds,
+/// and `MalformedJson` for a document that is not one JSON object or that
+/// carries a tail. `scratch` receives the escape region of whichever member the
+/// walk reads, and neither keeps a slice of it once the call returns, so the
+/// caller may reuse it at once. This decoder owns no output storage, so a
+/// failing path writes nothing outside `scratch` and returns no value.
 ///
 /// ## What this skips, and who does not
 ///
@@ -1452,7 +1579,8 @@ pub fn parseCacheScope(text: []const u8) DecodeError!CacheScope {
 /// A caller that wants the rest of the body uses one of the typed result
 /// decoders in section 4.10 instead. Those read the same two members through
 /// [`CacheableReader`] and **carry** every member they do not model as a
-/// borrowed lexeme, so `encode(decode(b)) == b` holds for them. This decoder
+/// borrowed lexeme, so re-encoding what they read reproduces its wire values;
+/// [`VerbatimMember`] states what that does and does not preserve. This decoder
 /// and those compose; neither replaces the other.
 pub fn decodeCacheable(raw: []const u8, scratch: []u8) DecodeError!Cacheable {
     var reader = json.Reader.init(raw);
@@ -1519,18 +1647,29 @@ pub const InputRequiredResult = struct {
     result_type: ResultType = ResultType{},
     /// The server-assigned request map, as borrowed JSON text.
     ///
-    /// The decoder does not walk the map, does not validate an inner `method`,
-    /// and does not check that the member is a JSON object at all, so
-    /// `"inputRequests": []` decodes as readily as an object does. A consumer
-    /// that needs a method name checked reads it itself and refuses a name
-    /// outside the three with [`lookupInputRequest`], which answers
-    /// `error.UnknownMethod`.
+    /// Any one JSON value: the decoder does not walk the map, does not validate
+    /// an inner `method`, and does not check that the member is a JSON object at
+    /// all, so `"inputRequests": []` decodes as readily as an object does. A
+    /// consumer that needs a method name checked reads the lexeme itself and
+    /// refuses a name outside the three with [`lookupInputRequest`], which
+    /// answers `error.UnknownMethod`.
+    ///
+    /// It is borrowed from the document handed to
+    /// [`decodeInputRequiredResult`] and never from the escape scratch, so it
+    /// stays valid as long as that document does. The encoder splices it back
+    /// after holding it to one whole JSON value, so a lexeme a caller built by
+    /// hand is `error.InvalidField` before the first byte is written.
     input_requests: ?[]const u8 = null,
     /// Opaque, and attacker-controlled.
     ///
     /// The specification requires a server to integrity-protect this whenever it
     /// influences authorization, so a client that parses its contents is already
     /// outside the contract. The library carries it and never interprets it.
+    ///
+    /// Read as a JSON string, so these are the **decoded** characters rather
+    /// than the lexeme: an escape in the document is resolved. It borrows the
+    /// escape scratch when the peer wrote one and the document otherwise, which
+    /// is the pair of regions a caller has to keep alive for it.
     request_state: ?[]const u8 = null,
     /// The members this shape does not model, as the peer sent them.
     ///
@@ -1540,6 +1679,10 @@ pub const InputRequiredResult = struct {
     /// ever dropped — the first occurrence and every repeat are carried, for
     /// the reason [`VerbatimMember`] states, and [`encodeInputRequiredResult`]
     /// writes them back last, in the order they arrived.
+    ///
+    /// The slice aliases the caller's store array rather than copying it, so it
+    /// is valid until that array is written again or released, and it shares no
+    /// storage with the escape scratch. [`VerbatimStore`] states the rule.
     verbatim: []const VerbatimMember = &.{},
 };
 
@@ -1567,6 +1710,13 @@ pub const InputRequiredResult = struct {
 /// The order is the ten section 4.10.3 decoders use — `raw`, the caller's
 /// regions, `scratch` — and the position is the same one in all of them, so a
 /// caller who has learned one has learned the other eleven.
+///
+/// On any error nothing is returned, and nothing already written into
+/// `verbatim` may be read as part of a result: the slice in
+/// [`InputRequiredResult.verbatim`] was never formed, so a caller that fixes
+/// the fault and calls again re-reads `raw` and writes over what the first
+/// attempt left. `raw` and `scratch` are borrowed for the call and never
+/// retained.
 pub fn decodeInputRequiredResult(
     raw: []const u8,
     verbatim: []VerbatimMember,
@@ -1614,19 +1764,30 @@ pub fn decodeInputRequiredResult(
 /// gives a second result type to, so it is a body a server both reads and
 /// writes.
 ///
-/// The exact inverse of [`decodeInputRequiredResult`], for the reason
-/// [`encodeDiscoverResult`] states for the same pair over the same document: a
-/// member the shape does not model is a member a peer may legally send, because
-/// `Result` declares `[key: string]: unknown` and a `_meta` of its own, and it
-/// comes back in [`InputRequiredResult.verbatim`] as the lexeme it arrived as
-/// rather than being skipped. The three modelled members come first, in the
-/// order [`inputRequired`] writes them, and the carried members follow in the
-/// order the peer sent them.
+/// The inverse of [`decodeInputRequiredResult`] for the values it produces,
+/// which is what a member the shape does not model buys: `Result`
+/// declares `[key: string]: unknown` and a `_meta` of its own, so such a member
+/// is one a peer may legally send and it comes back in
+/// [`InputRequiredResult.verbatim`] as the lexeme it arrived as rather than
+/// being skipped. [`VerbatimMember`] states what that preserves and what it
+/// does not; the short of it is that member order is the encoder's, so the
+/// encoding is stable rather than a copy of the peer's byte order.
 ///
-/// The value it writes back is exact: `inputRequests` is spliced as the lexeme
-/// it arrived as, `requestState` is written as a JSON string literal so the
-/// escapes do not end the member early, and a carried member is spliced whole
-/// after [`checkVerbatim`] has held it to one JSON value.
+/// The three modelled members come first, in the order [`inputRequired`]
+/// writes them, and the carried members follow in the order the peer sent them.
+/// `inputRequests` is spliced as the lexeme it arrived as, `requestState` is
+/// written as a JSON string literal so the escapes do not end the member early,
+/// and a carried member is spliced whole after [`checkVerbatim`] has held it to
+/// one JSON value. `error.InvalidField` names a value that is not one whole
+/// JSON value and lands before the first byte; after that the only failure
+/// left is `error.BufferTooSmall` from the writer, which leaves what it had
+/// already written in the caller's buffer.
+///
+/// The one obligation this leaves open is the module rule at the top of this
+/// file states: [`json.Writer.string`] does not check UTF-8, so this is an
+/// inverse for the values [`decodeInputRequiredResult`] produces and not for
+/// any value handed to it. In particular `request_state` must be valid UTF-8
+/// here; [`inputRequired`] is the entry point that checks it.
 pub fn encodeInputRequiredResult(
     result: InputRequiredResult,
     writer: *json.Writer,
@@ -1636,8 +1797,8 @@ pub fn encodeInputRequiredResult(
     // the caller's buffer, which is neither a result nor nothing, so a caller
     // that sized the buffer for the refusal would have to discard what it
     // holds rather than read it.
-    try checkRaw(&.{result.input_requests});
-    try checkVerbatim(result.verbatim);
+    try checkRaw(&.{result.input_requests}, 1);
+    try checkVerbatim(result.verbatim, 1);
 
     // The separator belongs to the object writer rather than to each member
     // here, for the reason `ObjectWriter` states: `resultType` is optional, and
@@ -1668,20 +1829,54 @@ pub fn permitsMrtr(method: []const u8) bool {
 /// PROTOCOLS.md 4.7 lets `tools/call`, `resources/read` and `prompts/get`
 /// answer with an interim result, and [`permitsMrtr`] is that list. A server
 /// that wants one on any other method is refused here rather than on the wire,
-/// because a peer has to treat such a result as invalid.
+/// because a peer has to treat such a result as invalid. That refusal is the
+/// first thing the call does and costs the caller no buffer: `out` and
+/// `requests` are both untouched.
 ///
 /// What comes back is the body and not the frame. The caller wraps it with
 /// `conn.respond`, so the id the answer echoes is the one the connection
-/// decoded rather than one written here.
+/// decoded rather than one written here. The result borrows `out` and is
+/// invalidated by the next write to it.
 ///
 /// `requests` is spliced as written, because it is a JSON object the caller
-/// built and keyed by the server-assigned ids. `request_state` is a string and
-/// not an object, so it is written as a JSON string literal with the escapes
-/// JSON requires, and what the peer reads back decodes to the characters that
-/// were passed in. Splicing it would have ended the member at the first quote
-/// in it and handed the peer a different state. It is opaque and attacker
-/// controlled besides, and PROTOCOLS.md 4.7 requires a server to
-/// integrity-protect it wherever it influences authorization.
+/// built and keyed by the server-assigned ids. It is also the one value here
+/// the caller built rather than decoded, so this call holds the caller to it
+/// rather than trusting it: `error.InvalidField` is the refusal when `requests`
+/// is not exactly one complete JSON object — a scalar, an array, a member that
+/// does not parse, or a second document behind the closing brace. Each of those
+/// used to be spliced, and the body it produced is one
+/// [`decodeInputRequiredResult`] and [`classifyResult`] both refuse, after the
+/// peer had already been sent it and with nothing on the sending side to say
+/// so. The check runs before the first byte, so a refused call leaves `out`
+/// exactly as the caller passed it and the retry after a fix reads a whole body.
+/// Neither the names nor the members inside are checked: PROTOCOLS.md 4.7
+/// constrains the member to being a map, and a caller that needs an inner
+/// `method` checked reads the map itself and refuses a name outside the three
+/// with [`lookupInputRequest`].
+///
+/// `request_state` is a string and not an object, so it is written as a JSON
+/// string literal with the escapes JSON requires, and what the peer reads back
+/// decodes to the characters that were passed in. Splicing it would have ended
+/// the member at the first quote in it and handed the peer a different state.
+/// It is opaque and attacker controlled besides, and PROTOCOLS.md 4.7 requires
+/// a server to integrity-protect it wherever it influences authorization.
+///
+/// That string is validated too, which is the one caller obligation
+/// [`json.Writer.string`] deliberately leaves open. The writer escapes every
+/// byte JSON names and passes every other one through, so a state carrying a
+/// stray byte would produce a literal this library's own
+/// [`json.Reader.string`] then refuses with `error.InvalidUtf8` on the far side
+/// of the wire — a body the sending side reported as written and the receiving
+/// side rejected. `error.InvalidField` is the right name for it rather than
+/// `error.BufferTooSmall`, because the fault is a value that is not JSON text
+/// this may quote and not a buffer that is too small; it lands before the first
+/// byte, so a refused call leaves `out` exactly as the caller passed it.
+///
+/// What can still fail once those three checks have passed is room:
+/// `error.BufferTooSmall` from any write below, with the writer's partial
+/// output left in `out`. A caller that grew the buffer and called again gets
+/// the whole body; one sent on the truncated prefix would hand the peer a state
+/// the server never chose, and the retry that comes back would key off it.
 ///
 /// It takes no revision and needs none: [`permitsMrtr`] reads a name and no
 /// revision, and the 4.7 list is the same at both. Everything below is decided
@@ -1691,10 +1886,11 @@ pub fn permitsMrtr(method: []const u8) bool {
 /// This is not a second copy of [`encodeInputRequiredResult`], and the
 /// difference is what each is handed rather than what either writes. That one
 /// writes the members a decoded value carries, which may be two rather than
-/// three, and refuses a value that is not JSON at all; this one always writes
-/// the three members 4.6 and 4.7 require, refuses the method before the first
-/// byte, and trusts `requests` because the caller built it. The bytes either
-/// writes for a whole interim result are the same three in the same order.
+/// three, and accepts any one JSON value where this one requires the map 4.7
+/// names; this one always writes the three members 4.6 and 4.7 require, refuses
+/// the method before the first byte, and checks state text where the typed
+/// encoder keeps the UTF-8 caller precondition. For a whole interim result,
+/// both write the same modeled members in the same order.
 pub fn inputRequired(
     method: []const u8,
     requests: []const u8,
@@ -1702,6 +1898,15 @@ pub fn inputRequired(
     out: []u8,
 ) ResultError![]const u8 {
     if (!permitsMrtr(method)) return error.InputRequiredUnexpected;
+    // Second, and still before the first byte. `requests` is the one value
+    // here the caller built rather than decoded, and PROTOCOLS.md 4.7 types it
+    // as a map.
+    if (!isOneJsonObject(requests)) return error.InvalidField;
+    // Third, and the last of the two caller-built values.
+    // `json.Writer.string` does not validate UTF-8 and escapes only the bytes
+    // JSON names, so a stray byte here becomes a literal this library's own
+    // reader refuses on the far side of the wire.
+    if (!std.unicode.utf8ValidateSlice(request_state)) return error.InvalidField;
     var writer = json.Writer.init(out);
     // `resultType` first, because PROTOCOLS.md 4.6 puts it on every
     // result, then the two members 4.7 names beside it in the order the
@@ -1838,6 +2043,12 @@ pub const DeprecatedFeature = enum {
     logging,
     dynamic_client_registration,
     http_sse_transport,
+    /// Asking a server to repeat server-set context values in a client request.
+    ///
+    /// Named here because the name is the only thing that carries the
+    /// deprecation: section 4.9 lists the feature, and nothing in the request
+    /// or result types encodes it. A peer that still sends it decodes, because
+    /// the members it affects are open.
     include_context_server_values,
 
     /// The earliest revision at which a deprecated feature may be removed.
@@ -1885,25 +2096,73 @@ pub fn isValidSkillDigest(digest: []const u8) bool {
 /// PROTOCOLS.md section 4.10.6 opens the member set of *any* result object:
 /// `Result` declares `[key: string]: unknown`, and `basic/index.md` says a
 /// result "MAY follow any JSON object structure". A key the shape cannot hold
-/// cannot be dropped either, because section 2 makes the encoder the exact
-/// inverse of the decoder for every accepted input. That is the rule
-/// `bridge.Envelope` and `bridge.OutcomePayload` follow, and a typed shape is
-/// exactly what re-opened a loss that had been closed for the life of this
-/// repository.
-///
-/// Both halves are borrowed from the input, so nothing is copied and nothing
-/// outlives the document the caller was handed.
+/// cannot be dropped either, because section 2 requires that re-encoding what
+/// a decoder read reproduce the wire values it read — every member, its value
+/// and its presence. That is the rule `bridge.Envelope` and
+/// `bridge.OutcomePayload` follow, and a typed shape is exactly what re-opened
+/// a loss that had been closed for the life of this repository.
 ///
 /// Every occurrence is carried, not the first one. A member this shape does
-/// not name is never interpreted, so there is no value for the first-wins
-/// rule to resolve; that rule guards the members a shape *does* name, where a
+/// not name is never interpreted, so there is no value for the first-wins rule
+/// to resolve; that rule guards the members a shape *does* name, where a
 /// later occurrence must not be able to make a failed comparison pass.
 /// Keeping one and dropping the next would be the silent loss this type
 /// exists to prevent.
+///
+/// ## What re-encoding preserves, and what it does not
+///
+/// Re-encoding a decoded value reproduces every wire value that value carried:
+/// each modelled member with the value the decoder read, each member's
+/// presence or absence, and every open member of this kind. It does not
+/// reproduce the **byte** form, and the three things it does not are all
+/// different spellings of the same wire values:
+///
+/// - Member order is the encoder's. The modelled members are written in a
+///   fixed order and the carried ones follow in the order the peer sent them,
+///   so a document whose peer wrote them in another order re-encodes to the
+///   canonical one.
+/// - Insignificant whitespace is not preserved.
+/// - `key` is the decoded name, not the source spelling, so `"\u0041"` arrives
+///   as `"A"` and is written back that way.
+///
+/// The encoding is **stable** in exchange: the same decoded value always
+/// encodes to the same bytes, which is the property a caller relies on when it
+/// compares an answer against a body it built. A caller that needs the peer's
+/// own bytes to survive has to hold them itself — this type never promises
+/// them.
+///
+/// ## Neither half copies
+///
+/// `key` and `value` are borrowed from two different places and are invalidated
+/// by two different writes, so a caller holding this member has to keep two
+/// regions alive:
+///
+/// - `value` always borrows the input document, never the escape scratch: no
+///   value of this kind is unescaped, so none of them can name a byte of it.
+/// - `key` borrows the escape scratch when the peer wrote the name with an
+///   escape and the document otherwise.
+///
+/// The record itself sits in the caller's [`VerbatimStore`] array and is never
+/// copied out of it, so the slice a caller holds aliases that array.
 pub const VerbatimMember = struct {
-    /// The member name, as written and as decoded.
+    /// The member name as `json.Reader.nextKey` returned it.
+    ///
+    /// With no escape this borrows the input document; with one it borrows the
+    /// escape scratch the decoder was handed, and a later escaped string from
+    /// the same decode takes a region after this one rather than over it. It is
+    /// the decoded name rather than the source spelling, so a peer that wrote
+    /// `"\u0041"` hands back `"A"` and the encoder writes that back — the same
+    /// member name under RFC 8259, in a spelling that differs from the peer's.
     key: []const u8,
-    /// The member value as raw JSON text, borrowed from the input.
+    /// The member value as the lexeme it arrived as: exactly one JSON value,
+    /// without its name and without the bytes behind it.
+    ///
+    /// Any JSON type, so a member the peer sent as `null`, a bare number or a
+    /// string is a value here too. Borrowed from the input document and never
+    /// from the escape scratch, so it stays valid as long as that document does
+    /// and independently of how many strings were decoded around it. An
+    /// encoder holds it to one whole JSON value and refuses anything else with
+    /// `error.InvalidField` before writing a byte.
     value: []const u8,
 };
 
@@ -1920,6 +2179,29 @@ pub const VerbatimMember = struct {
 /// refusal and never a truncation, because a card whose eleventh skill
 /// silently vanished is worse than one refused.
 ///
+/// ## What a copy of this type means
+///
+/// `arena` is a slice, so copying the store copies the descriptor and **both
+/// copies hand out the same `arena` slots**. `used` is a plain counter and not
+/// a shared one, so two copies issue their own regions over one array and
+/// silently overwrite one another. There is no move-only type in Zig to prevent
+/// it, so the rule is the caller's: one array per document, and a second array
+/// for the next document. A caller that wants to decode another document and
+/// keep the first result reads its members out — they borrow the document, not
+/// the store — rather than reusing the store.
+///
+/// ## What a mark and a range mean
+///
+/// [`VerbatimStore.mark`] is `used` as it stands and [`VerbatimStore.since`] is
+/// `arena[at..used]`, so a mark is an offset into **this** store's array and
+/// nothing else. It is not an index into any slice a call returned, and a mark
+/// taken from a store over one array cannot be spent on a store over another:
+/// `since` would then be asked for a range this store never issued, which
+/// slices past its own end. Every region inside a range therefore belongs to
+/// whatever filled it and to nothing else — and a nested payload fills the
+/// same store, which is what makes the ordering rule below a rule the decoders
+/// follow rather than one this type enforces.
+///
 /// ## Why a nested payload is decoded after its object closes
 ///
 /// A nested payload appends to the same store, so decoding one *during* the
@@ -1930,14 +2212,50 @@ pub const VerbatimMember = struct {
 /// [`VerbatimStore.since`] the moment the loop closes, and only then decodes
 /// the lexeme. That is what keeps one object's slice its own.
 pub const VerbatimStore = struct {
+    /// The caller's array, and the only storage a decode of one document may
+    /// fill. Nothing here allocates, so an array that is too small is a refusal
+    /// rather than a grow, and a caller sizes it from the document it was
+    /// handed — `testkit` derives the bound from the document length rather
+    /// than guessing at it.
+    ///
+    /// Borrowed, not copied, and the store never reallocates or clears it: it
+    /// has to stay alive for as long as any slice handed out of it is still
+    /// held, and it has to stay unwritten.
     arena: []VerbatimMember,
+    /// How much of `arena` is filled: the offset the next
+    /// [`VerbatimStore.take`] writes at.
+    ///
+    /// Monotone within a store's life. It is never reset while a caller still
+    /// holds a region and it is never shared between copies of the store, so
+    /// "start over" means "hand in a different array".
     used: usize = 0,
 
+    /// An empty store over `arena`.
+    ///
+    /// Takes no allocator and retains nothing of its own: the array is the
+    /// caller's, it is borrowed rather than copied, and it must stay alive and
+    /// unwritten for as long as any slice [`VerbatimStore.since`] or
+    /// [`VerbatimStore.take`] handed out is still held. A second decode over
+    /// the same array starts writing over the first one's members rather than
+    /// after them, which is why one array serves one document.
     pub fn init(arena: []VerbatimMember) VerbatimStore {
         return .{ .arena = arena };
     }
 
-    /// Record one member this shape does not name.
+    /// Record one member this shape does not name, and hand back its slot.
+    ///
+    /// `key` and `value` are recorded as given and are borrowed rather than
+    /// copied, so they have to outlive the returned slice — `key` from the
+    /// escape scratch when the peer wrote the name with an escape, `value`
+    /// from the input document, as [`VerbatimMember`] states. The store copies
+    /// neither, so nothing here can outlive the buffer it borrowed.
+    ///
+    /// The returned slice is one element long and aliases `arena` at the
+    /// position this call issued, so it stays valid until the next
+    /// [`VerbatimStore.take`] on the same store. `error.BufferTooSmall` when
+    /// `arena` is full, and nothing is recorded on that path: an exhausted
+    /// store is a refusal rather than a member that quietly stopped being
+    /// written back.
     pub fn take(
         self: *VerbatimStore,
         key: []const u8,
@@ -1950,15 +2268,28 @@ pub const VerbatimStore = struct {
         return region;
     }
 
-    /// Where an object is about to start filling the store.
+    /// Where an object is about to start filling the store: `used` as it
+    /// stands, with nothing written or reserved.
+    ///
+    /// An offset into **this** store's `arena` and nothing else, to be spent on
+    /// [`VerbatimStore.since`]. It is not an index into a slice any other call
+    /// returned, and a mark taken from a store over one array cannot be spent
+    /// on a store over another.
     pub fn mark(self: *const VerbatimStore) usize {
         return self.used;
     }
 
-    /// The members filled since `at`.
+    /// The members filled since `at`, in arrival order.
     ///
     /// Read this the moment the enclosing member loop closes, for the reason
-    /// the type documents.
+    /// the type documents: a nested payload appended after this call lands
+    /// inside the range a later `since` hands back, and the object would then
+    /// hold members that belong to something further in. `at` must be a mark
+    /// this store returned.
+    ///
+    /// The slice borrows `arena`, and each element borrows the input document
+    /// and the escape scratch as [`VerbatimMember`] states. A decode into the
+    /// same storage invalidates both, which is why this is read once and kept.
     pub fn since(self: *const VerbatimStore, at: usize) []const VerbatimMember {
         return self.arena[at..self.used];
     }
@@ -2122,13 +2453,9 @@ const ObjectWriter = struct {
 
     /// Write a member whose value is carried as raw JSON text.
     ///
-    /// The lexeme is checked before a byte is written, so an encoder cannot
-    /// emit a value its own reader would refuse: PROTOCOLS.md section 2 makes
-    /// that a requirement of the pair rather than of the reader alone. The
-    /// check covers the whole lexeme, for the reason [`isOneJsonValue`]
-    /// states.
+    /// Public encoders already checked every raw value at its write depth
+    /// before opening the document. This write half does not parse it again.
     fn raw(self: *ObjectWriter, name: []const u8, value: []const u8) EncodeError!void {
-        if (!isOneJsonValue(value)) return error.InvalidField;
         try self.key(name);
         try self.writer.slice(value);
     }
@@ -2173,9 +2500,35 @@ const ObjectWriter = struct {
 /// The walk borrows throughout: `skipValue` takes no scratch because a
 /// skipped value produces no slice, so the zero-length buffer below is the
 /// whole of what this check allocates.
-fn isOneJsonValue(text: []const u8) bool {
+fn isOneJsonValue(text: []const u8, depth: u32) bool {
     var reader = json.Reader.init(text);
+    reader.depth = depth;
     const no_scratch: [0]u8 = .{};
+    reader.skipValue(&no_scratch) catch return false;
+    return reader.atEnd();
+}
+
+/// Whether `text` is exactly one complete JSON **object**, for the
+/// `inputRequests` member this module's builder splices.
+///
+/// `isOneJsonValue` is not enough on its own: PROTOCOLS.md 4.7 types
+/// `inputRequests` as a map keyed by the server-assigned ids, so a scalar or an
+/// array spliced into the member is a body whose map no reader of this library
+/// would resolve. Only the opening byte is asked about here — the walk
+/// underneath already proved the lexeme is one whole value, and `peek` is the
+/// one step that reads no member.
+///
+/// The walk borrows throughout and `skipValue` takes no scratch because a
+/// skipped value produces no slice, so the zero-length buffer below is the
+/// whole of what this check allocates. That is also why member names are not
+/// decoded: decoding one would need a buffer sized from the document, and a
+/// caller would be handing a constructor scratch it has no other use for.
+fn isOneJsonObject(text: []const u8) bool {
+    var reader = json.Reader.init(text);
+    reader.depth = 1; // `inputRequests` is a member of the result object.
+    const no_scratch: [0]u8 = .{};
+    reader.skipWhitespace();
+    if ((reader.peek() orelse return false) != '{') return false;
     reader.skipValue(&no_scratch) catch return false;
     return reader.atEnd();
 }
@@ -2194,10 +2547,11 @@ fn isOneJsonValue(text: []const u8) bool {
 /// Every public encoder in this section opens with the checks for the whole
 /// value it is about to write, elements included, so the refusal is the same
 /// wherever in the document the offending member sat.
-fn checkRaw(lexemes: []const ?[]const u8) EncodeError!void {
+/// `depth` counts the containers around each raw field at its write position.
+fn checkRaw(lexemes: []const ?[]const u8, depth: u32) EncodeError!void {
     for (lexemes) |maybe| {
         const text = maybe orelse continue;
-        if (!isOneJsonValue(text)) return error.InvalidField;
+        if (!isOneJsonValue(text, depth)) return error.InvalidField;
     }
 }
 
@@ -2210,32 +2564,32 @@ fn checkRaw(lexemes: []const ?[]const u8) EncodeError!void {
 /// break PROTOCOLS.md section 2 in the `decode(encode(x)) == x` direction for
 /// a document this library itself decodes. `ObjectWriter.key` escapes the
 /// name, so an empty one writes `""` and an escaped one writes its value.
-fn checkVerbatim(members: []const VerbatimMember) EncodeError!void {
+fn checkVerbatim(members: []const VerbatimMember, depth: u32) EncodeError!void {
     for (members) |member| {
-        if (!isOneJsonValue(member.value)) return error.InvalidField;
+        if (!isOneJsonValue(member.value, depth)) return error.InvalidField;
     }
 }
 
-fn checkResourceContents(contents: ResourceContents) EncodeError!void {
+fn checkResourceContents(contents: ResourceContents, depth: u32) EncodeError!void {
     switch (contents) {
-        .text => |value| try checkRaw(&.{value.meta}),
-        .blob => |value| try checkRaw(&.{value.meta}),
+        .text => |value| try checkRaw(&.{value.meta}, depth),
+        .blob => |value| try checkRaw(&.{value.meta}, depth),
     }
     try checkVerbatim(switch (contents) {
         .text => |value| value.verbatim,
         .blob => |value| value.verbatim,
-    });
+    }, depth);
 }
 
-fn checkContentBlock(block: ContentBlock) EncodeError!void {
+fn checkContentBlock(block: ContentBlock, depth: u32) EncodeError!void {
     switch (block) {
-        .text => |value| try checkRaw(&.{ value.annotations, value.meta }),
-        .image => |value| try checkRaw(&.{ value.annotations, value.meta }),
-        .audio => |value| try checkRaw(&.{ value.annotations, value.meta }),
-        .resource_link => |value| try checkRaw(&.{ value.icons, value.meta }),
+        .text => |value| try checkRaw(&.{ value.annotations, value.meta }, depth),
+        .image => |value| try checkRaw(&.{ value.annotations, value.meta }, depth),
+        .audio => |value| try checkRaw(&.{ value.annotations, value.meta }, depth),
+        .resource_link => |value| try checkRaw(&.{ value.icons, value.meta }, depth),
         .resource => |value| {
-            try checkResourceContents(value.resource);
-            try checkRaw(&.{ value.annotations, value.meta });
+            try checkResourceContents(value.resource, depth + 1);
+            try checkRaw(&.{ value.annotations, value.meta }, depth);
         },
     }
     try checkVerbatim(switch (block) {
@@ -2244,24 +2598,24 @@ fn checkContentBlock(block: ContentBlock) EncodeError!void {
         .audio => |value| value.verbatim,
         .resource_link => |value| value.verbatim,
         .resource => |value| value.verbatim,
-    });
+    }, depth);
 }
 
-fn checkPromptMessage(message: PromptMessage) EncodeError!void {
-    try checkContentBlock(message.content);
-    try checkRaw(&.{message.meta});
-    try checkVerbatim(message.verbatim);
+fn checkPromptMessage(message: PromptMessage, depth: u32) EncodeError!void {
+    try checkContentBlock(message.content, depth + 1);
+    try checkRaw(&.{message.meta}, depth);
+    try checkVerbatim(message.verbatim, depth);
 }
 
-fn checkTool(tool: Tool) EncodeError!void {
+fn checkTool(tool: Tool, depth: u32) EncodeError!void {
     try checkRaw(&.{
         tool.input_schema,
         tool.output_schema,
         tool.annotations,
         tool.icons,
         tool.meta,
-    });
-    try checkVerbatim(tool.verbatim);
+    }, depth);
+    try checkVerbatim(tool.verbatim, depth);
 }
 
 /// The members every section 4.10 result object carries, collected apart from
@@ -2397,6 +2751,15 @@ pub const ContentBlockKind = enum {
     resource_link,
     resource,
 
+    /// The tag a wire `type` names, or null for one this revision does not
+    /// define.
+    ///
+    /// Null rather than a default: the set is closed, so a sixth string is a
+    /// block this revision cannot read and not the first of the five. Where a
+    /// decoder has an error to report it turns the null into
+    /// `error.UnknownTag`; a caller holding the string decides for itself. The
+    /// comparison is exact, so `"Text"` names nothing. `text` is only read and
+    /// the result is a tag, so nothing is borrowed and kept.
     pub fn fromString(text: []const u8) ?ContentBlockKind {
         if (std.mem.eql(u8, text, content_block_type.text)) return .text;
         if (std.mem.eql(u8, text, content_block_type.image)) return .image;
@@ -2406,6 +2769,11 @@ pub const ContentBlockKind = enum {
         return null;
     }
 
+    /// The wire spelling of this tag, which is what a peer sends.
+    ///
+    /// Points at this module's own `content_block_type` literals and borrows
+    /// static memory, so the result outlives every caller and needs no copy
+    /// and no allocation.
     pub fn string(self: ContentBlockKind) []const u8 {
         return switch (self) {
             .text => content_block_type.text,
@@ -2422,12 +2790,25 @@ pub const Role = enum {
     user,
     assistant,
 
+    /// The role a wire `role` names, or null for one this revision does not
+    /// define.
+    ///
+    /// Null rather than a default, for the reason
+    /// [`ContentBlockKind.fromString`] states: the set is closed, so `system`
+    /// is a third role a peer may send rather than the first of two. Where a
+    /// decoder has an error to report it turns the null into
+    /// `error.UnknownTag`. `text` is only read and the result is a tag, so
+    /// nothing is borrowed and kept.
     pub fn fromString(text: []const u8) ?Role {
         if (std.mem.eql(u8, text, role.user)) return .user;
         if (std.mem.eql(u8, text, role.assistant)) return .assistant;
         return null;
     }
 
+    /// The wire spelling of this role, which is what a peer sends.
+    ///
+    /// Points at this module's own `role` literals and borrows static memory,
+    /// so the result outlives every caller and needs no copy.
     pub fn string(self: Role) []const u8 {
         return switch (self) {
             .user => role.user,
@@ -2437,6 +2818,12 @@ pub const Role = enum {
 };
 
 /// A `TextContent` block: `type: "text"` and a `text` string.
+///
+/// `text` is a decoded string, `annotations` and `meta` are JSON lexemes, and
+/// `verbatim` is a carried member — each as the module rule at the top of this
+/// file states. Nothing here is required beyond `text`: a block the peer wrote
+/// with no `annotations` and no `_meta` decodes with both absent, and that is
+/// the same value as one whose peers sent them empty.
 pub const TextContent = struct {
     text: []const u8,
     /// The `Annotations` object, carried as the lexeme it arrived as.
@@ -2454,6 +2841,11 @@ pub const TextContent = struct {
 };
 
 /// An `ImageContent` block: `type: "image"`, base64 `data`, a `mimeType`.
+///
+/// `data` and `mime_type` are decoded strings, `annotations` and `meta` are
+/// JSON lexemes, and `verbatim` is a carried member — each as the module rule
+/// at the top of this file states. Both required members are required: a block
+/// without them is `error.MissingField` and not an empty image.
 pub const ImageContent = struct {
     /// The base64 **string**, not bytes.
     ///
@@ -2471,6 +2863,11 @@ pub const ImageContent = struct {
 };
 
 /// An `AudioContent` block. The same two required members as the image.
+///
+/// `data` and `mime_type` are decoded strings, `annotations` and `meta` are
+/// JSON lexemes, and `verbatim` is a carried member — each as the module rule
+/// at the top of this file states, and for the same reason
+/// [`ImageContent.data`] carries its base64 as a string.
 pub const AudioContent = struct {
     data: []const u8,
     mime_type: []const u8,
@@ -2487,6 +2884,10 @@ pub const AudioContent = struct {
 /// PROTOCOLS.md names are modelled; `mimeType`, `size`, `description` and
 /// `annotations` are among the ones it does not, and a block carrying them is
 /// carried in [`ResourceLink.verbatim`] rather than refused.
+///
+/// `uri`, `name` and `title` are decoded strings, `icons` and `meta` are JSON
+/// lexemes, and `verbatim` is a carried member — each as the module rule at the
+/// top of this file states.
 pub const ResourceLink = struct {
     uri: []const u8,
     name: []const u8,
@@ -2497,6 +2898,12 @@ pub const ResourceLink = struct {
 };
 
 /// An `EmbeddedResource` block: `type: "resource"` and one `resource`.
+///
+/// `resource` is a decoded value rather than a slice of this block's own:
+/// reading it appends to the same caller store the block's own `verbatim` came
+/// from, which is why the block's slice is taken before the resource is read.
+/// `annotations` and `meta` are JSON lexemes and `verbatim` is a carried
+/// member — each as the module rule at the top of this file states.
 pub const EmbeddedResource = struct {
     resource: ResourceContents,
     annotations: ?[]const u8 = null,
@@ -2505,6 +2912,11 @@ pub const EmbeddedResource = struct {
 };
 
 /// A `ContentBlock`, the closed union section 4.10.4 transcribes.
+///
+/// The active arm carries the members section 4.10.4 gives that arm; a member
+/// belonging to another arm is not refused here but carried in that arm's own
+/// `verbatim`, so a block this revision cannot read structurally still encodes
+/// back to the document it came from.
 pub const ContentBlock = union(enum) {
     text: TextContent,
     image: ImageContent,
@@ -2512,6 +2924,12 @@ pub const ContentBlock = union(enum) {
     resource_link: ResourceLink,
     resource: EmbeddedResource,
 
+    /// The tag this block writes as its `type`, and the arm its decoder read.
+    ///
+    /// A function of the active union member alone, so an encoder can ask
+    /// before it has reached the member and a caller can branch on it without
+    /// reading the payload. It copies nothing and borrows nothing, and the
+    /// block it takes by value is not retained.
     pub fn tag(self: ContentBlock) ContentBlockKind {
         return switch (self) {
             .text => .text,
@@ -2524,6 +2942,11 @@ pub const ContentBlock = union(enum) {
 };
 
 /// `TextResourceContents`: a `uri` and a `text`.
+///
+/// `uri`, `text` and `mime_type` are decoded strings, `meta` is a JSON lexeme,
+/// and `verbatim` is a carried member — each as the module rule at the top of
+/// this file states. Only `uri` is required; the union has no discriminator, so
+/// what `text` is, is what this arm is.
 pub const TextResourceContents = struct {
     uri: []const u8,
     text: []const u8,
@@ -2533,6 +2956,11 @@ pub const TextResourceContents = struct {
 };
 
 /// `BlobResourceContents`: a `uri` and a base64 `blob`.
+///
+/// `uri`, `blob` and `mime_type` are decoded strings, `meta` is a JSON lexeme,
+/// and `verbatim` is a carried member — each as the module rule at the top of
+/// this file states. `blob` is the base64 **string**, not bytes, and its
+/// alphabet is not checked, for the reason [`ImageContent.data`] states.
 pub const BlobResourceContents = struct {
     uri: []const u8,
     blob: []const u8,
@@ -2558,6 +2986,10 @@ pub const ResourceContents = union(enum) {
 /// as the one place a `ContentBlock` stands alone. It is also the reason the
 /// decode is two-staged here: the block is captured as a lexeme in the member
 /// loop and decoded after it, for the reason [`VerbatimStore`] documents.
+///
+/// `role` is a tag, `content` is the one block this shape carries, and `meta`
+/// is a JSON lexeme with `verbatim` a carried member — each as the module rule
+/// at the top of this file states.
 pub const PromptMessage = struct {
     role: Role,
     content: ContentBlock,
@@ -2574,6 +3006,10 @@ pub const PromptMessage = struct {
 /// block carrying them arrives in [`Tool.verbatim`] — which is a refusal to
 /// model rather than a refusal to accept, and is the reason the encoder can
 /// write one back.
+///
+/// `name` and `title` are decoded strings, `input_schema`, `output_schema`,
+/// `annotations`, `icons` and `meta` are JSON lexemes, and `verbatim` is a
+/// carried member — each as the module rule at the top of this file states.
 pub const Tool = struct {
     name: []const u8,
     /// The JSON Schema object, carried as the lexeme it arrived as.
@@ -3212,8 +3648,9 @@ fn writeStringArray(values: []const []const u8, writer: *json.Writer) EncodeErro
 /// Every result decoder ends here, for the reason `decodeResultType` states:
 /// bytes after the closing brace are a second document the transport did not
 /// split, and an encoder has nowhere inside an object to put them, so
-/// accepting one would make `encode(decode(b)) != b` for a `b` the decoder
-/// had called whole.
+/// accepting one would let a document the encoder could not have produced come
+/// back out of a decoder that called it whole. [`VerbatimMember`] states what
+/// re-encoding does preserve.
 fn closeResult(
     reader: *json.Reader,
     store: *VerbatimStore,
@@ -3233,6 +3670,12 @@ fn closeResult(
 /// paginated, and `resources/read` returns a sequence without a `nextCursor`,
 /// which is the row a decoder cannot get right from the field name alone.
 pub const PaginatedResult = struct {
+    /// The cursor for the next page, as a decoded string, or null when this is
+    /// the last page.
+    ///
+    /// Null is the absence the peer wrote, not a default: a page with a
+    /// `nextCursor` and one without are different facts, and a result this
+    /// module reads is not paginated at all on three of the ten rows.
     next_cursor: ?[]const u8 = null,
 };
 
@@ -3244,6 +3687,22 @@ pub const PaginatedResult = struct {
 /// [`Page.verbatim`] of the returned envelope rather than dropped,
 /// because a member this shape does not name cannot be written back if it is
 /// not carried.
+///
+/// `raw` is the `result` object as borrowed JSON text and the returned value
+/// keeps slices of it: `nextCursor` is a decoded string and `meta` a lexeme, so
+/// both borrow the document or the escape scratch as the module rule states,
+/// and `verbatim` aliases the caller's store array. `raw` and `scratch` must
+/// both outlive the returned [`Page`].
+///
+/// `verbatim` is filled with every member this shape does not model, the
+/// payload included, so the store has to be sized for the whole document rather
+/// than for the envelope. Exhaustion is `error.BufferTooSmall` and never a
+/// truncation.
+///
+/// On any error nothing is returned and nothing already in `verbatim` may be
+/// read as part of a page: [`Page.verbatim`] was never formed, so a caller that
+/// fixes the fault and calls again re-reads `raw` and writes over what the
+/// first attempt left.
 pub fn decodePaginatedResult(
     raw: []const u8,
     verbatim: []VerbatimMember,
@@ -3335,6 +3794,12 @@ fn buildCacheable(
 }
 
 /// A result read only for its page, and for what it carries beside it.
+///
+/// `next_cursor` is a decoded string and `meta` a JSON lexeme, and `verbatim`
+/// is a carried member aliasing the caller's store array — each as the module
+/// rule at the top of this file states, and each borrowed from the document
+/// and the store the [`decodePaginatedResult`] call was given rather than
+/// copied.
 pub const Page = struct {
     result_type: ResultType = ResultType{},
     /// The caching members, or null when the document did not carry both.
@@ -3347,17 +3812,40 @@ pub const Page = struct {
     /// the pair and keeping it is what lets the encoder be their inverse.
     cacheable: ?Cacheable = null,
     page: PaginatedResult = PaginatedResult{},
+    /// The `_meta` object, carried whole as the lexeme it arrived as.
+    ///
+    /// Optional and not defaulted: a peer that sent no `_meta` and one that sent
+    /// `{}` are the two documents they are.
     meta: ?[]const u8 = null,
+    /// The members this shape does not model, including the whole payload.
+    ///
+    /// This reader skips the payload rather than decoding it, so the payload
+    /// is the member most often found here — and it is carried for that reason
+    /// rather than dropped, as [`VerbatimMember`] requires.
     verbatim: []const VerbatimMember = &.{},
 };
 
 /// Encode what [`decodePaginatedResult`] read.
 ///
-/// The exact inverse for the documents it accepts, because a member it does
-/// not model comes back in [`Page.verbatim`] rather than being skipped.
+/// The inverse of it for the values [`decodePaginatedResult`] produces, and
+/// what a member it does not model buys: the payload and every other one
+/// comes back in [`Page.verbatim`] rather than being skipped, and
+/// [`VerbatimMember`] states what that preserves and what it does not — member
+/// order is the encoder's, so the encoding is stable rather than a copy of the
+/// peer's byte order.
+///
+/// `error.InvalidField` names a lexeme that is not one whole JSON value and
+/// lands before the first byte; after that the only failure left is
+/// `error.BufferTooSmall` from the writer, which leaves what it had already
+/// written in the caller's buffer.
+///
+/// The one obligation this leaves open is the module rule at the top of this
+/// file states: [`json.Writer.string`] does not check UTF-8, so this is an
+/// inverse for the values [`decodePaginatedResult`] produces and not for any
+/// value handed to it.
 pub fn encodePaginatedResult(page: Page, writer: *json.Writer) EncodeError!void {
-    try checkRaw(&.{page.meta});
-    try checkVerbatim(page.verbatim);
+    try checkRaw(&.{page.meta}, 1);
+    try checkVerbatim(page.verbatim, 1);
     var object: ObjectWriter = .{ .writer = writer };
     try object.open();
     try writeResultType(&object, page.result_type);
@@ -3372,15 +3860,35 @@ fn writeNextCursor(object: *ObjectWriter, page: PaginatedResult) EncodeError!voi
     try object.optText("nextCursor", page.next_cursor);
 }
 
-/// Encode the two members a cacheable result requires.
+/// Encode the two members a cacheable result requires, as a whole object.
 ///
-/// Not the inverse of [`decodeCacheable`], and deliberately so: that decoder
-/// skips every member the caching rules do not govern — it is the rule
+/// ## What this is, and what composes with it
+///
+/// What it writes is `{"ttlMs":…,"cacheScope":…}` and nothing else, so it is a
+/// **fragment constructor rather than a complete result**: PROTOCOLS.md 4.6
+/// puts `resultType` on every result, so an object this writes is not one
+/// [`checkResult`] would accept and not one any typed decoder reads as the
+/// answer to a method. A caller writing a whole cacheable result composes
+/// instead — [`encodeDiscoverResult`], [`encodeToolListResult`],
+/// [`encodeResourceReadResult`] and [`encodePaginatedResult`] each write this
+/// pair beside their own members — and reaches for this only when the object is
+/// genuinely nothing but a freshness hint, as the harness's cache battery
+/// does. This is the composition boundary: inside a result encoder the pair is
+/// a member, and here it is the whole document.
+///
+/// It is deliberately not the inverse of [`decodeCacheable`]. That decoder skips
+/// every member the caching rules do not govern — it is the rule
 /// [`checkResult`] applies to a body it did not build — so a document decoded
-/// by it has already lost the bytes this cannot put back.
-/// The result decoders in this section do not skip, and a result round trip
-/// through them is exact. What is here is the constructor half: the object a
-/// server writes when it has a freshness hint and nothing else to say.
+/// by it has already lost the members this cannot put back. The result decoders
+/// in this section do not skip, and a result round trip through them reproduces
+/// its wire values; [`VerbatimMember`] states what that does and does not
+/// preserve.
+///
+/// Both members are constructed here, so there is nothing to validate and no
+/// `error.InvalidField` to report: a `u64` and one of the two `cacheScope`
+/// literals are always a pair this library's own reader accepts. The only
+/// failure is `error.BufferTooSmall`, and the writer leaves what it had already
+/// written in the caller's buffer.
 pub fn encodeCacheable(cacheable: Cacheable, writer: *json.Writer) EncodeError!void {
     var object: ObjectWriter = .{ .writer = writer };
     try object.open();
@@ -3398,9 +3906,26 @@ pub fn encodeCacheable(cacheable: Cacheable, writer: *json.Writer) EncodeError!v
 /// presence is tracked apart from the count: an empty `content` and an absent
 /// one are both a zero-length slice here, and only the decoder's refusal can
 /// tell them apart.
+///
+/// `content` is the caller's own array of blocks, `meta` and
+/// `structured_content` are JSON lexemes and `verbatim` is a carried member —
+/// each as the module rule at the top of this file states, and each borrowed
+/// from the document, the escape scratch or the store array the
+/// [`decodeToolCallResult`] call was given rather than copied.
 pub const ToolCallResult = struct {
     result_type: ResultType = ResultType{},
+    /// The `_meta` object, carried whole as the lexeme it arrived as.
+    ///
+    /// Optional and not defaulted: a peer that sent no `_meta` and one that sent
+    /// `{}` are the two documents they are.
     meta: ?[]const u8 = null,
+    /// The blocks, in `out_content` — a slice of the caller's array, not a copy.
+    ///
+    /// Read-only here, and the decoder does not write through it afterwards, so
+    /// a caller may inspect or re-encode the blocks without disturbing the
+    /// array. An empty slice means either an empty `content` or a member the
+    /// decoder never had, which are different documents and only
+    /// `error.MissingField` tells them apart.
     content: []const ContentBlock = &.{},
     /// Any JSON value, conforming to the tool's `outputSchema` if it has one.
     ///
@@ -3416,15 +3941,29 @@ pub const ToolCallResult = struct {
     /// `false` default would make a result that said nothing
     /// indistinguishable from one that said false.
     is_error: ?bool = null,
+    /// Unmodeled members of this result object. Nested elements retain their
+    /// own members in their own `verbatim` slices.
+    ///
+    /// Aliases the caller's store array rather than copying it, so it is valid
+    /// until that array is written again or released.
     verbatim: []const VerbatimMember = &.{},
 };
 
 /// Decode a `CallToolResult`.
 ///
-/// `out_content` is the caller's array of blocks and `verbatim` is the
-/// caller's store for the members no shape names, across the whole document
-/// including the blocks. Nothing allocates, and a result with more content
-/// than the caller reserved is reported rather than truncated.
+/// `out_content` is the caller's array of blocks and `verbatim` its store for
+/// the members no shape names, across the whole document including the blocks,
+/// so size both for the document rather than for the envelope. Every slice the
+/// result holds borrows the document, the escape scratch or the store array —
+/// the three regions this call was given, which must all outlive it, as the
+/// module rule at the top of this file states.
+///
+/// Exhaustion of either is `error.BufferTooSmall` and never a truncation: a
+/// result with more content than the caller reserved is reported rather than
+/// cut. On any error nothing is returned and both arrays may hold what the
+/// failed attempt wrote; neither is readable as part of a result, because
+/// [`ToolCallResult.verbatim`] was never formed. A caller that fixes the fault
+/// calls again with the same storage and lets the second pass overwrite them.
 pub fn decodeToolCallResult(
     raw: []const u8,
     out_content: []ContentBlock,
@@ -3478,11 +4017,27 @@ pub fn decodeToolCallResult(
     };
 }
 
-/// Encode a `CallToolResult` — the exact inverse of [`decodeToolCallResult`].
+/// Encode a `CallToolResult` — the inverse of [`decodeToolCallResult`] for the
+/// values it produces, which is what a member the shape does not model
+/// buys: it comes back in [`ToolCallResult.verbatim`] rather than being
+/// skipped, and [`VerbatimMember`] states what that preserves and what it does
+/// not. Member order is the encoder's, so the encoding is stable rather than a
+/// copy of the peer's byte order.
+///
+/// `error.InvalidField` names a lexeme that is not one whole JSON value,
+/// wherever in the document it sat, and lands before the first byte; after that
+/// the only failure left is `error.BufferTooSmall` from the writer, which
+/// leaves what it had already written in the caller's buffer.
+///
+/// The one obligation this leaves open is the module rule at the top of this
+/// file states: [`json.Writer.string`] does not check UTF-8, so this is an
+/// inverse for the values [`decodeToolCallResult`] produces and not for any
+/// value handed to it. A caller building a result from strings it wrote itself
+/// must have them valid.
 pub fn encodeToolCallResult(result: ToolCallResult, writer: *json.Writer) EncodeError!void {
-    for (result.content) |block| try checkContentBlock(block);
-    try checkRaw(&.{ result.structured_content, result.meta });
-    try checkVerbatim(result.verbatim);
+    for (result.content) |block| try checkContentBlock(block, 3);
+    try checkRaw(&.{ result.structured_content, result.meta }, 1);
+    try checkVerbatim(result.verbatim, 1);
     var object: ObjectWriter = .{ .writer = writer };
     try object.open();
     try writeResultType(&object, result.result_type);
@@ -3501,16 +4056,51 @@ pub fn encodeToolCallResult(result: ToolCallResult, writer: *json.Writer) Encode
 }
 
 /// A `ListToolsResult`, the answer to `tools/list`.
+///
+/// `cacheable` is required and has no default, so a server that means to answer
+/// `tools/list` cannot build one without a freshness hint and a scope;
+/// `page` is optional, because a last page is a document without `nextCursor`.
+/// `tools` is a slice of the caller's array, `meta` a JSON lexeme and
+/// `verbatim` a carried member — each as the module rule at the top of this
+/// file states.
 pub const ToolListResult = struct {
     result_type: ResultType = ResultType{},
     cacheable: Cacheable,
     page: PaginatedResult = PaginatedResult{},
+    /// The `_meta` object, carried whole as the lexeme it arrived as.
+    ///
+    /// Optional and not defaulted: a peer that sent no `_meta` and one that sent
+    /// `{}` are the two documents they are.
     meta: ?[]const u8 = null,
+    /// The tools, in `out_tools` — a slice of the caller's array, not a copy.
+    ///
+    /// Required and present-and-empty is well formed, so an empty slice here
+    /// means a server that listed no tools and never an absent `tools`; only
+    /// `error.MissingField` tells those apart.
     tools: []const Tool = &.{},
+    /// Unmodeled members of this result object. Tools retain their own members
+    /// in `Tool.verbatim`, not in this slice.
+    ///
+    /// Aliases the caller's store array rather than copying it, so it is valid
+    /// until that array is written again or released.
     verbatim: []const VerbatimMember = &.{},
 };
 
 /// Decode a `ListToolsResult`.
+///
+/// `out_tools` is the caller's array of tools and `verbatim` its store for the
+/// members no shape names, across the whole document including the tools, so
+/// size both for the document rather than for the envelope. Every slice the
+/// result holds borrows the document, the escape scratch or the store array —
+/// the three regions this call was given, which must all outlive it, as the
+/// module rule at the top of this file states.
+///
+/// All three required members are required: an absent `tools`, `ttlMs` or
+/// `cacheScope` is `error.MissingField`. Exhaustion of either array is
+/// `error.BufferTooSmall` and never a truncation, and on any error nothing is
+/// returned and both arrays may hold what the failed attempt wrote — readable
+/// as nothing, because [`ToolListResult.verbatim`] was never formed. A caller
+/// that fixes the fault calls again with the same storage.
 pub fn decodeToolListResult(
     raw: []const u8,
     out_tools: []Tool,
@@ -3554,12 +4144,27 @@ pub fn decodeToolListResult(
     };
 }
 
-/// Encode a `ListToolsResult` — the exact inverse of
-/// [`decodeToolListResult`].
+/// Encode a `ListToolsResult` — the inverse of [`decodeToolListResult`] for the
+/// values it produces, which is what a member the shape does not model
+/// buys: it comes back in [`ToolListResult.verbatim`] rather than being
+/// skipped, and [`VerbatimMember`] states what that preserves and what it does
+/// not. Member order is the encoder's, so the encoding is stable rather than a
+/// copy of the peer's byte order.
+///
+/// `error.InvalidField` names a lexeme that is not one whole JSON value,
+/// wherever in the document it sat, and lands before the first byte; after that
+/// the only failure left is `error.BufferTooSmall` from the writer, which
+/// leaves what it had already written in the caller's buffer.
+///
+/// The one obligation this leaves open is the module rule at the top of this
+/// file states: [`json.Writer.string`] does not check UTF-8, so this is an
+/// inverse for the values [`decodeToolListResult`] produces and not for any
+/// value handed to it. A caller building a result from strings it wrote itself
+/// must have them valid.
 pub fn encodeToolListResult(result: ToolListResult, writer: *json.Writer) EncodeError!void {
-    for (result.tools) |tool| try checkTool(tool);
-    try checkRaw(&.{result.meta});
-    try checkVerbatim(result.verbatim);
+    for (result.tools) |tool| try checkTool(tool, 3);
+    try checkRaw(&.{result.meta}, 1);
+    try checkVerbatim(result.verbatim, 1);
     var object: ObjectWriter = .{ .writer = writer };
     try object.open();
     try writeResultType(&object, result.result_type);
@@ -3584,15 +4189,49 @@ pub fn encodeToolListResult(result: ToolListResult, writer: *json.Writer) Encode
 /// array for a resource that does not exist, and this decoder does not read
 /// that as a rule it may enforce — an empty array is a legal document, and the
 /// resource's existence is the caller's question to ask.
+///
+/// `contents` is a slice of the caller's array, `meta` a JSON lexeme and
+/// `verbatim` a carried member — each as the module rule at the top of this
+/// file states, and each borrowed from the document, the escape scratch or the
+/// store array the [`decodeResourceReadResult`] call was given rather than
+/// copied.
 pub const ResourceReadResult = struct {
     result_type: ResultType = ResultType{},
     cacheable: Cacheable,
+    /// The `_meta` object, carried whole as the lexeme it arrived as.
+    ///
+    /// Optional and not defaulted: a peer that sent no `_meta` and one that sent
+    /// `{}` are the two documents they are.
     meta: ?[]const u8 = null,
+    /// The contents, in `out_contents` — a slice of the caller's array, not a
+    /// copy.
+    ///
+    /// Required, and it may hold more than one entry: this is the row the field
+    /// name alone cannot classify, because a sequence is not a page.
     contents: []const ResourceContents = &.{},
+    /// Unmodeled members of this result object. Nested resource contents retain
+    /// their own members in their own `verbatim` slices.
+    ///
+    /// Aliases the caller's store array rather than copying it, so it is valid
+    /// until that array is written again or released.
     verbatim: []const VerbatimMember = &.{},
 };
 
 /// Decode a `ReadResourceResult`.
+///
+/// `out_contents` is the caller's array of contents and `verbatim` its store
+/// for the members no shape names, across the whole document including the
+/// contents, so size both for the document rather than for the envelope. Every
+/// slice the result holds borrows the document, the escape scratch or the store
+/// array — the three regions this call was given, which must all outlive it, as
+/// the module rule at the top of this file states.
+///
+/// All three required members are required: an absent `contents`, `ttlMs` or
+/// `cacheScope` is `error.MissingField`. Exhaustion of either array is
+/// `error.BufferTooSmall` and never a truncation, and on any error nothing is
+/// returned and both arrays may hold what the failed attempt wrote — readable
+/// as nothing, because [`ResourceReadResult.verbatim`] was never formed. A
+/// caller that fixes the fault calls again with the same storage.
 pub fn decodeResourceReadResult(
     raw: []const u8,
     out_contents: []ResourceContents,
@@ -3639,15 +4278,30 @@ pub fn decodeResourceReadResult(
     };
 }
 
-/// Encode a `ReadResourceResult` — the exact inverse of
-/// [`decodeResourceReadResult`].
+/// Encode a `ReadResourceResult` — the inverse of [`decodeResourceReadResult`]
+/// for the values it produces, which is what a member the shape does not
+/// model buys: it comes back in [`ResourceReadResult.verbatim`] rather than
+/// being skipped, and [`VerbatimMember`] states what that preserves and what it
+/// does not. Member order is the encoder's, so the encoding is stable rather
+/// than a copy of the peer's byte order.
+///
+/// `error.InvalidField` names a lexeme that is not one whole JSON value,
+/// wherever in the document it sat, and lands before the first byte; after that
+/// the only failure left is `error.BufferTooSmall` from the writer, which
+/// leaves what it had already written in the caller's buffer.
+///
+/// The one obligation this leaves open is the module rule at the top of this
+/// file states: [`json.Writer.string`] does not check UTF-8, so this is an
+/// inverse for the values [`decodeResourceReadResult`] produces and not for any
+/// value handed to it. A caller building a result from strings it wrote itself
+/// must have them valid.
 pub fn encodeResourceReadResult(
     result: ResourceReadResult,
     writer: *json.Writer,
 ) EncodeError!void {
-    for (result.contents) |entry| try checkResourceContents(entry);
-    try checkRaw(&.{result.meta});
-    try checkVerbatim(result.verbatim);
+    for (result.contents) |entry| try checkResourceContents(entry, 3);
+    try checkRaw(&.{result.meta}, 1);
+    try checkVerbatim(result.verbatim, 1);
     var object: ObjectWriter = .{ .writer = writer };
     try object.open();
     try writeResultType(&object, result.result_type);
@@ -3665,15 +4319,54 @@ pub fn encodeResourceReadResult(
 }
 
 /// A `GetPromptResult`, the answer to `prompts/get`.
+///
+/// `messages` is a slice of the caller's array, `description` a decoded string,
+/// `meta` a JSON lexeme and `verbatim` a carried member — each as the module
+/// rule at the top of this file states, and each borrowed from the document, the
+/// escape scratch or the store array the [`decodePromptsGetResult`] call was
+/// given rather than copied.
 pub const PromptsGetResult = struct {
     result_type: ResultType = ResultType{},
+    /// The `_meta` object, carried whole as the lexeme it arrived as.
+    ///
+    /// Optional and not defaulted: a peer that sent no `_meta` and one that sent
+    /// `{}` are the two documents they are.
     meta: ?[]const u8 = null,
+    /// The messages, in `out_messages` — a slice of the caller's array, not a
+    /// copy.
+    ///
+    /// Required, and present-and-empty is well formed: an empty slice here is a
+    /// prompt with no messages and never an absent `messages`.
     messages: []const PromptMessage = &.{},
+    /// The prompt's prose, as a decoded string.
+    ///
+    /// Optional because the section does not require it, and not defaulted to an
+    /// empty string: a prompt the server left undescribed and one it described
+    /// as `""` are different documents.
     description: ?[]const u8 = null,
+    /// Unmodeled members of this result object. Messages retain their own
+    /// members in `PromptMessage.verbatim`, not in this slice.
+    ///
+    /// Aliases the caller's store array rather than copying it, so it is valid
+    /// until that array is written again or released.
     verbatim: []const VerbatimMember = &.{},
 };
 
 /// Decode a `GetPromptResult`.
+///
+/// `out_messages` is the caller's array of messages and `verbatim` its store
+/// for the members no shape names, across the whole document including the
+/// messages and the block each one carries, so size both for the document
+/// rather than for the envelope. Every slice the result holds borrows the
+/// document, the escape scratch or the store array — the three regions this
+/// call was given, which must all outlive it, as the module rule at the top of
+/// this file states.
+///
+/// Exhaustion of either array is `error.BufferTooSmall` and never a truncation,
+/// and on any error nothing is returned and both arrays may hold what the
+/// failed attempt wrote — readable as nothing, because
+/// [`PromptsGetResult.verbatim`] was never formed. A caller that fixes the
+/// fault calls again with the same storage.
 pub fn decodePromptsGetResult(
     raw: []const u8,
     out_messages: []PromptMessage,
@@ -3722,12 +4415,27 @@ pub fn decodePromptsGetResult(
     };
 }
 
-/// Encode a `GetPromptResult` — the exact inverse of
-/// [`decodePromptsGetResult`].
+/// Encode a `GetPromptResult` — the inverse of [`decodePromptsGetResult`] for
+/// the values it produces, which is what a member the shape does not model
+/// buys: it comes back in [`PromptsGetResult.verbatim`] rather than being
+/// skipped, and [`VerbatimMember`] states what that preserves and what it does
+/// not. Member order is the encoder's, so the encoding is stable rather than a
+/// copy of the peer's byte order.
+///
+/// `error.InvalidField` names a lexeme that is not one whole JSON value,
+/// wherever in the document it sat, and lands before the first byte; after that
+/// the only failure left is `error.BufferTooSmall` from the writer, which
+/// leaves what it had already written in the caller's buffer.
+///
+/// The one obligation this leaves open is the module rule at the top of this
+/// file states: [`json.Writer.string`] does not check UTF-8, so this is an
+/// inverse for the values [`decodePromptsGetResult`] produces and not for any
+/// value handed to it. A caller building a result from strings it wrote itself
+/// must have them valid.
 pub fn encodePromptsGetResult(result: PromptsGetResult, writer: *json.Writer) EncodeError!void {
-    for (result.messages) |message| try checkPromptMessage(message);
-    try checkRaw(&.{result.meta});
-    try checkVerbatim(result.verbatim);
+    for (result.messages) |message| try checkPromptMessage(message, 3);
+    try checkRaw(&.{result.meta}, 1);
+    try checkVerbatim(result.verbatim, 1);
     var object: ObjectWriter = .{ .writer = writer };
     try object.open();
     try writeResultType(&object, result.result_type);
@@ -3748,11 +4456,25 @@ pub fn encodePromptsGetResult(result: PromptsGetResult, writer: *json.Writer) En
 ///
 /// The one mandatory method, and the only result a client cannot route by
 /// guessing: it is what tells the client which versions it may speak.
+///
+/// `supported_versions` is a slice of the caller's array of decoded strings,
+/// `capabilities` and `meta` are JSON lexemes, `instructions` a decoded string
+/// and `verbatim` a carried member — each as the module rule at the top of this
+/// file states, and each borrowed from the document, the escape scratch or the
+/// store array the [`decodeDiscoverResult`] call was given rather than copied.
 pub const DiscoverResult = struct {
     result_type: ResultType = ResultType{},
     cacheable: Cacheable,
+    /// The `_meta` object, carried whole as the lexeme it arrived as.
+    ///
+    /// Optional and not defaulted: a peer that sent no `_meta` and one that sent
+    /// `{}` are the two documents they are.
     meta: ?[]const u8 = null,
     /// The versions the server speaks; the client picks one.
+    ///
+    /// In `out_versions`, one slice per element: every element stays live at
+    /// once, so the strings borrow separate regions of the escape scratch or of
+    /// the document rather than one another.
     supported_versions: []const []const u8 = &.{},
     /// The `ServerCapabilities` object, carried whole.
     ///
@@ -3766,11 +4488,34 @@ pub const DiscoverResult = struct {
     /// — a session with no capabilities writes the literal `null`, and a
     /// reader that collapsed the two would report a refusal as an omission.
     capabilities: []const u8,
+    /// Prose for the model, as a decoded string.
+    ///
+    /// Optional because the section does not require it, and not defaulted to an
+    /// empty string: a server that said nothing and one that said `""` are
+    /// different documents.
     instructions: ?[]const u8 = null,
+    /// The members this shape does not model.
+    ///
+    /// Aliases the caller's store array rather than copying it, so it is valid
+    /// until that array is written again or released.
     verbatim: []const VerbatimMember = &.{},
 };
 
 /// Decode a `DiscoverResult`.
+///
+/// `out_versions` is the caller's array of version strings and `verbatim` its
+/// store for the members no shape names, so size the store for the whole
+/// document. Every slice the result holds borrows the document, the escape
+/// scratch or the store array — the three regions this call was given, which
+/// must all outlive it, as the module rule at the top of this file states.
+///
+/// All three required members are required: an absent `supportedVersions`,
+/// `capabilities`, `ttlMs` or `cacheScope` is `error.MissingField`.
+/// Exhaustion of either array is `error.BufferTooSmall` and never a truncation,
+/// and on any error nothing is returned and both arrays may hold what the
+/// failed attempt wrote — readable as nothing, because
+/// [`DiscoverResult.verbatim`] was never formed. A caller that fixes the fault
+/// calls again with the same storage.
 pub fn decodeDiscoverResult(
     raw: []const u8,
     out_versions: [][]const u8,
@@ -3819,18 +4564,37 @@ pub fn decodeDiscoverResult(
     };
 }
 
-/// Encode a `DiscoverResult` — the exact inverse of
-/// [`decodeDiscoverResult`].
+/// Encode a `DiscoverResult` — the inverse of [`decodeDiscoverResult`] for the
+/// values it produces, which is what a member the shape does not model
+/// buys: it comes back in [`DiscoverResult.verbatim`] rather than being
+/// skipped, and [`VerbatimMember`] states what that preserves and what it does
+/// not. Member order is the encoder's, so the encoding is stable rather than a
+/// copy of the peer's byte order.
 ///
-/// The member order is the one `mcp_session.Server.discoverBody` already
-/// writes, so a body a session built re-encodes to the same bytes rather than
-/// to an equivalent document in another order. `nextCursor` is not a member
-/// of this result, and `DiscoverResult` is not one of the four paginated rows:
-/// the artifact has it extend `CacheableResult` and not `PaginatedResult`, so
-/// it is the sixth cacheable row and none of the four that page.
+/// The order chosen is the one `mcp_session.Server.discoverBody` already
+/// writes, so a body a session built re-encodes to the very bytes it was built
+/// from rather than to the same document in another member order. That is the
+/// stable-encoding half of the contract and it is why this is the member order
+/// this module fixes; it is not a promise that a peer's own order survives.
+///
+/// `nextCursor` is not a member of this result, and `DiscoverResult` is not one
+/// of the four paginated rows: the artifact has it extend `CacheableResult` and
+/// not `PaginatedResult`, so it is the sixth cacheable row and none of the four
+/// that page.
+///
+/// `error.InvalidField` names a lexeme that is not one whole JSON value,
+/// wherever in the document it sat, and lands before the first byte; after that
+/// the only failure left is `error.BufferTooSmall` from the writer, which
+/// leaves what it had already written in the caller's buffer.
+///
+/// The one obligation this leaves open is the module rule at the top of this
+/// file states: [`json.Writer.string`] does not check UTF-8, so this is an
+/// inverse for the values [`decodeDiscoverResult`] produces and not for any
+/// value handed to it. A caller building a result from strings it wrote itself
+/// must have them valid.
 pub fn encodeDiscoverResult(result: DiscoverResult, writer: *json.Writer) EncodeError!void {
-    try checkRaw(&.{ result.capabilities, result.meta });
-    try checkVerbatim(result.verbatim);
+    try checkRaw(&.{ result.capabilities, result.meta }, 1);
+    try checkVerbatim(result.verbatim, 1);
     var object: ObjectWriter = .{ .writer = writer };
     try object.open();
     try writeResultType(&object, result.result_type);
@@ -5084,7 +5848,7 @@ test "an InputRequiredResult needs at least one of its two optional members" {
     , verbatim[0..], &scratch));
 }
 
-test "an unmodelled member of an interim result round-trips byte for byte" {
+test "an unmodelled member of an interim result is written back whole" {
     var scratch: [512]u8 = undefined;
     var out: [512]u8 = undefined;
     var verbatim: [16]VerbatimMember = undefined;
@@ -5161,7 +5925,7 @@ test "requestState is carried and never interpreted" {
     var scratch: [128]u8 = undefined;
     var verbatim: [16]VerbatimMember = undefined;
     // A value that would be dangerous if parsed as anything else. The library
-    // hands it back byte for byte.
+    // hands back the same characters without ever reading them as a structure.
     const hostile = "{\"admin\":true,\"role\":\"owner\"}";
     const decoded = try decodeInputRequiredResult(
         \\{"resultType":"input_required","requestState":"{\"admin\":true,\"role\":\"owner\"}"}
@@ -5248,8 +6012,8 @@ test "a result object with a trailing byte is refused, not truncated" {
 
     // The document is one result and the tail is a second one. Accepting it
     // lost the tail silently: the bytes that came back still decoded, so
-    // nothing downstream ever reported an error, and `encode(decode(b)) != b`
-    // for a `b` the decoder had called a whole document.
+    // nothing downstream ever reported an error, and a document no encoder here
+    // could have produced came back out of a decoder that called it whole.
     try testing.expectError(
         error.MalformedJson,
         decodeResultType("{\"resultType\":\"complete\",\"tools\":[]} trailing", &scratch),
@@ -5437,7 +6201,7 @@ test "an unrecognised ContentBlock type is UnknownTag, not a carried lexeme" {
     );
 }
 
-test "an unrecognised member beside a recognised one round-trips byte for byte" {
+test "an unrecognised member beside a recognised one is written back whole" {
     var scratch: [512]u8 = undefined;
     var out: [512]u8 = undefined;
     var blocks: [4]ContentBlock = undefined;
@@ -6477,4 +7241,134 @@ test "an encoder refuses a spliced value that is not one whole value" {
     try testing.expectEqualStrings(
         \\{"content":[],"structuredContent":{} }
     , writer.written());
+}
+
+test "inputRequired refuses a request map that is not one whole JSON object" {
+    var scratch: [256]u8 = undefined;
+    var verbatim: [8]VerbatimMember = undefined;
+    var out: [512]u8 = undefined;
+
+    // Section 4.7 types `inputRequests` as a map keyed by the server-assigned
+    // ids, and this is the one encoder in the module that takes a value the
+    // caller built rather than one a decoder handed back. Each of these used to
+    // be spliced as written, and each produced a body this library's own reader
+    // refuses — after the peer had already been sent it, and with no error
+    // anywhere on the sending side.
+    const refused = [_][]const u8{
+        "",
+        "e1",
+        "42",
+        "null",
+        "[]",
+        "{} extra",
+        "{\"e1\":}",
+        "{\"e1\":{\"method\":\"elicitation/create\"}",
+        "{\"e1\" {\"method\":\"elicitation/create\"}}",
+    };
+    for (refused) |requests| {
+        @memset(&out, 'x');
+        try testing.expectError(
+            error.InvalidField,
+            inputRequired("tools/call", requests, "st", &out),
+        );
+        // The refusal lands before the first byte, so a caller that fixed the
+        // value and called again is not reading a body with a hole in it.
+        try testing.expectEqual(@as(u8, 'x'), out[0]);
+    }
+
+    // The state is quoted with `json.Writer.string`, which escapes every byte
+    // JSON names and passes every other one through without checking it. A
+    // stray byte used to become a literal in the body, so the sending side
+    // reported the write as done and this library's own `json.Reader.string`
+    // refused the same bytes with `error.InvalidUtf8` on the far side of the
+    // wire. It is `InvalidField` rather than `BufferTooSmall`: the value is not
+    // text this may quote, which is a different fault from a buffer too small
+    // to hold it.
+    const stray: [3]u8 = .{ 0xC3, 0x28, 'x' };
+    @memset(&out, 'x');
+    try testing.expectError(
+        error.InvalidField,
+        inputRequired("tools/call", "{\"e1\":{}}", &stray, &out),
+    );
+    try testing.expectEqual(@as(u8, 'x'), out[0]);
+
+    // The valid half of the same check: multi-byte UTF-8 that is well formed is
+    // passed through byte for byte and comes back as the same characters,
+    // because the preflight is a validation rather than a normalisation.
+    const body_utf8 = try inputRequired("tools/call", "{\"e1\":{}}", "Zürich", &out);
+    const decoded_utf8 = try decodeInputRequiredResult(body_utf8, verbatim[0..], &scratch);
+    try testing.expectEqualStrings("Zürich", decoded_utf8.request_state.?);
+
+    // The method is still refused before the value is looked at, so a caller
+    // that named a method PROTOCOLS.md 4.7 does not allow learns that from the
+    // one error it already handles rather than from a second one.
+    @memset(&out, 'x');
+    try testing.expectError(
+        error.InputRequiredUnexpected,
+        inputRequired("tools/list", "[]", "st", &out),
+    );
+    try testing.expectEqual(@as(u8, 'x'), out[0]);
+
+    // A whole object is accepted whatever its names are spelled with and
+    // whatever whitespace sits inside it, so the check asks for the shape and
+    // not for a spelling the peer was free to choose. It needs no escape
+    // scratch to ask either, which is why a name written with a `\u` escape is
+    // not refused here.
+    const built = "{ \"e\\u0031\" : { \"method\" : \"elicitation/create\" } }";
+    const body = try inputRequired("prompts/get", built, "a\"b\\c", &out);
+    try testing.expectEqualStrings(
+        "{\"resultType\":\"input_required\"," ++
+            "\"inputRequests\":" ++ built ++
+            ",\"requestState\":\"a\\\"b\\\\c\"}",
+        body,
+    );
+
+    // ... and what it writes is a body the decoders read back with every wire
+    // value intact, which is the half the refused values above would have
+    // broken on the receiving side.
+    const decoded = try decodeInputRequiredResult(body, verbatim[0..], &scratch);
+    try testing.expectEqualStrings(built, decoded.input_requests.?);
+    try testing.expectEqualStrings("a\"b\\c", decoded.request_state.?);
+    try testing.expectEqual(@as(usize, 0), decoded.verbatim.len);
+    try testing.expect(!decoded.result_type.isComplete());
+    try checkResult((try lookupMethod(.current, "prompts/get")), body, &scratch);
+
+    var again: [512]u8 = undefined;
+    var writer = json.Writer.init(&again);
+    try encodeInputRequiredResult(decoded, &writer);
+    try testing.expectEqualStrings(body, writer.written());
+}
+
+test "opaque MCP values spend their enclosing containers" {
+    const map = "{\"1\":" ++ "[" ** (json.max_depth - 2) ++ "0" ++ "]" ** (json.max_depth - 2) ++ "}";
+    const deep_map = "{\"1\":" ++ "[" ** (json.max_depth - 1) ++ "0" ++ "]" ** (json.max_depth - 1) ++ "}";
+    const schema = "{\"k\":" ++ "[" ** (json.max_depth - 4) ++ "0" ++ "]" ** (json.max_depth - 4) ++ "}";
+    const deep_schema = "{\"k\":" ++ "[" ** (json.max_depth - 3) ++ "0" ++ "]" ** (json.max_depth - 3) ++ "}";
+    var out: [1024]u8 = undefined;
+    var scratch: [256]u8 = undefined;
+    var verbatim: [8]VerbatimMember = undefined;
+    const interim = try inputRequired("tools/call", map, "state", &out);
+    const decoded_interim = try decodeInputRequiredResult(interim, &verbatim, &scratch);
+    try testing.expectEqualStrings(map, decoded_interim.input_requests.?);
+    @memset(&out, 0xa5);
+    try testing.expectError(error.InvalidField, inputRequired("tools/call", deep_map, "state", &out));
+    try testing.expectEqualSlices(u8, &([_]u8{0xa5} ** out.len), &out);
+
+    const tools = [_]Tool{.{ .name = "t", .input_schema = schema }};
+    var writer = json.Writer.init(&out);
+    try encodeToolListResult(.{
+        .cacheable = .{ .ttl_ms = 0, .cache_scope = .public },
+        .tools = &tools,
+    }, &writer);
+    var decoded_tools: [1]Tool = undefined;
+    const decoded_page = try decodeToolListResult(writer.written(), &decoded_tools, &verbatim, &scratch);
+    try testing.expectEqualStrings(schema, decoded_page.tools[0].input_schema);
+    const deep_tools = [_]Tool{.{ .name = "t", .input_schema = deep_schema }};
+    @memset(&out, 0xa5);
+    writer = json.Writer.init(&out);
+    try testing.expectError(error.InvalidField, encodeToolListResult(.{
+        .cacheable = .{ .ttl_ms = 0, .cache_scope = .public },
+        .tools = &deep_tools,
+    }, &writer));
+    try testing.expectEqualSlices(u8, &([_]u8{0xa5} ** out.len), &out);
 }

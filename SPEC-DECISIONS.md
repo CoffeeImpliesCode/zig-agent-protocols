@@ -99,11 +99,11 @@ invent one; the case is an explicit decode or encode failure instead.
   inventing one — the same rule `a2a.TaskState.fromTag`, `a2a.Role.fromTag` and
   `acp.PermissionOptionKind` already follow, and the reason
   `root.DecodeError` carries `UnknownTag` at all. The object is open, so a key
-  no result type models cannot be dropped: `PROTOCOLS.md` §2 requires
-  `encode(decode(b)) == b`, and a typed shape cannot hold a key it does not
-  name. That is the rule `bridge.Envelope.meta` and `bridge.OutcomePayload`
-  follow, and a typed shape is exactly what re-opened a loss that had been open
-  for the life of this repository.
+  no result type models cannot be dropped: `PROTOCOLS.md` §2 requires modeled
+  opaque JSON and its presence to survive. A closed shape cannot hold an open
+  key set. `bridge.Envelope.meta` and `bridge.OutcomePayload` therefore carry
+  borrowed lexemes. That is a wire-value preservation rule, not a promise to
+  replay the surrounding document's whitespace, ordering or escapes.
 - **Note:** an earlier draft of `PROTOCOLS.md` §4.10 described `ContentBlock`
   as an open union. The artifact does not support that, and the transcription
   follows the artifact.
@@ -174,6 +174,10 @@ invent one; the case is an explicit decode or encode failure instead.
   RFD declaration currently validates by falling through to `other`; and neither
   `meta.json` lists any `mcp/*` method. Full transcription at
   [`research/normative/acp-v1-v2.md`](research/normative/acp-v1-v2.md) §10e.
+  Re-counted 2026-10-03 at the immutable tags this library pins —
+  `schema-v1.23.0` and `schema-v2.0.0-alpha.5`, both annotated tags on commit
+  `6d08f412` — where every count above holds; entry 11 records the released SDK
+  that declares the key anyway.
 - **Resolution:** both values are stated, as §5 does for `ContentBlock` — the
   RFD's and the released schemas' positions are recorded side by side and
   neither is presented as the other's correction. The constants stay because the
@@ -246,11 +250,98 @@ invent one; the case is an explicit decode or encode failure instead.
   because it rested on the union, not on a member set. Members: the declaration
   fixes the names and the requiredness and nothing more. There is no clause to
   reject an undeclared key against and none to forbid one, so the contract states
-  the silence instead of resolving it — a decoder may model exactly the declared
-  members, and if it accepts more than that, §2 requires it to write them back.
+  the silence instead of resolving it. A typed decoder may skip unmodeled members.
+  Section 2 requires represented opaque JSON and open carriers to preserve them.
 - **Consequence.** `src/mcp.zig` has no typed capability decoder. The field
   `DiscoverResult.capabilities` is `[]const u8` — the whole object carried as the
   lexeme it arrived as, L3752–L3763 — so there is no nested member set to accept or
   reject and the correction moves no behaviour. The `ContentBlock` comment now
   cites the union's literal discriminator values and generated-schema `const`
   constraints, not the unrelated absence of an index signature.
+
+## 10. Native API contract corrections
+
+These records describe this API-conformance change on stable Zig 0.16.0.
+They do not infer motives for earlier implementations.
+
+### Round-trip normalization
+
+- **Priority:** preserve modeled wire values and open data without heap-owned
+  documents.
+- **Constraint:** typed models do not retain original member order, whitespace
+  or escape spelling. The user approved stable encoding, not lexical provenance.
+- **Caller cost:** consumers cannot use re-encoded bytes as an exact copy of
+  the incoming document. They must retain input themselves when they need that copy.
+  Input, scratch and arena borrows must remain alive and unchanged.
+- **Counterchoice:** lexical provenance storage wins for a byte-preserving proxy
+  or signature pipeline. It requires retained source spans and additional model
+  state that this zero-allocation typed interface does not provide.
+- **Grade and origin:** taste `analyst-inferred`, from this conformance change.
+  The normalization contract itself is user-approved.
+
+### Connection-wide metadata
+
+- **Priority:** remove races without changing call/notification return shapes.
+- **Constraint:** existing consumers observe `lastEncodedLen` and `nextId`;
+  each value describes one shared connection, not one caller.
+- **Caller cost:** getters require mutable Conn and a short uncancelable lock.
+  Consumers must exclude other encoders when correlating a length with their buffer.
+  An id snapshot does not reserve an id.
+- **Counterchoice:** per-call encoding receipts win when independent concurrent
+  issuers must retain correlated metadata. That would change the return surface
+  and migrate every consumer that expects the current response shape.
+- **Grade and origin:** taste `analyst-inferred`, from this conformance change.
+
+### Validation boundaries and error meaning
+
+- **Safety-fixed:** a malformed raw body cannot become a successful wire message.
+  Conn now reuses JSON-RPC validation. Raw fields are charged for their actual
+  enclosing containers. MCP input-required construction validates its source
+  document before output writes. ACP v2 initialization checks required info
+  before composing either body.
+- **Safety-fixed:** decode input and writable scratch must not overlap.
+  MCP HTTP checks this before decoding. Constructor buffer assertions document
+  caller preconditions and their optimize-mode limits.
+- **Semantics-fixed:** cancellation, local encoding shortage and inbound response
+  shortage are different events. Conn exposes `Canceled`, `EncodeBufferTooSmall`
+  and `ResponseTooLarge` separately. A reserved id is never reused.
+- **Caller cost:** exhaustive error handling must cover the new Conn tags.
+  Failed operations may dirty caller buffers. Cancellation or inbound overflow
+  does not prove that the peer performed no action.
+- **Origin:** obligations identified and repaired in this conformance change.
+  No unsafe counterchoice is presented as a design preference.
+
+## 11. The pinned SDK declares `acp` and `mcp/message`; PROTOCOLS keeps both RFD-only
+
+- **Decision:** unchanged. `bridge` carries `mcpCapabilities.acp`,
+  `capabilities.session.mcp.acp` and `{"type":"acp"}` as RFD-specified values.
+  The pinned v1 and v2 schema artifacts do not declare them; §6.5.1 records
+  the differing SDK snapshot.
+- **Conflict:** `agent-client-protocol` `1.0.0rc2`, the SDK this repository pins
+  for `interop-acp`, generates `acp.schema.McpCapabilities.acp` — `acp: False`
+  sits in the `InitializeResponse.agent_capabilities` default dict — and the
+  `MessageMcpRequest`, `MessageMcpResponse` and `MessageMcpNotification`
+  models, and its `schema/meta.json` registers `mcp/message` on both sides.
+  Read against entry 7 that looks like a contradiction: the same tag, a
+  different answer.
+- **Evidence:** the SDK's own bytes settle it. Its `schema/VERSION` reads
+  `refs/tags/schema-v1.23.0` and `schema/v2/VERSION` reads
+  `refs/tags/schema-v2.0.0-alpha.5` — the tags this library pins — but the files
+  beside them are not those artifacts. The released `schema/v1/schema.json` at
+  commit `6d08f412` is 247 168 bytes with 170 `$defs`; the SDK's vendored copy is
+  389 552 bytes with 268, adds `McpServerAcp`, `McpConnectionId` and the
+  provider, document and NES surfaces, and carries `"acp"` four times. Upstream
+  `main` also had no `"acp"` or `mcp/message` on the research date. This
+  comparison covers the two pinned schema artifacts and the SDK snapshot,
+  not every historical schema release. The SDK's `MessageMcpRequest` carries
+  `connectionId`, where the implemented RFD envelope carries `serverId`.
+  The SDK labels the key `**UNSTABLE**`: *"This capability is not part of
+  the spec yet, and may be removed or changed at any point."*
+- **Resolution:** both states stand side by side, as §5 does for
+  `ContentBlock`. The key belongs to a schema snapshot upstream marks unstable
+  and that SDK generates from. It is absent from the two pinned published
+  schema artifacts. Their shared commit is
+  [`6d08f412a7a1370d3cc9a124e3be3d6acf92641e`](https://github.com/agentclientprotocol/agent-client-protocol/tree/6d08f412a7a1370d3cc9a124e3be3d6acf92641e/schema).
+  No library behaviour changes: `bridge` still decodes the RFD's shapes, and the
+  `acp` advertisement still gates `mcp/message` here rather than being read as
+  evidence that a peer built from a released schema will honour it.

@@ -13,7 +13,7 @@ Git.
   `fuzz` step compiles as its own root; `testio.zig`, the shared test executor
   the build adds to the library module as `testio`; and `bench_codec.zig` and
   `bench_runtime.zig`, which the `run-bench` driver reaches the same way. The
-  eight executable roots under `src/` are programs rather than library surface.
+  ten executable roots under `src/` are programs rather than library surface.
 - `src/json.zig` is the substrate: a borrowing pull parser and a fixed-buffer
   writer. It exists because `std.json` owns heap memory, which the encoding
   contract forbids, so a decoder that touched it would allocate on every call.
@@ -100,26 +100,29 @@ Git.
   modules, each with the frozen entry point `run(io, out, iterations,
   samples)`. The first measures a fixed literal corpus in caller buffers; the
   second measures a `Conn` round trip and an HTTP first valid event between
-  real peers over real sockets. Neither allocates per iteration and neither
-  grows with the counts a caller asks for. `src/bench.zig` is the driver: it
+  real peers over real sockets. Their caller buffers are fixed and do not grow
+  with the counts. The supplied executor may allocate for tasks and I/O;
+  fixed benchmark storage is not a claim about whole-process heap traffic.
+  `src/bench.zig` is the driver: it
   owns the command line and the work budget, and it reaches both modules as
   named imports, so the driver and the test binary share one module instance
   each instead of compiling a second copy of a benchmark.
-- `src/mcp_interop.zig` and `src/a2a_interop.zig` are the two interoperability
-  participants, not library modules: a supervisor in `test/interop/` starts one
-  and an independent upstream SDK serves the other end of the wire. Nothing in
-  the library imports them, which is how the zero-dependency guarantee survives
-  their existence — a peer is a process, not a caller. `test/interop/` holds
-  the supervisors, and `test/interop/sdk-pins.json` the versions, digests and
-  API facts that both of them read and refuse to run without.
-- `build.zig` exposes the `zig-agent-proto` module, installs a static library,
-  the five examples, the benchmark driver and the two interoperability
-  participants, and defines `run`, `run-runtime`, `run-sessions`, `run-http`,
-  `run-a2a`, `run-bench`, `interop-mcp`, `interop-a2a`, `test`,
-  `test-artifacts`, `fuzz` and `docs`. The two `interop-*` steps build a
-  participant and stop; the exchange
-  is driven by the `devenv` scripts of the same names. `run-bench` forwards
-  `-- …` to the driver, which owns its own flags and bounds.
+- `src/mcp_interop.zig`, `src/mcp_current_interop.zig`, `src/a2a_interop.zig`
+  and `src/acp_interop.zig` are four interoperability participants, not library
+  modules. Supervisors in `test/interop/` start them against independent SDKs.
+  No library module imports a participant or an SDK. `test/interop/sdk-pins.json`
+  records the versions, digests and API facts that each peer checks before a run.
+  The two MCP participants cover separate revisions without a compatibility shim.
+  The ACP participant uses wire 1 by default. Wire 2 requires explicit selection
+  and the pinned SDK's experimental runtime.
+- `build.zig` exposes the `zig-agent-proto` module and installs a static library,
+  five examples, the benchmark driver and four interoperability participants.
+  It defines `run`, `run-runtime`, `run-sessions`, `run-http`, `run-a2a`,
+  `run-bench`, `interop-mcp`, `interop-mcp-current`, `interop-a2a`, `interop-acp`,
+  `test`, `test-artifacts`, `fuzz` and `docs`. Each `interop-*` build step
+  installs a participant without starting an SDK. The matching `devenv` script
+  drives the exchange. `run-bench` forwards `-- …` to the driver, which owns
+  its flags and bounds.
 - The library has no dependencies beyond the Zig toolchain and no system library
   dependencies.
 
@@ -134,10 +137,11 @@ Git.
   because every byte read off the wire is untrusted input. A `MalformedJson`
   error is a JSON syntax fault; `InvalidUtf8` is reserved for bytes that are
   genuinely not UTF-8. Do not collapse the two.
-- Encoding must be the exact inverse of decoding: `decode(encode(x)) == x` and
-  `encode(decode(b)) == b` for every accepted input, including a notification,
-  which encodes without an `id`. Both directions are tested. `encode` validates
-  a message before writing, so it cannot emit bytes its own `decode` rejects.
+- Encoding preserves modeled wire values and represented presence, not the
+  original JSON spelling. `PROTOCOLS.md` section 2 defines normalization,
+  first-wins duplicates, stable re-encoding and carried opaque JSON. A
+  notification still encodes without `id`. Encoders validate their modeled
+  shape; publish any unchecked text or alias preconditions on the owning API.
 - Unknown enum tags and unknown method names are errors, not `unreachable`
   arms. An agent speaking a newer protocol version must not crash an older one.
 - Do not allocate in a decode or encode path. Use caller-supplied buffers. A
@@ -149,15 +153,15 @@ Git.
 These are the rules the layer above the codec is bound by. They are not
 style; each one has a failure that is hard to see from the code alone.
 
-- **Every runtime entry point takes `io: std.Io`.** No library type stores an
-  `Io` it did not receive, and only the examples and tests name
-  `std.Io.Threaded`. This is what keeps the executor a consumer's choice; see
-  `ARCHITECTURE.md`.
-  The one exception is `http.Server.init`, which takes an `Io.Reader` and an
-  `Io.Writer` and no `Io`: every wait that transport does is a read or a write,
-  and both already carry the interface. The exception is stated here rather
-  than only in the source, because a rule with an unrecorded exception is a
-  rule a reader has to discover by finding the thing that breaks it.
+- **Runtime execution comes from caller-supplied `std.Io` capabilities.**
+  Entry points take `io` directly or use a capability received at construction.
+  `Conn` stores the `Io` passed to `init` for its locks and condition waits;
+  readers/writers and HTTP requests also carry their backend. None constructs
+  an executor. Keep backend state alive until all borrowed operations finish.
+  Only examples and tests name `std.Io.Threaded`; selecting an interface is
+  not certification that every backend implements the needed operations.
+  `http.Server.init` takes `Io.Reader`/`Io.Writer`, not a redundant `Io`, since
+  those interfaces supply every wait it performs. See `ARCHITECTURE.md`.
   Three `a2a_http` entry points cross-check their executor rather than making an
   exception to the rule: `discover`, `Client.init` and `Client.sendMessage` take
   the `io` *and* a borrowed `*std.http.Client`, and debug-assert that the two
@@ -174,6 +178,12 @@ style; each one has a failure that is hard to see from the code alone.
 - **A transport must `shutdown` before `close`.** Closing a file descriptor
   does not interrupt a `read` already blocked on it, so the reader sits on an
   open file description and the group never finishes.
+- **The owner closes a duplex stream only after all readers and writers join.**
+  A reader that returns must not close the descriptor its caller can still
+  write. Teardown marks the connection dead and shuts down the stream, then
+  joins or cancels every task that uses it, then closes it once. Ownership is
+  recorded before fallible connection initialization so a refused open still
+  shuts down and releases its accepted descriptor.
 - **Read with `readVec`, never `readSliceShort`, to mean "read what is
   available".** `readSliceShort` means *fill this buffer completely* and blocks
   waiting for the remaining kilobytes of a frame that already fully arrived.
@@ -306,24 +316,30 @@ style; each one has a failure that is hard to see from the code alone.
 - **A JSON document is exactly one value.** Every decoder checks `reader.atEnd()`
   after its member loop — never inside an arm that captures a lexeme around a
   validation call, and never before the loop closes. Ten decoders once skipped
-  it and swallowed the tail, and for three of them with a matching encoder that
-  was a silent `encode(decode(b)) != b`. The property harness asserts it over
-  generated input; see `src/testkit.zig`'s `tail_rule`.
-- **A decoder that accepts a member has to be able to write it back.** A member
-  the shape does not model is carried as the borrowed lexeme it arrived as,
-  never decoded into a type that cannot hold every key a peer may send — that is
-  what `bridge.Envelope.meta` and `bridge.OutcomePayload` do, and a typed shape
-  is exactly what re-opened the loss.
+  it and swallowed trailing bytes instead of refusing a second value. The
+  property harness asserts the whole-document rule over generated input;
+  see `src/testkit.zig`'s `tail_rule`.
+- **Represented open data must survive encoding.** Carried raw JSON stays a
+  borrowed lexeme, not a closed projection that loses keys. This is the contract
+  of `bridge.Envelope.meta` and `bridge.OutcomePayload`. Typed decoders may skip
+  unmodeled members where their API states that policy; section 2 of
+  PROTOCOLS.md does not promise source-document replay.
 
 ## Toolchain traps
 
-Three facts about the pinned Zig `0.16.0`. Each one names neither its cause
-nor its file, so the next reader pays for it twice unless it is written down.
+Four traps in the pinned Zig `0.16.0`:
 
 - **`std.http.Client.connectUnix` does not compile.** It names a
   `std.posix.SocketError` that this `std` no longer defines. A loopback that
   wants a Unix socket uses `Io.net.UnixAddress` instead, and a real client uses
   `connectTcp`.
+- **`std.Io.Uring` does not compile unchanged.** Its `dirOpenDir` and
+  `dirRealPathFile` implementations return `ReadOnlyFileSystem`, which their
+  declared error sets exclude. A real consumer compile fails in `Uring.zig`
+  at lines 2732 and 3157. The kernel accepts `io_uring_setup` on this host,
+  but that does not establish a working Zig backend. Its socket vtable also
+  returns `NetworkDown`; do not substitute another `Threaded` configuration
+  and call it a second backend.
 - **A line is streamed, never taken.** `std.Io.Reader.takeDelimiter` bounds the
   result by the reader's own buffer rather than the caller's, so an event
   stream line longer than the transfer buffer fails there. `http.readEvent`
@@ -342,21 +358,21 @@ nor its file, so the next reader pays for it twice unless it is written down.
 Run at the repository root:
 
 - `zig build` installs the static library, the five examples, the benchmark
-  driver and the two interoperability participants, and makes the
+  driver and the four interoperability participants, and makes the
   `zig-agent-proto` module available to consumers.
-  `zig build test` runs thirteen roots: the library unit tests, the golden
+  `zig build test` registers fifteen roots: the library unit tests, the golden
   vectors, the loopback tests, the test blocks the four socket-driven examples
   carry, the benchmark driver, each benchmark module as a root of its own,
-  `testio`, and both interoperability participants. Each is a separate module
+  `testio`, and all four interoperability participants. Each is a separate module
   instance, so a benchmark or a participant is never compiled twice for the
   test that covers it. `zig build docs` generates documentation.
-  `zig build test-artifacts` installs those same thirteen binaries and their
+  `zig build test-artifacts` installs those same fifteen binaries and their
   generated manifest without running them. `cross-test.bsd.profile.sh` drives
-  that export inside full-system guests for the eighteen BSD rows it registers
-  — three FreeBSD, nine NetBSD, six OpenBSD — through
+  that export inside full-system guests for twenty-two registered BSD rows:
+  six FreeBSD, nine NetBSD and seven OpenBSD, through
   `devenv --profile bsd-cross shell`. The manifest is the same registry
-  `test` uses, so a guest runs the same thirteen roots and reports the same
-  executed test count. Binaries stay on a read-only payload CD, fixtures use
+  `test` uses, so a guest must run all fifteen roots and report its executed
+  test count. Binaries stay on a read-only payload CD, fixtures use
   writable guest scratch, disks are opened as snapshots so a cached image is
   never written, and the receipt reader refuses a missing, repeated or
   zero-test root, a failed exit, skipped tests and an incomplete transcript.
@@ -405,16 +421,15 @@ Run at the repository root:
   are not a peak: nothing is allocated in order to have one. A number from here
   is a baseline for a later candidate measured the same way, not a claim about
   another host or about peer behaviour.
-- `zig build interop-mcp` and `zig build interop-a2a` build the participants and
-  stop; neither starts an SDK, and neither is a run. The exchange is driven
-  from `devenv shell` by `interop-mcp`, which runs `mcp_peer.py --role
-  supervise`, and `interop-a2a`, which runs `a2a_peer.py --role zig-interop` —
-  the two roles that between them drive the Zig client against the SDK server
-  and the SDK client against the Zig server. Both accept `--work-dir` for the
-  capture and reports and bound the whole run with `--deadline`, and
-  `ZIG_AGENT_PROTO_MCP_INTEROP` / `ZIG_AGENT_PROTO_A2A_INTEROP` override the
-  participant path they start. `interop-python` is the same interpreter with the
-  pinned SDKs for anything the two scripts do not cover.
+- `zig build interop-mcp`, `interop-mcp-current`, `interop-a2a` and `interop-acp`
+  build and install participants. They do not start SDKs.
+  From `devenv shell`, the matching scripts run the supervisors in `test/interop/`.
+  `interop-mcp` covers MCP `2025-11-25`. `interop-mcp-current` covers MCP
+  `2026-07-28`. `interop-a2a` drives both unary A2A JSON-RPC directions.
+  `interop-acp` covers ACP wire 1. `interop-acp --protocol-version 2` selects
+  experimental wire 2 without a fallback. Each supervisor accepts `--work-dir`
+  for captured evidence and `--deadline` for the whole run.
+  The interpreters are isolated where package versions conflict.
 - `zig build fuzz` runs the property and differential harness on its own. It
   takes `-Dfuzz-seed=<u64>` and `-Dfuzz-iterations=<usize>`, both in decimal, and
   prints them on every run, so a failure is reproducible from the log. It
@@ -439,7 +454,7 @@ Run at the repository root:
   `CROSS_REQUIRE_RUNNERS=0`, recording compilation, execution and executed
   test counts separately so a `build_only` row cannot be read as a pass;
   `cross-test --profile cross-test.bsd.profile.sh --output "$TMPDIR/bsd-cross"`
-  runs the same thirteen roots in full-system guests and needs
+  runs all fifteen registered roots in full-system guests and needs
   `devenv --profile bsd-cross shell` first. `--targets` selects rows already in
   a profile and never adds one, so an unregistered port is not runnable by
   naming it. Known runtime failures stay failures: on this host the full audit
@@ -454,12 +469,14 @@ macOS, in `.github/workflows/ci.yml`. It installs the toolchain named by
 `.minimum_zig_version` from `ziglang.org`, checks the tarball against the
 sha256 the download index publishes, cross-checks `zig version` against the
 pin the way `gate` does, and then runs `zig fmt --check .`, `zig build`,
-`zig build test` in Debug and again in ReleaseSafe, `zig ast-check` over every
-Zig file under `build.zig`, `src` and `test`, `zig build fuzz`, all five
+`zig build test` in Debug, ReleaseSafe, ReleaseFast and ReleaseSmall, `zig ast-check`
+over every Zig file under `build.zig`, `src` and `test`, and `zig build fuzz`
+with seeds `0`, `1` and `18446744073709551615` at 20 000 iterations each in Debug,
+all five
 demonstrations (`run`, `run-runtime`, `run-sessions`, `run-http`, `run-a2a`),
 one bounded benchmark smoke — `zig build run-bench -- --mode all --iterations 4
 --samples 3`, which proves the driver runs and asserts no threshold — and
-`zig build docs`. The two interoperability participants are installed by
+`zig build docs`. The four interoperability participants are installed by
 `zig build` and nothing in CI drives them: their SDK peers are declarative
 devenv development state that CI does not evaluate, so what CI proves about
 them is that they compile and that their own test blocks pass.
@@ -469,9 +486,9 @@ have to vendor an unpinned third-party build to run them.
 
 This NixOS project declares development dependencies and tools in `devenv.nix`.
 Do not install system or development libraries imperatively. Use `devenv shell`,
-or let direnv read `.envrc`. That environment also provides `gate`,
-`interop-python`, `interop-mcp` and `interop-a2a`, and it pins both SDKs against
-`test/interop/sdk-pins.json` so a peer refuses an environment that does not
+or let direnv read `.envrc`. That environment provides `gate`, the SDK
+interpreters and four `interop-*` scripts. It pins every SDK against
+`test/interop/sdk-pins.json`, so a peer refuses an environment that does not
 match. Nothing in this repository repairs, extends or depends on host-wide
 state around it.
 

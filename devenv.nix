@@ -1,7 +1,7 @@
 { pkgs, lib, ... }:
 
 # The interface library has no system library dependencies. Development inputs
-# are the house gate, cross-target runners and the two interoperability SDKs.
+# are the house gate, cross-target runners and the interoperability SDKs.
 # `packages` stays free of `zig`: `zig` on this host is the anyzig shim, which
 # resolves the toolchain by reading `.minimum_zig_version` from build.zig.zon.
 # A nixpkgs `zig` here would shadow the shim and build with whatever version
@@ -9,31 +9,88 @@
 #
 # Python supplies development SDK peers and analyzer-policy tests only.
 # Neither is a library dependency: no Zig file imports Python, and the peers
-# are separate processes speaking real wire bytes. SDK versions, hashes and
-# the API facts each peer uses are recorded in
-# `test/interop/sdk-pins.json`, and both peers read that file and refuse to run
-# against an environment that does not match it.
+# are separate processes speaking real wire bytes. Four peers run over three
+# interpreters — MCP at the previous revision and at the current one, ACP, and
+# A2A — because one interpreter cannot hold one distribution at two versions,
+# and the point of a pin is that it states a version rather than resolving one.
+# SDK versions, hashes and the API facts each peer uses are recorded in
+# `test/interop/sdk-pins.json`, and every peer reads that file and refuses to
+# run against an environment that does not match it.
 let
   inherit (pkgs) python3;
   # Nix already provides `python3Packages`; the override is built from it so
   # every transitive dependency is a pinned nixpkgs package rather than
   # something a resolver would fetch at shell entry.
   inherit (pkgs.python3.pkgs)
+    anyio
     buildPythonPackage
+    cryptography
     google-api-core
     googleapis-common-protos
     hatchling
     httpx
     json-rpc
+    jsonschema
     packaging
     protobuf
     pydantic
+    pyjwt
     sse-starlette
     starlette
     uvicorn
-    uv-dynamic-versioning
     pytest
     ;
+
+  # nixpkgs spells these with hyphens, which a Nix identifier cannot carry.
+  # They are bound under names that can, so that every use below is a package
+  # and not a string: a quoted name is a valid attribute in `inherit` and a
+  # bare string anywhere else, and a dependency list full of strings builds
+  # nothing and says nothing.
+  pythonHatchFancyReadme = pkgs.python3.pkgs."hatch-fancy-pypi-readme";
+  pythonPdmBackend = pkgs.python3.pkgs."pdm-backend";
+  pythonPydanticCore = pkgs.python3.pkgs."pydantic-core";
+  pythonOpenTelemetry = pkgs.python3.pkgs."opentelemetry-api";
+  pythonMultipart = pkgs.python3.pkgs."python-multipart";
+  pythonTypingExtensions = pkgs.python3.pkgs."typing-extensions";
+  pythonTypingInspection = pkgs.python3.pkgs."typing-inspection";
+
+  # uv-dynamic-versioning 0.14.1 requires dunamai~=1.26.1. Keep that
+  # requirement intact instead of relaxing it to nixpkgs' 1.25.0.
+  dunamaiPinned = pkgs.python3.pkgs.dunamai.overridePythonAttrs (_: {
+    version = "1.26.1";
+    src = pkgs.fetchurl {
+      url = "https://files.pythonhosted.org/packages/9f/67/d5611975faaa5e4a920f4b19e4caccd5df0facb925687850f1e45f5876f2/dunamai-1.26.1.tar.gz";
+      hash = "sha256-O0YAe9ZbALSCTq0KGu42X9ItDsK5whlJfU/Uj1KGDIs=";
+    };
+  });
+
+  # uv-dynamic-versioning 0.14.1 over the 0.13.0 this nixpkgs revision carries.
+  # Not a preference: every package in this file that injects its version at
+  # publish time does it through this plugin, `fallback-version` is the key it
+  # reads when there is no `.git` to read a tag from, and that key does not
+  # exist in 0.13.0. httpx2 and httpcore2 additionally declare
+  # `uv-dynamic-versioning>=0.14.1` in their own build-system.
+  uvDynamicVersioning = pkgs.python3.pkgs.uv-dynamic-versioning.overridePythonAttrs (old: {
+    version = "0.14.1";
+    src = pkgs.fetchurl {
+      url = "https://files.pythonhosted.org/packages/6f/c8/fa500ee29af69cfeeea5ff6d6597919f1989b2e3f1a236c3006bdb21d320/uv_dynamic_versioning-0.14.1.tar.gz";
+      hash = "sha256-hkLbaGzlxQQXA156JXrHO35cOnoywz5FvX42uiLutkg=";
+    };
+    dependencies = map (
+      dependency: if lib.getName dependency == "dunamai" then dunamaiPinned else dependency
+    ) old.dependencies;
+    # The sdist has no Git history, but tests/conftest.py tags HEAD in the
+    # unpacked source. Give that private build fixture one commit; run every
+    # upstream test rather than disabling the VCS-dependent cases.
+    preCheck = (old.preCheck or "") + ''
+      export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+      git init --quiet --initial-branch=main
+      git config --local user.name fixture
+      git config --local user.email fixture@invalid
+      git add .
+      git commit --quiet -m "sdist test fixture"
+    '';
+  });
 
   # a2a-sdk 1.2.1, built from the exact PyPI release rather than from
   # `python3Packages.a2a-sdk`, because the nixpkgs revision devenv.lock pins
@@ -55,7 +112,7 @@ let
       hash = "sha256-BSMa3p4FmJo0RBRHREC/KrBJUDEt7VUZz3ef6h+5GNY=";
     };
 
-    build-system = [ hatchling uv-dynamic-versioning ];
+    build-system = [ hatchling uvDynamicVersioning ];
 
     # The sdist is a tagged release, not a checkout: there is no `.git` in it
     # for the `uv-dynamic-versioning` hatch plugin to read a version from. The
@@ -100,14 +157,274 @@ let
     };
   };
 
-  # One interpreter carrying both SDKs, so a peer process spawned by another
-  # peer process resolves the same `mcp` and the same `a2a` as its parent. The
-  # MCP SDK is the pinned nixpkgs package: 1.29.0 is the newest revision whose
-  # own LATEST_PROTOCOL_VERSION is the 2025-11-25 this repository pins, and it
-  # is already a fixed-output fetch of tag v1.29.0.
+  # One interpreter carrying the previous-revision MCP SDK and A2A, so a peer
+  # process spawned by another peer process resolves the same `mcp` and the
+  # same `a2a` as its parent. The MCP SDK is the pinned nixpkgs package.
+  #
+  # 1.29.0 is held here as the PREVIOUS revision, not because it is the newest:
+  # 1.30 exists and speaks the same 2025-11-25 protocol line. What fixes this
+  # version is that `sdks["mcp"]` names 1.29.0 and the previous-revision peer
+  # asserts that version at run time, so the repository pins a revision rather
+  # than picking whichever newest one would satisfy the protocol line.
   interopPython = python3.withPackages (ps: [
     ps.mcp
     a2aSdk
+  ]);
+
+  # agent-client-protocol 1.0.0rc2, built from the exact PyPI sdist: no
+  # nixpkgs attribute exists for this distribution at the revision
+  # devenv.lock pins, so this is the shape a2aSdk above uses — a
+  # fixed-output fetch, a pinned build backend, and nothing a resolver
+  # picks at shell entry.
+  #
+  # The published sdist already declares version 1.0.0rc2. The tag's older
+  # project version is not the artifact built here, so no version patch is needed.
+  # This prerelease supplies stable wire 1 and an opt-in experimental wire 2.
+  # It stays isolated from the MCP interpreters and never falls back to 0.12.1.
+  acpSdk = buildPythonPackage {
+    pname = "agent-client-protocol";
+    version = "1.0.0rc2";
+    pyproject = true;
+
+    src = pkgs.fetchurl {
+      url = "https://files.pythonhosted.org/packages/57/ac/53520d32dd6afb8cef77bf2b731f9eb451d4a8dffbf0df104a1148724eed/agent_client_protocol-1.0.0rc2.tar.gz";
+      hash = "sha256-yDuHXv0DapUnPVgtrwKymlCQJNAjKir9YYfOjVVkJ30=";
+    };
+
+    build-system = [ pythonPdmBackend ];
+
+
+    # Both declared runtime dependencies. The optional logfire and HTTP extras
+    # are not requested by this stdio peer.
+    dependencies = [
+      pydantic
+      pythonPydanticCore
+    ];
+
+    # Importing the package is the check that matters here; the upstream test
+    # suite needs pytest and a network, and a peer does not carry either.
+    pythonImportsCheck = [ "acp" ];
+    doCheck = false;
+
+    meta = {
+      description = "Agent Client Protocol SDK, the 1.0.0rc2 wire-1 build with opt-in wire-2 alpha";
+      homepage = "https://agentclientprotocol.com";
+      license = lib.licenses.asl20;
+    };
+  };
+
+  # Its own interpreter, like the other two: a peer process spawned by another
+  # peer process has to resolve the same `acp` as its parent, and the pins file
+  # has to be able to say which distribution that is.
+  acpPython = python3.withPackages (ps: [ acpSdk ]);
+
+  # httpx2 2.12.0 and httpcore2 2.12.0, built from the publisher's own bytes
+  # over the nixpkgs packages of the same names.
+  #
+  # mcp 2.3.0 declares `httpx2>=2.10.0`; the nixpkgs revision devenv.lock pins
+  # carries httpx2 2.9.1. Relaxing that floor would suppress a real
+  # prerequisite with no compatibility proof, so the floor is met with the
+  # exact release instead. httpx2 pins httpcore2 exactly, so that one is
+  # overridden the same way rather than left at 2.9.1.
+  #
+  # 2.12.0 rather than 2.10.0 because 2.10.0 is the first version that clears
+  # the floor and it carries three published advisories — CVE-2026-84379
+  # (CRLF injection into multipart part headers), CVE-2026-84380 (a
+  # Content-Length/Transfer-Encoding conflict usable for request smuggling)
+  # and CVE-2026-84382 (unbounded decompression), the latter two fixed in
+  # 2.11.0 and 2.12.0. `>=2.10.0` is satisfied by 2.12.0, and it is not
+  # satisfied by anything that still carries them.
+  #
+  # Every other floor this pair declares is met by the nixpkgs revision
+  # devenv.lock pins, read out of its own package definitions rather than
+  # assumed: idna 3.18 against `>=3.18`, h11 0.16.0 against `>=0.16`, and
+  # truststore 0.10.4 against `>=0.10`. None of them needs an override here,
+  # and none of them is relaxed.
+  # The published sdists omit tests. Use the matching release's complete
+  # test tree instead of retaining nixpkgs paths that do not exist in them.
+  httpx2Tests = pkgs.fetchFromGitHub {
+    owner = "pydantic";
+    repo = "httpx2";
+    rev = "71ae23be5448f859c2b4e21d9972ddfa7b8d759d"; # v2.12.0
+    hash = "sha256-mEJHlG6skKkV90SfjTg+MHGkL7gnf3QLKLbWlTtEb9Q=";
+  };
+  httpx2TestTree = ''
+    cp -R ${httpx2Tests}/tests .
+    chmod -R u+w tests
+  '';
+
+  httpcore2Pinned = pkgs.python3.pkgs.httpcore2.overridePythonAttrs (_: {
+    pname = "httpcore2";
+    version = "2.12.0";
+    src = pkgs.fetchurl {
+      url = "https://files.pythonhosted.org/packages/be/ad/f4f0e57345f1870f3e8cb624e058d7eca6e5a27d33bcc3311d9b618734cd/httpcore2-2.12.0.tar.gz";
+      hash = "sha256-kpNSK7oKp8TI6ePwQMFldb2IaOFVp3+jDHqQhaXq5kg=";
+    };
+    # Its own build-system, read out of its sdist:
+    #   requires = ["hatchling", "hatch-fancy-pypi-readme", "uv-dynamic-versioning>=0.14.1"]
+    # The version is injected at publish time and its pyproject carries
+    # `fallback-version = "0.0.0"`, which is what an sdist with no tag would
+    # otherwise install; naming it here is what makes the installed version
+    # the one this pin claims.
+    build-system = [
+      hatchling
+      pythonHatchFancyReadme
+      uvDynamicVersioning
+    ];
+    postPatch = ''
+      substituteInPlace pyproject.toml \
+        --replace-fail 'fallback-version = "0.0.0"' 'fallback-version = "2.12.0"'
+    '';
+    # The nixpkgs source is a workspace whose postPatch pushes a directory.
+    # This artifact is already the package root; its tests need no matching popd.
+    # Copy release tests into the sdist root; no workspace pushd was run.
+    preCheck = httpx2TestTree;
+    # httpcore2 2.12.0 declares exactly these two.
+    dependencies = [
+      pkgs.python3.pkgs.h11
+      pkgs.python3.pkgs.truststore
+    ];
+  });
+
+  httpx2Pinned = pkgs.python3.pkgs.httpx2.overridePythonAttrs (_: {
+    pname = "httpx2";
+    version = "2.12.0";
+    src = pkgs.fetchurl {
+      url = "https://files.pythonhosted.org/packages/7f/f8/579a8b51e42e38ee32647df9f08aa25643ae788e275cc625b199829c4671/httpx2-2.12.0.tar.gz";
+      hash = "sha256-djH+mIeooidfSiVA4FOqZw/MUHQoZKmufGbmCf3PEs8=";
+    };
+    build-system = [
+      hatchling
+      pythonHatchFancyReadme
+      uvDynamicVersioning
+    ];
+    postPatch = ''
+      substituteInPlace pyproject.toml \
+        --replace-fail 'fallback-version = "0.0.0"' 'fallback-version = "2.12.0"'
+    '';
+    preCheck = httpx2TestTree;
+    # httpx2 2.12.0's own list, with the markers already resolved for a Linux
+    # CPython 3.14 build: `httpx2-jsfetch` is emscripten-only and
+    # `typing-extensions` is `python_version < "3.13"`. httpcore2 is the
+    # override above, because httpx2 pins it with `==`, not a floor.
+    dependencies = [
+      anyio
+      httpcore2Pinned
+      pkgs.python3.pkgs.idna
+      pkgs.python3.pkgs.truststore
+    ];
+  });
+
+  # mcp-types 2.3.0 and mcp 2.3.0, built from the exact PyPI sdists.
+  #
+  # They are two derivations because mcp 2.3.0 declares `mcp-types==2.3.0` as
+  # one of its own runtime requirements: the types package is installed
+  # separately, from its own published sdist, at the version mcp pins. Building
+  # it here rather than taking whatever the interpreter happens to resolve is
+  # what makes that requirement true rather than incidental, and the peer's
+  # `importlib.metadata.version("mcp-types")` then has exactly one answer.
+  mcpTypesCurrentSdk = buildPythonPackage {
+    pname = "mcp-types";
+    version = "2.3.0";
+    pyproject = true;
+
+    src = pkgs.fetchurl {
+      url = "https://files.pythonhosted.org/packages/9e/2d/7c251e34207f6c51000312fc8839111ac45cfe02023f90b44e7f1051dd8e/mcp_types-2.3.0.tar.gz";
+      hash = "sha256-0eRlSe2zXuGalJQPzubRrd1+WJq36pLdqD9dhHgfw2I=";
+    };
+
+    # Read out of this release's own pyproject, not inferred from mcp's:
+    #   requires = ["hatchling", "uv-dynamic-versioning"]
+    #   build-backend = "hatchling.build"
+    #   [tool.hatch.version] source = "uv-dynamic-versioning"
+    # `version = "2.3.0"` is absent because the version is injected at publish
+    # time and the sdist carries no `.git` for the plugin to read it from, so
+    # it is named here and `--replace-fail` keeps that claim honest.
+    build-system = [ hatchling uvDynamicVersioning ];
+
+    postPatch = ''
+      substituteInPlace pyproject.toml \
+        --replace-fail 'style = "pep440"' 'style = "pep440"
+      fallback-version = "2.3.0"'
+    '';
+
+    dependencies = [
+      pydantic
+      pythonTypingExtensions
+    ];
+
+    pythonImportsCheck = [ "mcp_types" ];
+    doCheck = false;
+
+    meta = {
+      description = "MCP wire types, the 2026-07-28 line";
+      homepage = "https://modelcontextprotocol.io";
+      license = lib.licenses.mit;
+    };
+  };
+
+  mcpCurrentSdk = buildPythonPackage {
+    pname = "mcp";
+    version = "2.3.0";
+    pyproject = true;
+
+    src = pkgs.fetchurl {
+      url = "https://files.pythonhosted.org/packages/9d/8d/e0d339616f4810e9051d4aba6887afab289ab1f81875fe908b606cdfd0e3/mcp-2.3.0.tar.gz";
+      hash = "sha256-ixR6UEQc8FnciMaE4K7tNofwqg85xs3nuQMw7/0rNNg=";
+    };
+
+    build-system = [ hatchling uvDynamicVersioning ];
+
+    # The same released-sdist problem a2aSdk above has, and the same answer:
+    # the version is injected at publish time and the sdist carries no `.git`
+    # for the plugin to read it from, so it is named here. `--replace-fail`
+    # keeps the claim honest — a pyproject that no longer carries the line
+    # fails the build instead of quietly installing an unversioned package.
+    postPatch = ''
+      substituteInPlace pyproject.toml \
+        --replace-fail 'style = "pep440"' 'style = "pep440"
+      fallback-version = "2.3.0"'
+    '';
+
+    # Exactly the distribution set its metadata declares, minus the two extras
+    # the peer does not use (`cli`, `rich`). `pyjwt[crypto]` is NOT among them:
+    # the SDK declares the extra, so the requirement behind it — cryptography
+    # — is listed here rather than assumed away on the grounds that a stdio run
+    # never verifies a token. A declared requirement is satisfied or reported,
+    # not dropped because this particular run would not reach it.
+    dependencies = [
+      anyio
+      httpx2Pinned
+      jsonschema
+      mcpTypesCurrentSdk
+      pythonOpenTelemetry
+      cryptography
+      pydantic
+      pyjwt
+      pythonMultipart
+      sse-starlette
+      starlette
+      pythonTypingExtensions
+      pythonTypingInspection
+      uvicorn
+    ];
+
+    pythonImportsCheck = [ "mcp" "mcp_types" ];
+    doCheck = false;
+
+    meta = {
+      description = "Model Context Protocol SDK, the 2026-07-28 line";
+      homepage = "https://modelcontextprotocol.io";
+      license = lib.licenses.mit;
+    };
+  };
+
+  # A third interpreter, beside the 1.29.0 one rather than merged into it: the
+  # previous-revision peer reads `sdks["mcp"]` and must keep resolving 1.29.0,
+  # and one interpreter cannot hold both distributions at two versions.
+  mcpCurrentPython = python3.withPackages (ps: [
+    mcpCurrentSdk
+    mcpTypesCurrentSdk
   ]);
 
   # The gate analysis tests are development tooling as well, and `gate` runs
@@ -116,18 +433,68 @@ let
   # the pinned SDKs are the peers' business and stay exactly as
   # `test/interop/sdk-pins.json` records them, and a test-only package has no
   # business in the environment that drives an exchange.
-  gateTestPython = python3.withPackages (ps: [ pytest ]);
+  gateTestPython = python3.withPackages (ps: [ pytest ps.pexpect ]);
 
-  # User-mode QEMU covers the published Linux architectures without installing
-  # system emulators. Wine's WoW64 build runs both x86 and x86_64 PE executables
-  # without requiring a 32-bit host environment. Both are development processes,
-  # never dependencies of the interface library.
+  # User-mode QEMU covers the published Linux architectures. WoW64 is selected
+  # for x86 and x86_64 PE files without a 32-bit host environment; availability
+  # is not proof of successful execution. The matrix records each result.
+  # These runners are development processes, never library dependencies.
   crossRunners = lib.optionals pkgs.stdenv.hostPlatform.isLinux [
     (pkgs.qemu.override { userOnly = true; })
     pkgs.wineWow64Packages.minimal
   ];
 
-  packages = [ interopPython gateTestPython ] ++ crossRunners;
+  # The interpreters the scripts exec by absolute path, named as a list so
+  # each SDK line is one binding above and one entry here.
+  #
+  # `interopPython` is the previous-revision MCP 1.29.0 (2025-11-25) plus A2A
+  # 1.2.1 and stays exactly that, because `sdks["mcp"]` names those versions
+  # and the peer that reads it has not moved. `acpPython` carries the one ACP
+  # distribution under `sdks["agent-client-protocol"]`, and
+  # `mcpCurrentPython` carries mcp 2.3.0 and mcp-types 2.3.0 under
+  # `sdks["mcp-current"]`. One interpreter cannot hold `mcp` at two versions,
+  # so a newer revision is a new binding rather than an import added to an old
+  # one: an SDK version is a fact the pins file states, never one a resolver
+  # picks at run time, and nothing here falls back to another version.
+  interpreters = [ interopPython acpPython mcpCurrentPython gateTestPython ];
+
+  # Gate and cross-audit tools remain development dependencies.
+  #
+  # `lsof` is here because `tools/safe-rm-dir.sh` requires it. The helper
+  # refuses to remove anything it cannot establish is unreferenced, and the
+  # /proc walk it pairs lsof with already covers this account's processes —
+  # lsof is a second reading of the same ground, not a wider one: it reads the
+  # same procfs under the same permissions, so on a host that forbids it lsof
+  # sees no more than the walk does, and no package this repository builds
+  # imports it.
+  #
+  # `util-linux` is here for `mountpoint`, which `.envrc`'s scratch bootstrap
+  # calls to require a candidate volume to be a mount in its own right rather
+  # than an autofs stub, and which `test/devenv_enter_shell_test.py` resolves
+  # as one of the remover's tools. It was previously satisfied by whatever the
+  # host happened to have. The remover reads /proc/self/mountinfo: a nonzero
+  # mountpoint status cannot distinguish an absent mount from a failed check
+  # or a missing command.
+  #
+  # `nettools` supplies `hostname`, which cross-test records in its receipt.
+  packages = interpreters ++ crossRunners ++ [ pkgs.lsof pkgs.util-linux pkgs.nettools ];
+
+  # Where this environment's tools come from when nixpkgs does not carry
+  # them. The pinned compiler is the anyzig shim, which resolves
+  # `.minimum_zig_version` out of `build.zig.zon`; `zig-gate` and the four
+  # analyzers it drives are host builds under the caller's own account. They
+  # are not added to `packages` and they are not built here: a nixpkgs `zig`
+  # would shadow the shim with a version the manifest does not pin, and
+  # wrapping the analyzers again would put a second, drifted copy of each
+  # next to the first.
+  #
+  # Read from the caller's environment for the same reason `scratchUser` is:
+  # it is the caller's account that owns the directory, and this file
+  # publishes no account name. Not checked for existence here — evaluation
+  # has to succeed for `devenv print-dev-env` and for the profile modules on
+  # a host where the shell is never entered. `enterShell` is where a missing
+  # tool is a sentence naming it.
+  hostBin = let home = builtins.getEnv "HOME"; in "${home}/.local/bin";
 
   # One scratch root, one policy. `.envrc` bootstraps the same choice into
   # the shell before this file is evaluated and README.md states it; the
@@ -146,18 +513,37 @@ let
   # directories on mounts every account on the node can read. It is read
   # from the caller's environment rather than committed, so this file
   # publishes no account name and `devenv shell` resolves for whichever
-  # account evaluates it.
-  scratchUser = builtins.getEnv "USER";
+  # account evaluates it. The four mounts are named once, here, because the
+  # project root and the shared toolchain store below are both derived from
+  # them and a second copy of the list is a second answer to give.
+  scratchMounts = [
+    "/home/tmp2"
+    "/home/tmp"
+    "/vol/tmp2"
+    "/vol/tmp"
+  ];
+  scratchUser =
+    let u = builtins.getEnv "USER";
+    in if u != "" then u else builtins.getEnv "LOGNAME";
   scratchCandidates =
     if scratchUser == "" then
-      throw "zig-agent-proto: USER is unset, so this environment cannot name its per-account scratch directory; export USER before evaluating."
+      throw "zig-agent-proto: USER and LOGNAME are both unset, so this environment cannot name its per-account scratch directory; export USER before evaluating."
     else
-      builtins.map (mount: "${mount}/${scratchUser}/zig-agent-proto") [
-        "/home/tmp2"
-        "/home/tmp"
-        "/vol/tmp2"
-        "/vol/tmp"
-      ];
+      builtins.map (mount: "${mount}/${scratchUser}/zig-agent-proto") scratchMounts;
+
+  # Downloaded toolchains are shared; build caches are not. The shim unpacks
+  # each toolchain into `<zigGlobal>/p/<hash>` and records that hash under
+  # `$XDG_DATA_HOME/anyzig/hashstore/`, so a second scratch root downloads the
+  # same toolchain again unless it can see the first one's `p`. The store is
+  # therefore a sibling of the project root, searched on the same mounts in
+  # the same order under the same per-account name: this file names no
+  # account and no mount of its own, which is what the hard-coded
+  # `/home/tmp2/<account>/zig-global-cache/p` it replaces got wrong. A store
+  # is optional. A node without one is not a failure — the shim unpacks the
+  # pinned toolchain itself — so the list is handed to the shell whole and
+  # the first entry that is still there when the shell starts wins.
+  toolchainStores =
+    builtins.map (mount: "${mount}/${scratchUser}/zig-global-cache/p") scratchMounts;
 
   scratchRoot =
     let present = builtins.filter builtins.pathExists scratchCandidates;
@@ -167,12 +553,10 @@ let
     else
       builtins.head present;
 
-  # Every path this environment writes through, named once. The anyzig shim
-  # downloads the pinned toolchain into `zigGlobal/p/<hash>` itself, so a
-  # node that has never run this project needs no toolchain store prepared
-  # for it. Nothing symlinks one cache's store into another: the shared
-  # store this file used to name is gone, and a symlink to a missing target
-  # makes the shim exit 1 without a word.
+  # Every path this environment writes through, named once. `zigGlobal/p` is
+  # linked to `toolchainStores` at shell entry when one of them is present,
+  # and is otherwise a directory the shim fills on first use, so a node that
+  # has never run this project still needs no store prepared for it.
   scratch = {
     tmp = "${scratchRoot}/tmp";
     cache = "${scratchRoot}/cache";
@@ -605,6 +989,14 @@ in
     ZIG_LOCAL_CACHE_DIR = scratch.zigLocal;
 
     XDG_CACHE_HOME = scratch.cache;
+
+    # No `__pycache__` anywhere in this checkout. The peers and the gate's
+    # python tests are development tooling that runs with the project as its
+    # working directory, so an unset bytecode cache would write compiled
+    # modules into an NFS export the gate is otherwise careful not to touch,
+    # and into a working tree no reader asked to be dirty. Off entirely is
+    # stronger than relocating it: there is no local prefix that is both
+    # approved for this account and inside the gate's own rules by accident.
     PYTHONDONTWRITEBYTECODE = "1";
 
     # Wine's registry, drives and service state belong to this project's cache,
@@ -630,35 +1022,160 @@ in
     GATE_EXCLUDE = "/[.]zig-cache/ /zig-out/ /zig-cache/ /zig-global-cache/ /.zig-global-cache/";
   };
 
-  # The shim exits 1 with no output when it cannot resolve a toolchain, so a
-  # broken pin looks like a mysterious silent build failure. Report the
-  # version on entry instead. The directories the environment above names
-  # are created first and under a 077 umask, because they are per-account
-  # directories on a mount every account on the node can read, and because a
-  # cache root that does not exist yet makes the shim download the toolchain
-  # again on every entry.
+  # Shell entry does three things in order, and each one is a step the next
+  # depends on: put the caller's tool directory on PATH, point the toolchain
+  # store at a shared one when this account has one, and resolve the pinned
+  # compiler once so the rest of the session runs the toolchain that was
+  # checked. The last step is the point of the sequence, and the only one that
+  # stops entry.
+  #
+  # The host analyzers are deliberately NOT one of those three. They are the
+  # gate's inputs and the gate checks for them, because a missing analyzer
+  # says nothing about whether this shell can resolve the pinned compiler,
+  # run one interoperability peer, or read a build log — and refusing entry for
+  # it would make an account that has not built this account's tools unable to
+  # use any part of the environment. The gate is not relaxed by this: it names
+  # every missing tool and fails before it runs a section that would silently
+  # skip.
+  #
+  # The shim exits 1 with no output when it cannot resolve a toolchain, and
+  # `zig` was reaching it through whatever PATH the caller happened to carry.
+  # Nix runs this environment inside a sandbox whose PATH is the container's
+  # own — no `$HOME/.local/bin`, no project host tools — so on a fresh node
+  # the pinned compiler was simply not on PATH, `zig version` exited 127, and
+  # `2>/dev/null` turned that into one soft line that named the wrong thing.
+  # Everything below reports the real state and stops on it instead.
+  #
+  # The directories the environment above names are created first and under a
+  # 077 umask, because they are per-account directories on a mount every
+  # account on the node can read, and because a cache root that does not exist
+  # yet makes the shim download the toolchain again on every entry. Each is
+  # checked before it is created, and a path that is a symlink or belongs to
+  # another account is refused rather than written through — `.envrc` applies
+  # the same rule for the same directories, and this is the path that covers
+  # `devenv shell`, which never sources it.
   enterShell = ''
+    # The caller's own tool directory, declared here rather than inherited.
+    # Appended, never prepended: `packages` is this file's statement about
+    # which Python and which runners win, and a host tool directory must not
+    # quietly replace the `pytest` that carries this project's test-only
+    # dependencies. Added only when it is not already there, because
+    # `enterShell` runs again on every `direnv reload`.
+    case ":''${PATH}:" in
+      *:"${hostBin}":*) ;;
+      *) PATH="''${PATH}:${hostBin}"; export PATH ;;
+    esac
+
+    for _zap_path in ${builtins.concatStringsSep " " (builtins.attrValues scratch)}; do
+      if [ -e "$_zap_path" ] || [ -L "$_zap_path" ]; then
+        if [ ! -d "$_zap_path" ] || [ -L "$_zap_path" ] || [ ! -O "$_zap_path" ]; then
+          echo "zig-agent-proto: refusing $_zap_path: not a directory this account owns." >&2
+          exit 1
+        fi
+      fi
+    done
     (umask 077
     mkdir -p ${builtins.concatStringsSep " " (builtins.attrValues scratch)})
+
+    # `<zigGlobal>/p` is where the shim looks for every toolchain. Point it at
+    # the first shared store this account has, so a second scratch root does
+    # not download the same toolchain again; leave it alone entirely when
+    # there is none, because the shim fills a real directory on first use and
+    # a node that has never run this project needs no store prepared for it.
+    #
+    # Nothing here deletes. A link is made only when the name is entirely
+    # absent — `[ -e ]` and `[ -L ]` both have to say so — so an existing
+    # entry is never re-pointed, and a link whose target is gone is not
+    # repaired either: that is the case the hard-coded target this replaces
+    # used to cause on every host but this one, and unlinking a path is not a
+    # decision this file takes on a path it did not create. It stops instead,
+    # and `tools/safe-rm-dir.sh --link` is how a person removes one: that
+    # checks the link's owner, the volume its directory is on, whether it is
+    # a mount point, and what its target is, before it unlinks anything.
+    _zap_p="${scratch.zigGlobal}/p"
+    if [ ! -e "$_zap_p" ] && [ ! -L "$_zap_p" ]; then
+      for _zap_store in ${builtins.concatStringsSep " " toolchainStores}; do
+        [ -d "$_zap_store" ] || continue
+        ln -s "$_zap_store" "$_zap_p" 2>/dev/null && break
+      done
+    fi
+    if [ -L "$_zap_p" ] && [ ! -d "$_zap_p" ]; then
+      echo "zig-agent-proto: $_zap_p is a link to nothing ($(readlink -- "$_zap_p"))." >&2
+      echo "  The shim looks for every toolchain through that path, so nothing" >&2
+      echo "  resolves until the link is gone, and this file will not remove it" >&2
+      echo "  for you. Inspect it, then:" >&2
+      echo "    readlink -- $_zap_p" >&2
+      echo "    ''${DEVENV_ROOT:-$PWD}/tools/safe-rm-dir.sh --link $_zap_p" >&2
+      exit 1
+    fi
 
     ${lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
       # Wine deliberately drops the Unix TMPDIR while importing the host
       # environment. Preserve its caller-selected value in this project's own
       # prefix instead of falling back to Wine's TEMP or the host's /tmp.
-      wine_tmpdir=$(WINEDEBUG=-all winepath -w "$TMPDIR") || exit 1
-      WINEDEBUG=-all wine reg add 'HKCU\Environment' /v TMPDIR /t REG_SZ /d "$wine_tmpdir" /f || exit 1
+      # Guarded on the tools existing: direnv evaluates enterShell through
+      # `devenv direnvrc` in the host shell, where wine is not installed,
+      # and an unguarded call aborts entry with `winepath: command not found`.
+      if command -v winepath >/dev/null 2>&1 && command -v wine >/dev/null 2>&1; then
+        wine_tmpdir=$(WINEDEBUG=-all winepath -w "$TMPDIR") || exit 1
+        WINEDEBUG=-all wine reg add 'HKCU\Environment' /v TMPDIR /t REG_SZ /d "$wine_tmpdir" /f || exit 1
+      fi
     ''}
 
-    echo "scratch root: ${scratchRoot}"
-    echo "zig $(zig version 2>/dev/null || echo '<unresolved: check .minimum_zig_version>')"
+    # The pin is the manifest's. The shim reads it out of `build.zig.zon` and
+    # the gate re-reads the same line on every run; neither this file nor the
+    # host states a version anywhere. `DEVENV_ROOT` rather than `$PWD`, because
+    # direnv evaluates this from wherever the caller happened to be.
+    _zap_root="''${DEVENV_ROOT:-$PWD}"
+    _zap_pin=$(sed -n 's/.*\.minimum_zig_version = "\(.*\)".*/\1/p' "$_zap_root/build.zig.zon")
+    if [ -z "$_zap_pin" ]; then
+      echo "zig-agent-proto: $_zap_root/build.zig.zon names no .minimum_zig_version," >&2
+      echo "  so there is no pinned toolchain to resolve and no answer to check one against." >&2
+      exit 1
+    fi
+    if ! _zap_version=$(zig version); then
+      echo "zig-agent-proto: zig is $(command -v zig) and it could not resolve $_zap_pin." >&2
+      echo "  The shim reads the pin from build.zig.zon and unpacks the toolchain into" >&2
+      echo "  $ZIG_GLOBAL_CACHE_DIR/p, and it exits without a message when that download" >&2
+      echo "  fails. That silence is what this message replaces; see README.md." >&2
+      exit 1
+    fi
+    if [ "$_zap_version" != "$_zap_pin" ]; then
+      echo "zig-agent-proto: zig $_zap_version is not the pinned $_zap_pin." >&2
+      echo "  $(command -v zig) is the shim, which takes its version from the manifest;" >&2
+      echo "  something ahead of it on PATH is answering instead." >&2
+      exit 1
+    fi
 
-    # The shim downloads the pinned toolchain into <global>/p/<hash> on first
-    # use. Say which of the two states this root is in, because the other
-    # state's failure mode is a silent exit 1.
-    if [ -n "$(ls -A ${scratch.zigGlobal}/p 2>/dev/null)" ]; then
-      echo "toolchain store: ${scratch.zigGlobal}/p"
+    # Resolve once and keep. `zig env` names the executable the shim actually
+    # selected; from here `zig` IS that executable and `ZIG` points at it, so
+    # the rest of the session cannot be moved onto another toolchain by
+    # anything that changes a cache directory underneath it. `cross-test`
+    # sources the host scratch policy, which repoints ZIG_GLOBAL_CACHE_DIR,
+    # and the gate script below does the same resolution for the same reason.
+    _zap_env=$(zig env) || exit 1
+    _zap_exe=$(printf '%s\n' "$_zap_env" | sed -n 's/.*\.zig_exe = "\([^"\\]*\)".*/\1/p')
+    if [ -z "$_zap_exe" ] || [ ! -x "$_zap_exe" ]; then
+      echo "zig-agent-proto: 'zig env' named no runnable .zig_exe for $_zap_pin." >&2
+      echo "  '$_zap_exe'" >&2
+      exit 1
+    fi
+    ZIG="$_zap_exe"
+    export ZIG
+    case ":''${PATH}:" in
+      *:"''${_zap_exe%/*}":*) ;;
+      *) PATH="''${_zap_exe%/*}:''${PATH}"; export PATH ;;
+    esac
+
+    echo "scratch root: ${scratchRoot}"
+    echo "zig: $_zap_version, pinned by build.zig.zon, selected at $_zap_exe"
+
+    # Which of the two states this root is in, because the other state's
+    # failure mode is a silent exit 1.
+    if [ -n "$(ls -A "$_zap_p" 2>/dev/null)" ]; then
+      echo "toolchain store: $_zap_p"
     else
-      echo "toolchain store: empty; the shim downloads the pinned toolchain on first use"
+      echo "toolchain store: $_zap_p is empty; the shim downloads the pinned toolchain on first use"
     fi
 
     # Named, not aliased over `python3`: the system interpreter is what a
@@ -666,11 +1183,17 @@ in
     # are started by absolute path in the run commands, so this entry is a
     # report rather than the mechanism.
     echo "interop python: $(command -v interop-python || echo '<not on PATH>')"
+
+    unset _zap_path _zap_p _zap_store _zap_root _zap_pin \
+      _zap_version _zap_env _zap_exe
   '';
 
   # The house gate: fmt, build, test, ast-check, ziglint, zlint, zbc, zwanzig
   # and cross-test, plus coverage on request. The version cross-check runs first
   # because every later step is meaningless against a toolchain the manifest
+  # does not pin, and enterShell has already resolved and exported that
+  # toolchain, so this check re-reads the same line against the same `ZIG`
+  # rather than resolving anything a second time.
   #
   # `ZBC` and `ZLINT` are this repository's two wrappers around the analyzers,
   # and they are named here rather than in `env` so that they are the GATE's
@@ -705,7 +1228,6 @@ in
       echo "zig $version does not match .minimum_zig_version $pin" >&2
       exit 1
     }
-
     # Resolve the shim while the project's toolchain cache is still selected.
     # cross-test sources the host scratch policy, which may select a different
     # cache; the already-checked executable must survive that change.
@@ -720,14 +1242,74 @@ in
     # zbc queries `zig env` by name rather than honoring ZIG.
     export PATH="''${ZIG%/*}:$PATH"
 
+    # Every host tool the gate runs is checked here, at the gate, rather than at
+    # shell entry. `tools/gate_zbc.py` and `tools/gate_zlint.py` resolve their
+    # analyzer with `shutil.which`, so PATH is the only place that decision can
+    # be made; `zig-gate` looks the rest up under `$HOME/.local/bin` by
+    # absolute path and falls back to PATH, and is itself called by bare name
+    # from the last line below. A missing one is named and the run stops, so no
+    # section is silently skipped.
+    gate_missing=
+    for gate_tool in zig zig-gate ziglint zlint zbc zwanzig cross-test; do
+      command -v "$gate_tool" >/dev/null 2>&1 || gate_missing="$gate_missing $gate_tool"
+    done
+    if [ -n "$gate_missing" ]; then
+      echo "zig-gate: not on PATH, and this environment does not install them:" >&2
+      echo "  ''${gate_missing# }" >&2
+      echo "  PATH searched: ''${PATH}" >&2
+      echo "  They are host tools, not nixpkgs packages, and the gate cannot run" >&2
+      echo "  a section whose analyzer is absent." >&2
+      exit 1
+    fi
+
     # Analyzer policy and guest receipts decide whether evidence is accepted.
     # Check all three readers before using their verdicts. Their fixtures stay
     # under approved scratch; pytest writes no cache into the NFS checkout.
+    #
+    # One private directory per run, created by mktemp. A fixed name is a path
+    # any other process on this approved mount can fill in before this run
+    # reaches it, and deleting one by name deletes whatever is there then
+    # rather than what this run put there.
+    #
+    # Nothing removes it here. `tools/safe-rm-dir.sh` does, and it removes it
+    # only after checking that the tree belongs to this account, is mode 0700
+    # so no other account has a path into it, sits on an approved volume with
+    # no filesystem mounted at or under it, and holds no device, socket or fifo
+    # out of which a recursive delete could mean something other than removing
+    # the entry. An owned symlink inside it is removed as itself and nothing
+    # more: `rm` unlinks a link and does not follow it.
+    #
+    # Liveness is checked too, and the honest scope of that check is stated
+    # rather than implied: no process OF THIS ACCOUNT holds it — cwd, root,
+    # executable, open descriptor or mapping — and `lsof` reports nothing under
+    # it, as a second witness over the same ground. It is not a claim about
+    # every process on the node, which no account can make from /proc; the
+    # 0700 mode is what turns that limitation into a precondition the helper
+    # can actually verify.
+    #
+    # The check runs after pytest, not from a trap, so a failing run leaves
+    # its fixtures where a reader can look at them; and a refusal leaves them
+    # too, and fails the gate with the path named, because an unverified
+    # recursive delete is not worth the evidence it would remove.
+    #
+    # `devenv_enter_shell_test.py` is here for the same reason the gate runs
+    # before the sources: it reads the `enterShell` body out of this file and
+    # runs it, so a shell that cannot resolve the pinned compiler is caught by
+    # a test that needs no nix evaluation and no download.
+    # `safe_rm_dir_test.py` is here because the line above hands a removal to
+    # a helper, and a removal nobody has checked is a removal nobody should
+    # trust: its cases are every way the tree can be unsafe to delete.
     echo "gate: analyzer-policy and guest-receipt tests"
     fixture_root="''${TMPDIR:?TMPDIR is unset, so there is no approved fixture root}"
-    rm -rf "$fixture_root/gate-analysis"
-    pytest -q -p no:cacheprovider --basetemp "$fixture_root/gate-analysis" \
-      test/gate_analysis_test.py test/gate_zlint_test.py test/cross_guest_test.py
+    fixture_dir="$(mktemp -d "$fixture_root/gate-analysis.XXXXXXXX")"
+    pytest -q -p no:cacheprovider --basetemp "$fixture_dir" \
+      test/gate_analysis_test.py test/gate_zlint_test.py test/cross_guest_test.py \
+      test/devenv_enter_shell_test.py test/safe_rm_dir_test.py \
+      test/interop/process_guard_test.py
+    if ! "$(pwd)/tools/safe-rm-dir.sh" "$fixture_dir"; then
+      echo "gate: leaving this run's fixtures in place: $fixture_dir" >&2
+      exit 1
+    fi
 
     # The house gate hides zero-open analyzer output, including review records.
     # State the mechanisms on every run. The wrapper computes review counts
@@ -779,6 +1361,39 @@ in
       exec ${interopPython}/bin/python3 test/interop/a2a_peer.py \
         --role zig-interop \
         --zig-binary "''${ZIG_AGENT_PROTO_A2A_INTEROP:-zig-out/bin/zig-agent-proto-a2a-interop}" \
+        "$@"
+    '';
+  };
+
+  # The ACP peer runs on its own interpreter, not on `interopPython`: the
+  # distribution it imports is a different one, and a peer that spawned
+  # another peer process has to resolve the same `acp` as its parent.
+  # `--protocol-version` is passed through, so the stable wire and the
+  # explicitly opt-in experimental wire-2 alpha are both reachable from the
+  # same script; nothing here switches distribution if one of them fails.
+  scripts.interop-acp = {
+    description = "Drive the ACP wire-1 exchange, or wire-2 alpha with --protocol-version 2";
+    exec = ''
+      set -eu
+      exec ${acpPython}/bin/python3 test/interop/acp_peer.py \
+        --role supervise \
+        --zig-binary "''${ZIG_AGENT_PROTO_ACP_INTEROP:-zig-out/bin/zig-agent-proto-acp-interop}" \
+        "$@"
+    '';
+  };
+
+  # The 2026-07-28 MCP peer, on its own interpreter. It is a sibling of
+  # `interop-mcp`, not a replacement: the previous-revision peer reads
+  # `sdks["mcp"]` and must keep resolving mcp 1.29.0, and one environment
+  # cannot carry `mcp` at two versions. `--role` is passed through, so
+  # `refusals` and `selftest` are reachable here too.
+  scripts.interop-mcp-current = {
+    description = "Drive the MCP 2026-07-28 interop peer against the Zig client";
+    exec = ''
+      set -eu
+      exec ${mcpCurrentPython}/bin/python3 test/interop/mcp_current_peer.py \
+        --role supervise \
+        --zig-binary "''${ZIG_AGENT_PROTO_MCP_CURRENT_INTEROP:-zig-out/bin/zig-agent-proto-mcp-current-interop}" \
         "$@"
     '';
   };

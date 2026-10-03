@@ -35,16 +35,15 @@ validates the receipt.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import gzip
+import guest_process
 import hashlib
 import os
 from pathlib import Path
 import shutil
-import signal
 import subprocess
 import sys
-import tempfile
+import guest_storage
 from dataclasses import dataclass
 from types import ModuleType
 
@@ -410,10 +409,6 @@ ZAP_PAYLOAD_EOF"""
 
 SUITE_COMMAND = "/bin/sh /home/cross-data/suite.sh"
 
-# The machine of the run in progress, so a cancelled run can shut the guest
-# down before the process goes away.
-_LIVE: list = []
-
 
 class GuestFailure(RuntimeError):
     """A NetBSD guest did not boot, or did not deliver a runnable suite."""
@@ -489,7 +484,7 @@ def _publish(source: Path, destination: Path, gzipped: bool,
     """
     if destination.is_file():
         return
-    with tempfile.TemporaryDirectory(prefix="netbsd-", dir=destination.parent) as scratch:
+    with guest_storage.temporary_directory(prefix="netbsd-", dir=destination.parent) as scratch:
         staged = Path(scratch) / destination.name
         if gzipped:
             with gzip.open(source, "rb") as compressed, staged.open("wb") as output:
@@ -499,7 +494,7 @@ def _publish(source: Path, destination: Path, gzipped: bool,
         if pad:
             os.truncate(staged, 1 << (staged.stat().st_size - 1).bit_length())
         staged.chmod(0o444)
-        os.replace(staged, destination)
+        guest_storage.publish(staged, destination)
 
 
 def _host_bin() -> Path:
@@ -589,7 +584,7 @@ def _root_image(guest: Guest, tree: dict[str, Path], cache: Path) -> None:
     if not os.access(makefs, os.X_OK):
         raise GuestFailure(f"CROSS_NETBSD_MAKEFS names {makefs}, which is not executable")
     _require_mtree(makefs)
-    with tempfile.TemporaryDirectory(prefix="netbsd-root-", dir=cache) as workdir:
+    with guest_storage.temporary_directory(prefix="netbsd-root-", dir=cache) as workdir:
         scratch = Path(workdir)
         stage = scratch / "root"
         stage.mkdir()
@@ -603,7 +598,7 @@ def _root_image(guest: Guest, tree: dict[str, Path], cache: Path) -> None:
                         "-o", "version=2,bsize=8192",
                         "-F", str(spec), str(staged), str(stage)], check=True)
         staged.chmod(0o444)
-        os.replace(staged, cache / "wd0.img")
+        guest_storage.publish(staged, cache / "wd0.img")
 
 
 def _require_mtree(makefs: str) -> None:
@@ -717,12 +712,16 @@ def prepare(guest: Guest) -> Path:
     ).encode()).hexdigest()[:16]
     cache = Path(_require("CROSS_GUEST_CACHE")) / f"netbsd-{RELEASE}" / guest.port / digest
     cache.mkdir(mode=0o700, parents=True, exist_ok=True)
+    guest_storage.check_directory(cache)
     with (cache / "lock").open("ab") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         for member, source in tree.items():
             link = cache / "dist" / guest.port / member
             link.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-            link.unlink(missing_ok=True)
+            if link.is_symlink() and link.readlink() == source:
+                continue
+            if link.exists() or link.is_symlink():
+                guest_storage.unlink_link(link)
             link.symlink_to(source)
         if guest.disk_member is not None:
             _publish(tree[guest.disk_member], cache / "wd0.img", guest.gzipped,
@@ -867,39 +866,63 @@ def _wait_for_login(child) -> None:
             return
 
 
-def _close(machine, pexpect: ModuleType, graceful: bool) -> None:
-    """Close the console, shutting the guest down only if it got that far.
+def _hold_on_configure_child(machine, guard: guest_process.Guard, label: str,
+                             held: list) -> None:
+    """Adopt every emulator anita starts, the moment its console exists.
 
-    A halt is a login plus a command on the console, so asking a guest that
-    never reached a login prompt to halt costs a second full expect timeout on
-    top of the failure already being reported. Such a console is force-closed
-    instead, which is immediate and leaves nothing running.
+    anita forks the machine inside its own `start_*` calls, and each of them
+    hands the new console to `configure_child` before it returns it. That one
+    method is the only seam every emulator passes through, and it is the one
+    that has to be hooked to cover an installation: anita's sysinst driver
+    calls `start_qemu` itself and never comes back through `start_boot`, so a
+    wrapper on `start_boot` alone holds the runtime emulator and leaves the
+    installer's unheld — and anita closes the installer's console itself when
+    the install is over. That close is `PtyProcess.close(force=True)`, which
+    hangs up the pseudo terminal and then escalates to SIGKILL on a pid this
+    run has not proved is its own.
+
+    Adoption runs after the original method, because recording the console as
+    `machine.child` is what anita's own teardown and this driver's halt both
+    go through, and both are only guarded on the object anita is holding.
+
+    Every console is kept, not just the first: a port anita installs starts
+    two emulators in one run, and both have to be stopped through the guard.
+    The wrapper goes on this one machine object rather than on anita's class,
+    so nothing outside this run changes.
     """
-    child = machine.child
-    if child is None:
-        return
+    original = machine.configure_child
+
+    def configure_child(child) -> object:
+        result = original(child)
+        held.append(guest_process.adopt(guard, child, label))
+        return result
+
+    machine.configure_child = configure_child
+
+
+def _halt(machine, pexpect: ModuleType) -> str | None:
+    """Power the guest down through anita, and report why it could not be asked.
+
+    A halt is a login plus a command on the console, so it is only asked of a
+    machine that reached a login prompt; one that did not would spend a second
+    full expect timeout on a question that has no answer. Whatever anita does
+    about a machine that will not halt — and it escalates, through the
+    console's own `terminate()`, to signals that adoption replaced with a
+    refusal — the guarded stop that follows is what actually accounts for the
+    pid.
+
+    The reason is returned rather than raised, because this is called on the
+    way out of a run that may already have failed for a better reason, and a
+    run that reports both is more useful than one that reports the first and
+    leaves the second inside a `finally` where nobody reads it.
+    """
+    if machine.halted or machine.child is None:
+        return None
     try:
-        if graceful and not machine.halted:
-            machine.halt()
-    except (pexpect.ExceptionPexpect, OSError, RuntimeError):
-        pass
-    finally:
-        machine.child = None
-        try:
-            child.close(force=True)
-        except OSError:
-            pass
-
-
-def _cancel(signum: int, frame: object) -> None:
-    """Shut the guest down when the caller cancels, then die as asked."""
-    for machine in _LIVE:
-        try:
-            _close(machine, _module("pexpect"), False)
-        except Exception:
-            pass
-    signal.signal(signum, signal.SIG_DFL)
-    os.kill(os.getpid(), signum)
+        machine.halt()
+    except (pexpect.ExceptionPexpect, OSError, RuntimeError) as error:
+        return str(error)
+    return None
 
 
 def run_guest(target: str, artifact: Path) -> bytes:
@@ -911,6 +934,24 @@ def run_guest(target: str, artifact: Path) -> bytes:
     guest that cannot boot, cannot mount the payload, or whose suite exits
     nonzero raises instead of returning a receipt; the console it produced
     has already been written to stdout either way.
+
+    anita forks the emulator itself, on a pseudo terminal and therefore in a
+    session and process group of its own, which is out of reach of any group
+    this driver chose. So every pid is adopted from `/proc` at the moment anita
+    has started it, and every stop goes through `process_guard`. A port anita
+    installs starts two of them — the sysinst emulator and the one that runs
+    the suite — and both are held. Adoption also takes anita's own teardown
+    away on each console object: `halt()` and the error paths reach `os.kill`
+    through `close(force=True)`, `terminate()` and `kill()`, and those now
+    send nothing this run has not proved is its own — they say which pid and
+    which signal they would have sent instead.
+
+    A cancellation is an exception, not a signal this process sends to itself.
+    The old handler shut the guest down and then re-raised its own signal, which
+    stopped the machine twice: once on whatever the pid looked like inside the
+    handler, and once through the interpreter's default disposition with no
+    guard read at all. Raising unwinds into the same `finally` every other exit
+    takes, so the machine is stopped once and through the guard.
     """
     if target not in GUESTS:
         raise GuestFailure(f"{target} is not a NetBSD target this driver runs; "
@@ -927,37 +968,83 @@ def run_guest(target: str, artifact: Path) -> bytes:
     # emulator, so it has to be in place before the boot begins.
     machine.unstructured_log_f = receipt
     payload = _payload(guest, machine, str(Path(artifact).resolve()))
-    _LIVE.append(machine)
-    handlers = {number: signal.signal(number, _cancel)
-                for number in (signal.SIGINT, signal.SIGTERM)}
+    label = f"{guest.emulator} for {target}"
+    guard = guest_process.Guard()
+    held: list = []
+    _hold_on_configure_child(machine, guard, label, held)
+    handlers = guest_process.install_cancellation()
     booted = False
+    status = 0
+    halt_note: str | None = None
+    failure: BaseException | None = None
+    stops: list = []
     try:
         try:
-            if guest.loader_console is None:
-                machine.boot([*_extras(guest, workdir), *payload])
-            else:
-                _boot_through_loader(machine, guest, workdir, payload)
-        except pexpect.TIMEOUT as error:
-            raise GuestFailure(f"{target}: the guest never reached a login prompt") from error
-        except pexpect.EOF as error:
-            raise GuestFailure(f"{target}: the console closed during boot") from error
-        except OSError as error:
-            raise GuestFailure(f"{target}: the emulator could not be started") from error
-        booted = True
-        if machine.shell_cmd(MOUNT_SCRIPT, timeout=MOUNT_TIMEOUT) != 0:
-            raise GuestFailure(f"{target}: the guest could not write its bootstrap")
-        if machine.shell_cmd("/bin/sh /home/cross-scratch/zap-payload.sh",
-                             timeout=MOUNT_TIMEOUT) != 0:
-            raise GuestFailure(f"{target}: the guest found no payload to mount")
-        status = machine.shell_cmd(SUITE_COMMAND, timeout=SUITE_TIMEOUT,
-                                   keepalive_patterns=list(KEEPALIVE))
-    except pexpect.ExceptionPexpect as error:
-        raise GuestFailure(f"{target}: the console stopped responding: {error}") from error
+            # The boot and what follows it are two phases with two different
+            # failures, so they do not share a handler. A timeout or an end of
+            # file while the machine is coming up says the boot failed; the
+            # same two while the suite runs say a console that had already
+            # answered a login prompt stopped answering, and an OSError then
+            # says the console could not be driven — not that an emulator this
+            # run has been talking to for an hour was never started.
+            try:
+                if guest.loader_console is None:
+                    machine.boot([*_extras(guest, workdir), *payload])
+                else:
+                    _boot_through_loader(machine, guest, workdir, payload)
+            except pexpect.TIMEOUT as error:
+                raise GuestFailure(f"{target}: the guest never reached a login prompt") from error
+            except pexpect.EOF as error:
+                raise GuestFailure(f"{target}: the console closed during boot") from error
+            except OSError as error:
+                raise GuestFailure(f"{target}: the emulator could not be started") from error
+            try:
+                booted = True
+                if machine.shell_cmd(MOUNT_SCRIPT, timeout=MOUNT_TIMEOUT) != 0:
+                    raise GuestFailure(f"{target}: the guest could not write its bootstrap")
+                if machine.shell_cmd("/bin/sh /home/cross-scratch/zap-payload.sh",
+                                     timeout=MOUNT_TIMEOUT) != 0:
+                    raise GuestFailure(f"{target}: the guest found no payload to mount")
+                status = machine.shell_cmd(SUITE_COMMAND, timeout=SUITE_TIMEOUT,
+                                           keepalive_patterns=list(KEEPALIVE))
+            except pexpect.ExceptionPexpect as error:
+                raise GuestFailure(
+                    f"{target}: the guest console stopped responding after the login prompt: "
+                    f"{error}") from error
+            except OSError as error:
+                raise GuestFailure(
+                    f"{target}: the guest console could not be driven any further: "
+                    f"{error}") from error
+        finally:
+            halt_note = _halt(machine, pexpect) if booted else None
+            machine.child = None
+    except BaseException as error:
+        # Recorded rather than raised: the teardown below has to run before
+        # anything is reported, and a refusal from it outranks whatever the run
+        # was already failing on.
+        failure = error
     finally:
-        _close(machine, pexpect, booted)
-        for number, handler in handlers.items():
-            signal.signal(number, handler)
-        _LIVE.clear()
+        # Stop every adopted console before restoring the handlers.
+        try:
+            stops = guest_process.finish_many(held, guest_process.SHUTDOWN_GRACE)
+        except BaseException as teardown:
+            if failure is None:
+                raise
+            raise teardown from failure
+        finally:
+            guest_process.restore_cancellation(handlers)
+    for stop in stops:
+        guest_process.require_stopped(stop, label, failure)
+    if failure is not None:
+        raise failure
+
+    # `stops` is in the order the consoles were adopted, and the last of them
+    # is the emulator `halt()` was asked to power off — an installer starts an
+    # earlier one, which anita stopped itself at the end of the install.
+    if halt_note is not None and stops and stops[-1].signals:
+        raise GuestFailure(
+            f"{target}: the guest was not asked to power itself off, because {halt_note}; "
+            f"it was stopped with {stops[-1].sent} instead and the receipt is complete")
 
     console = bytes(receipt.data)
     if status:
@@ -979,7 +1066,10 @@ def main() -> int:
             run_guest(args.target, args.artifact)
         else:
             print(prepare(GUESTS[args.target]))
-    except (GuestFailure, OSError) as error:
+    except guest_process.Cancelled as cancelled:
+        print(f"cross-netbsd: {cancelled}", file=sys.stderr)
+        return 128 + cancelled.signum
+    except (GuestFailure, RuntimeError, OSError) as error:
         print(f"cross-netbsd: {error}", file=sys.stderr)
         return 1
     return 0

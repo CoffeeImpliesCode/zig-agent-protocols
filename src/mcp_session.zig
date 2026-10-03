@@ -96,6 +96,16 @@ const Io = std.Io;
 /// because it is not about a result: it is a `params` the caller passed that
 /// cannot carry a `_meta` wrapper, which is a fault of the call rather than of
 /// anything a decoder read.
+///
+/// Three of these members name a caller buffer that was too small, and they
+/// are not the same repair. `error.BufferTooSmall` is this layer's own or the
+/// codec's: the `_meta` merge could not write into `params_out`, a classify
+/// could not unescape a key into the scratch, or an answer did not fit
+/// `result`. `error.EncodeBufferTooSmall` is the connection's, for a frame
+/// this call composed that does not fit `out`. `error.ResponseTooLarge` is
+/// the inbound direction: an answer that did not fit the region it was copied
+/// into. Every one of them is a caller-owned size, so none of them says
+/// anything about the peer.
 pub const Error = mcp.ResultError || error{
     /// The method is not part of the pinned revision, so it was not sent.
     ///
@@ -144,13 +154,52 @@ pub const Error = mcp.ResultError || error{
 } || conn.Error;
 
 /// A client bound to one revision.
+///
+/// Holds the connection every call goes out on, the revision every gate below
+/// is decided against, and a borrowed capability object. It allocates
+/// nothing, retains nothing past a call and releases nothing: the caller keeps
+/// the connection, the bytes `capabilities` borrows and every buffer it hands
+/// over, alive and unmodified for as long as this client is used.
+///
+/// Copying one copies the pointer and the pin, so both copies drive the same
+/// connection and both are pinned to the same revision. No field here is
+/// updated independently of its copy, so a copy needs no lock of its own; what
+/// a copy does need is the connection's own rule, which is that two tasks may
+/// call at once and that each call brings its own `out`, `result` and
+/// `params_out`.
 pub const Client = struct {
+    /// The connection every call goes out on. Borrowed: the caller owns it,
+    /// keeps it alive, and this client neither closes it nor re-initialises
+    /// it. The `std.Io` backend the connection borrows, and the reader and
+    /// writer it borrows from that, are the caller's too and must outlive this
+    /// client's use of them.
+    ///
+    /// A call blocks on this connection, so what a caller may do concurrently
+    /// is the connection's rule rather than this type's: two tasks may call at
+    /// once, and the handler a connection runs for an inbound request runs
+    /// inline on its reader task, where a call on the same connection
+    /// deadlocks.
     connection: *conn.Conn,
+    /// The revision every gate below is decided against. Set by `init` and
+    /// changed by nothing in this file, so a caller that needs another
+    /// revision builds another client rather than rewriting this field.
     revision: mcp.Revision,
-    /// The capabilities object sent in `_meta` at the current revision, or
-    /// null to send none. Borrowed; never copied.
+    /// The capabilities object spliced into the `_meta` of every request at
+    /// `2026-07-28`, or null to send none. Borrowed for the client's life and
+    /// read at every call rather than cached, so the bytes must stay alive and
+    /// unmodified for as long as this client is used. Ignored at `2025-11-25`,
+    /// which carries the capabilities in `initialize` instead.
     capabilities: ?[]const u8 = null,
-
+    /// A client that speaks `revision` over `connection`.
+    ///
+    /// `connection` is borrowed rather than owned, and neither it nor the
+    /// `std.Io` backend behind it is reached for here: nothing is allocated,
+    /// nothing is registered, and this cannot fail. The caller keeps all of it
+    /// alive for as long as the client is used.
+    ///
+    /// `capabilities` is left null, which sends no `_meta` wrapper at all. A
+    /// caller that wants one sets the field before its first call; setting it
+    /// afterwards does not change a request that has already gone out.
     pub fn init(connection: *conn.Conn, revision: mcp.Revision) Client {
         return .{ .connection = connection, .revision = revision };
     }
@@ -182,6 +231,32 @@ pub const Client = struct {
     /// spliced verbatim and the framer, not the codec, is what refuses a body
     /// that does not parse; this layer only walks a `params` it has to rewrite
     /// anyway, which is what makes that walk free to refuse a malformed one.
+    ///
+    /// The three output regions are the caller's and no two of them may share a
+    /// byte, and neither may share one with `params` or with
+    /// `Client.capabilities`: `params` and the capabilities are read into
+    /// `params_out` while `out` backs the merge and holds the frame, and
+    /// `result` is where the reader copies the answer. One region for two of
+    /// them is `error.OverlappingBuffers`, refused before anything is written
+    /// and before the connection is reached, because the fault it prevents is
+    /// a frame or an answer that is wrong rather than absent.
+    ///
+    /// Blocks until the peer answers, the transport fails, the connection
+    /// closes, or the calling task is cancelled. `error.Canceled` arrives
+    /// unchanged from the wait: the frame has gone out and its id is spent,
+    /// the pending slot has been given back, and the connection stays usable.
+    /// Whether to send the call again is the caller's policy and not something
+    /// this layer decides — the peer may have run the tool call before the
+    /// answer was abandoned, and a duplicate `tools/call` is not a free retry.
+    ///
+    /// `body` borrows `result` and is invalidated by the next call that writes
+    /// there. `error.BufferTooSmall` leaves `out` and `params_out` holding
+    /// prefixes of what was being composed — neither is a body and neither is
+    /// returned, so both are discarded and nothing was sent.
+    /// `error.ResponseTooLarge` is the inbound direction: the peer answered and
+    /// the answer did not fit, so `result` holds as much of it as fitted, no
+    /// body is returned, and asking again with a larger `result` sends the call
+    /// a second time.
     pub fn request(
         self: *Client,
         method: []const u8,
@@ -193,6 +268,23 @@ pub const Client = struct {
         // Checked before the wire, so a removed method is refused locally and a
         // notification never goes on the wire as a request.
         _ = try requestMethod(self.revision, method);
+        // Before anything is written, and through the one predicate the
+        // connection uses for its own regions. All five regions are live at
+        // once on a call this session wraps, and three of them are written
+        // while the other two are read: `params` and `capabilities` go into
+        // `params_out` while `out` backs the merge and holds the frame, and
+        // `result` is where the reader copies the answer. Two of them sharing
+        // a byte produces a frame or an answer that is wrong rather than
+        // absent, which is the one fault kind in this library that no tag
+        // would otherwise name.
+        const regions = [_][]const u8{
+            result,
+            out,
+            params_out,
+            params orelse "",
+            self.capabilities orelse "",
+        };
+        if (anyOverlap(&regions)) return error.OverlappingBuffers;
 
         const payload = if (self.capabilities) |caps| blk: {
             // At the previous revision the capabilities travel in `initialize`,
@@ -237,6 +329,16 @@ pub const Client = struct {
     /// they are sent. Nothing here checks that it parses — the framer is what
     /// refuses a body that does not, and the peer's decoder is what reads it.
     ///
+    /// `out` receives the frame and must not share a byte with `params`, which
+    /// the connection splices into it while it writes. One region for both is
+    /// `error.OverlappingBuffers`, refused before the connection is reached.
+    ///
+    /// Nothing here waits for an answer, so no `error.Canceled` is reachable
+    /// from this call and a peer that never replies costs it nothing. A writer
+    /// that refuses is `error.Transport` and marks the connection dead;
+    /// `error.Framing` leaves it usable, because those same bytes fail however
+    /// often they are sent.
+    ///
     /// No `_meta` is added, and there is no buffer to add it into. PROTOCOLS.md
     /// 4.8 makes the client capabilities a property of a request, and a
     /// notification is not one, so there is nothing here for the injection
@@ -249,6 +351,12 @@ pub const Client = struct {
         params: ?[]const u8,
         out: []u8,
     ) Error!void {
+        // The only pair live here: `params` is spliced into the frame the
+        // connection writes while this call is still reading it. Refused
+        // before the connection is reached, so the writer never sees bytes that
+        // moved under it.
+        const regions = [_][]const u8{ out, params orelse "" };
+        if (anyOverlap(&regions)) return error.OverlappingBuffers;
         _ = try notificationMethod(self.revision, method);
         return self.connection.notify(method, params, out);
     }
@@ -277,6 +385,25 @@ pub const Client = struct {
     /// The caller drives this rather than the library looping, because
     /// answering `input_required` needs input this layer has no business
     /// inventing.
+    ///
+    /// `answer_interim` is what answers the interim result: the members the
+    /// interim asked for, keyed as it asked for them. Null is
+    /// `error.InputRequiredUnexpected` rather than a retry carrying nothing,
+    /// because an exchange answered with no input is one the peer has to resolve
+    /// on its own and this layer has no business inventing the answer.
+    ///
+    /// Both legs are [`Client.request`] calls, so every region rule that method
+    /// states holds for both, and the check runs on each leg rather than once
+    /// for the exchange. The retry's params are `answer_interim` and not the
+    /// `params` the first leg read, so one region serving as `result` and as
+    /// `answer_interim` is refused on the second leg — after the first leg's
+    /// frame has gone out, which is why the regions a caller holds across an
+    /// exchange are the same five the first leg names.
+    ///
+    /// Two calls reach the wire on an `input_required` exchange and each blocks
+    /// for its own answer, so `error.Canceled` can arrive on either leg with
+    /// that leg's id already spent. Nothing is retained between the legs except
+    /// the three regions and the classifier's borrow of `params_out`.
     pub fn respond(
         self: *Client,
         method: []const u8,
@@ -326,13 +453,29 @@ pub const Client = struct {
 /// the same gate, so a name the client refuses to send is a name the server
 /// refuses to answer, and the two sides agree on what exists without
 /// exchanging a version to find out.
+///
+/// Like [`Client`] it allocates nothing, retains nothing past a call and
+/// releases nothing, and the caller keeps the connection, the capability
+/// object, the version list and every buffer alive for as long as the session
+/// is used. A copy shares all of that with the original: the two describe one
+/// server, and a field written through one is visible through the other.
+///
+/// Nothing here sends or waits. Every method either reads a request the caller
+/// decoded or writes an answer into a region the caller owns, so a server is
+/// not tied to a task — but the handler it is used from runs inline on the
+/// connection's reader task, and a handler that makes an outbound call on the
+/// same connection deadlocks, which is the connection's rule and not this
+/// type's.
 pub const Server = struct {
     /// The connection this server answers on.
     ///
-    /// Nothing here reads or writes through it. Every builder below returns
-    /// text the caller hands to that connection's handler, because the handler
-    /// holds the frame and the scratch. The field is here so a server is one
-    /// value with its connection, the way [`Client`] is.
+    /// Borrowed like [`Client.connection`]: the caller owns it and keeps it
+    /// alive, and nothing here reads or writes through it.
+    ///
+    /// Every builder below returns text the caller hands to that connection's
+    /// handler, because the handler holds the frame and the scratch. The field
+    /// is here so a server is one value with its connection, the way
+    /// [`Client`] is.
     ///
     /// There is no `notify` to go with it, and that is the reason rather than
     /// an oversight. PROTOCOLS.md 4.4 puts two of the server-to-client
@@ -345,24 +488,34 @@ pub const Server = struct {
     /// returns the frame itself, which is what a [`conn.Handler`] already
     /// answers with.
     connection: *conn.Conn,
+    /// The revision every gate below is decided against, and the revision the
+    /// session answers for whatever `supported_versions` advertises. Set by
+    /// `init`; nothing in this file changes it.
     revision: mcp.Revision,
     /// The capabilities object this server advertises in its `server/discover`
     /// result, or null to advertise none. Borrowed for the session's life and
-    /// never copied.
+    /// spliced verbatim into whatever body the caller builds, so the bytes must
+    /// stay alive and unmodified for as long as the session is used.
     capabilities: ?[]const u8 = null,
-    /// The revisions this server answers for. Borrowed for the session's life
-    /// and never copied, so a caller that assembles the list holds it for as
-    /// long as the session lives.
+    /// The revisions this server answers for, spliced into the same body.
+    /// Borrowed for the session's life and never copied, so a caller that
+    /// assembles the list holds it for as long as the session lives. Empty is
+    /// a valid value and writes `[]`; it does not make `discoverBody` refuse,
+    /// because the two caching values are the ones it refuses over.
     supported_versions: []const []const u8 = &.{},
     /// The freshness hint the `server/discover` result advertises, in
     /// milliseconds, or null when this server has not chosen one.
     ///
     /// PROTOCOLS.md 4.6 makes `ttlMs` required on a cacheable result and 4.4
-    /// marks `server/discover` one, so [`Server.discoverBody`] refuses without
-    /// it.
+    /// marks `server/discover` one, so [`Server.discoverBody`] refuses a
+    /// session that has none. Null is therefore not a value to send and not a
+    /// request to omit the member: it is a session that cannot answer
+    /// `server/discover` at all.
+    ///
     /// The type is `u64` because that is what [`mcp.decodeCacheable`] reads
     /// the field back as, and a negative count of milliseconds has no
-    /// representation there.
+    /// representation there. `0` is a value the specification has — a result
+    /// that is stale on arrival — and is written as `0` rather than refused.
     cache_ttl_ms: ?u64 = null,
     /// The caching scope the same result advertises, or null when this server
     /// has not chosen one.
@@ -370,8 +523,20 @@ pub const Server = struct {
     /// The tag is the wire spelling, so [`Server.discoverBody`] writes it with
     /// `@tagName` rather than keeping a second copy of the two literals
     /// [`mcp.parseCacheScope`] reads.
+    /// Null means what a null `cache_ttl_ms` means, and is refused the same
+    /// way: a cacheable result carries both members, so a session with neither
+    /// value has no body it is allowed to write, and neither field is
+    /// defaulted silently into a scope the caller never chose.
     cache_scope: ?mcp.CacheScope = null,
-
+    /// A server that answers `revision` requests on `connection`.
+    ///
+    /// `connection` is borrowed and must outlive the server; nothing here
+    /// reaches through it, and nothing here can fail. Every other field keeps
+    /// its default, which is a server that advertises nothing: no capabilities,
+    /// no versions and no caching values. That last pair is the one that bites,
+    /// because a cacheable result needs both and [`Server.discoverBody`]
+    /// refuses with `error.NotAResult` rather than write a body a peer would
+    /// refuse on arrival.
     pub fn init(connection: *conn.Conn, revision: mcp.Revision) Server {
         return .{ .connection = connection, .revision = revision };
     }
@@ -392,16 +557,24 @@ pub const Server = struct {
     }
 
     /// What one request told the server, decided in one pass over it.
+    ///
+    /// A value and nothing owned: every field is either a copy or a borrow of
+    /// the request the caller decoded, so an observation needs no release and
+    /// its borrows die with the frame they were read out of.
     pub const Observation = struct {
+        /// The revision the server is pinned to, and the entry that pin
+        /// resolved the request's method to. Both are values, and both are the
+        /// server's own rather than anything read off the wire.
         revision: mcp.Revision,
         info: mcp.MethodInfo,
         /// The capabilities object the client sent in `_meta`, as raw JSON
         /// text, or null when it sent none. PROTOCOLS.md 4.8 lets a client
         /// advertise nothing, so an absent member is a fact and not a fault.
         ///
-        /// The slice borrows `request.params` and copies nothing. `scratch`
-        /// backs the unescaping of a key alone, so the value never lands in
-        /// it.
+        /// The slice borrows `request.params` and copies nothing, so it dies
+        /// with the frame the request was decoded from. `scratch` backs the
+        /// unescaping of a key alone, so the value never lands in it and
+        /// nothing here keeps the region borrowed after the call.
         client_capabilities: ?[]const u8,
     };
 
@@ -418,6 +591,17 @@ pub const Server = struct {
     /// on that revision. A client at `2025-11-25` carries its capabilities in
     /// `initialize` instead, and this reports the absence rather than going
     /// after them.
+    ///
+    /// `scratch` must not share a byte with `request.params`, which is where
+    /// the result borrows from: it backs the unescaping of every key this walk
+    /// reads, and the escape offset a reader keeps is per reader rather than
+    /// per buffer, so one region for both writes each decoded name over the
+    /// bytes it was decoded from. One region for two is
+    /// `error.OverlappingBuffers`, refused before either member is read.
+    ///
+    /// Copies nothing and retains nothing: `client_capabilities` borrows
+    /// `request.params` and is invalidated when the caller writes there or
+    /// reuses that region, and `scratch` is free the moment this returns.
     pub fn observe(self: Server, request: jsonrpc.Request, scratch: []u8) Error!Observation {
         const info = try self.gate(request.method.text);
         var observation: Observation = .{
@@ -431,6 +615,14 @@ pub const Server = struct {
             // capabilities.
             else => return observation,
         };
+        // `scratch` backs the unescaping of every key this walk reads while the
+        // params are still being read, and the escape offset a reader keeps is
+        // per reader rather than per buffer, so one region for both writes each
+        // decoded name over the bytes it was decoded from. Refused through the
+        // connection's own predicate, before either member is read.
+        const regions = [_][]const u8{ params, scratch };
+        if (anyOverlap(&regions)) return error.OverlappingBuffers;
+
         const meta = json.memberText(params, "_meta", scratch) orelse return observation;
         observation.client_capabilities =
             json.memberText(meta, mcp.meta_key.client_capabilities, scratch);
@@ -449,7 +641,21 @@ pub const Server = struct {
     /// here is [`conn.Error`], which has no member for "you asked me to refuse
     /// a method I do have", so a check on the revision would have nowhere to
     /// report itself. [`Server.gate`] is where the revision is read.
+    ///
+    /// `out` receives the frame, and one region of the request must stay clear
+    /// of it: the id. An integer id is a value and nothing is read beside it,
+    /// but `jsonrpc.Id` also has a string arm, and that arm borrows the frame or
+    /// the region the transport decoded it from. The connection writes the
+    /// envelope's opening bytes into `out` and echoes the id afterwards, so a
+    /// string id sharing a byte with `out` is echoed from bytes the writer has
+    /// already moved. One such overlap is `error.OverlappingBuffers`, refused
+    /// before a byte is written; everything else about the request — the method
+    /// name, the params — is not read by this frame and imposes nothing.
+    ///
+    /// `error.EncodeBufferTooSmall` leaves `out` holding a prefix rather than a
+    /// frame, and nothing is sent. The result borrows `out`.
     pub fn methodNotFound(request: jsonrpc.Request, out: []u8) conn.Error![]const u8 {
+        if (idOverlaps(request.id, out)) return error.OverlappingBuffers;
         return conn.methodNotFound(request, out);
     }
 
@@ -472,11 +678,32 @@ pub const Server = struct {
     /// member present with no object in it. That is not the same as leaving
     /// the member out, and a caller reading the difference with
     /// [`json.memberText`] is right to.
+    ///
+    /// `out` must not share a byte with `capabilities`, with any entry of
+    /// `supported_versions`, or with `instructions`: the body quotes all three
+    /// while it is written into `out`. One region for two of them is
+    /// `error.OverlappingBuffers`, refused before a byte is written, as the two
+    /// caching refusals above are.
+    ///
+    /// The result borrows `out` and is invalidated by the next write to it.
+    /// `error.BufferTooSmall` leaves `out` holding a prefix of the body — not a
+    /// body, and nothing is sent — so it is discarded and the call repeated
+    /// with a region that fits.
     pub fn discoverBody(self: Server, instructions: ?[]const u8, out: []u8) Error![]const u8 {
         // Refused before a byte is written, so a server that cannot answer
         // `server/discover` learns so without a frame half-built in `out`.
         const ttl_ms = self.cache_ttl_ms orelse return error.NotAResult;
         const cache_scope = self.cache_scope orelse return error.NotAResult;
+        // The body quotes the session's own capability object and version list
+        // while it is written into `out`, so one region for both composes the
+        // body over the text it is quoting and the peer decodes a member the
+        // caller never wrote. Checked before a byte is written, and against
+        // the connection's own predicate.
+        if (conn.overlaps(out, self.capabilities orelse "")) return error.OverlappingBuffers;
+        if (conn.overlaps(out, instructions orelse "")) return error.OverlappingBuffers;
+        for (self.supported_versions) |version| {
+            if (conn.overlaps(out, version)) return error.OverlappingBuffers;
+        }
         var writer = json.Writer.init(out);
         writer.slice("{\"resultType\":\"" ++ mcp.result_type_value.complete ++
             "\",\"ttlMs\":") catch return error.BufferTooSmall;
@@ -749,6 +976,36 @@ fn readFailure(err: root.DecodeError) root.EncodeError {
     return switch (err) {
         error.BufferTooSmall => error.BufferTooSmall,
         else => error.InvalidField,
+    };
+}
+/// Whether any two of `regions` share a byte.
+///
+/// [`conn.overlaps`] answers one pair, and every buffer rule on this file's
+/// public methods has more than two regions to compare. A caller that checks
+/// the pairs its author remembered leaves the rest with no diagnostic and with
+/// an answer that is wrong rather than absent, which is the one fault kind in
+/// this library that no tag names.
+fn anyOverlap(regions: []const []const u8) bool {
+    for (regions, 0..) |region, at| {
+        for (regions[at + 1 ..]) |other| {
+            if (conn.overlaps(region, other)) return true;
+        }
+    }
+    return false;
+}
+
+/// Whether `id` borrows a byte of the region a frame is written into.
+///
+/// [`jsonrpc.Id`] has two arms and they are not alike here. An integer id is a
+/// value, so a frame may echo it from anywhere. A string id borrows the frame
+/// or the region the transport decoded it from, and every builder that echoes
+/// one writes the envelope's opening bytes before reading it back — so an id
+/// inside the output region is echoed from bytes the writer has already moved,
+/// and the peer reads a punctuation mark where its own id should be.
+fn idOverlaps(id: jsonrpc.Id, out: []const u8) bool {
+    return switch (id) {
+        .integer => false,
+        .string => |text| conn.overlaps(text, out),
     };
 }
 
@@ -1141,6 +1398,108 @@ test "a request whose params are not an object never reaches the wire" {
         error.NotAnObject,
         client.request("tools/list", "{]}", &result, &out, &params_out),
     );
+}
+test "a request whose regions share a byte is refused before the wire" {
+    // The connection is `undefined` on purpose: the refusal has to happen
+    // before the session reaches it, so a caller that got past it would fault
+    // here rather than send a frame composed over the values the frame is
+    // built from.
+    var client: Client = .{ .connection = undefined, .revision = .current };
+    client.capabilities = "{\"tools\":{}}";
+    var result: [512]u8 = undefined;
+    var out: [512]u8 = undefined;
+    var params_out: [512]u8 = undefined;
+
+    // `out` is the frame and the scratch the `_meta` merge unescapes member
+    // names with, so a wrapper written into it lands on the names the walk is
+    // still reading: the params the peer decodes are not the params the caller
+    // wrote, and nothing says so.
+    try testing.expectError(
+        error.OverlappingBuffers,
+        client.request("tools/list", null, &result, &out, out[0..256]),
+    );
+    // The frame and the answer are one region: the connection writes the
+    // request while the reader copies the response in.
+    try testing.expectError(
+        error.OverlappingBuffers,
+        client.request("tools/list", null, &result, &result, &params_out),
+    );
+    // The caller's own params inside the frame, which is what a caller that
+    // composes in place does without noticing.
+    const params = "{\"name\":\"echo\"}";
+    @memcpy(out[0..params.len], params);
+    try testing.expectError(
+        error.OverlappingBuffers,
+        client.request("tools/list", out[0..params.len], &result, &out, &params_out),
+    );
+    // The capabilities inside the frame: they are spliced into the `_meta`
+    // wrapper while the frame is written.
+    const caps = "{\"tools\":{}}";
+    @memcpy(out[0..caps.len], caps);
+    client.capabilities = out[0..caps.len];
+    try testing.expectError(
+        error.OverlappingBuffers,
+        client.request("tools/list", null, &result, &out, &params_out),
+    );
+}
+
+test "a notification whose params share the frame is refused before the wire" {
+    // The connection is `undefined` for the reason the test above gives. A
+    // notification has no answer to be corrupted and no wrapper to be written,
+    // so the only pair left is the params the connection splices while it
+    // encodes the frame.
+    var client: Client = .{ .connection = undefined, .revision = .current };
+    var out: [256]u8 = undefined;
+    @memcpy(out[0..14], "{\"requestId\":0");
+    try testing.expectError(
+        error.OverlappingBuffers,
+        client.notify("notifications/cancelled", out[0..14], &out),
+    );
+}
+
+test "a server half whose scratch shares the request is refused" {
+    // `observe` unescapes the member names of `request.params` into `scratch`
+    // while the params are still being read, so one region for both is the
+    // hazard the connection refuses in its own regions, reached here through a
+    // public entry point rather than through `Conn.init`.
+    var server: Server = .{ .connection = undefined, .revision = .current };
+    var params: [256]u8 = undefined;
+    const body = "{\"_meta\":{\"io.modelcontextprotocol/x\":1}}";
+    @memcpy(params[0..body.len], body);
+    const request: jsonrpc.Request = .{
+        .id = .{ .integer = 1 },
+        .method = jsonrpc.Method.split("tools/list"),
+        .params = .{ .value = params[0..body.len] },
+    };
+    try testing.expectError(
+        error.OverlappingBuffers,
+        server.observe(request, params[0..params.len]),
+    );
+}
+
+test "a discover body that shares a region with its own members is refused" {
+    // The body quotes the session's own capability object and version list,
+    // so a region the session borrows inside the one the body is written into
+    // is a body assembled over the text it is quoting.
+    var server: Server = .{ .connection = undefined, .revision = .current };
+    server.cache_ttl_ms = 30_000;
+    server.cache_scope = .private;
+    var out: [512]u8 = undefined;
+    const caps = "{\"tools\":{}}";
+    @memcpy(out[0..caps.len], caps);
+    server.capabilities = out[0..caps.len];
+    try testing.expectError(error.OverlappingBuffers, server.discoverBody(null, &out));
+
+    // The same for the caller's own instructions, and for the version list the
+    // session borrows.
+    var plain: Server = .{ .connection = undefined, .revision = .current };
+    plain.cache_ttl_ms = 30_000;
+    plain.cache_scope = .private;
+    try testing.expectError(error.OverlappingBuffers, plain.discoverBody(out[0..4], &out));
+    const version = "2026-07-28";
+    @memcpy(out[0..version.len], version);
+    plain.supported_versions = &.{out[0..version.len]};
+    try testing.expectError(error.OverlappingBuffers, plain.discoverBody(null, &out));
 }
 
 test "a _meta wrapper that does not fit is reported before the wire" {
@@ -1581,19 +1940,25 @@ const Endpoint = struct {
     reader: Io.net.Stream.Reader = undefined,
     // SAFETY: `open` assigns it before it lends `writer.interface` to `Conn.init`.
     writer: Io.net.Stream.Writer = undefined,
-    // SAFETY: `open` assigns it before the pump and `hangUp` that read the descriptor.
-    stream: Io.net.Stream = undefined,
-    // SAFETY: `open` assigns it before it sets `pumping`, and only a pumping endpoint reads it.
+    /// The descriptor this endpoint owns, and the proof that it owns one.
+    ///
+    /// `open` stores the stream before it can refuse, so a caller that gives up
+    /// on a refused `open` still holds the descriptor it has to release, and
+    /// `release` stores `null` before it closes, so a second release closes
+    /// nothing rather than an unrelated descriptor this process opened in the
+    /// meantime. An option rather than an `undefined` field because the owner
+    /// releases every endpoint after the join, and one whose `open` never ran
+    /// owns no descriptor at all.
+    stream: ?Io.net.Stream = null,
+    // SAFETY: `open` assigns it before it sets `connected`, and only a connected endpoint reads it.
     connection: conn.Conn = undefined,
+    /// Whether `open` built a connection over `stream`, which it sets once
+    /// `conn.Conn.init` hands one back. A hang-up reads the connection through
+    /// it, so a refused `init` leaves the field alone rather than calling into
+    /// a `Conn` that was never initialised.
+    connected: bool = false,
     /// Whether this endpoint has been hung up already.
     closed: bool = false,
-    /// Whether a task reads this endpoint, which [`open`] sets.
-    ///
-    /// It decides who releases the descriptor: the pump, because it is the only
-    /// task that reads it, whenever there is one. See [`hangUp`].
-    pumping: bool = false,
-    /// Whether the descriptor has been released.
-    released: bool = false,
 
     /// Hand the endpoint its connection, or the reason it cannot have one.
     ///
@@ -1601,6 +1966,10 @@ const Endpoint = struct {
     /// and the peer never shows them: the connection runs and the answers it
     /// writes are wrong. `conn.Conn.init` refuses both before it touches the
     /// slot table, so a refused endpoint leaves `side` as it was handed over.
+    ///
+    /// The stream is stored first, so a refusal leaves the descriptor with this
+    /// endpoint and the owner releases it after the join with every other one,
+    /// rather than to a task that is not there to release it.
     fn open(
         self: *Endpoint,
         io: Io,
@@ -1617,83 +1986,80 @@ const Endpoint = struct {
             .decode_scratch = &self.side.decode_scratch,
             .answer = &self.side.answer,
         });
+        self.connected = true;
         if (handler) |h| self.connection.setHandler(h);
-        // A blocking reader needs concurrency; `async` may run it inline.
-        // Publish ownership before spawning, but give it back on refusal.
-        self.pumping = true;
-        group.concurrent(io, pump, .{self}) catch |err| {
-            self.pumping = false;
-            return err;
-        };
+        // A blocking reader needs concurrency; `async` may run it inline. A
+        // refused spawn leaves the descriptor with this endpoint and no reader
+        // on it, which the owner releases like any other one: `hangUp` shuts it
+        // down so the peer is not left on a socket nobody will answer, and this
+        // endpoint's join is on the group the caller is already awaiting.
+        try group.concurrent(io, pump, .{self});
     }
 
-    /// Hang up: stop the reader, wake it, and let the descriptor go once.
+    /// Hang up: tell the reader to stop, wake it, and leave the descriptor to
+    /// the owner.
     ///
-    /// `shutdown` before `close`: closing a descriptor does not interrupt a read
-    /// already blocked on it, so the peer's pump would sit on an open
-    /// description and the group would never finish.
+    /// `shutdown` before anything else, and no `close` here at all. Closing a
+    /// descriptor does not interrupt a read already blocked on it, so a hang-up
+    /// that only closed would leave the pump sitting on an open description and
+    /// the group would never finish; `shutdown` is what makes the next read
+    /// return zero bytes and the loop leave.
     ///
-    /// The pump releases the descriptor, not this call, and it is the only task
-    /// that may. `conn.pump` asks again after a read of zero bytes, and a local
-    /// `shutdown` makes the next read return exactly that, so a caller that
-    /// released the descriptor under a live pump would have that pump read a
-    /// freed descriptor: the standard library aborts on `EBADF` inside
-    /// `netReadPosix`, before the pump's own `catch` can see an error, and the
-    /// whole test binary dies instead of the test failing. Telling the
-    /// connection first is what makes the loop stop — the pump leaves at its
-    /// next turn and closes the stream on its way out, after the last read that
-    /// can touch it.
+    /// The pump is not the only task on this socket, and never was.
+    /// [`Calling.run`] writes every request on it from a task of its own, and a
+    /// handler answers on the very task that is reading. A reader that released
+    /// the descriptor on its way out would take it away from a write in flight,
+    /// and the standard library aborts the process on the `EBADF` that follows
+    /// rather than returning an error the pump's own `catch` could see.
+    /// [`release`] is the owner's, and runs once every task has joined.
     ///
-    /// The guards are what make the several callers safe: each of the seven
-    /// exits from an exchange can reach this on a path another one already
-    /// took, and the pump reaches it on the way out of every one of them.
-    /// Releasing the same descriptor twice would close an unrelated one that
-    /// the process had opened in the meantime, and every call below is a
-    /// syscall on it.
+    /// Best effort, and nothing is lost by it: the reader has already been told
+    /// to stop, and a `shutdown` that cannot be sent means the peer is already
+    /// gone, which is the case this runs in. This call returns nothing and its
+    /// caller is a task, so a failure has nowhere to propagate.
     fn hangUp(self: *Endpoint, io: Io) void {
         if (self.closed) return;
         self.closed = true;
-        if (self.released) return;
-        if (self.pumping) {
-            self.connection.close();
-            // Shutting a descriptor down while the pump still drains it is
-            // best effort and its outcome is not reported: every failure here
-            // is one the close the pump performs on its way out reports the
-            // same way, and a peer that hung up first must not turn this
-            // teardown into a second fault.
-            // gate-reviewed-zlint-next-statement: suppressed-errors
-            // ziglint-ignore: Z026
-            // zwanzig-disable-next-line: empty-catch-engine
-            self.stream.shutdown(io, .both) catch {};
-            return;
-        }
-        self.release(io);
-    }
-
-    /// Release the descriptor once, and only on a stream that still has one.
-    fn release(self: *Endpoint, io: Io) void {
-        if (self.released) return;
-        self.released = true;
-        // The same best-effort shutdown `hangUp` documents, for the same
-        // reason: the close below owns the descriptor's last word, and no
-        // failure of this one changes what it does or what the caller learns.
+        const stream = self.stream orelse return;
+        if (self.connected) self.connection.close();
         // gate-reviewed-zlint-next-statement: suppressed-errors
         // ziglint-ignore: Z026
         // zwanzig-disable-next-line: empty-catch-engine
-        self.stream.shutdown(io, .both) catch {};
-        self.stream.close(io);
+        stream.shutdown(io, .both) catch {};
+    }
+
+    /// Release the descriptor once, and only on a stream this endpoint still
+    /// owns.
+    ///
+    /// The owner calls this after the group has been joined or cancelled, never
+    /// before and never from a task a live reader runs beside. By then every
+    /// task that could read or write the socket has returned, and the two
+    /// syscalls below are the last any of them will see of it.
+    ///
+    /// `shutdown` before `close`, and best effort before both. Nothing is
+    /// blocked on the descriptor any more, so the shutdown only tells the peer
+    /// the exchange is over; the close releases the number whether or not that
+    /// reached it.
+    fn release(self: *Endpoint, io: Io) void {
+        const stream = self.stream orelse return;
+        self.stream = null;
+        // gate-reviewed-zlint-next-statement: suppressed-errors
+        // ziglint-ignore: Z026
+        // zwanzig-disable-next-line: empty-catch-engine
+        stream.shutdown(io, .both) catch {};
+        stream.close(io);
     }
 };
 
-/// Drive the connection, then release the descriptor it drained.
+/// Drive the connection until it is told to stop, and stop there.
 ///
-/// The pump takes the endpoint rather than the connection because it is the one
-/// task that reads the descriptor and therefore the one that closes it: a
-/// caller that closed it first would have this loop read a freed descriptor and
-/// the process would abort inside the read.
+/// It takes the endpoint rather than the connection because that is what
+/// `open` spawns it with, and because what it does *not* do is the point: the
+/// descriptor is the owner's to release. This task is the only one that reads
+/// the stream, but it is not the only one that uses it, so it leaves the
+/// release to an owner that has joined this task and every other one first.
 fn pump(self: *Endpoint) void {
     self.connection.pump();
-    self.release(self.connection.io);
 }
 
 /// A listening Unix socket, with the address that reaches it.
@@ -2238,8 +2604,17 @@ test "a peer error is a failure and an interim result is never the final one" {
     // The group's own failure is the test's, not a third party's to swallow:
     // a cancellation here means a task stopped before this test could read
     // what it recorded, and every assertion below would read a half-finished
-    // exchange as the outcome it was written to prove.
-    try group.await(io);
+    // exchange as the outcome it was written to prove. It is reported after the
+    // releases rather than returned from the join, because this owner is the
+    // only task that may close either descriptor and it has to reach the join
+    // to know the readers are gone.
+    const joined = group.await(io);
+    // Every task has returned, so both endpoints may let go of their streams.
+    // A release before this point would take a socket away from a pump still
+    // reading it or a caller still writing its next request on it.
+    peer_endpoint.release(io);
+    client_endpoint.release(io);
+    try joined;
 
     try testing.expect(!exchange.failed);
 

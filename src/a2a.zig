@@ -79,8 +79,8 @@
 //! encodings. `TaskStatus.timestamp` and
 //! `ListTasksRequest.status_timestamp_after` are already the ISO-8601 text a
 //! peer sent, so there is no `Timestamp` to convert and re-formatting one would
-//! break the round trip the contract requires: re-encoding has to put back the
-//! peer's bytes, and a normalised spelling is not those bytes. Every
+//! change the value a re-encode writes: a normalised spelling is a spelling
+//! this library chose, not the one the peer sent. Every
 //! `metadata`, every `PartContent.data`, every `AgentExtension.params` and
 //! every `AgentCardSignature.header` is already the borrowed JSON lexeme, read
 //! with `reader.rawValue`, which is what `bridge.Envelope.meta` does and why
@@ -107,6 +107,85 @@
 //! so `u8` is a narrowing this library chose, not a transcription. It is sound
 //! because no value exceeds 8, and a tag above the declared range is
 //! `error.UnknownTag` rather than a silent fallback to `unspecified`.
+//! ## What a caller has to hold
+//!
+//! Nothing here owns memory and nothing allocates. Every decoded value is a
+//! set of slices into buffers the caller names, and a decoder says which:
+//!
+//!   - **text members** come out of `raw` or `scratch`, and which one depends on
+//!     the bytes: `json.Reader.string` returns a member with no escape sequence
+//!     as a sub-slice of `raw`, and copies one that has an escape into the
+//!     unread tail of `scratch`. Two strings with escapes therefore never
+//!     alias, and a document with no escapes at all costs no scratch.
+//!   - **opaque JSON** — every `metadata`, every `PartContent.data`, every
+//!     `AgentExtension.params`, every `AgentCardSignature.header` — is a slice
+//!     of `raw`, the document the caller passed in. It is the peer's own
+//!     lexeme, so it costs no scratch however deeply it nests. An encoder reads
+//!     one back before splicing it and refuses anything that is not exactly one
+//!     JSON value at the depth the field is actually written at, so
+//!     `json.max_depth` is spent the way the matching decoder spends it.
+//!   - **element slices and decoded `Part.raw` bytes** are runs of an array the
+//!     caller passed: the out array of a page decoder, or one array of
+//!     [`ContentArena`] or [`CardArena`].
+//!
+//! A decoded value is therefore live exactly as long as `raw`, `scratch` and
+//! that array are. Every public decoder resets its arena before it reads, so
+//! one arena serves one document at a time and the next decode writes the
+//! second document over the first one's storage: the slices a previous call
+//! returned still point into the same memory, and what they name is about to
+//! change. Holding a decoded message across a second decode into the same arena
+//! holds the second document's values.
+//!
+//! ## The round trip
+//!
+//! Decoding is total: every path returns `root.DecodeError` and no peer's byte
+//! reaches `unreachable`. Encoding is the inverse in value, not in bytes.
+//! `decode(encode(x)) == x` for every value an encoder accepts, and
+//! `encode(decode(b))` is a stable encoding of the same values: members in
+//! field-number order, one member name each, no whitespace, strings escaped by
+//! one rule. It is not a byte-for-byte reproduction of `b`. Member order,
+//! whitespace and escape spelling are the encoder's own, and a member no field
+//! of a message carries is skipped by the decoder and so absent from the
+//! re-encode.
+//!
+//! An encoder accepts a value only when the matching decoder could have returned
+//! it. Every such value is walked whole before the first byte is written, so a
+//! refusal is `error.InvalidField`, `error.UnknownTag` or
+//! `error.BufferTooSmall` with the caller's buffer untouched.
+//!
+//! That is why a member the wire may omit is a presence here and never a scalar
+//! carrying that member's default: `{"required":false}` and `{}` are two
+//! documents, and one `false` can write neither of them back.
+//!
+//! ## Caller obligations
+//!
+//! - **An opaque lexeme is spliced verbatim, so it is checked first.** Every
+//!   encoder writes a raw JSON field with `json.Writer.slice`, and each one
+//!   reads the value back with the decoder's own reader before it writes, at the
+//!   container depth the field is written at — a task's `metadata` on a page is
+//!   three containers down, a part's `data` under a streamed message is six. A
+//!   lexeme that is not exactly one JSON value there is `error.InvalidField`,
+//!   and the caller's buffer is untouched. What the check does not do is read
+//!   the value, so a key this library does not model still reaches the wire with
+//!   its own spelling.
+//! - **Text must be valid UTF-8.** Every encoder writes a text member with
+//!   `json.Writer.string`, which escapes the bytes the JSON grammar forbids and
+//!   passes every other byte through without checking it. A `[]const u8` that
+//!   is not valid UTF-8 therefore produces a document the matching decoder
+//!   refuses with `error.InvalidUtf8`, and nothing enforces the precondition in
+//!   any optimize mode: neither Debug nor ReleaseSafe diagnoses it.
+//! - **Page size is application policy.** [`page_size_default`] is the cap a
+//!   peer applies to the page it sends, and [`isValidPageSize`] is a range check
+//!   a caller may apply to a page size it received. No decoder substitutes the
+//!   default for an absent `pageSize` and no decoder refuses one outside the
+//!   range, so `ListTasksRequest.page_size` stays null for a request that sent
+//!   no member.
+//!
+//! ## What this module does not do
+//!
+//! It decodes and encodes documents. It opens no socket, keeps no connection,
+//! owns no allocator and reads no global state; the transport and the binding
+//! that carries these documents over HTTP live above this module.
 
 const std = @import("std");
 const root = @import("root.zig");
@@ -165,6 +244,10 @@ pub const binding = struct {
     pub const http_json = "HTTP+JSON";
 };
 
+/// The three core binding identifiers, in the order `binding` declares them.
+///
+/// Static text, so a caller may iterate it at comptime or hold the slices for
+/// as long as it likes; nothing here borrows a decoder's buffer.
 pub const core_bindings = [_][]const u8{
     binding.jsonrpc,
     binding.grpc,
@@ -178,6 +261,13 @@ pub const Version = struct {
     major: u16,
     minor: u16,
 
+    /// Write `self` as `Major.Minor`, the only form `A2A-Version` may carry and
+    /// the only form a card version may carry either.
+    ///
+    /// The result borrows `buffer` and is invalidated the next time the caller
+    /// writes it or releases it. `error.BufferTooSmall` when the two components
+    /// do not fit, and eleven bytes is enough for the widest `u16` pair, so a
+    /// caller sizing from that never meets the tag. Allocates nothing.
     pub fn format(self: Version, buffer: []u8) EncodeError![]const u8 {
         const text = std.fmt.bufPrint(buffer, "{d}.{d}", .{
             self.major,
@@ -310,6 +400,11 @@ pub fn isTerminal(state: TaskState) bool {
     return false;
 }
 
+/// Whether a state is one of the two that hand the turn back to a client.
+///
+/// The counterpart of [`isTerminal`]. A task in either state is not finished,
+/// so `SubscribeToTask` and a further message both accept it where a terminal
+/// state is refused with `UnsupportedOperationError`.
 pub fn isInterrupted(state: TaskState) bool {
     for (interrupted_states) |interrupted| {
         if (interrupted == state) return true;
@@ -323,6 +418,10 @@ pub const Role = enum(u8) {
     user = 1,
     agent = 2,
 
+    /// The ProtoJSON spelling, which is the full proto enum name.
+    ///
+    /// Static text rather than a slice of the document it was read from, so it
+    /// outlives every decode that produced it.
     pub fn wireName(self: Role) []const u8 {
         return switch (self) {
             .unspecified => "ROLE_UNSPECIFIED",
@@ -331,6 +430,11 @@ pub const Role = enum(u8) {
         };
     }
 
+    /// Parse a ProtoJSON enum value, the counterpart of `wireName`.
+    ///
+    /// Only the wire spelling matches, for the reason
+    /// [`TaskState.fromWireName`] gives: `error.UnknownTag` for the Zig field
+    /// name `user`, and never a fallback to `unspecified`.
     pub fn parse(text: []const u8) DecodeError!Role {
         inline for (@typeInfo(Role).@"enum".fields) |field| {
             const value: Role = @field(Role, field.name);
@@ -434,7 +538,7 @@ fn numberAfterLeadingOneof(comptime T: type) u32 {
         else => return 0,
     };
     if (oneof.tag_type == null) return 0;
-    return @intCast(oneof.fields.len + 1);
+    return oneof.fields.len + 1;
 }
 
 /// Assert that `T`'s `fields` table agrees with `T`'s own fields.
@@ -592,8 +696,8 @@ pub const Task = struct {
     /// 4.
     ///
     /// A `[]const Artifact = &.{}` default would make `"artifacts":[]` and no
-    /// `artifacts` the same value, and an encoder could then not put back the
-    /// bytes of the one the peer did not write. Null is the absent list and a
+    /// `artifacts` the same value, and an encoder could then not tell which of
+    /// the two documents to write back. Null is the absent list and a
     /// zero-length slice is the empty one, and the two are told apart.
     artifacts: ?[]const Artifact = null,
     /// 5. Soft-deprecated in favour of a timeline, retained through 1.x.
@@ -1045,6 +1149,19 @@ comptime {
     assertFieldTable(GetTaskRequest);
 }
 
+/// The `ListTasks` RPC's request, field numbers 1 to 8.
+///
+/// No member is REQUIRED, so `{}` is a complete request: the first page of
+/// everything the tenant holds. Every member the wire may omit is a presence
+/// rather than a scalar carrying its default, so an absent member and a
+/// present one holding that default stay two documents and each re-encodes as
+/// itself; `tenant` is `?[]const u8` for that reason and not for any of its
+/// own. No codec substitutes a page size for an absent `pageSize`, and none
+/// refuses one outside the stated range.
+///
+/// Owns nothing. Every slice is the `raw` document or the `scratch` buffer
+/// `decodeListTasksRequest` was given, so the value is live exactly as long as
+/// those two are and a copy names the same bytes rather than a second copy.
 pub const ListTasksRequest = struct {
     /// 1.
     tenant: ?[]const u8 = null,
@@ -1055,12 +1172,14 @@ pub const ListTasksRequest = struct {
     ///
     /// The proto gives `TaskState` an implicit presence, so `unspecified` and
     /// an absent member are the same value on the wire and `fromTag` says so.
-    /// They are two documents though, and the encoder has to put back the one
+    /// They are two documents though, and the encoder has to write back the one
     /// that arrived: a peer that wrote `"status":"TASK_STATE_UNSPECIFIED"` is a
     /// peer that filtered, and a re-encode that drops the member changes what
     /// it asked for. See the codec section's note on presence.
     status: ?TaskState = null,
-    /// 4. If present, 1 to 100 inclusive; see `isValidPageSize`.
+    /// 4. If present, 1 to 100 inclusive. No codec checks it: an out-of-range
+    /// value decodes and re-encodes as itself, and [`isValidPageSize`] is where
+    /// a caller applies the range.
     page_size: ?i32 = null,
     /// 5.
     page_token: ?[]const u8 = null,
@@ -1068,9 +1187,9 @@ pub const ListTasksRequest = struct {
     history_length: ?i32 = null,
     /// 7. ISO-8601 UTC in ProtoJSON, carried as the text the peer wrote.
     ///
-    /// There is no `Timestamp` to convert and none is wanted. Re-encoding has
-    /// to put back the peer's bytes, and a normalised spelling of the same
-    /// instant is not those bytes.
+    /// There is no `Timestamp` to convert and none is wanted. Re-encoding writes
+    /// the text back as it arrived, because a normalised spelling of the same
+    /// instant would be a spelling this library chose.
     status_timestamp_after: ?[]const u8 = null,
     /// 8. Explicit presence; absent defaults to false.
     include_artifacts: ?bool = null,
@@ -1092,6 +1211,19 @@ comptime {
     assertFieldTable(ListTasksRequest);
 }
 
+/// The `ListTasks` RPC's response page, field numbers 1 to 4.
+///
+/// All four members are REQUIRED and none may be invented, so a page that omits
+/// one is `error.MissingField`. `tasks` may be empty, because an empty page is
+/// a page and its absence is the case that is refused. `next_page_token` is
+/// the empty string on the last page, which [`hasNextPage`] reads, and
+/// `page_size` and `total_size` are plain `int32`s at the width ProtoJSON
+/// spells.
+///
+/// `tasks` is a run of the caller's own array rather than of an arena, and
+/// every task in it reaches the arena the caller sized beside it. Copying the
+/// page copies the slice, not the tasks, so both copies name one array and the
+/// next decode into it overwrites what they name.
 pub const ListTasksResponse = struct {
     /// 1. Required, but may be empty.
     tasks: []const Task,
@@ -1115,6 +1247,17 @@ comptime {
     assertFieldTable(ListTasksResponse);
 }
 
+/// The `CancelTask` RPC's request, field numbers 1 to 3.
+///
+/// `id` is the only REQUIRED member and an empty one is `error.InvalidField` on
+/// both sides, because an empty task id is not a task. `metadata` is a
+/// `google.protobuf.Struct` carried as the peer's own lexeme, so it is a slice
+/// of `raw` rather than of `scratch`. An encoder splices it back verbatim after
+/// reading it back with the decoder's own reader, so a value that is not one
+/// complete JSON value is `error.InvalidField` and nothing is written.
+///
+/// Owns nothing: `tenant` and `id` borrow `raw` or `scratch`, `metadata`
+/// borrows `raw`, and a copy names the same bytes rather than a second copy.
 pub const CancelTaskRequest = struct {
     /// 1.
     tenant: ?[]const u8 = null,
@@ -1135,6 +1278,11 @@ comptime {
     assertFieldTable(CancelTaskRequest);
 }
 
+/// The `SubscribeToTask` RPC's request, field numbers 1 to 2.
+///
+/// `id` is the only REQUIRED member, so `{}` is `error.MissingField` and an
+/// empty `id` is `error.InvalidField`. Owns nothing: both slices borrow `raw` or
+/// `scratch` and a copy names the same bytes.
 pub const SubscribeToTaskRequest = struct {
     /// 1.
     tenant: ?[]const u8 = null,
@@ -1152,6 +1300,13 @@ comptime {
     assertFieldTable(SubscribeToTaskRequest);
 }
 
+/// The `GetTaskPushNotificationConfig` RPC's request, field numbers 1 to 3.
+///
+/// `task_id` and `id` are both REQUIRED and both name something: the task a
+/// config belongs to, and the config within it. Either empty is
+/// `error.InvalidField`, and the absence of either member is
+/// `error.MissingField`. Owns nothing: all three slices borrow `raw` or
+/// `scratch` and a copy names the same bytes.
 pub const GetTaskPushNotificationConfigRequest = struct {
     /// 1.
     tenant: ?[]const u8 = null,
@@ -1172,6 +1327,12 @@ comptime {
     assertFieldTable(GetTaskPushNotificationConfigRequest);
 }
 
+/// The `DeleteTaskPushNotificationConfig` RPC's request, field numbers 1 to 3.
+///
+/// The same shape and the same refusals as
+/// [`GetTaskPushNotificationConfigRequest`]: both ids are REQUIRED, both name
+/// something, and the response this RPC answers with is [`Empty`] rather than a
+/// configuration. Owns nothing: all three slices borrow `raw` or `scratch`.
 pub const DeleteTaskPushNotificationConfigRequest = struct {
     /// 1.
     tenant: ?[]const u8 = null,
@@ -1219,6 +1380,18 @@ comptime {
     assertFieldTable(ListTaskPushNotificationConfigsRequest);
 }
 
+/// The `ListTaskPushNotificationConfigs` RPC's response page, field numbers 1
+/// to 2.
+///
+/// Neither member is REQUIRED, so `{}` is a page that mentioned neither, and
+/// each is a presence the encoder writes back as itself. `configs` is null for
+/// a page that never named the list and a zero-length slice for `[]`;
+/// `next_page_token` is null for a page that never named a token and `""` for
+/// the last page.
+///
+/// `configs` is a run of the caller's own array and every string in it borrows
+/// `raw` or `scratch`. Nothing under a configuration is arena storage, which is
+/// why this decode takes no arena. A copy shares that run rather than owning it.
 pub const ListTaskPushNotificationConfigsResponse = struct {
     /// 1. Not REQUIRED, so it is a presence: an empty list and no list are two
     /// documents, and this field being null is what tells the second from the
@@ -1240,6 +1413,12 @@ comptime {
     assertFieldTable(ListTaskPushNotificationConfigsResponse);
 }
 
+/// The `GetExtendedAgentCard` RPC's request, field number 1.
+///
+/// The message declares one member and it is optional, so `{}` is a complete
+/// request: the card of the agent the caller reached, with no tenant segment.
+/// Owns nothing: the one slice borrows `raw` or `scratch` and a copy names the
+/// same bytes.
 pub const GetExtendedAgentCardRequest = struct {
     /// 1.
     tenant: ?[]const u8 = null,
@@ -1487,13 +1666,28 @@ pub fn isMethodValidAt(version: Version, method_name: []const u8) bool {
 
 // --- 5.4 Pagination ------------------------------------------------------------
 
-/// `ListTasksRequest.page_size` bounds, section 5.4.
+/// The smallest `page_size` a peer may ask for, section 5.4.
 pub const page_size_min: i32 = 1;
+/// The largest `page_size` a peer may ask for, section 5.4.
 pub const page_size_max: i32 = 100;
 
-/// The default cap when `page_size` is unspecified.
+/// The cap a peer applies to the page it sends when the request carried no
+/// `pageSize`, section 5.4.
+///
+/// This is the responder's own policy and it is stated here as a number rather
+/// than applied by a codec: no decoder writes it into `ListTasksRequest` or
+/// `ListTaskPushNotificationConfigsRequest` for an absent member, so a request
+/// this library decoded has `page_size == null` when the peer sent none. A
+/// server choosing a cap of its own uses this; a client does not.
 pub const page_size_default: i32 = 50;
 
+/// Whether `page_size` is inside the range a peer may ask for.
+///
+/// A range check, and nothing more: no decoder in this file refuses a `pageSize`
+/// outside it, so a value this returns false for still decodes into
+/// `ListTasksRequest.page_size` and still re-encodes. What a caller does with
+/// the answer — reject the page, clamp it, apply [`page_size_default`] to a
+/// request of its own — is the caller's policy and not this library's.
 pub fn isValidPageSize(page_size: i32) bool {
     return page_size >= page_size_min and page_size <= page_size_max;
 }
@@ -1509,7 +1703,12 @@ pub fn hasNextPage(next_page_token: []const u8) bool {
 
 // --- 5.6 Errors ----------------------------------------------------------------
 
-/// The gRPC status names A2A maps onto.
+/// The four gRPC status names A2A maps an error onto.
+///
+/// `A2aError.grpcStatus` returns one of these four and no other, and each one
+/// has a number beside it in the `grpc_code_*` constants below. Static text, so
+/// a caller may compare or forward a name without holding the error that
+/// produced it.
 pub const GrpcStatus = struct {
     pub const not_found = "NOT_FOUND";
     pub const failed_precondition = "FAILED_PRECONDITION";
@@ -1517,10 +1716,14 @@ pub const GrpcStatus = struct {
     pub const internal = "INTERNAL";
 };
 
-/// The gRPC status numbers, from `google/rpc/code.proto`.
+/// The gRPC status numbers, from `google/rpc/code.proto`. Each constant is the
+/// number `grpcCode` reports for the status `GrpcStatus` names beside it.
 pub const grpc_code_not_found: u8 = 5;
+/// The number for `GrpcStatus.failed_precondition`.
 pub const grpc_code_failed_precondition: u8 = 9;
+/// The number for `GrpcStatus.invalid_argument`.
 pub const grpc_code_invalid_argument: u8 = 3;
+/// The number for `GrpcStatus.internal`.
 pub const grpc_code_internal: u8 = 13;
 
 /// The `google.rpc.ErrorInfo` domain that identifies an A2A error.
@@ -1560,6 +1763,11 @@ pub const A2aError = enum(i32) {
         };
     }
 
+    /// The gRPC status name an error maps onto, one of `GrpcStatus`.
+    ///
+    /// Six of the nine share `GrpcStatus.failed_precondition`, so the name does
+    /// not tell two of them apart; `reason` does. Static text, borrowed from
+    /// nothing.
     pub fn grpcStatus(self: A2aError) []const u8 {
         return switch (self) {
             .task_not_found => GrpcStatus.not_found,
@@ -1570,6 +1778,11 @@ pub const A2aError = enum(i32) {
         };
     }
 
+    /// The gRPC status number `grpcStatus` names, as `u8` because
+    /// `google/rpc/code.proto` numbers a status below 256.
+    ///
+    /// Always the number of the status `grpcStatus` returns, so the two agree
+    /// by construction.
     pub fn grpcCode(self: A2aError) u8 {
         return switch (self) {
             .task_not_found => grpc_code_not_found,
@@ -1579,6 +1792,12 @@ pub const A2aError = enum(i32) {
         };
     }
 
+    /// The HTTP status an error maps onto, section 5.6.
+    ///
+    /// Seven of the nine share `400`, so the status alone does not identify the
+    /// failure; the `ErrorInfo` reason does. `404` for
+    /// [`task_not_found`](A2aError.task_not_found) and `500` for
+    /// [`invalid_agent_response`](A2aError.invalid_agent_response).
     pub fn httpStatus(self: A2aError) u16 {
         return switch (self) {
             .task_not_found => 404,
@@ -1588,6 +1807,13 @@ pub const A2aError = enum(i32) {
         };
     }
 
+    /// The error a wire code names, or null.
+    ///
+    /// Null for a code outside the nine, including one a newer revision added
+    /// and the JSON-RPC codes in `error_range_min..error_range_max` that no
+    /// A2A error occupies. A caller reading a peer's code with this gets the
+    /// cause only for a code this library knows; `classifyReason` is the route
+    /// that also tells an unknown reason from a foreign domain.
     pub fn fromCode(code: i32) ?A2aError {
         return switch (code) {
             -32001 => .task_not_found,
@@ -1611,6 +1837,8 @@ pub const A2aError = enum(i32) {
 /// names say which end of the interval each is, and the check is
 /// `range_min <= code and code <= range_max`.
 pub const error_range_min: i32 = -32099;
+/// The numerically larger end of the specification's stated range, and the
+/// largest code any A2A error occupies.
 pub const error_range_max: i32 = -32001;
 
 /// What an `ErrorInfo` detail classifies to, section 5.6.
@@ -2051,6 +2279,12 @@ pub const ApiKeyLocation = enum {
     header,
     cookie,
 
+    /// Parse the `location` member's spelling, or `error.UnknownTag`.
+    ///
+    /// Exactly three spellings match, the same three `string` renders, so a card
+    /// this library decoded always re-encodes to a value it can read back.
+    /// `body` is the spelling a peer may send and this library refuses; the proto
+    /// leaves the field unconstrained and the receiver must enforce it.
     pub fn parse(text: []const u8) DecodeError!ApiKeyLocation {
         if (std.mem.eql(u8, text, "query")) return .query;
         if (std.mem.eql(u8, text, "header")) return .header;
@@ -2058,6 +2292,10 @@ pub const ApiKeyLocation = enum {
         return error.UnknownTag;
     }
 
+    /// The spelling the `location` member carries, which `parse` accepts.
+    ///
+    /// Static text, so it outlives the document it was rendered from and a
+    /// receiver may hold it for as long as it holds the card.
     pub fn string(self: ApiKeyLocation) []const u8 {
         return @tagName(self);
     }
@@ -2296,6 +2534,16 @@ comptime {
     assertFieldTable(DeviceCodeOAuthFlow);
 }
 
+/// The `SecurityScheme.api_key` arm, field numbers 1 to 3.
+///
+/// `location` and `name` are both REQUIRED and neither may be empty, because
+/// an empty header name names no header and a query parameter with no name is
+/// not a credential a receiver can read. The proto leaves `location`
+/// unconstrained, so [`ApiKeyLocation`] is where a receiver enforces it.
+///
+/// Owns nothing: `description` and `name` borrow `raw` or `scratch`, a copy
+/// names the same bytes, and a decoded scheme is live exactly as long as the
+/// `raw` document and the `scratch` its decoder was given.
 pub const ApiKeySecurityScheme = struct {
     /// 1.
     description: ?[]const u8 = null,
@@ -2316,6 +2564,12 @@ comptime {
     assertFieldTable(ApiKeySecurityScheme);
 }
 
+/// The `SecurityScheme.http_auth` arm, field numbers 1 to 3.
+///
+/// `scheme` is the only REQUIRED member and may not be empty. `bearer_format`
+/// is a hint a receiver may ignore, so it is optional and its absence is kept
+/// rather than defaulted. Owns nothing: every slice borrows `raw` or `scratch`
+/// and a copy names the same bytes.
 pub const HttpAuthSecurityScheme = struct {
     /// 1.
     description: ?[]const u8 = null,
@@ -2336,6 +2590,13 @@ comptime {
     assertFieldTable(HttpAuthSecurityScheme);
 }
 
+/// The `SecurityScheme.oauth2` arm, field numbers 1 to 3.
+///
+/// `flows` is REQUIRED and carries exactly one of the five arms, so an
+/// `OAuthFlows` no decoder could have produced is refused before the first
+/// byte is written. Owns nothing: the strings borrow `raw` or `scratch`, the
+/// scope entries under a flow are a run of `CardArena.scopes`, and a copy names
+/// the same bytes rather than a second copy.
 pub const OAuth2SecurityScheme = struct {
     /// 1.
     description: ?[]const u8 = null,
@@ -2356,6 +2617,11 @@ comptime {
     assertFieldTable(OAuth2SecurityScheme);
 }
 
+/// The `SecurityScheme.open_id_connect` arm, field numbers 1 to 2.
+///
+/// `open_id_connect_url` is the only REQUIRED member and may not be empty.
+/// `description` is optional and its absence is kept. Owns nothing: both
+/// slices borrow `raw` or `scratch` and a copy names the same bytes.
 pub const OpenIdConnectSecurityScheme = struct {
     /// 1.
     description: ?[]const u8 = null,
@@ -2373,6 +2639,12 @@ comptime {
     assertFieldTable(OpenIdConnectSecurityScheme);
 }
 
+/// The `SecurityScheme.mtls` arm, field number 1.
+///
+/// `description` is the only member and it is optional, so `{}` is a complete
+/// scheme: mutual TLS is asserted by the transport and this message adds
+/// nothing to it. Owns nothing: the one slice borrows `raw` or `scratch` and a
+/// copy names the same bytes.
 pub const MutualTlsSecurityScheme = struct {
     /// 1.
     description: ?[]const u8 = null,
@@ -2453,17 +2725,17 @@ pub const extension_missing_error = A2aError.extension_support_required;
 // is the only `bytes` field in the module and `json.base64` is what a codec for
 // it needs.
 //
-// Presence, because the round trip is byte-exact
+// Presence, because the round trip is a round trip of values
 //
-// PROTOCOLS.md section 2 makes the encoder the exact inverse of the decoder,
-// so a member the wire allows to omit is optional in Zig here and not a plain
-// scalar carrying a default. `{"required":false}` and `{}` are two documents,
-// and a struct holding one `false` for both cannot write either of them back.
-// That is why `AgentExtension.required` is a `?bool` and
-// `ListTasksRequest.status` is a `?TaskState`, and why `tenant` is a
-// `?[]const u8` on every request below rather than the `[]const u8 = ""` the
-// tables above used to declare: a peer that wrote `"tenant":""` is not a peer
-// this library may answer with no `tenant` at all.
+// `decode(encode(x)) == x` for every value an encoder accepts, so a member the
+// wire allows to omit is optional in Zig here and not a plain scalar carrying a
+// default. `{"required":false}` and `{}` are two documents, and a struct
+// holding one `false` for both cannot write either of them back. That is why
+// `AgentExtension.required` is a `?bool` and `ListTasksRequest.status` is a
+// `?TaskState`, and why `tenant` is a `?[]const u8` on every request below
+// rather than the `[]const u8 = ""` the tables above used to declare: a peer
+// that wrote `"tenant":""` is not a peer this library may answer with no
+// `tenant` at all.
 //
 // The rule is not local to this section. Every message in the content half
 // follows it too, and nine fields had to change shape before their encoder
@@ -2490,6 +2762,36 @@ pub const extension_missing_error = A2aError.extension_support_required;
 // Every decoder below checks `reader.atEnd()` after its member loop and never
 // inside it, so a body that is one JSON value and a second one behind it are
 // told apart.
+//
+// What a caller holds after a decode in this section
+//
+// A decoder here takes `raw` and `scratch` and no arena, so a returned value
+// borrows exactly those two buffers: a text member with no escape sequence is a
+// sub-slice of `raw` and one with an escape is a region of `scratch`, and an
+// opaque lexeme — every `metadata`, `params` and `header` below — is a region
+// of `raw` itself. Nothing is copied out and nothing is retained, so the value
+// dies with the smaller of the two, and a copy of it names the same regions
+// rather than second copies.
+//
+// A refusal leaves no value to use. The one decoder here that takes an out
+// array, `decodeSendMessageConfiguration`, writes its modes in place and
+// reports no count, so a caller that wants the count reads
+// `accepted_output_modes` off the value it got back; a refusal leaves that
+// array holding a partial walk and the caller discards it.
+//
+// An encoder checks the whole value before it writes its first byte, so a
+// refusal is `error.InvalidField`, `error.UnknownTag` or
+// `error.BufferTooSmall` with the caller's buffer untouched. An opaque lexeme is
+// included in that walk, and each walk carries the container depth of the object
+// it is checking, so a lexeme is read back at the depth it will be written at
+// and one that nests past what that allows is `error.InvalidField` before the
+// first byte. The check reads the lexeme and does not read into it, so a key
+// this library does not model still reaches the wire.
+//
+// Text is the one thing the walk cannot settle. Every encoder writes it with
+// `json.Writer.string`, which escapes the bytes the grammar forbids and passes
+// every other byte through unchecked, so valid UTF-8 is the caller's
+// precondition and no optimize mode diagnoses a breach of it.
 
 /// Read an `int32` member at the width its field declares.
 ///
@@ -2541,6 +2843,39 @@ fn writeStringList(items: []const []const u8, writer: *json.Writer) EncodeError!
     try writer.byte(']');
 }
 
+/// Whether `lexeme` is one complete JSON value that fits where it is written.
+///
+/// An encoder splices an opaque JSON field verbatim, so a value that is not a
+/// value is a document the matching decoder refuses on the way back in, and one
+/// that nests too deeply is refused there with `error.LimitExceeded`. Both are
+/// settled here: the lexeme is walked with the same reader the decoder uses, and
+/// anything behind it is a second value rather than trailing whitespace.
+///
+/// `depth` is the container depth at which the field's value is read in the
+/// document this encoder writes, and every validation walk carries it. A
+/// `metadata` in a task on a page is at three — the page object, its `tasks`
+/// array and the task — and a `PartContent.data` under a message's part inside
+/// a stream response is at six. `json.Reader.depth` is the field that count
+/// belongs to, so `json.max_depth` is spent exactly as the matching decoder
+/// spends it, a lexeme one level past what its own place allows is refused here
+/// rather than produced, and a value `decode` returned — admitted at that depth
+/// already — re-encodes and decodes again.
+///
+/// `skipValue` never writes the scratch it is handed — a skipped value produces
+/// no slice — so a zero-length one is the whole of what the walk needs and no
+/// buffer reaches the encoder's caller.
+///
+/// Every failure is `error.InvalidField`. `root.EncodeError` carries neither a
+/// JSON syntax tag nor a depth one, and a lexeme the decoder would refuse is one
+/// caller fault whichever walk found it.
+fn validateRawValue(lexeme: []const u8, depth: u32) EncodeError!void {
+    var reader = json.Reader.init(lexeme);
+    reader.depth = depth;
+    var no_scratch: [0]u8 = undefined;
+    _ = reader.rawValue(&no_scratch) catch return error.InvalidField;
+    if (!reader.atEnd()) return error.InvalidField;
+}
+
 /// Decode a `google.protobuf.Empty` response body.
 ///
 /// The message declares no field, so every member is one this shape does not
@@ -2548,6 +2883,9 @@ fn writeStringList(items: []const []const u8, writer: *json.Writer) EncodeError!
 /// response is the one body a peer may decorate and still be understood, and a
 /// re-encode of a decorated body drops the decoration, which is the stated
 /// consequence every decoder in this library records.
+///
+/// The value carries nothing, so it borrows no buffer and no argument of this
+/// call survives it.
 pub fn decodeEmpty(raw: []const u8, scratch: []u8) DecodeError!Empty {
     var reader = json.Reader.init(raw);
     const is_empty = try reader.beginObject();
@@ -2564,6 +2902,9 @@ pub fn decodeEmpty(raw: []const u8, scratch: []u8) DecodeError!Empty {
 }
 
 /// Encode a `google.protobuf.Empty` response body.
+///
+/// Writes `{}`. Nothing can be refused: the message declares no field, so the
+/// value carries nothing for an encoder to check. Allocates nothing.
 pub fn encodeEmpty(_: Empty, writer: *json.Writer) EncodeError!void {
     try writer.slice("{}");
 }
@@ -2619,8 +2960,12 @@ pub fn decodeGetTaskRequest(raw: []const u8, scratch: []u8) DecodeError!GetTaskR
 /// Encode a `GetTaskRequest`.
 ///
 /// Members go out in field-number order, so a body that already reads in that
-/// order comes back unchanged and one that does not comes back with the same
-/// members in it. `bridge.encodeEnvelope` is the same rule for the same reason.
+/// order is reproduced member for member and one that does not comes back with
+/// the same members in a different order. `bridge.encodeEnvelope` is the same
+/// rule for the same reason.
+///
+/// An empty `id` is `error.InvalidField` before the first byte is written, so
+/// every value `decodeGetTaskRequest` returned can be written back.
 pub fn encodeGetTaskRequest(request: GetTaskRequest, writer: *json.Writer) EncodeError!void {
     if (request.id.len == 0) return error.InvalidField;
 
@@ -2651,6 +2996,11 @@ pub fn encodeGetTaskRequest(request: GetTaskRequest, writer: *json.Writer) Encod
 /// lexeme rather than decoded into a shape. A shape cannot write back a key a
 /// peer may send, which is the defect `bridge.Envelope.meta` exists to remove,
 /// and borrowing costs no scratch however deeply the object nests.
+///
+/// `tenant` and `id` are text members and `metadata` is a region of `raw`, so
+/// the result borrows `raw` and `scratch` and is live as long as the smaller of
+/// the two is. A text member with no escape sequence is itself a sub-slice of
+/// `raw`.
 pub fn decodeCancelTaskRequest(raw: []const u8, scratch: []u8) DecodeError!CancelTaskRequest {
     var reader = json.Reader.init(raw);
     var request: CancelTaskRequest = .{ .id = "" };
@@ -2691,8 +3041,17 @@ pub fn decodeCancelTaskRequest(raw: []const u8, scratch: []u8) DecodeError!Cance
 }
 
 /// Encode a `CancelTaskRequest`.
+///
+/// An empty `id` is `error.InvalidField` before the first byte is written, so
+/// every value `decodeCancelTaskRequest` returned can be written back.
+/// `metadata` is spliced verbatim and is read back first, so a value that is not
+/// exactly one complete JSON value is `error.InvalidField` and nothing is
+/// written. Allocates nothing.
 pub fn encodeCancelTaskRequest(request: CancelTaskRequest, writer: *json.Writer) EncodeError!void {
     if (request.id.len == 0) return error.InvalidField;
+    // The request object is the document this encoder writes, so it is one
+    // container deep and a member is read at one.
+    if (request.metadata) |metadata| try validateRawValue(metadata, 1);
 
     try writer.byte('{');
     var separator: []const u8 = "";
@@ -2715,7 +3074,8 @@ pub fn encodeCancelTaskRequest(request: CancelTaskRequest, writer: *json.Writer)
 /// Decode a `SubscribeToTaskRequest`.
 ///
 /// The message declares two members and one of them is REQUIRED, so an empty
-/// object is not a subscription.
+/// object is not a subscription. Both strings in the result are regions of
+/// `scratch`, so it is live exactly as long as that buffer is.
 pub fn decodeSubscribeToTaskRequest(
     raw: []const u8,
     scratch: []u8,
@@ -2753,6 +3113,10 @@ pub fn decodeSubscribeToTaskRequest(
 }
 
 /// Encode a `SubscribeToTaskRequest`.
+///
+/// An empty `id` is `error.InvalidField` before the first byte is written, so
+/// every value `decodeSubscribeToTaskRequest` returned can be written back.
+/// Allocates nothing.
 pub fn encodeSubscribeToTaskRequest(
     request: SubscribeToTaskRequest,
     writer: *json.Writer,
@@ -2773,7 +3137,10 @@ pub fn encodeSubscribeToTaskRequest(
 /// Decode a `GetTaskPushNotificationConfigRequest`.
 ///
 /// `taskId` and `id` are both REQUIRED, and both name something: the task a
-/// config belongs to, and the config within it. Neither may be empty.
+/// config belongs to, and the config within it. Neither may be empty, so
+/// `{}` and `{"taskId":"t"}` are both `error.MissingField` and an empty id is
+/// `error.InvalidField`. All three strings in the result are regions of
+/// `scratch`.
 pub fn decodeGetTaskPushNotificationConfigRequest(
     raw: []const u8,
     scratch: []u8,
@@ -2819,6 +3186,10 @@ pub fn decodeGetTaskPushNotificationConfigRequest(
 }
 
 /// Encode a `GetTaskPushNotificationConfigRequest`.
+///
+/// An empty `task_id` or `id` is `error.InvalidField` before the first byte is
+/// written, so every value `decodeGetTaskPushNotificationConfigRequest`
+/// returned can be written back. Allocates nothing.
 pub fn encodeGetTaskPushNotificationConfigRequest(
     request: GetTaskPushNotificationConfigRequest,
     writer: *json.Writer,
@@ -2839,6 +3210,11 @@ pub fn encodeGetTaskPushNotificationConfigRequest(
 }
 
 /// Decode a `DeleteTaskPushNotificationConfigRequest`.
+///
+/// `taskId` and `id` are both REQUIRED and neither may be empty, so `{}` and
+/// `{"taskId":"t"}` are both `error.MissingField` and an empty id is
+/// `error.InvalidField`. All three strings in the result are regions of
+/// `scratch`.
 pub fn decodeDeleteTaskPushNotificationConfigRequest(
     raw: []const u8,
     scratch: []u8,
@@ -2884,6 +3260,10 @@ pub fn decodeDeleteTaskPushNotificationConfigRequest(
 }
 
 /// Encode a `DeleteTaskPushNotificationConfigRequest`.
+///
+/// An empty `task_id` or `id` is `error.InvalidField` before the first byte is
+/// written, so every value `decodeDeleteTaskPushNotificationConfigRequest`
+/// returned can be written back. Allocates nothing.
 pub fn encodeDeleteTaskPushNotificationConfigRequest(
     request: DeleteTaskPushNotificationConfigRequest,
     writer: *json.Writer,
@@ -2910,6 +3290,9 @@ pub fn encodeDeleteTaskPushNotificationConfigRequest(
 /// `"pageSize":0` and no `pageSize` are the same page and two different
 /// documents. `tenant` is field 4 in the proto although the source lists it
 /// first, so it is written last here too.
+///
+/// Borrowed from `raw` and `scratch`; a text member with no escape sequence is
+/// itself a sub-slice of `raw`.
 pub fn decodeListTaskPushNotificationConfigsRequest(
     raw: []const u8,
     scratch: []u8,
@@ -2959,6 +3342,11 @@ pub fn decodeListTaskPushNotificationConfigsRequest(
 }
 
 /// Encode a `ListTaskPushNotificationConfigsRequest`.
+///
+/// An empty `task_id` is `error.InvalidField` before the first byte is written,
+/// so every value `decodeListTaskPushNotificationConfigsRequest` returned can
+/// be written back. No page size is substituted for an absent `pageSize` and
+/// none is range-checked. Allocates nothing.
 pub fn encodeListTaskPushNotificationConfigsRequest(
     request: ListTaskPushNotificationConfigsRequest,
     writer: *json.Writer,
@@ -2986,6 +3374,8 @@ pub fn encodeListTaskPushNotificationConfigsRequest(
 ///
 /// The message declares one member and it is optional, so `{}` is a complete
 /// request: the card of the agent the caller reached, with no tenant segment.
+/// Borrowed from `raw` and `scratch`; a text member with no escape sequence is
+/// itself a sub-slice of `raw`.
 pub fn decodeGetExtendedAgentCardRequest(
     raw: []const u8,
     scratch: []u8,
@@ -3013,6 +3403,10 @@ pub fn decodeGetExtendedAgentCardRequest(
 }
 
 /// Encode a `GetExtendedAgentCardRequest`.
+///
+/// Nothing here can be refused: the message declares one optional member, so
+/// every value `decodeGetExtendedAgentCardRequest` returned is written and a
+/// null `tenant` becomes `{}`. Allocates nothing.
 pub fn encodeGetExtendedAgentCardRequest(
     request: GetExtendedAgentCardRequest,
     writer: *json.Writer,
@@ -3035,7 +3429,10 @@ pub fn encodeGetExtendedAgentCardRequest(
 /// unspecified state and no member is a peer that did not filter at all.
 /// `statusTimestampAfter` is the ISO-8601 text the peer wrote: there is no
 /// `Timestamp` here to convert, and a normalised spelling of the same instant
-/// would not be the bytes that came in.
+/// would be a value this library chose rather than the one that arrived.
+///
+/// Borrowed from `raw` and `scratch`; a text member with no escape sequence is
+/// itself a sub-slice of `raw`.
 pub fn decodeListTasksRequest(raw: []const u8, scratch: []u8) DecodeError!ListTasksRequest {
     var reader = json.Reader.init(raw);
     var request: ListTasksRequest = .{};
@@ -3104,7 +3501,10 @@ pub fn decodeListTasksRequest(raw: []const u8, scratch: []u8) DecodeError!ListTa
 /// Encode a `ListTasksRequest`.
 ///
 /// `status` goes out as the full proto name, because that is the spelling
-/// `TaskState.parse` accepts and the only one a peer sends.
+/// `TaskState.parse` accepts and the only one a peer sends. Nothing here is
+/// substituted and nothing is refused: a null `page_size` writes no `pageSize`
+/// and no default stands in for it, so every value `decodeListTasksRequest`
+/// returned can be written back. Allocates nothing.
 pub fn encodeListTasksRequest(request: ListTasksRequest, writer: *json.Writer) EncodeError!void {
     try writer.byte('{');
     var separator: []const u8 = "";
@@ -3164,6 +3564,9 @@ pub fn encodeListTasksRequest(request: ListTasksRequest, writer: *json.Writer) E
 /// than defaulting to the empty string, because the two are different
 /// requests: no credential is a scheme sent without a secret, and an empty
 /// credential is a secret that happens to be blank.
+///
+/// Borrowed from `raw` and `scratch`; a text member with no escape sequence is
+/// itself a sub-slice of `raw`.
 pub fn decodeAuthenticationInfo(raw: []const u8, scratch: []u8) DecodeError!AuthenticationInfo {
     var reader = json.Reader.init(raw);
     const info = try readAuthenticationInfo(&reader, scratch);
@@ -3210,6 +3613,9 @@ fn readAuthenticationInfo(
 }
 
 /// Encode an `AuthenticationInfo`.
+///
+/// An empty `scheme` is `error.InvalidField` before the first byte is written,
+/// so every value `decodeAuthenticationInfo` returned can be written back.
 pub fn encodeAuthenticationInfo(info: AuthenticationInfo, writer: *json.Writer) EncodeError!void {
     try validateAuthenticationInfo(info);
     try writeAuthenticationInfo(info, writer);
@@ -3234,6 +3640,10 @@ fn writeAuthenticationInfo(info: AuthenticationInfo, writer: *json.Writer) Encod
 /// get and list response, so the decoder has to hold every member the three
 /// uses carry. `url` is the only REQUIRED member and is where the agent posts
 /// the `StreamResponse`; an empty URL is not a webhook and is refused.
+///
+/// Borrowed from `raw` and `scratch`; a text member with no escape sequence is
+/// itself a sub-slice of `raw`. Nothing under a configuration is arena storage,
+/// which is why this takes no arena.
 pub fn decodeTaskPushNotificationConfig(
     raw: []const u8,
     scratch: []u8,
@@ -3309,6 +3719,10 @@ fn readTaskPushNotificationConfig(
 }
 
 /// Encode a `TaskPushNotificationConfig`.
+///
+/// An empty `url`, or a nested `authentication` with an empty `scheme`, is
+/// `error.InvalidField` before the first byte is written, so every value
+/// `decodeTaskPushNotificationConfig` returned can be written back.
 pub fn encodeTaskPushNotificationConfig(
     config: TaskPushNotificationConfig,
     writer: *json.Writer,
@@ -3369,6 +3783,10 @@ fn writeTaskPushNotificationConfig(
 /// two are told apart: the field is null for the first and a zero-length slice
 /// for the second, and the encoder writes `[]` for the one and nothing for the
 /// other.
+///
+/// A refusal leaves `out_modes` holding a partial walk and reports no count, so
+/// the caller discards it. On success the count is the length of the returned
+/// `accepted_output_modes`, and every element borrows `raw` or `scratch`.
 pub fn decodeSendMessageConfiguration(
     raw: []const u8,
     out_modes: [][]const u8,
@@ -3437,6 +3855,11 @@ fn readSendMessageConfiguration(
 }
 
 /// Encode a `SendMessageConfiguration`.
+///
+/// A nested `task_push_notification_config` is walked first, so a nested empty
+/// `url` is `error.InvalidField` before the first byte is written and every
+/// value `decodeSendMessageConfiguration` returned can be written back.
+/// Allocates nothing.
 pub fn encodeSendMessageConfiguration(
     configuration: SendMessageConfiguration,
     writer: *json.Writer,
@@ -3556,6 +3979,11 @@ fn readAgentInterface(reader: *json.Reader, scratch: []u8) DecodeError!AgentInte
 }
 
 /// Encode an `AgentInterface`.
+///
+/// An empty `url`, `protocol_binding` or `protocol_version` is
+/// `error.InvalidField` before the first byte is written, so every value
+/// `decodeAgentInterface` returned can be written back. `protocol_version` is
+/// written as given and is not parsed; [`parseVersion`] is what reads it.
 pub fn encodeAgentInterface(
     interface: AgentInterface,
     writer: *json.Writer,
@@ -3595,6 +4023,12 @@ fn writeAgentInterface(interface: AgentInterface, writer: *json.Writer) EncodeEr
 }
 
 /// Decode an `AgentProvider`.
+///
+/// Both members are REQUIRED and neither may be empty, so `{}` is
+/// `error.MissingField` and an empty member is `error.InvalidField`.
+///
+/// Borrowed from `raw` and `scratch`; a text member with no escape sequence is
+/// itself a sub-slice of `raw`.
 pub fn decodeAgentProvider(raw: []const u8, scratch: []u8) DecodeError!AgentProvider {
     var reader = json.Reader.init(raw);
     const provider = try readAgentProvider(&reader, scratch);
@@ -3641,6 +4075,10 @@ fn readAgentProvider(reader: *json.Reader, scratch: []u8) DecodeError!AgentProvi
 }
 
 /// Encode an `AgentProvider`.
+///
+/// An empty `url` or `organization` is `error.InvalidField` before the first
+/// byte is written, so every value `decodeAgentProvider` returned can be
+/// written back.
 pub fn encodeAgentProvider(provider: AgentProvider, writer: *json.Writer) EncodeError!void {
     try validateAgentProvider(provider);
     try writeAgentProvider(provider, writer);
@@ -3725,11 +4163,17 @@ fn readAgentCardSignature(
 }
 
 /// Encode an `AgentCardSignature`.
+///
+/// An empty `protected` or `signature` is `error.InvalidField` before the first
+/// byte is written, so a signature list can never be left truncated in the
+/// caller's buffer and every value `decodeAgentCardSignature` returned can be
+/// written back. `header` is spliced verbatim and is read back first, so one
+/// that is not exactly one complete JSON value is `error.InvalidField`.
 pub fn encodeAgentCardSignature(
     signature: AgentCardSignature,
     writer: *json.Writer,
 ) EncodeError!void {
-    try validateAgentCardSignature(signature);
+    try validateAgentCardSignature(signature, 1);
     try writeAgentCardSignature(signature, writer);
 }
 
@@ -3739,8 +4183,9 @@ pub fn encodeAgentCardSignature(
 /// half-written card is a card whose `signatures` member is truncated, and a
 /// verifier that reads the buffer rather than the error sees a signature that
 /// verifies against nothing.
-fn validateAgentCardSignature(signature: AgentCardSignature) EncodeError!void {
+fn validateAgentCardSignature(signature: AgentCardSignature, depth: u32) EncodeError!void {
     if (signature.protected.len == 0 or signature.signature.len == 0) return error.InvalidField;
+    if (signature.header) |header| try validateRawValue(header, depth);
 }
 
 /// Write an `AgentCardSignature` without checking it first.
@@ -3817,7 +4262,13 @@ fn readAgentExtension(reader: *json.Reader, scratch: []u8) DecodeError!AgentExte
 }
 
 /// Encode an `AgentExtension`.
+///
+/// Every value `decodeAgentExtension` returned is written and an all-null one
+/// becomes `{}`, with one refusal: `params` is spliced verbatim and is read
+/// back first, so one that is not exactly one complete JSON value is
+/// `error.InvalidField`.
 pub fn encodeAgentExtension(extension: AgentExtension, writer: *json.Writer) EncodeError!void {
+    if (extension.params) |params| try validateRawValue(params, 1);
     try writer.byte('{');
     var separator: []const u8 = "";
     if (extension.uri) |uri| {
@@ -3855,6 +4306,9 @@ pub fn encodeAgentExtension(extension: AgentExtension, writer: *json.Writer) Enc
 /// not. These four are decoded as the messages they are, which is what a
 /// caller holding one entry of a card's `securitySchemes` needs, and the
 /// discovery half reads the fifth as the `SecurityScheme` arm it is.
+///
+/// Borrowed from `raw` and `scratch`; a text member with no escape sequence is
+/// itself a sub-slice of `raw`.
 pub fn decodeApiKeySecurityScheme(
     raw: []const u8,
     scratch: []u8,
@@ -3915,6 +4369,10 @@ fn readApiKeySecurityScheme(
 }
 
 /// Encode an `ApiKeySecurityScheme`.
+///
+/// An empty `name` is `error.InvalidField` before the first byte is written, so
+/// every value `decodeApiKeySecurityScheme` returned can be written back.
+/// `location` goes out as `ApiKeyLocation.string`, a spelling `parse` accepts.
 pub fn encodeApiKeySecurityScheme(
     scheme: ApiKeySecurityScheme,
     writer: *json.Writer,
@@ -3949,6 +4407,12 @@ fn writeApiKeySecurityScheme(
 }
 
 /// Decode an `HttpAuthSecurityScheme`.
+///
+/// `scheme` is the only REQUIRED member and may not be empty; `bearer_format`
+/// is optional and its absence is kept.
+///
+/// Borrowed from `raw` and `scratch`; a text member with no escape sequence is
+/// itself a sub-slice of `raw`.
 pub fn decodeHttpAuthSecurityScheme(
     raw: []const u8,
     scratch: []u8,
@@ -4005,6 +4469,9 @@ fn readHttpAuthSecurityScheme(
 }
 
 /// Encode an `HttpAuthSecurityScheme`.
+///
+/// An empty `scheme` is `error.InvalidField` before the first byte is written,
+/// so every value `decodeHttpAuthSecurityScheme` returned can be written back.
 pub fn encodeHttpAuthSecurityScheme(
     scheme: HttpAuthSecurityScheme,
     writer: *json.Writer,
@@ -4041,6 +4508,11 @@ fn writeHttpAuthSecurityScheme(
 }
 
 /// Decode an `OpenIdConnectSecurityScheme`.
+///
+/// `openIdConnectUrl` is the only REQUIRED member and may not be empty.
+///
+/// Borrowed from `raw` and `scratch`; a text member with no escape sequence is
+/// itself a sub-slice of `raw`.
 pub fn decodeOpenIdConnectSecurityScheme(
     raw: []const u8,
     scratch: []u8,
@@ -4091,6 +4563,10 @@ fn readOpenIdConnectSecurityScheme(
 }
 
 /// Encode an `OpenIdConnectSecurityScheme`.
+///
+/// An empty `open_id_connect_url` is `error.InvalidField` before the first byte
+/// is written, so every value `decodeOpenIdConnectSecurityScheme` returned can
+/// be written back.
 pub fn encodeOpenIdConnectSecurityScheme(
     scheme: OpenIdConnectSecurityScheme,
     writer: *json.Writer,
@@ -4170,6 +4646,10 @@ fn readMutualTlsSecurityScheme(
 }
 
 /// Encode a `MutualTlsSecurityScheme`.
+///
+/// Nothing here can be refused: the message declares one optional member, so
+/// every value `decodeMutualTlsSecurityScheme` returned is written and a null
+/// `description` becomes `{}`.
 pub fn encodeMutualTlsSecurityScheme(
     scheme: MutualTlsSecurityScheme,
     writer: *json.Writer,
@@ -4190,7 +4670,8 @@ pub fn encodeMutualTlsSecurityScheme(
 // Eleven messages: `PartContent`, `Part`, `Message`, `Artifact`, `TaskStatus`,
 // `Task`, `TaskStatusUpdateEvent`, `TaskArtifactUpdateEvent`,
 // `SendMessageRequest`, `SendMessageResponse` and `StreamResponse`. Each has a
-// decoder and an encoder, and the two are exact inverses.
+// decoder and an encoder, and the two are inverses in value: what a decoder
+// produced re-encodes to the same values, in field-number order.
 //
 // One caller-owned arena, not nine out arrays
 //
@@ -4309,21 +4790,72 @@ pub fn encodeMutualTlsSecurityScheme(
 // absent `parts` from an empty one, and absence is the only case a decoder
 // refuses there. They carry no default and no emptiness rule for that reason
 // and not because an empty list is a valid part.
+//
+// What a caller holds after a decode in this section
+//
+// A decoder here takes `raw`, `scratch` and an arena, and the result names all
+// three: a text member with no escape sequence is a sub-slice of `raw` and one
+// with an escape is a region of `scratch`, an opaque lexeme — every `metadata`
+// and every `PartContent.data` — is a region of `raw`, an element slice is a
+// run of one arena array, and a `Part.raw` is a run of `arena.bytes`. Nothing
+// is copied out, so a decoded message is live as long as those three are and
+// the next decode into the same arena overwrites what it names.
+//
+// Every decoder here resets the arena before it reads. A refusal leaves the
+// counters at whatever the partial walk reached and the arrays holding a
+// partial document; a caller discards both, because the counters are not a
+// resume and the next call writes them again from zero.
+//
+// `base64` is the encoder's own scratch and nothing in it survives the call.
+// Size it from `json.base64.encodedLen` of the largest `Part.raw` the value
+// holds: a `Part.raw` that does not fit is `error.BufferTooSmall` raised by the
+// validation walk before the first byte of the message is written, and one
+// raised by the writer instead leaves a prefix in the caller's buffer that the
+// caller discards.
+//
+// An opaque lexeme is settled by the validation walk: it is read back with the
+// decoder's own reader before the first byte, at the container depth the walk
+// carries, which is the depth the member is written at — a part's `data` in a
+// bare message is three containers down. A lexeme that nests past
+// `json.max_depth` there is `error.InvalidField`.
+// The check reads the lexeme and does not read into it, so a key this library
+// does not model still reaches the wire with its own spelling.
+//
+// Text is the one thing that walk cannot settle. Every encoder writes it with
+// `json.Writer.string`, which escapes the bytes the grammar forbids and passes
+// every other byte through unchecked, so valid UTF-8 is the caller's
+// precondition and no optimize mode diagnoses a breach of it.
 
 /// The caller-owned storage a content-half decode writes into.
 ///
 /// Every array here is sized by the caller, and a decode that finds more
 /// elements than an array holds is `error.BufferTooSmall` rather than a
-/// truncated message. The `*_used` fields are the fill levels: they start at
-/// zero, and every public decoder in this section resets them before it reads,
-/// so one arena serves one document at a time. Reusing an arena for a second
-/// document overwrites the first one's values, which is the same contract
-/// `acp.decodePermissionRequest` offers its option array.
+/// truncated message. Nothing in here is retained past the call that filled it:
+/// the borrowed strings and lexemes still point into the document and the
+/// caller's scratch, and the decoded `Part.raw` bytes into `bytes`, so all of
+/// it dies with the buffers the caller named.
 ///
-/// Nothing in here is retained past the call that filled it. The borrowed
-/// strings and lexemes still point into the document and the caller's scratch,
-/// and the decoded `Part.raw` bytes into `bytes`, so all of it dies with the
-/// buffers the caller named.
+/// **One arena, one document.** The `*_used` fields are the fill levels. They
+/// start at zero, every public decoder in this section calls `reset` before it
+/// reads, and `reset` runs before any byte of `raw` is walked. A decode
+/// therefore invalidates every slice the previous one returned: those slices
+/// still point into the same arrays, and the second document is written over
+/// the first one's values. Holding a `Task` across a second decode into the
+/// same arena holds the second document's task.
+///
+/// **A copy is not a second owner.** `init` and every assignment copy the five
+/// slices, not the storage behind them, so two `ContentArena` values built
+/// from the same arrays name one set of buffers: a decode through one is
+/// visible through the other, and neither may be reset while the other is
+/// being read. `reset` frees nothing and invalidates nothing on its own — the
+/// decode that follows it is what overwrites the storage.
+///
+/// **What a caller reads after a failure.** A refusal leaves the counters at
+/// whatever the partial walk reached and the arrays holding a partial document.
+/// Those counters describe how far the reader got, not what it holds, so a
+/// caller discards both and re-runs with storage it sized. The counters are not
+/// accumulated across calls: each decode writes them, so re-running is not a
+/// resume.
 pub const ContentArena = struct {
     /// Every `Part` in the document, in the order the document spells them.
     parts: []Part,
@@ -4339,13 +4871,26 @@ pub const ContentArena = struct {
     /// The decoded bytes of every `Part.raw`.
     bytes: []u8,
 
+    /// How much of `parts` the last decode filled.
     parts_used: usize = 0,
+    /// How much of `artifacts` the last decode filled.
     artifacts_used: usize = 0,
+    /// How much of `messages` the last decode filled.
     messages_used: usize = 0,
+    /// How much of `strings` the last decode filled, counting every
+    /// `repeated string` element in the document together.
     strings_used: usize = 0,
+    /// How much of `bytes` the last decode filled, counting the decoded form
+    /// of every `Part.raw` together.
     bytes_used: usize = 0,
 
     /// An arena over storage the caller already has.
+    ///
+    /// The slices are taken as given and are not retained by value: they are
+    /// the caller's arrays and the caller keeps them alive and unmodified for
+    /// as long as any decode writes through this arena. Every counter starts at
+    /// zero, so a fresh arena holds no document. The result is a shallow copy
+    /// of the slices rather than a second set of storage.
     pub fn init(
         parts: []Part,
         artifacts: []Artifact,
@@ -4363,6 +4908,12 @@ pub const ContentArena = struct {
     }
 
     /// Forget what a previous decode wrote, keeping the storage.
+    ///
+    /// Sets all five counters to zero. Nothing is freed and no element is
+    /// cleared, so the next decode starts again at the front of the same
+    /// arrays and overwrites what a previous call put there. A caller that
+    /// still holds a message from the previous decode is holding storage that
+    /// this call has promised to reuse.
     pub fn reset(self: *ContentArena) void {
         self.parts_used = 0;
         self.artifacts_used = 0;
@@ -5303,6 +5854,8 @@ fn readStreamResponse(
 /// received a part from somewhere other than this library's own `Part` has.
 /// A `oneof` carries exactly one member, so an object with none is
 /// `error.MissingField` and an object with two is first-wins.
+///
+/// Borrowed from `scratch`, `raw` and `arena`; see `ContentArena`.
 pub fn decodePartContent(
     raw: []const u8,
     arena: *ContentArena,
@@ -5326,6 +5879,8 @@ pub fn decodePartContent(
 /// decoded into `arena.bytes` and the `Part` holds a slice of the caller's own
 /// storage. A part with no content member is `error.MissingField`, for the
 /// reason the section above gives.
+///
+/// Borrowed from `scratch`, `raw` and `arena`; see `ContentArena`.
 pub fn decodePart(raw: []const u8, arena: *ContentArena, scratch: []u8) DecodeError!Part {
     arena.reset();
     var reader = json.Reader.init(raw);
@@ -5341,6 +5896,8 @@ pub fn decodePart(raw: []const u8, arena: *ContentArena, scratch: []u8) DecodeEr
 /// neither may be empty. `parts` is REQUIRED too, and an empty array satisfies
 /// it, so `[]` is a message with no parts and only the absence of the member is
 /// refused.
+///
+/// Borrowed from `scratch`, `raw` and `arena`; see `ContentArena`.
 pub fn decodeMessage(raw: []const u8, arena: *ContentArena, scratch: []u8) DecodeError!Message {
     arena.reset();
     var reader = json.Reader.init(raw);
@@ -5351,6 +5908,12 @@ pub fn decodeMessage(raw: []const u8, arena: *ContentArena, scratch: []u8) Decod
 }
 
 /// Decode an `Artifact`.
+///
+/// `artifactId` is the only REQUIRED member and may not be empty; `parts` is
+/// REQUIRED and an empty array satisfies it, so `[]` is an artifact with no
+/// parts and only the absence of the member is refused.
+///
+/// Borrowed from `scratch`, `raw` and `arena`; see `ContentArena`.
 pub fn decodeArtifact(raw: []const u8, arena: *ContentArena, scratch: []u8) DecodeError!Artifact {
     arena.reset();
     var reader = json.Reader.init(raw);
@@ -5361,6 +5924,11 @@ pub fn decodeArtifact(raw: []const u8, arena: *ContentArena, scratch: []u8) Deco
 }
 
 /// Decode a `TaskStatus`.
+///
+/// `state` is the only REQUIRED member, and a `message` nested beside it is
+/// held in the arena like any other.
+///
+/// Borrowed from `scratch`, `raw` and `arena`; see `ContentArena`.
 pub fn decodeTaskStatus(
     raw: []const u8,
     arena: *ContentArena,
@@ -5381,6 +5949,8 @@ pub fn decodeTaskStatus(
 /// and every message and artifact holds parts, and every part may hold bytes.
 /// Nine positional out arrays is the other shape and it is not one a call site
 /// can read.
+///
+/// Borrowed from `scratch`, `raw` and `arena`; see `ContentArena`.
 pub fn decodeTask(raw: []const u8, arena: *ContentArena, scratch: []u8) DecodeError!Task {
     arena.reset();
     var reader = json.Reader.init(raw);
@@ -5391,6 +5961,11 @@ pub fn decodeTask(raw: []const u8, arena: *ContentArena, scratch: []u8) DecodeEr
 }
 
 /// Decode a `TaskStatusUpdateEvent`.
+///
+/// `taskId` and `contextId` are both REQUIRED and neither may be empty, and the
+/// status may itself hold a message.
+///
+/// Borrowed from `scratch`, `raw` and `arena`; see `ContentArena`.
 pub fn decodeTaskStatusUpdateEvent(
     raw: []const u8,
     arena: *ContentArena,
@@ -5405,6 +5980,12 @@ pub fn decodeTaskStatusUpdateEvent(
 }
 
 /// Decode a `TaskArtifactUpdateEvent`.
+///
+/// `taskId` and `contextId` are both REQUIRED and neither may be empty, and the
+/// artifact's own parts come out of the arena. `append` and `lastChunk` are
+/// proto3 `optional`, so an absent one and a present `false` are two documents.
+///
+/// Borrowed from `scratch`, `raw` and `arena`; see `ContentArena`.
 pub fn decodeTaskArtifactUpdateEvent(
     raw: []const u8,
     arena: *ContentArena,
@@ -5423,6 +6004,8 @@ pub fn decodeTaskArtifactUpdateEvent(
 /// The accepted output modes come from `arena.strings` like every other list in
 /// the half, so this is three parameters rather than four and the caller sizes
 /// one element array instead of two.
+///
+/// Borrowed from `scratch`, `raw` and `arena`; see `ContentArena`.
 pub fn decodeSendMessageRequest(
     raw: []const u8,
     arena: *ContentArena,
@@ -5437,6 +6020,11 @@ pub fn decodeSendMessageRequest(
 }
 
 /// Decode a `SendMessageResponse`.
+///
+/// The union carries exactly one arm, so an object with none is
+/// `error.MissingField` and an object with two is first-wins.
+///
+/// Borrowed from `scratch`, `raw` and `arena`; see `ContentArena`.
 pub fn decodeSendMessageResponse(
     raw: []const u8,
     arena: *ContentArena,
@@ -5451,6 +6039,11 @@ pub fn decodeSendMessageResponse(
 }
 
 /// Decode a `StreamResponse`.
+///
+/// The union carries exactly one arm, so an object with none is
+/// `error.MissingField` and an object with two is first-wins.
+///
+/// Borrowed from `scratch`, `raw` and `arena`; see `ContentArena`.
 pub fn decodeStreamResponse(
     raw: []const u8,
     arena: *ContentArena,
@@ -5465,92 +6058,144 @@ pub fn decodeStreamResponse(
 }
 
 /// Encode a `PartContent`.
+///
+/// A `.raw` whose base64 does not fit `base64` is `error.BufferTooSmall` before
+/// the first byte is written. A `.data` lexeme is spliced verbatim and is not
+/// inspected. Allocates nothing.
 pub fn encodePartContent(
     content: PartContent,
     writer: *json.Writer,
     base64: []u8,
 ) EncodeError!void {
-    try validatePartContent(content, base64);
+    try validatePartContent(content, base64, 1);
     try writePartContent(content, writer, base64);
 }
 
 /// Encode a `Part`.
+///
+/// The `oneof` is written under its own member name and is always first. A
+/// `.raw` whose base64 does not fit `base64` is `error.BufferTooSmall` before
+/// the first byte is written, and `metadata` is spliced verbatim and not
+/// inspected. Allocates nothing.
 pub fn encodePart(part: Part, writer: *json.Writer, base64: []u8) EncodeError!void {
-    try validatePart(part, base64);
+    try validatePart(part, base64, 1);
     try writePart(part, writer, base64);
 }
 
 /// Encode a `Message`.
+///
+/// An empty `message_id` is `error.InvalidField` and a `Part.raw` anywhere in
+/// `parts` that does not fit `base64` is `error.BufferTooSmall`; both are
+/// raised before the first byte is written, so every value `decodeMessage`
+/// returned can be written back. Allocates nothing.
 pub fn encodeMessage(message: Message, writer: *json.Writer, base64: []u8) EncodeError!void {
-    try validateMessage(message, base64);
+    try validateMessage(message, base64, 1);
     try writeMessage(message, writer, base64);
 }
 
 /// Encode an `Artifact`.
+///
+/// An empty `artifact_id` is `error.InvalidField` and a `Part.raw` anywhere in
+/// `parts` that does not fit `base64` is `error.BufferTooSmall`; both are
+/// raised before the first byte is written, so every value `decodeArtifact`
+/// returned can be written back. Allocates nothing.
 pub fn encodeArtifact(artifact: Artifact, writer: *json.Writer, base64: []u8) EncodeError!void {
-    try validateArtifact(artifact, base64);
+    try validateArtifact(artifact, base64, 1);
     try writeArtifact(artifact, writer, base64);
 }
 
 /// Encode a `TaskStatus`.
+///
+/// `state` cannot be refused, but a nested `message` is walked first, so an
+/// empty `message_id` or an oversized `Part.raw` under it is raised before the
+/// first byte is written. Allocates nothing.
 pub fn encodeTaskStatus(status: TaskStatus, writer: *json.Writer, base64: []u8) EncodeError!void {
-    try validateTaskStatus(status, base64);
+    try validateTaskStatus(status, base64, 1);
     try writeTaskStatus(status, writer, base64);
 }
 
 /// Encode a `Task`.
+///
+/// An empty `id` is `error.InvalidField` and every `Part.raw` under the status
+/// message, the artifacts and the history is checked against `base64` first, so
+/// a refusal leaves the caller's buffer untouched and every value `decodeTask`
+/// returned can be written back. Allocates nothing.
 pub fn encodeTask(task: Task, writer: *json.Writer, base64: []u8) EncodeError!void {
-    try validateTask(task, base64);
+    try validateTask(task, base64, 1);
     try writeTask(task, writer, base64);
 }
 
 /// Encode a `TaskStatusUpdateEvent`.
+///
+/// An empty `task_id` or `context_id` is `error.InvalidField` and every
+/// `Part.raw` under the status is checked against `base64`, all before the
+/// first byte is written. Allocates nothing.
 pub fn encodeTaskStatusUpdateEvent(
     event: TaskStatusUpdateEvent,
     writer: *json.Writer,
     base64: []u8,
 ) EncodeError!void {
-    try validateTaskStatusUpdateEvent(event, base64);
+    try validateTaskStatusUpdateEvent(event, base64, 1);
     try writeTaskStatusUpdateEvent(event, writer, base64);
 }
 
 /// Encode a `TaskArtifactUpdateEvent`.
+///
+/// An empty `task_id` or `context_id` is `error.InvalidField` and every
+/// `Part.raw` under the artifact is checked against `base64`, all before the
+/// first byte is written. Allocates nothing.
 pub fn encodeTaskArtifactUpdateEvent(
     event: TaskArtifactUpdateEvent,
     writer: *json.Writer,
     base64: []u8,
 ) EncodeError!void {
-    try validateTaskArtifactUpdateEvent(event, base64);
+    try validateTaskArtifactUpdateEvent(event, base64, 1);
     try writeTaskArtifactUpdateEvent(event, writer, base64);
 }
 
 /// Encode a `SendMessageRequest`.
+///
+/// The message and the nested configuration are both walked first, so an empty
+/// `message_id`, a nested empty webhook `url` and every oversized `Part.raw`
+/// under either are raised before the first byte is written. Allocates nothing.
 pub fn encodeSendMessageRequest(
     request: SendMessageRequest,
     writer: *json.Writer,
     base64: []u8,
 ) EncodeError!void {
-    try validateSendMessageRequest(request, base64);
+    try validateSendMessageRequest(request, base64, 1);
     try writeSendMessageRequest(request, writer, base64);
 }
 
 /// Encode a `SendMessageResponse`.
+///
+/// The arm the union holds is walked first, so an empty `Task.id` or
+/// `Message.message_id` and every oversized `Part.raw` under it are raised
+/// before the first byte is written. Allocates nothing.
 pub fn encodeSendMessageResponse(
     response: SendMessageResponse,
     writer: *json.Writer,
     base64: []u8,
 ) EncodeError!void {
-    try validateSendMessageResponse(response, base64);
+    // The arm is written under the response object, so it is the second
+    // container of the document this encoder produces.
+    try validateSendMessageResponse(response, base64, 2);
     try writeSendMessageResponse(response, writer, base64);
 }
 
 /// Encode a `StreamResponse`.
+///
+/// The arm the union holds is walked first, so every refusal that arm can
+/// raise — an empty id, a nested configuration — is reported before the first
+/// byte is written. Allocates nothing.
 pub fn encodeStreamResponse(
     response: StreamResponse,
     writer: *json.Writer,
     base64: []u8,
 ) EncodeError!void {
-    try validateStreamResponse(response, base64);
+    // The arm is written under the response object, so it is the second
+    // container of the document this encoder produces.
+    try validateStreamResponse(response, base64, 2);
     try writeStreamResponse(response, writer, base64);
 }
 
@@ -5560,79 +6205,99 @@ pub fn encodeStreamResponse(
 // for the reason `acp.encodePermissionRequest` checks its whole request: a
 // refusal halfway through leaves `{"id":"t","status":{"sta` in the caller's
 // buffer, which is neither a message nor nothing. What is refused is a value
-// the decoder could not have returned — an empty REQUIRED string, or a
-// `Part.raw` that does not fit the caller's base64 buffer — and both are
-// `error.InvalidField` and `error.BufferTooSmall` rather than a truncated
-// document. The walk reaches every member that can refuse, which includes the
+// the decoder could not have returned — an empty REQUIRED string, a `Part.raw`
+// that does not fit the caller's base64 buffer, or an opaque lexeme that is not
+// exactly one JSON value where it is written — and each is `error.InvalidField` or
+// `error.BufferTooSmall` rather than a truncated document. The walk reaches
+// every member that can refuse, which includes the
 // ones nested inside another message: a `SendMessageRequest` whose
 // configuration carries an empty webhook `url` is refused before the writer
 // has been touched, because the write half that would place it no longer
 // validates anything of its own.
 
-fn validatePartContent(content: PartContent, base64: []u8) EncodeError!void {
+/// `depth` is the container depth at which this object's own members are read.
+fn validatePartContent(content: PartContent, base64: []u8, depth: u32) EncodeError!void {
     switch (content) {
-        .text, .url, .data => {},
+        .text, .url => {},
+        .data => |data| try validateRawValue(data, depth),
         .raw => |raw| {
             if (json.base64.encodedLen(raw.len) > base64.len) return error.BufferTooSmall;
         },
     }
 }
 
-fn validatePart(part: Part, base64: []u8) EncodeError!void {
-    try validatePartContent(part.content, base64);
+fn validatePart(part: Part, base64: []u8, depth: u32) EncodeError!void {
+    try validatePartContent(part.content, base64, depth);
+    if (part.metadata) |metadata| try validateRawValue(metadata, depth);
 }
 
-fn validateParts(parts: []const Part, base64: []u8) EncodeError!void {
-    for (parts) |part| try validatePart(part, base64);
+fn validateParts(parts: []const Part, base64: []u8, depth: u32) EncodeError!void {
+    for (parts) |part| try validatePart(part, base64, depth);
 }
 
-fn validateMessage(message: Message, base64: []u8) EncodeError!void {
+fn validateMessage(message: Message, base64: []u8, depth: u32) EncodeError!void {
     if (message.message_id.len == 0) return error.InvalidField;
-    try validateParts(message.parts, base64);
+    if (message.metadata) |metadata| try validateRawValue(metadata, depth);
+    // `parts` is an array member, so each element is an object two containers
+    // below this one: the array, then the part.
+    try validateParts(message.parts, base64, depth + 2);
 }
 
-fn validateMessages(messages: []const Message, base64: []u8) EncodeError!void {
-    for (messages) |message| try validateMessage(message, base64);
+fn validateMessages(messages: []const Message, base64: []u8, depth: u32) EncodeError!void {
+    for (messages) |message| try validateMessage(message, base64, depth);
 }
 
-fn validateArtifact(artifact: Artifact, base64: []u8) EncodeError!void {
+fn validateArtifact(artifact: Artifact, base64: []u8, depth: u32) EncodeError!void {
     if (artifact.artifact_id.len == 0) return error.InvalidField;
-    try validateParts(artifact.parts, base64);
+    if (artifact.metadata) |metadata| try validateRawValue(metadata, depth);
+    try validateParts(artifact.parts, base64, depth + 2);
 }
 
-fn validateArtifacts(artifacts: []const Artifact, base64: []u8) EncodeError!void {
-    for (artifacts) |artifact| try validateArtifact(artifact, base64);
+fn validateArtifacts(artifacts: []const Artifact, base64: []u8, depth: u32) EncodeError!void {
+    for (artifacts) |artifact| try validateArtifact(artifact, base64, depth);
 }
 
-fn validateTaskStatus(status: TaskStatus, base64: []u8) EncodeError!void {
-    if (status.message) |message| try validateMessage(message, base64);
+fn validateTaskStatus(status: TaskStatus, base64: []u8, depth: u32) EncodeError!void {
+    if (status.message) |message| try validateMessage(message, base64, depth + 1);
 }
 
-fn validateTask(task: Task, base64: []u8) EncodeError!void {
+fn validateTask(task: Task, base64: []u8, depth: u32) EncodeError!void {
     if (task.id.len == 0) return error.InvalidField;
-    try validateTaskStatus(task.status, base64);
-    if (task.artifacts) |artifacts| try validateArtifacts(artifacts, base64);
-    if (task.history) |history| try validateMessages(history, base64);
+    if (task.metadata) |metadata| try validateRawValue(metadata, depth);
+    try validateTaskStatus(task.status, base64, depth + 1);
+    // `artifacts` and `history` are array members, so each element is an object
+    // two containers below this one.
+    if (task.artifacts) |artifacts| try validateArtifacts(artifacts, base64, depth + 2);
+    if (task.history) |history| try validateMessages(history, base64, depth + 2);
 }
 
 fn validateTaskStatusUpdateEvent(
     event: TaskStatusUpdateEvent,
     base64: []u8,
+    depth: u32,
 ) EncodeError!void {
     if (event.task_id.len == 0 or event.context_id.len == 0) return error.InvalidField;
-    try validateTaskStatus(event.status, base64);
+    if (event.metadata) |metadata| try validateRawValue(metadata, depth);
+    try validateTaskStatus(event.status, base64, depth + 1);
 }
 
 fn validateTaskArtifactUpdateEvent(
     event: TaskArtifactUpdateEvent,
     base64: []u8,
+    depth: u32,
 ) EncodeError!void {
     if (event.task_id.len == 0 or event.context_id.len == 0) return error.InvalidField;
-    try validateArtifact(event.artifact, base64);
+    if (event.metadata) |metadata| try validateRawValue(metadata, depth);
+    try validateArtifact(event.artifact, base64, depth + 1);
 }
 
-fn validateSendMessageRequest(request: SendMessageRequest, base64: []u8) EncodeError!void {
-    try validateMessage(request.message, base64);
+fn validateSendMessageRequest(
+    request: SendMessageRequest,
+    base64: []u8,
+    depth: u32,
+) EncodeError!void {
+    try validateMessage(request.message, base64, depth + 1);
+    if (request.metadata) |metadata| try validateRawValue(metadata, depth);
     // The configuration carries a REQUIRED member of its own, so it is walked
     // here rather than left to the write half that follows: a refusal raised
     // once the buffer holds `{"message":{…},"configuration":{"taskP` is a
@@ -5660,19 +6325,20 @@ fn validateSendMessageConfiguration(configuration: SendMessageConfiguration) Enc
 fn validateSendMessageResponse(
     response: SendMessageResponse,
     base64: []u8,
+    depth: u32,
 ) EncodeError!void {
     switch (response) {
-        .task => |task| try validateTask(task, base64),
-        .message => |message| try validateMessage(message, base64),
+        .task => |task| try validateTask(task, base64, depth),
+        .message => |message| try validateMessage(message, base64, depth),
     }
 }
 
-fn validateStreamResponse(response: StreamResponse, base64: []u8) EncodeError!void {
+fn validateStreamResponse(response: StreamResponse, base64: []u8, depth: u32) EncodeError!void {
     switch (response) {
-        .task => |task| try validateTask(task, base64),
-        .message => |message| try validateMessage(message, base64),
-        .status_update => |event| try validateTaskStatusUpdateEvent(event, base64),
-        .artifact_update => |event| try validateTaskArtifactUpdateEvent(event, base64),
+        .task => |task| try validateTask(task, base64, depth),
+        .message => |message| try validateMessage(message, base64, depth),
+        .status_update => |event| try validateTaskStatusUpdateEvent(event, base64, depth),
+        .artifact_update => |event| try validateTaskArtifactUpdateEvent(event, base64, depth),
     }
 }
 
@@ -6421,6 +7087,46 @@ test "page size bounds are 1 to 100 with a default cap of 50" {
     try testing.expectEqual(@as(i32, 50), page_size_default);
 }
 
+test "an absent page size stays absent and no codec range-checks one" {
+    var scratch: [64]u8 = undefined;
+    var out: [256]u8 = undefined;
+
+    // `page_size_default` is the cap a peer applies to the page it sends, and
+    // nothing here writes it into a request. `{}` asked for no page size, and a
+    // re-encode writes no `pageSize` at all.
+    const bare = try decodeListTasksRequest("{\"tenant\":\"acme\"}", &scratch);
+    try testing.expectEqual(@as(?i32, null), bare.page_size);
+    var writer = json.Writer.init(&out);
+    try encodeListTasksRequest(bare, &writer);
+    try testing.expectEqualStrings("{\"tenant\":\"acme\"}", writer.written());
+
+    // `"pageSize":0` is the other request and a different document, so it
+    // survives as itself rather than being read as the absent one.
+    const zero = try decodeListTasksRequest("{\"pageSize\":0}", &scratch);
+    try testing.expectEqual(@as(?i32, 0), zero.page_size.?);
+    writer = json.Writer.init(&out);
+    try encodeListTasksRequest(zero, &writer);
+    try testing.expectEqualStrings("{\"pageSize\":0}", writer.written());
+
+    // The range is the caller's policy rather than a decode rule: an
+    // out-of-range page size decodes and re-encodes, and `isValidPageSize` is
+    // what a caller reads it with.
+    const over = try decodeListTasksRequest("{\"pageSize\":101}", &scratch);
+    try testing.expectEqual(@as(?i32, 101), over.page_size.?);
+    try testing.expect(!isValidPageSize(over.page_size.?));
+    writer = json.Writer.init(&out);
+    try encodeListTasksRequest(over, &writer);
+    try testing.expectEqualStrings("{\"pageSize\":101}", writer.written());
+
+    // And the same for the push-notification page request, whose `pageSize` is
+    // a plain `int32` in the proto rather than an `optional int32`.
+    const config_page = try decodeListTaskPushNotificationConfigsRequest(
+        "{\"taskId\":\"t\"}",
+        &scratch,
+    );
+    try testing.expectEqual(@as(?i32, null), config_page.page_size);
+}
+
 test "an empty nextPageToken means the last page, and absence is an error" {
     try testing.expect(!hasNextPage(""));
     try testing.expect(hasNextPage("cursor-1"));
@@ -7094,6 +7800,208 @@ test "CancelTaskRequest carries its metadata lexeme" {
         error.MalformedJson,
         decodeCancelTaskRequest("{\"id\":\"t\"} x", &scratch),
     );
+}
+
+test "an opaque lexeme that is not one value is refused before a byte is written" {
+    var out: [512]u8 = undefined;
+    var base64: [64]u8 = undefined;
+
+    // An encoder splices an opaque field verbatim, so a lexeme that is not one
+    // complete JSON value is a document the matching decoder would refuse on
+    // the way back in. The refusal is `error.InvalidField` from the validation
+    // walk, ahead of the first byte, so the caller's buffer holds nothing.
+    var writer = json.Writer.init(&out);
+    try testing.expectError(
+        error.InvalidField,
+        encodeCancelTaskRequest(.{ .id = "t", .metadata = "{\"reason\":}" }, &writer),
+    );
+    try testing.expectEqual(@as(usize, 0), writer.written().len);
+
+    // A second value behind the first is refused too: the check is one whole
+    // value, not one parsable prefix.
+    writer = json.Writer.init(&out);
+    try testing.expectError(
+        error.InvalidField,
+        encodeCancelTaskRequest(.{ .id = "t", .metadata = "{} {}" }, &writer),
+    );
+    try testing.expectEqual(@as(usize, 0), writer.written().len);
+
+    // The same rule reaches every other opaque field, each through the walk its
+    // own encoder already makes.
+    writer = json.Writer.init(&out);
+    try testing.expectError(
+        error.InvalidField,
+        encodePart(.{ .content = .{ .data = "{\"a\":}" } }, &writer, &base64),
+    );
+    try testing.expectEqual(@as(usize, 0), writer.written().len);
+
+    writer = json.Writer.init(&out);
+    try testing.expectError(
+        error.InvalidField,
+        encodeMessage(
+            .{ .message_id = "m", .role = .user, .parts = &.{}, .metadata = "[" },
+            &writer,
+            &base64,
+        ),
+    );
+    try testing.expectEqual(@as(usize, 0), writer.written().len);
+
+    writer = json.Writer.init(&out);
+    try testing.expectError(
+        error.InvalidField,
+        encodeAgentExtension(.{ .params = "{\"a\":}" }, &writer),
+    );
+    try testing.expectEqual(@as(usize, 0), writer.written().len);
+
+    writer = json.Writer.init(&out);
+    try testing.expectError(
+        error.InvalidField,
+        encodeAgentCardSignature(
+            .{ .protected = "p", .signature = "s", .header = "]" },
+            &writer,
+        ),
+    );
+    try testing.expectEqual(@as(usize, 0), writer.written().len);
+
+    // `json.max_depth` bounds the containers of a whole document, and a member is
+    // read with the containers around it already open. The object this encoder
+    // writes is at one, so a lexeme nested `max_depth - 1` deep is the last
+    // that fits here and one more is refused.
+    writer = json.Writer.init(&out);
+    try testing.expectError(
+        error.InvalidField,
+        encodeCancelTaskRequest(
+            .{ .id = "t", .metadata = "[" ** json.max_depth ++ "]" ** json.max_depth },
+            &writer,
+        ),
+    );
+    try testing.expectEqual(@as(usize, 0), writer.written().len);
+
+    const at_limit = "[" ** (json.max_depth - 1) ++ "]" ** (json.max_depth - 1);
+    writer = json.Writer.init(&out);
+    try encodeCancelTaskRequest(.{ .id = "t", .metadata = at_limit }, &writer);
+    try testing.expectEqualStrings(
+        "{\"id\":\"t\",\"metadata\":" ++ at_limit ++ "}",
+        writer.written(),
+    );
+
+    // And a lexeme that is one whole value is still written as it stands, which
+    // is what keeps a key this library does not model inside it. `null` is a
+    // value too, so a `null` lexeme stays the member present and carrying
+    // nothing rather than becoming the member absent.
+    writer = json.Writer.init(&out);
+    try encodeCancelTaskRequest(
+        .{ .id = "t", .metadata = "{\"reason\":\"user\",\"depth\":2}" },
+        &writer,
+    );
+    try testing.expectEqualStrings(
+        "{\"id\":\"t\",\"metadata\":{\"reason\":\"user\",\"depth\":2}}",
+        writer.written(),
+    );
+
+    writer = json.Writer.init(&out);
+    try encodePart(.{ .content = .{ .data = "{\"x\":[1,2]}" } }, &writer, &base64);
+    try testing.expectEqualStrings("{\"data\":{\"x\":[1,2]}}", writer.written());
+}
+
+test "an opaque lexeme is checked at the depth its member is written" {
+    var scratch: [512]u8 = undefined;
+    var base64: [64]u8 = undefined;
+    var parts: [4]Part = undefined;
+    var artifacts: [2]Artifact = undefined;
+    var messages: [4]Message = undefined;
+    var strings: [8][]const u8 = undefined;
+    var bytes: [128]u8 = undefined;
+    var arena = ContentArena.init(&parts, &artifacts, &messages, &strings, &bytes);
+    var out: [2048]u8 = undefined;
+
+    // A task on a page is the third container of the document it is written
+    // into — the page object, its `tasks` array and the task — so its `metadata`
+    // has two fewer levels available than the same task written on its own.
+    const page_fits = json.max_depth - 3;
+    const page: ListTasksResponse = .{
+        .tasks = &[_]Task{.{
+            .id = "t",
+            .status = .{ .state = .working },
+            .metadata = "[" ** page_fits ++ "]" ** page_fits,
+        }},
+        .next_page_token = "",
+        .page_size = 1,
+        .total_size = 1,
+    };
+    var writer = json.Writer.init(&out);
+    try encodeListTasksResponse(page, &writer, &base64);
+
+    // One level deeper than that page allows is refused, and refused before the
+    // first byte rather than after a task is half written.
+    const page_too_deep: ListTasksResponse = .{
+        .tasks = &[_]Task{.{
+            .id = "t",
+            .status = .{ .state = .working },
+            .metadata = "[" ** (page_fits + 1) ++ "]" ** (page_fits + 1),
+        }},
+        .next_page_token = "",
+        .page_size = 1,
+        .total_size = 1,
+    };
+    writer = json.Writer.init(&out);
+    try testing.expectError(
+        error.InvalidField,
+        encodeListTasksResponse(page_too_deep, &writer, &base64),
+    );
+    try testing.expectEqual(@as(usize, 0), writer.written().len);
+
+    // The same value written on its own has the levels back, so the same lexeme
+    // the page refused is a bare task's metadata at two more and is written.
+    writer = json.Writer.init(&out);
+    try encodeTask(page_too_deep.tasks[0], &writer, &base64);
+
+    // A part's `data` under a message inside a stream response is six
+    // containers down: the response object, the task, its status, the message,
+    // the `parts` array and the part.
+    const nested_fits = json.max_depth - 6;
+    const nested = StreamResponse{ .task = .{
+        .id = "t",
+        .status = .{ .state = .working, .message = .{
+            .message_id = "m",
+            .role = .user,
+            .parts = &[_]Part{.{
+                .content = .{ .data = "[" ** nested_fits ++ "]" ** nested_fits },
+            }},
+        } },
+    } };
+    writer = json.Writer.init(&out);
+    try encodeStreamResponse(nested, &writer, &base64);
+
+    const nested_too_deep = StreamResponse{ .task = .{
+        .id = "t",
+        .status = .{ .state = .working, .message = .{
+            .message_id = "m",
+            .role = .user,
+            .parts = &[_]Part{.{
+                .content = .{ .data = "[" ** (nested_fits + 1) ++ "]" ** (nested_fits + 1) },
+            }},
+        } },
+    } };
+    writer = json.Writer.init(&out);
+    try testing.expectError(
+        error.InvalidField,
+        encodeStreamResponse(nested_too_deep, &writer, &base64),
+    );
+    try testing.expectEqual(@as(usize, 0), writer.written().len);
+
+    // And the deepest a decode admits is the deepest an encode writes, so a
+    // value that decoded still writes back and decodes again. A bare task is at
+    // one, so a `metadata` lexeme nested `max_depth - 1` deep is the boundary.
+    const deepest = "[" ** (json.max_depth - 1) ++ "]" ** (json.max_depth - 1);
+    const body = "{\"id\":\"t\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}," ++
+        "\"metadata\":" ++ deepest ++ "}";
+    const task = try decodeTask(body, &arena, &scratch);
+    writer = json.Writer.init(&out);
+    try encodeTask(task, &writer, &base64);
+    try testing.expectEqualStrings(body, writer.written());
+    arena.reset();
+    _ = try decodeTask(writer.written(), &arena, &scratch);
 }
 
 test "SubscribeToTaskRequest round-trips and refuses an empty id" {
@@ -7921,11 +8829,13 @@ test "Part.raw is the base64 of the bytes, in the standard alphabet" {
     try encodePart(empty, &writer, &storage.base64);
     try testing.expectEqualStrings("{\"raw\":\"\"}", writer.written());
 
-    // The URL-safe spelling is what `AgentCardSignature` carries and not what
-    // this field does, so a peer that sent it here is refused rather than
-    // quietly accepted and written back in the other alphabet: the contract is
-    // `encode(decode(b)) == b`, and accepting both alphabets would break it for
-    // every document that used the second one.
+    // `Part.raw` is a protobuf `bytes` field, and ProtoJSON renders `bytes` as
+    // RFC 4648 section 4 base64: `A-Za-z0-9+/` with `=` padding. That is the
+    // one alphabet this field admits. The URL-safe spelling is what
+    // `AgentCardSignature` carries and not what this field does, so a peer that
+    // sent it here is refused rather than quietly accepted and written back in
+    // the alphabet the field does not prescribe: a decoder that took both would
+    // turn one document into another.
     try testing.expectError(
         error.InvalidField,
         decodePart("{\"raw\":\"____\"}", &storage.arena, &storage.scratch),
@@ -9242,6 +10152,67 @@ test "an out array that fills is an error and never a truncation" {
     try testing.expectEqualStrings("{\"raw\":\"AAECAwQ=\"}", fits.written());
 }
 
+test "an arena counter is a fill level and not a resume" {
+    var scratch: [512]u8 = undefined;
+    var parts: [8]Part = undefined;
+    var artifacts: [2]Artifact = undefined;
+    var messages: [4]Message = undefined;
+    var strings: [8][]const u8 = undefined;
+    var bytes: [64]u8 = undefined;
+    var arena = ContentArena.init(&parts, &artifacts, &messages, &strings, &bytes);
+
+    // A message with three parts fills three of them, and the counters say so
+    // after the call rather than only through the returned value.
+    const first = try decodeMessage(
+        "{\"messageId\":\"m\",\"role\":\"ROLE_USER\",\"parts\":" ++
+            "[{\"text\":\"a\"},{\"text\":\"b\"},{\"text\":\"c\"}]}",
+        &arena,
+        &scratch,
+    );
+    try testing.expectEqual(@as(usize, 3), arena.parts_used);
+    try testing.expectEqual(@as(usize, 3), first.parts.len);
+
+    // A refusal in the middle leaves the counters where the walk stopped. They
+    // describe how far the reader got, not a document the caller may keep, and
+    // the storage behind them holds a partial message.
+    var one_part: [1]Part = undefined;
+    var tight = ContentArena.init(&one_part, &artifacts, &messages, &strings, &bytes);
+    try testing.expectError(
+        error.BufferTooSmall,
+        decodeMessage(
+            "{\"messageId\":\"m\",\"role\":\"ROLE_USER\"," ++
+                "\"parts\":[{\"text\":\"a\"},{\"text\":\"b\"}]}",
+            &tight,
+            &scratch,
+        ),
+    );
+
+    // A copy of an arena names the same arrays rather than a second set of
+    // them, so a decode through the copy writes into the storage the original
+    // names too, and each copy keeps its own counters.
+    var copy = tight;
+    const second = try decodeMessage(
+        "{\"messageId\":\"m\",\"role\":\"ROLE_USER\",\"parts\":[{\"text\":\"a\"}]}",
+        &copy,
+        &scratch,
+    );
+    try testing.expectEqual(@as(usize, 1), copy.parts_used);
+    try testing.expectEqual(@as(usize, 0), tight.parts_used);
+    try testing.expectEqual(@as(usize, 1), second.parts.len);
+    try testing.expectEqualStrings("a", one_part[0].content.text);
+
+    // And the next decode starts from zero rather than continuing from the
+    // counters the previous one left, so a re-run is not a resume.
+    const third = try decodeMessage(
+        "{\"messageId\":\"m\",\"role\":\"ROLE_USER\",\"parts\":[{\"text\":\"z\"}]}",
+        &arena,
+        &scratch,
+    );
+    try testing.expectEqual(@as(usize, 1), arena.parts_used);
+    try testing.expectEqual(@as(usize, 1), third.parts.len);
+    try testing.expectEqualStrings("z", third.parts[0].content.text);
+}
+
 // --- Codec: the two list responses ----------------------------------------------
 
 // What this section carries
@@ -9316,12 +10287,42 @@ test "an out array that fills is an error and never a truncation" {
 // through `validateTaskPushNotificationConfig`. A page refused halfway is
 // neither a page nor nothing, so the refusal comes first and neither encoder
 // validates anything once it has started writing.
+//
+// What a caller holds after a decode in this section
+//
+// `decodeListTasksResponse` takes the caller's own array of `Task` and the
+// content arena. The page's `tasks` is a run of the first, and every part,
+// artifact, message and `Part.raw` under it is a run of the second. The arena
+// is reset before the walk, so a second call into the same arena overwrites the
+// first page's values. A refusal leaves the caller's array holding the elements
+// the walk reached and the counters at that point, and the caller discards
+// both: neither is a resume, and the next call writes both again from zero.
+//
+// `decodeListTaskPushNotificationConfigsResponse` takes no arena at all,
+// because nothing under a configuration is arena storage. `configs` is a run of
+// the caller's array and every string in it borrows `raw` or `scratch`. A
+// refusal again leaves the array holding a partial walk, and no count is
+// reported, so the caller discards it.
+//
+// An encoder here checks the whole page before its first byte, an opaque
+// lexeme included: a webhook credential and every string beside it are read
+// back with the decoder's own reader at the depth a task on a page is written
+// at, which is three, so a value that is not exactly one JSON value there is
+// `error.InvalidField` with the caller's buffer untouched.
+//
+// Valid UTF-8 is the caller's precondition and is not checked in any optimize
+// mode.
 
 /// Decode a `ListTasksResponse` page.
 ///
 /// All four members are REQUIRED and none of them may be invented, so a page
 /// missing one is `error.MissingField` rather than a page answered with a
 /// default. `tasks` may be empty, because an empty page is a page.
+///
+/// `tasks` is a run of the caller's own array and everything under it comes out
+/// of `arena`, which is reset before the walk. A refusal leaves that array
+/// holding a partial walk and the arena counters at that point, and the caller
+/// discards both.
 pub fn decodeListTasksResponse(
     raw: []const u8,
     tasks: []Task,
@@ -9419,13 +10420,17 @@ fn readTasks(
 /// Every task is validated first, for the reason the section above gives: the
 /// walk reaches a status message, an artifact and a history message, and so
 /// every `Part.raw` that does not fit `base64`, and a page refused halfway is
-/// neither a page nor nothing.
+/// neither a page nor nothing. Every value `decodeListTasksResponse` returned
+/// can therefore be written back, and a refusal leaves the caller's buffer
+/// untouched.
 pub fn encodeListTasksResponse(
     response: ListTasksResponse,
     writer: *json.Writer,
     base64: []u8,
 ) EncodeError!void {
-    for (response.tasks) |task| try validateTask(task, base64);
+    // The page object is the document, its `tasks` array is the second
+    // container and each task is the third, which is where its members are read.
+    for (response.tasks) |task| try validateTask(task, base64, 3);
 
     try writer.byte('{');
     try writeMemberName(ListTasksResponse, 0, writer);
@@ -9453,6 +10458,10 @@ pub fn encodeListTasksResponse(
 /// them, and each is a presence the encoder can write back as itself. There is
 /// no arena and no reset, because nothing under a configuration is arena
 /// storage; the caller's array and the reader's scratch are the whole of it.
+///
+/// `configs` is a run of the caller's own array and every string in it borrows
+/// `raw` or `scratch`. A refusal leaves that array holding a partial walk, and
+/// the caller discards it.
 pub fn decodeListTaskPushNotificationConfigsResponse(
     raw: []const u8,
     configs: []TaskPushNotificationConfig,
@@ -9514,11 +10523,15 @@ fn readPushNotificationConfigs(
 
 /// Encode a `ListTaskPushNotificationConfigsResponse` page.
 ///
-/// Both members are written or both are left out, because both are presences:
-/// a page holding no configuration and a page that never said are two
-/// documents, and only the first of them is `{"configs":[]}`. Every
-/// configuration is validated first, for the reason
-/// `encodeListTasksResponse` gives.
+/// Each member is written or left out on its own, because each is a presence: a
+/// null `configs` becomes no member and an empty one becomes `{"configs":[]}`,
+/// and a null `next_page_token` becomes no member while `""` is written as the
+/// last page. Every configuration is validated first, for the reason
+/// `encodeListTasksResponse` gives, so every value
+/// `decodeListTaskPushNotificationConfigsResponse` returned can be written
+/// back.
+///
+/// Allocates nothing.
 pub fn encodeListTaskPushNotificationConfigsResponse(
     response: ListTaskPushNotificationConfigsResponse,
     writer: *json.Writer,
@@ -10217,7 +11230,8 @@ test "a config list encoder validates every configuration before it writes a byt
 // `StringList`, `SecurityRequirement`, the `SecurityScheme` union and its five
 // arms, the `OAuthFlows` union and its five arms, `OAuthScope`, and the three
 // map entries between them. Every one of them has a decoder and an encoder, and
-// the two are exact inverses.
+// the two are inverses in value: what a decoder produced re-encodes to the same
+// values, in field-number order.
 //
 // A card, not a task
 //
@@ -10355,23 +11369,67 @@ test "a config list encoder validates every configuration before it writes a byt
 // `error.MissingField`. The three live OAuth flows keep their REQUIRED scope
 // maps for the same reason, so `"scopes":{}` is a flow that authorizes nothing
 // rather than a flow with no scope member.
+//
+// What a caller holds after a decode in this section
+//
+// A decoder here takes `raw`, `scratch` and a `CardArena`, and the result names
+// all three: a text member with no escape sequence is a sub-slice of `raw` and
+// one with an escape is a region of `scratch`, an opaque lexeme —
+// `AgentExtension.params` and `AgentCardSignature.header` — is a region of
+// `raw`, and every element slice is a run of one arena array. A map entry's key
+// is text read like any other. Nothing in a card decodes into the caller's own
+// bytes, which is why no card encoder takes a base64 buffer.
+//
+// Every decoder here resets the arena before it reads, so a second call into
+// the same arena overwrites the first card's values. A refusal leaves the
+// counters at whatever the partial walk reached and the arrays holding a
+// partial card; the caller discards both, because the counters are not a
+// resume and the next call writes them again from zero.
+//
+// An encoder here checks the whole card before its first byte, the two opaque
+// lexemes included: `AgentExtension.params` and `AgentCardSignature.header` are
+// read back with the decoder's own reader at the depth they are written at, so
+// one that is not exactly one JSON value there is `error.InvalidField`
+// with the caller's buffer untouched. The check reads the lexeme and does not
+// read into it, so a key this library does not model still reaches the wire.
+// Valid UTF-8 is the caller's precondition and no optimize mode diagnoses a
+// breach of it.
 
 /// The caller-owned storage a discovery-half decode writes into.
 ///
 /// Every array here is sized by the caller, and a decode that finds more
 /// elements than an array holds is `error.BufferTooSmall` rather than a
-/// truncated card. The `*_used` fields are the fill levels: they start at zero,
-/// and every public decoder in this section resets them before it reads, so one
-/// arena serves one document at a time. Reusing an arena for a second document
-/// overwrites the first one's values.
+/// truncated card.
 ///
-/// The nine arrays are the nine distinct element types a card reaches. A
-/// tenth would be the caller sizing storage for nothing, which is why the
-/// three map arrays carry a second job: the keys a map spent on a `null`
-/// value are recorded in the tail of the array that map is filling, since
-/// they produce no entry and would otherwise want a tenth array of their own.
-/// A key costs a slot whether it decides a value or nothing, so a caller
-/// sizing for N entries has room for N keys.
+/// The nine arrays are the nine distinct element types a card reaches. A tenth
+/// would be the caller sizing storage for nothing, which is why the three map
+/// arrays carry a second job: the keys a map spent on a `null` value are
+/// recorded in the tail of the array that map is filling, since they produce no
+/// entry and would otherwise want a tenth array of their own. A key costs a
+/// slot whether it decides a value or nothing, so a caller sizing for N entries
+/// has room for N keys.
+///
+/// **One arena, one card.** The `*_used` fields are the fill levels. They start
+/// at zero, every public decoder in this section calls `reset` before it reads,
+/// and `reset` runs before any byte of `raw` is walked. A decode therefore
+/// invalidates every slice the previous one returned: those slices still point
+/// into the same arrays, and the second card is written over the first one's
+/// values. Holding an `AgentCard` across a second decode into the same arena
+/// holds the second card.
+///
+/// **A copy is not a second owner.** `init` and every assignment copy the nine
+/// slices, not the storage behind them, so two `CardArena` values built from the
+/// same arrays name one set of buffers: a decode through one is visible through
+/// the other, and neither may be reset while the other is being read. `reset`
+/// frees nothing and invalidates nothing on its own — the decode that follows
+/// it is what overwrites the storage.
+///
+/// **What a caller reads after a failure.** A refusal leaves the counters at
+/// whatever the partial walk reached and the arrays holding a partial card.
+/// Those counters describe how far the reader got, not what it holds, so a
+/// caller discards both and re-runs with storage it sized. They are not
+/// accumulated across calls: each decode writes them, so re-running is not a
+/// resume.
 ///
 /// Nothing in here is retained past the call that filled it. The borrowed
 /// strings and lexemes still point into the document and into the caller's
@@ -10406,17 +11464,39 @@ pub const CardArena = struct {
     /// to one number.
     strings: [][]const u8,
 
+    /// How much of `interfaces` the last decode filled.
     interfaces_used: usize = 0,
+    /// How much of `skills` the last decode filled.
     skills_used: usize = 0,
+    /// How much of `extensions` the last decode filled.
     extensions_used: usize = 0,
+    /// How much of `signatures` the last decode filled.
     signatures_used: usize = 0,
+    /// How much of `security_schemes` the last decode filled, counting the
+    /// entries it decided and the keys it spent on a `null` value.
     security_schemes_used: usize = 0,
+    /// How much of `security_requirements` the last decode filled, counting the
+    /// requirements on the card and those on every skill together.
     security_requirements_used: usize = 0,
+    /// How much of `requirement_entries` the last decode filled, counting the
+    /// entries every `SecurityRequirement.schemes` map decided and the keys
+    /// those maps spent on a `null` value.
     requirement_entries_used: usize = 0,
+    /// How much of `scopes` the last decode filled, counting the entries every
+    /// OAuth flow's `scopes` map decided and the keys those maps spent on a
+    /// `null` value.
     scopes_used: usize = 0,
+    /// How much of `strings` the last decode filled, counting every
+    /// `repeated string` element in the document together.
     strings_used: usize = 0,
 
     /// An arena over storage the caller already has.
+    ///
+    /// The slices are taken as given and are not copied: they are the caller's
+    /// arrays and the caller keeps them alive and unmodified for as long as any
+    /// decode writes through this arena. Every counter starts at zero, so a
+    /// fresh arena holds no card. The result is a shallow copy of the slices
+    /// rather than a second set of storage.
     pub fn init(
         interfaces: []AgentInterface,
         skills: []AgentSkill,
@@ -10442,6 +11522,12 @@ pub const CardArena = struct {
     }
 
     /// Forget what a previous decode wrote, keeping the storage.
+    ///
+    /// Sets all nine counters to zero. Nothing is freed and no element is
+    /// cleared, so the next decode starts again at the front of the same arrays
+    /// and overwrites what a previous call put there. A caller that still holds
+    /// a card from the previous decode is holding storage this call has promised
+    /// to reuse.
     pub fn reset(self: *CardArena) void {
         self.interfaces_used = 0;
         self.skills_used = 0;
@@ -11643,12 +12729,12 @@ fn readAgentCard(reader: *json.Reader, arena: *CardArena, scratch: []u8) DecodeE
 /// `discovery_path` serves and what `GetExtendedAgentCard` answers with, and
 /// every other message in this file is something a card describes how to
 /// reach. Eight members are REQUIRED and six are optional, and the six are
-/// presences rather than defaults so the bytes the agent published are the
-/// bytes that come back.
+/// presences rather than defaults, so a member the agent omitted stays omitted
+/// in a re-encode and a member it wrote with its default value comes back.
 ///
-/// `arena` is the caller's own storage and the decoded elements borrow from
-/// both the document and `scratch`; nothing is retained past the buffers the
-/// caller named.
+/// Borrowed from `scratch`, `raw` and `arena`; see `CardArena`. The arena is
+/// reset before the walk, so a refusal leaves it holding a partial card with
+/// the counters at that point, and the caller discards both.
 pub fn decodeAgentCard(
     raw: []const u8,
     arena: *CardArena,
@@ -11666,6 +12752,11 @@ pub fn decodeAgentCard(
 }
 
 /// Decode an `AgentSkill` on its own.
+///
+/// `id`, `name` and `description` are REQUIRED and none may be empty; `tags` is
+/// REQUIRED and an empty array satisfies it.
+///
+/// Borrowed from `scratch`, `raw` and `arena`; see `CardArena`.
 pub fn decodeAgentSkill(
     raw: []const u8,
     arena: *CardArena,
@@ -11680,6 +12771,11 @@ pub fn decodeAgentSkill(
 }
 
 /// Decode an `AgentCapabilities` on its own.
+///
+/// Every member is optional and kept as a presence, so an agent that did not
+/// answer is not an agent that answered no.
+///
+/// Borrowed from `scratch`, `raw` and `arena`; see `CardArena`.
 pub fn decodeAgentCapabilities(
     raw: []const u8,
     arena: *CardArena,
@@ -11694,6 +12790,14 @@ pub fn decodeAgentCapabilities(
 }
 
 /// Decode a `SecurityRequirement` on its own.
+///
+/// The map inside it is walked over keys, so `schemes` is null for a
+/// requirement that never said what it requires and a run of
+/// `arena.requirement_entries` otherwise. The keys that map spent on a `null`
+/// value occupy the tail of that run, so sizing for N entries leaves room for N
+/// keys.
+///
+/// Borrowed from `scratch`, `raw` and `arena`; see `CardArena`.
 pub fn decodeSecurityRequirement(
     raw: []const u8,
     arena: *CardArena,
@@ -11710,7 +12814,10 @@ pub fn decodeSecurityRequirement(
 /// Decode a `SecurityScheme` on its own.
 ///
 /// The union carries exactly one arm, so an object with none is
-/// `error.MissingField` and an object with two is first-wins.
+/// `error.MissingField` and an object with two is first-wins. The `oauth2` arm
+/// needs `arena.scopes`; the other four hold no map.
+///
+/// Borrowed from `scratch`, `raw` and `arena`; see `CardArena`.
 pub fn decodeSecurityScheme(
     raw: []const u8,
     arena: *CardArena,
@@ -11725,6 +12832,12 @@ pub fn decodeSecurityScheme(
 }
 
 /// Decode an `OAuthFlows` on its own.
+///
+/// The union carries exactly one arm, so an object with none is
+/// `error.MissingField` and an object with two is first-wins. The `scopes` map
+/// of the arm it holds is walked over keys into `arena.scopes`.
+///
+/// Borrowed from `scratch`, `raw` and `arena`; see `CardArena`.
 pub fn decodeOAuthFlows(
     raw: []const u8,
     arena: *CardArena,
@@ -11739,6 +12852,11 @@ pub fn decodeOAuthFlows(
 }
 
 /// Decode an `OAuth2SecurityScheme` on its own.
+///
+/// `flows` is REQUIRED and carries exactly one arm; every scope entry under it
+/// is a run of `arena.scopes`.
+///
+/// Borrowed from `scratch`, `raw` and `arena`; see `CardArena`.
 pub fn decodeOAuth2SecurityScheme(
     raw: []const u8,
     arena: *CardArena,
@@ -11753,6 +12871,11 @@ pub fn decodeOAuth2SecurityScheme(
 }
 
 /// Decode a `StringList` on its own.
+///
+/// `list` is optional and kept as a presence, so `{}` and `{"list":[]}` stay
+/// two documents, and every element is a run of `arena.strings`.
+///
+/// Borrowed from `scratch`, `raw` and `arena`; see `CardArena`.
 pub fn decodeStringList(
     raw: []const u8,
     arena: *CardArena,
@@ -12206,15 +13329,15 @@ fn writeAgentCard(card: AgentCard, writer: *json.Writer) EncodeError!void {
 // for the reason the content half's validation note gives: a refusal halfway
 // through leaves `{"name":"W","description":"Fo` in the caller's buffer, which
 // is neither a card nor nothing. What is refused is a value the decoder could
-// not have returned — an empty REQUIRED string — and it is `error.InvalidField`.
+// not have returned — an empty REQUIRED string, or an opaque lexeme that is not
+// exactly one JSON value where it is written — and it is `error.InvalidField`.
 //
-// Four shapes in the card have nothing to refuse and so have no validator at
-// all: an `AgentExtension`, a `MutualTlsSecurityScheme`, an `AgentCapabilities`
-// and a `SecurityRequirement`. Every member of each of the four is optional, so
-// there is no value of any of them that `decodeAgentCard` would have refused
-// and `encodeAgentCard` has to refuse with it. A validator that returned
-// `void` unconditionally would be a function that cannot fail, and a reader of
-// `validateAgentCard` would have to work out which of its calls could.
+// Two shapes in the card have nothing to refuse and so have no validator of
+// their own: a `MutualTlsSecurityScheme` and a `SecurityRequirement`. Every
+// member of each is optional, so there is no value of either that
+// `decodeAgentCard` would have refused and `encodeAgentCard` has to refuse with
+// it. An `AgentExtension` and an `AgentCapabilities` carry no required member
+// either, and each is walked only for the one lexeme it can hold: `params`.
 
 fn validateAuthorizationCodeOAuthFlow(flow: AuthorizationCodeOAuthFlow) EncodeError!void {
     if (flow.authorization_url.len == 0 or flow.token_url.len == 0) return error.InvalidField;
@@ -12265,46 +13388,91 @@ fn validateAgentSkill(skill: AgentSkill) EncodeError!void {
     // refuse either.
 }
 
-fn validateAgentCard(card: AgentCard) EncodeError!void {
+/// Whether `extension` is a value `decodeAgentExtension` could have returned.
+///
+/// Every member of the message is optional, so the only thing a walk can refuse
+/// is the one raw lexeme: `params` has to be one complete JSON value for the
+/// encoder to splice it and for the matching decoder to read it back.
+fn validateAgentExtension(extension: AgentExtension, depth: u32) EncodeError!void {
+    if (extension.params) |params| try validateRawValue(params, depth);
+}
+
+fn validateAgentCard(card: AgentCard, depth: u32) EncodeError!void {
     if (card.name.len == 0 or card.description.len == 0 or card.version.len == 0) {
         return error.InvalidField;
     }
     for (card.supported_interfaces) |interface| try validateAgentInterface(interface);
     if (card.provider) |provider| try validateAgentProvider(provider);
+    // `capabilities` is a member object, its `extensions` is an array member of
+    // that, and each extension is an object: three containers below the card.
+    if (card.capabilities.extensions) |extensions| {
+        for (extensions) |extension| try validateAgentExtension(extension, depth + 3);
+    }
     if (card.security_schemes) |security_schemes| {
         for (security_schemes) |entry| try validateSecurityScheme(entry.scheme);
     }
     for (card.skills) |skill| try validateAgentSkill(skill);
+    // `signatures` is an array member of the card, so each signature is an
+    // object two containers below it.
     if (card.signatures) |signatures| {
-        for (signatures) |signature| try validateAgentCardSignature(signature);
+        for (signatures) |signature| try validateAgentCardSignature(signature, depth + 2);
     }
 }
 
 /// Encode an `AgentCard`.
 ///
 /// Members go out in field-number order, so a card that already reads in that
-/// order comes back unchanged and one that does not comes back with the same
-/// members in it. The whole card is checked before the first byte is written.
+/// order is reproduced member for member and one that does not comes back with
+/// the same members in a different order.
+///
+/// The whole card is walked before the first byte is written: an empty `name`,
+/// `description` or `version`, an empty member of any interface, provider or
+/// skill, an empty `name` in a scheme, and an empty `protected` or `signature`
+/// are all `error.InvalidField` with the caller's buffer untouched, so every
+/// value `decodeAgentCard` returned can be written back. `AgentExtension.params`
+/// and `AgentCardSignature.header` are spliced verbatim and are read back
+/// first, so one that is not exactly one complete JSON value is
+/// `error.InvalidField`.
 pub fn encodeAgentCard(card: AgentCard, writer: *json.Writer) EncodeError!void {
-    try validateAgentCard(card);
+    // The card object is the document this encoder writes, so it is one container
+    // deep and a member is read at one.
+    try validateAgentCard(card, 1);
     try writeAgentCard(card, writer);
 }
 
 /// Encode an `AgentSkill`.
+///
+/// An empty `id`, `name` or `description` is `error.InvalidField` before the
+/// first byte is written, so every value `decodeAgentSkill` returned can be
+/// written back. Allocates nothing.
 pub fn encodeAgentSkill(skill: AgentSkill, writer: *json.Writer) EncodeError!void {
     try validateAgentSkill(skill);
     try writeAgentSkill(skill, writer);
 }
 
 /// Encode an `AgentCapabilities`.
+///
+/// Every member is optional, so every value `decodeAgentCapabilities` returned
+/// is written and an all-null one becomes `{}`, with one refusal: a `params`
+/// lexeme under `extensions` that is not exactly one complete JSON value.
+/// Allocates nothing.
 pub fn encodeAgentCapabilities(
     capabilities: AgentCapabilities,
     writer: *json.Writer,
 ) EncodeError!void {
+    if (capabilities.extensions) |extensions| {
+        // `extensions` is an array member of this object, so each element is an
+        // object two containers below the capabilities the caller gave us.
+        for (extensions) |extension| try validateAgentExtension(extension, 3);
+    }
     try writeAgentCapabilities(capabilities, writer);
 }
 
 /// Encode a `SecurityRequirement`.
+///
+/// Nothing here can be refused: the one member is optional, so a null `schemes`
+/// becomes `{}` and every entry is written as a member named by its own key.
+/// Allocates nothing.
 pub fn encodeSecurityRequirement(
     requirement: SecurityRequirement,
     writer: *json.Writer,
@@ -12313,18 +13481,32 @@ pub fn encodeSecurityRequirement(
 }
 
 /// Encode a `SecurityScheme`.
+///
+/// The arm the union holds is walked first, so an empty `name` in the `api_key`
+/// arm, an empty `scheme` in the `http_auth` arm, an empty `open_id_connect_url`
+/// and an empty URL in the live OAuth flows are all `error.InvalidField` before
+/// the first byte is written. The `mtls` arm has one optional member and so
+/// nothing to refuse. Allocates nothing.
 pub fn encodeSecurityScheme(scheme: SecurityScheme, writer: *json.Writer) EncodeError!void {
     try validateSecurityScheme(scheme);
     try writeSecurityScheme(scheme, writer);
 }
 
 /// Encode an `OAuthFlows`.
+///
+/// The arm the union holds is walked first, so an empty URL in either live flow
+/// is `error.InvalidField` before the first byte is written. The two deprecated
+/// flows have no REQUIRED field and so nothing to refuse. Allocates nothing.
 pub fn encodeOAuthFlows(flows: OAuthFlows, writer: *json.Writer) EncodeError!void {
     try validateOAuthFlows(flows);
     try writeOAuthFlows(flows, writer);
 }
 
 /// Encode an `OAuth2SecurityScheme`.
+///
+/// `flows` is walked first, so an empty URL in either live flow is
+/// `error.InvalidField` before the first byte is written and every value
+/// `decodeOAuth2SecurityScheme` returned can be written back. Allocates nothing.
 pub fn encodeOAuth2SecurityScheme(
     scheme: OAuth2SecurityScheme,
     writer: *json.Writer,
@@ -12334,6 +13516,9 @@ pub fn encodeOAuth2SecurityScheme(
 }
 
 /// Encode a `StringList`.
+///
+/// Nothing here can be refused: the one member is optional, so a null `list`
+/// becomes `{}` and an empty one becomes `{"list":[]}`. Allocates nothing.
 pub fn encodeStringList(list: StringList, writer: *json.Writer) EncodeError!void {
     try writeStringListObject(list, writer);
 }

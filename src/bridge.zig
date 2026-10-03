@@ -21,6 +21,13 @@
 //! The binding supports MCP `2026-07-28` only. It does not emulate earlier
 //! revisions and performs no MCP handshake, so [`supported_revision`] is a
 //! constant rather than a parameter.
+//!
+//! Both encoders validate before they write. The payload members are the
+//! caller's own bytes spliced into a frame, so a body this library's own
+//! decoder would refuse is refused here as `error.InvalidField` rather than
+//! handed to the peer to find out about. A failure of any kind rewinds the
+//! writer's length to the value it arrived with, which is the state a retry
+//! starts from.
 
 const std = @import("std");
 const root = @import("root.zig");
@@ -47,6 +54,14 @@ pub const Direction = enum {
 };
 
 /// The `mcp/message` envelope parameters.
+///
+/// Every text field borrows one of the two buffers `decodeEnvelope` was
+/// given, and which one differs per member: `server_id`, `request_id` and
+/// `inner_method` come from the input when the name carried no escape and from
+/// the scratch buffer when it did, while `inner_params` and `meta` are lexemes
+/// read out of the input and never reach the scratch at all. Both buffers have
+/// to stay alive and unmodified for as long as the envelope is read, and they
+/// must not overlap.
 pub const Envelope = struct {
     /// Names a server declared by its provider.
     ///
@@ -93,8 +108,10 @@ pub const Envelope = struct {
     /// [`Envelope.inner_params`] holding the four bytes `null` is not the fact
     /// the specification means by carrying parameters. The field keeps those
     /// bytes so the envelope re-encodes to what arrived; this is where the
-    /// equivalence is applied. Normalising the member away instead would
-    /// trade a semantic wrinkle for a broken `encode(decode(b)) == b`.
+    /// equivalence is applied. Normalising the member away instead would trade
+    /// a semantic wrinkle for a lost member: an envelope that arrived with
+    /// `params` written out would go back out without it, and the presence the
+    /// peer chose would be one this binding had made on its behalf.
     pub fn carriesParams(self: Envelope) bool {
         const params = self.inner_params orelse return false;
         return !std.mem.eql(u8, params, "null");
@@ -241,14 +258,50 @@ pub fn decodeEnvelope(
 
 /// Encode a `mcp/message` params object.
 ///
-/// Members are written in the order table 10b lists them, so a byte sequence
-/// that already reads in that order comes back unchanged and one that does not
-/// comes back with the same members in it. `_meta` is written last, which is
-/// where the table puts it.
+/// The envelope is validated before a byte is written: the three named members
+/// have to be non-empty, and the two spliced ones — `inner_params` against the
+/// shape `decodeEnvelope` requires of it, `meta` against being one complete
+/// JSON value — are walked first. A refused envelope leaves the writer at the
+/// length it arrived with, which is the state a retry starts from; the bytes
+/// behind that length are not restored, so the guarantee is about the frame
+/// written and not about memory past it.
+///
+/// The three named members are checked for the same reason the spliced ones
+/// are: `decodeEnvelope` reads a name as text and this writes one through a
+/// writer that does not check, so a name that is not valid UTF-8 is
+/// `error.InvalidField` here rather than a frame the far side refuses.
+///
+/// Members are written in the order table 10b lists them and `_meta` is written
+/// last, which is where the table puts it. That is a *stable* spelling rather
+/// than a byte-for-byte one: two encodes of one envelope are the same bytes,
+/// and an envelope that arrived in this order comes back unchanged, but the
+/// round trip this module promises is the value-level one
+/// `decode(encode(decode(b))) == decode(b)`. A member the RFD does not define
+/// is skipped on decode and therefore absent here, and the spliced members keep
+/// the spelling the peer sent, escapes and insignificant whitespace included.
 pub fn encodeEnvelope(envelope: Envelope, writer: *json.Writer) EncodeError!void {
+    const mark = writer.len;
+    errdefer writer.len = mark;
+
     if (envelope.server_id.len == 0) return error.InvalidField;
     if (envelope.request_id.len == 0) return error.InvalidField;
     if (envelope.inner_method.len == 0) return error.InvalidField;
+    // The three names go through `json.Writer.string`, whose UTF-8
+    // precondition is the caller's and is not checked there. A name carrying a
+    // stray byte would reach the wire inside a literal `decodeEnvelope` then
+    // refuses, so it is refused here where the caller can still be told which
+    // of its three values was wrong. Every name arriving from a decode is
+    // already validated, so this is paid once per envelope a caller built.
+    try requireText(envelope.server_id);
+    try requireText(envelope.request_id);
+    try requireText(envelope.inner_method);
+    // The two spliced members, read before the opening brace. `inner_params`
+    // is checked against the shape `decodeEnvelope` requires of it and `meta`
+    // against being one complete value at all, because neither is a member a
+    // comparison here can vouch for and both reach the wire as the caller's
+    // own bytes.
+    if (envelope.inner_params) |params| try requireEnvelopeParams(params);
+    if (envelope.meta) |meta| try requireValue(meta, 1);
 
     try writer.slice("{\"serverId\":");
     try writer.string(envelope.server_id);
@@ -274,6 +327,12 @@ pub fn encodeEnvelope(envelope: Envelope, writer: *json.Writer) EncodeError!void
 /// did not produce, and the carrier `_meta` is carried the same way because a
 /// typed shape cannot write back a member it does not model, which is the
 /// defect carrying it fixes.
+///
+/// Both members borrow the input `decodeOutcome` was given. Neither reaches
+/// the scratch buffer: a payload is read as an extent and the carrier is not
+/// modelled, so a document nesting as deeply as it likes costs no scratch at
+/// all. The `text` of the `error` arm is the whole inner error object as it
+/// arrived, with its unknown members still in it.
 pub const OutcomePayload = struct {
     /// The inner MCP payload under the `result` or `error` member.
     text: []const u8,
@@ -311,6 +370,15 @@ pub const Outcome = union(enum) {
 /// first one. What is still refused is the *pair*: an object carrying both
 /// `result` and `error` has two outcomes whichever order they arrived in, and
 /// the specification allows one.
+///
+/// `scratch` backs a member *name* carrying an escape and nothing else. The
+/// payload and the carrier are read as extents, the inner error's own member
+/// names are compared as bytes rather than decoded, and its `message` is walked
+/// rather than decoded because the caller keeps its lexeme. A document whose
+/// names are all plain therefore decodes with a zero-length buffer however deep
+/// the payload nests and however many escapes it holds, and the names inside an
+/// inner error object cost nothing whatever their spelling. Both buffers have to
+/// stay alive for as long as the outcome is read, and they must not overlap.
 pub fn decodeOutcome(raw: []const u8, scratch: []u8) DecodeError!Outcome {
     var reader = json.Reader.init(raw);
     // The outcome member and the carrier metadata are collected apart and
@@ -356,7 +424,7 @@ pub fn decodeOutcome(raw: []const u8, scratch: []u8) DecodeError!Outcome {
                 // look at it.
                 reader.skipWhitespace();
                 const start = reader.pos;
-                try checkInnerError(&reader, scratch);
+                try checkInnerError(&reader);
                 text = reader.input[start..reader.pos];
                 is_error = true;
             }
@@ -396,7 +464,15 @@ pub fn decodeOutcome(raw: []const u8, scratch: []u8) DecodeError!Outcome {
 /// the caller `null`, `{}` or `"boom"` labelled as an error object, with no
 /// code to report and no message to show. `result` is deliberately not checked
 /// the same way, because it carries any JSON value.
-fn checkInnerError(reader: *json.Reader, scratch: []u8) DecodeError!void {
+///
+/// It needs no scratch at all, which is what lets the encode preflight and this
+/// decoder run the same walk: the names are read as the peer's bytes with
+/// [`json.Reader.nextKeyRaw`] and compared through [`keyIs`], a member this does
+/// not model is stepped over, and the `message` is walked as an extent rather
+/// than decoded because the caller keeps its lexeme. Every one of those is a
+/// read of a name or a value whose decoded form nothing here holds.
+fn checkInnerError(reader: *json.Reader) DecodeError!void {
+    const none: [0]u8 = .{};
     // `null`, a string, an array, a number, a boolean: none is the error
     // object, and a caller cannot tell which of them it was handed. Input
     // that ended is none of those six: PROTOCOLS.md 2.1 calls that `Truncated`,
@@ -410,13 +486,13 @@ fn checkInnerError(reader: *json.Reader, scratch: []u8) DecodeError!void {
 
     var saw_code = false;
     var saw_message = false;
-    while (try reader.nextKey(scratch)) |key| {
+    while (try reader.nextKeyRaw()) |key| {
         // First-wins here as in every other member walk in this library, so a
         // second `code` cannot supply the integer the first one was refused
         // for.
-        if (std.mem.eql(u8, key, "code")) {
+        if (keyIs(key, "code")) {
             if (saw_code) {
-                try reader.skipValue(scratch);
+                try reader.skipValue(&none);
                 continue;
             }
             // A JSON-RPC code is an integer: not a quoted number, and not a
@@ -431,34 +507,69 @@ fn checkInnerError(reader: *json.Reader, scratch: []u8) DecodeError!void {
                 }
             }
             saw_code = true;
-        } else if (std.mem.eql(u8, key, "message")) {
+        } else if (keyIs(key, "message")) {
             if (saw_message) {
-                try reader.skipValue(scratch);
+                try reader.skipValue(&none);
                 continue;
             }
             reader.skipWhitespace();
             if ((reader.peek() orelse return error.Truncated) != '"') {
                 return error.InvalidField;
             }
-            _ = try reader.string(scratch);
+            // Walked as an extent rather than decoded: the caller keeps the
+            // lexeme, so a decoded copy would be written into the scratch
+            // buffer and read by nobody. The walk checks the same escapes and
+            // the same UTF-8 `string` checks, and reports the same faults.
+            _ = try reader.rawValue(&none);
             saw_message = true;
         } else {
-            try reader.skipValue(scratch);
+            try reader.skipValue(&none);
         }
     }
     if (!saw_code) return error.MissingField;
     if (!saw_message) return error.MissingField;
 }
 
+/// Whether the key lexeme `raw` is the member name `name`.
+///
+/// `raw` is what [`json.Reader.nextKeyRaw`] returns: the bytes the name arrived
+/// as, quotes and escapes included. The key is decoded through `json.Reader`
+/// into a stack buffer the size of `name`, so the comparison is exact and no
+/// scratch the caller owns is spent: a name decoding to more bytes than `name`
+/// has cannot be `name`, and that is the only case the buffer refuses.
+///
+/// A name longer than the buffer is not a fault and is not a member this shape
+/// knows — it is an unmodelled name, which the caller steps over. Nothing here
+/// decides that a key is malformed: `nextKeyRaw` has already refused the ones
+/// that are, with the same faults `Reader.string` reports for the same string.
+fn keyIs(raw: []const u8, name: []const u8) bool {
+    var buffer: [8]u8 = undefined;
+    var reader = json.Reader.init(raw);
+    const decoded = reader.string(buffer[0..@min(name.len, buffer.len)]) catch return false;
+    return std.mem.eql(u8, decoded, name);
+}
+
 /// Encode the inner MCP outcome of a successful outer response.
 ///
-/// The payload is borrowed JSON text, and it is spliced verbatim, exactly as
+/// The payload is borrowed JSON text and it is spliced, exactly as
 /// [`jsonrpc.encode`] splices a `result`. A codec does not re-serialise a value
-/// it did not produce, and the payload came from [`decodeOutcome`], which has
-/// already checked it against the shape its arm requires. So a payload the
-/// `result` arm takes as any JSON value at all, a bare string or a number or
-/// `null`, is written as it stands. Checking it here instead would make the
-/// encoder refuse bytes its own decoder accepted.
+/// it did not produce, and a shape would lose the members of the inner error
+/// object this module does not model.
+///
+/// Splicing is not the same as skipping the check. Each arm is validated against
+/// the shape its own decoder reads back before either brace is written: the
+/// `result` arm carries any JSON value at all, so what it refuses is a body
+/// that is not one value or is two, and the `error` arm must be the inner MCP
+/// error object `decodeOutcome` requires. A refused outcome leaves the writer
+/// at the length it arrived with, so a retry starts from the same prefix rather
+/// than from a half frame. The one shape the preflight cannot read is a member
+/// *name* carrying an escape on the `error` arm, which the encoder has no
+/// scratch for; that is `error.InvalidField` here.
+///
+/// The encoding is stable rather than byte-for-byte: two encodes of one
+/// outcome are the same bytes and an outcome that arrived in this order comes
+/// back unchanged, while the round trip this module promises is the value-level
+/// `decode(encode(decode(b))) == decode(b)`.
 ///
 /// The carrier `_meta` is spliced the same way, for the same reason: it is a
 /// member this module does not model, so it is written back as it arrived
@@ -468,6 +579,18 @@ fn checkInnerError(reader: *json.Reader, scratch: []u8) DecodeError!void {
 /// refuses such a frame on its way to the wire, because a message carrying one
 /// has already broken the framing.
 pub fn encodeOutcome(outcome: Outcome, writer: *json.Writer) EncodeError!void {
+    const mark = writer.len;
+    errdefer writer.len = mark;
+
+    // The payload is checked against the shape its own arm carries, and the
+    // carrier against being one complete value, before either brace is
+    // written. What each arm requires is what `decodeOutcome` reads back on the
+    // other side of the wire, so this is that one rule and not a second.
+    switch (outcome) {
+        .result => |arm| try requireResultBody(arm),
+        .@"error" => |arm| try requireErrorBody(arm),
+    }
+
     switch (outcome) {
         .result => |arm| {
             try writer.slice("{\"result\":");
@@ -491,6 +614,85 @@ fn writeCarrierMeta(meta: ?[]const u8, writer: *json.Writer) EncodeError!void {
     const text = meta orelse return;
     try writer.slice(",\"_meta\":");
     try writer.slice(text);
+}
+
+/// Refuse text that would reach the wire as a literal this module's decoder
+/// refuses.
+///
+/// `json.Writer.string` escapes what the JSON grammar forbids and passes every
+/// other byte through, and it deliberately does not check that what it is given
+/// is text. `decodeEnvelope` names the same fault `error.InvalidUtf8` on the
+/// way in; this names it `error.InvalidField` on the way out, which is the tag
+/// `root.zig` gives a value that could not have been decoded.
+fn requireText(text: []const u8) EncodeError!void {
+    if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidField;
+}
+
+/// Refuse a spliced body that is not one complete JSON value the frame around
+/// it can carry.
+///
+/// `depth` is what the frame has already spent. The value lands inside the
+/// object `encodeEnvelope` and `encodeOutcome` are part way through writing,
+/// so the walk starts one level in and a body this accepts at the depth bound
+/// is one `decodeEnvelope` and `decodeOutcome` accept for the same bytes.
+///
+/// Every fault is `error.InvalidField`, which is what `root.zig` gives a value
+/// that could not have been decoded, and it is the caller's own: these are
+/// bytes spliced into a frame rather than decoded out of one. One pass over the
+/// text, no allocation, and nothing the caller did not hand over already —
+/// a value that is stepped over writes no scratch.
+fn requireValue(text: []const u8, depth: u32) EncodeError!void {
+    var reader = json.Reader.init(text);
+    reader.depth = depth;
+    const none: [0]u8 = .{};
+    _ = reader.rawValue(&none) catch return error.InvalidField;
+    // `rawValue` stops at the end of the first value, and text behind it would
+    // land behind one colon of the frame as a second member.
+    if (!reader.atEnd()) return error.InvalidField;
+}
+
+/// Refuse an envelope `params` body that `decodeEnvelope` would refuse.
+///
+/// The member is typed "object | `null`", so a scalar is a valid JSON value
+/// and still not a params, and the walk above has already proved the text is
+/// one complete value. That leaves the leading byte. `null` is compared as the
+/// whole literal because `decodeEnvelope` accepts a leading `n` and then
+/// requires the rest of it to parse, so anything shorter is a truncated value
+/// rather than the member the row names.
+fn requireEnvelopeParams(text: []const u8) EncodeError!void {
+    try requireValue(text, 1);
+    const body = std.mem.trimStart(u8, text, " \t\r\n");
+    if (body.len == 0) return error.InvalidField;
+    if (body[0] != '{' and !std.mem.eql(u8, body, "null")) return error.InvalidField;
+}
+
+/// Refuse a `result` payload, which carries any JSON value at all.
+///
+/// Only the two things a body can be that is not one: not a value, or two
+/// values. The shape of the value is none of this module's business — an MCP
+/// operation may return a string, a number, `null` or an object — so a payload
+/// the `result` arm accepts is any text `decodeOutcome` reads back as the same
+/// value.
+fn requireResultBody(arm: OutcomePayload) EncodeError!void {
+    try requireValue(arm.text, 1);
+    if (arm.meta) |meta| try requireValue(meta, 1);
+}
+
+/// Refuse an `error` payload that is not the inner MCP error object.
+///
+/// This arm's shape is the one the union names, so the walk is
+/// `checkInnerError`'s — a non-null object carrying an integer `code` and a
+/// string `message`, and any other member left in it untouched. That walk needs
+/// no scratch, so it accepts exactly what [`decodeOutcome`] accepts: a member
+/// name spelled with an escape is compared as bytes here and there, and a name
+/// no spelling can make one of the two is stepped over rather than refused.
+/// Every shape fault it reports is the one `decodeOutcome` reports.
+fn requireErrorBody(arm: OutcomePayload) EncodeError!void {
+    var reader = json.Reader.init(arm.text);
+    reader.depth = 1;
+    checkInnerError(&reader) catch return error.InvalidField;
+    if (!reader.atEnd()) return error.InvalidField;
+    if (arm.meta) |meta| try requireValue(meta, 1);
 }
 
 /// The binding-level failures, which are *outer* ACP errors.
@@ -558,7 +760,11 @@ pub fn isBindingFailure(code: i32, level: ErrorLevel) bool {
 ///
 /// The `acp` key is in no published schema in either version. A v1 peer
 /// advertises it as a boolean, a v2 peer as a presence object, and v2 removes
-/// the boolean form entirely.
+/// the boolean form entirely. One released SDK declares the key and the
+/// `{"type":"acp"}` declaration from a schema snapshot that is not a released
+/// artifact and that marks them unstable, so a peer built from it round-trips
+/// values a released schema does not define; PROTOCOLS.md 6.5.1 records both
+/// and this constant keeps describing what a released schema says.
 pub const capability_path = struct {
     pub const v1 = "mcpCapabilities.acp";
     pub const v2 = "capabilities.session.mcp.acp";
@@ -614,8 +820,8 @@ test "an envelope missing any required member is MissingField" {
 test "decode and encode refuse an empty inner method alike" {
     var scratch: [128]u8 = undefined;
     // An empty method names no operation. Without the decode-side check the
-    // decoder hands a proxy an envelope it cannot re-encode, so the
-    // `encode(decode(b))` identity fails for bytes the decoder accepted.
+    // decoder hands a proxy an envelope it cannot re-encode, so a message this
+    // library accepts would be one it cannot write back out.
     try testing.expectError(error.InvalidField, decodeEnvelope(
         \\{"serverId":"s","requestId":"r","method":""}
     , &scratch, null));
@@ -695,10 +901,10 @@ test "omitted and null inner params mean the same thing, and both re-encode" {
     try testing.expect(!explicit_null.carriesParams());
 
     // The bytes are kept rather than normalised to an absent member. Dropping
-    // them would make `encode(decode(b)) != b` for an envelope that arrived
-    // with the member written out, and the encoding contract is not
-    // negotiable per protocol. The equivalence lives in `carriesParams`
-    // instead, where a caller reaches it by name.
+    // them would lose the presence the peer chose, because an envelope that
+    // arrived with the member written out would go back out without it. The
+    // semantic equivalence lives in `carriesParams` instead, where a caller
+    // reaches it by name.
     try testing.expectEqual(@as(?[]const u8, null), omitted.inner_params);
     try testing.expectEqualStrings("null", explicit_null.inner_params.?);
 
@@ -723,7 +929,7 @@ test "an envelope round-trips through the encoder" {
     try testing.expectEqualStrings(raw, writer.written());
 }
 
-test "an envelope round-trips its outer _meta byte for byte" {
+test "an envelope re-encodes its outer _meta as the lexeme that arrived" {
     var scratch: [256]u8 = undefined;
     var buffer: [256]u8 = undefined;
 
@@ -906,10 +1112,11 @@ test "the outer id is what tells a request from a notification" {
     const raw =
         \\{"serverId":"s","requestId":"r","method":"tools/call"}
     ;
-    // The params object is byte-identical in both directions. What differs is
-    // the outer ACP message, and a request carries an `id` while a
-    // notification does not, so the decoder reads the direction from the id
-    // the caller already has rather than asserting a request for everything.
+    // The params object is spliced unchanged in both directions, which is what
+    // a borrowed lexeme buys. What differs is the outer ACP message, and a
+    // request carries an `id` while a notification does not, so the decoder
+    // reads the direction from the id the caller already has rather than
+    // asserting a request for everything.
     const request = try decodeEnvelope(raw, &scratch, .{ .integer = 7 });
     try testing.expect(request.direction == .agent_to_provider);
 
@@ -1131,7 +1338,7 @@ test "the error arm round-trips through the encoder" {
     try testing.expectEqualStrings(outcome.@"error".text, again.@"error".text);
 }
 
-test "an outcome round-trips its carrier _meta byte for byte" {
+test "an outcome re-encodes its carrier _meta as the lexeme that arrived" {
     var scratch: [256]u8 = undefined;
     var buffer: [256]u8 = undefined;
 
@@ -1323,4 +1530,368 @@ test "the inner method is validated against the MCP registry" {
     // The RFD targets 2026-07-28 only, so a method removed at that revision is
     // not available over this binding.
     try testing.expectError(error.UnknownMethod, mcp.lookupMethod(.current, "ping"));
+}
+
+test "an envelope body the far side would refuse is refused here, and writes nothing" {
+    var buffer: [512]u8 = undefined;
+
+    // Both spliced members reach the wire as the caller's own bytes, so before
+    // the preflight each of them framed a document `decodeEnvelope` refuses and
+    // the peer was the first thing to find out. Every case below is `InvalidField`
+    // for the reason the decoder gives, not a parse error of its own.
+    const cases = [_][]const u8{
+        // `params` is typed "object | `null`". A scalar, an array and a
+        // truncated object are all JSON and none of them a params.
+        "[1,2]",
+        "7",
+        "\"echo\"",
+        "{\"name\":",
+        // Two values behind one colon is one too many.
+        "{\"a\":1} {\"b\":2}",
+        // `null` is the other half of the type, spelled in full.
+        "nul",
+    };
+    for (cases) |params| {
+        var writer = json.Writer.init(&buffer);
+        try testing.expectError(error.InvalidField, encodeEnvelope(.{
+            .server_id = "s",
+            .request_id = "r",
+            .inner_method = "tools/call",
+            .inner_params = params,
+            .direction = .agent_to_provider,
+        }, &writer));
+        try testing.expectEqual(@as(usize, 0), writer.written().len);
+    }
+
+    // The carrier is unmodelled, so the only thing to check is that it is one
+    // complete value. A well formed value of any type is accepted, which is
+    // what an unmodelled member means; what is refused is the text that is not
+    // one value at all, and nothing else.
+    const carriers = [_][]const u8{
+        "",
+        " ",
+        "{\"a\":",
+        "{\"a\":1} {\"b\":2}",
+        "nul",
+        "\"unterminated",
+    };
+    for (carriers) |meta| {
+        var writer = json.Writer.init(&buffer);
+        try testing.expectError(error.InvalidField, encodeEnvelope(.{
+            .server_id = "s",
+            .request_id = "r",
+            .inner_method = "tools/call",
+            .meta = meta,
+            .direction = .agent_to_provider,
+        }, &writer));
+        try testing.expectEqual(@as(usize, 0), writer.written().len);
+    }
+    // The accepted half, so the refusals above are the bodies and not the
+    // envelope: any well formed value of any type is spliced as it stands,
+    // which is what an unmodelled member means.
+    const accepted = [_][]const u8{ "{}", "[1,2]", "null", "7" };
+    inline for (accepted) |meta| {
+        var writer = json.Writer.init(&buffer);
+        try encodeEnvelope(.{
+            .server_id = "s",
+            .request_id = "r",
+            .inner_method = "tools/call",
+            .meta = meta,
+            .direction = .agent_to_provider,
+        }, &writer);
+        const tail = "\"_meta\":" ++ meta ++ "}";
+        try testing.expect(std.mem.endsWith(u8, writer.written(), tail));
+    }
+
+    // Nesting past the bound the decoder applies. The frame's own object is
+    // already open, so the body is charged one level and a body nesting to the
+    // bound on its own is refused here — which is what the far side does a
+    // level earlier when it meets the same body inside the frame.
+    var deep: [json.max_depth + 4]u8 = undefined;
+    @memset(deep[0 .. json.max_depth + 2], '{');
+    var nested = json.Writer.init(&buffer);
+    try testing.expectError(error.InvalidField, encodeEnvelope(.{
+        .server_id = "s",
+        .request_id = "r",
+        .inner_method = "tools/call",
+        .inner_params = deep[0 .. json.max_depth + 2],
+        .direction = .agent_to_provider,
+    }, &nested));
+    try testing.expectEqual(@as(usize, 0), nested.written().len);
+
+    // The members that are still what they have to be are written, so the
+    // refusals above are the bodies and not the envelope around them.
+    var good = json.Writer.init(&buffer);
+    try encodeEnvelope(.{
+        .server_id = "s",
+        .request_id = "r",
+        .inner_method = "tools/call",
+        .inner_params = "{\"name\":\"echo\"}",
+        .meta = "null",
+        .direction = .agent_to_provider,
+    }, &good);
+    try testing.expectEqualStrings(
+        \\{"serverId":"s","requestId":"r","method":"tools/call","params":{"name":"echo"},"_meta":null}
+    , good.written());
+}
+
+test "an outcome payload the far side would refuse is refused here, and writes nothing" {
+    var buffer: [512]u8 = undefined;
+
+    // The `result` arm carries any JSON value, so what it refuses is a body
+    // that is not one value, or two. It does not second-guess the value.
+    const results = [_][]const u8{ "{", "{\"a\":1} {\"b\":2}", "\"unterminated" };
+    for (results) |text| {
+        var writer = json.Writer.init(&buffer);
+        try testing.expectError(error.InvalidField, encodeOutcome(
+            .{ .result = .{ .text = text } },
+            &writer,
+        ));
+        try testing.expectEqual(@as(usize, 0), writer.written().len);
+    }
+
+    // The `error` arm is the one with a shape, and these are the shapes
+    // `decodeOutcome` refuses: not an object at all, an object without the
+    // required members, a `code` that is not an integer, and a second value
+    // behind the object.
+    const errors = [_][]const u8{
+        "\"boom\"",
+        "null",
+        "[{\"code\":-1,\"message\":\"m\"}]",
+        "{}",
+        "{\"code\":-1}",
+        "{\"message\":\"m\"}",
+        "{\"code\":\"-1\",\"message\":\"m\"}",
+        "{\"code\":-1.0,\"message\":\"m\"}",
+        "{\"code\":-1,\"message\":7}",
+        "{\"code\":-1,\"message\":\"m\"} trailing",
+    };
+    for (errors) |text| {
+        var writer = json.Writer.init(&buffer);
+        try testing.expectError(error.InvalidField, encodeOutcome(
+            .{ .@"error" = .{ .text = text } },
+            &writer,
+        ));
+        try testing.expectEqual(@as(usize, 0), writer.written().len);
+    }
+
+    // The carrier is unmodelled on either arm, so the same rule applies to it.
+    var carrier = json.Writer.init(&buffer);
+    try testing.expectError(error.InvalidField, encodeOutcome(
+        .{ .result = .{ .text = "null", .meta = "{\"a\":" } },
+        &carrier,
+    ));
+    try testing.expectEqual(@as(usize, 0), carrier.written().len);
+
+    // And nesting, on the arm that has a member to nest inside.
+    const head = "{\"code\":-1,\"message\":\"m\",\"data\":";
+    var deep: [head.len + json.max_depth + 8]u8 = undefined;
+    @memcpy(deep[0..head.len], head);
+    @memset(deep[head.len..][0 .. json.max_depth + 2], '{');
+    deep[head.len + json.max_depth + 2] = '}';
+    var nested = json.Writer.init(&buffer);
+    try testing.expectError(error.InvalidField, encodeOutcome(
+        .{ .@"error" = .{ .text = deep[0 .. head.len + json.max_depth + 3] } },
+        &nested,
+    ));
+    try testing.expectEqual(@as(usize, 0), nested.written().len);
+
+    // What each arm does accept still goes out as it arrived, so the refusals
+    // above are the payloads and not the wrapper.
+    var result = json.Writer.init(&buffer);
+    try encodeOutcome(.{ .result = .{ .text = "\"a bare string\"" } }, &result);
+    try testing.expectEqualStrings("{\"result\":\"a bare string\"}", result.written());
+
+    var failure = json.Writer.init(&buffer);
+    try encodeOutcome(
+        .{ .@"error" = .{ .text = "{\"code\":-1,\"message\":\"m\",\"vendor\":{\"x\":1}}" } },
+        &failure,
+    );
+    try testing.expectEqualStrings(
+        \\{"error":{"code":-1,"message":"m","vendor":{"x":1}}}
+    , failure.written());
+}
+
+test "a short buffer leaves the committed prefix, and the retry starts from it" {
+    var buffer: [256]u8 = undefined;
+    var writer = json.Writer.init(&buffer);
+
+    // Bytes already committed by the caller. A failed append must leave this
+    // logical prefix intact.
+    try encodeEnvelope(.{
+        .server_id = "s",
+        .request_id = "r",
+        .inner_method = "tools/call",
+        .direction = .agent_to_provider,
+    }, &writer);
+    const committed = writer.len;
+
+    // A second frame that does not fit in what is left fails part way through
+    // writing, with the payload itself valid: the preflight passes and the
+    // buffer runs out. The length goes back to the committed one, which is what
+    // a caller retrying with a larger buffer starts from.
+    var long_payload: [240]u8 = undefined;
+    long_payload[0] = '"';
+    @memset(long_payload[1..239], 'x');
+    long_payload[239] = '"';
+    try testing.expectError(error.BufferTooSmall, encodeOutcome(
+        .{ .result = .{ .text = long_payload[0..] } },
+        &writer,
+    ));
+    try testing.expectEqual(committed, writer.len);
+    try testing.expectEqualStrings(
+        \\{"serverId":"s","requestId":"r","method":"tools/call"}
+    , writer.written());
+
+    // A frame that does fit lands after the committed one rather than over it,
+    // which is the whole point of the rewind.
+    try encodeOutcome(.{ .result = .{ .text = "1" } }, &writer);
+    try testing.expectEqualStrings(
+        \\{"serverId":"s","requestId":"r","method":"tools/call"}{"result":1}
+    , writer.written());
+}
+
+test "an escaped inner error message costs no scratch, because nothing reads it" {
+    const none: [0]u8 = .{};
+
+    // The outcome keeps the error object as its lexeme, so unescaping the
+    // message would write decoded bytes into the scratch buffer for a value
+    // no caller holds: the only reader of that text is `encodeOutcome`, which
+    // splices it. The walk that validates it checks the same escapes and the
+    // same UTF-8 without needing anywhere to put the result.
+    const outcome = try decodeOutcome(
+        \\{"error":{"code":-1,"message":"a\nb"}}
+    , &none);
+    try testing.expect(outcome == .@"error");
+    try testing.expectEqualStrings(
+        "{\"code\":-1,\"message\":\"a\\nb\"}",
+        outcome.@"error".text,
+    );
+
+    // The same frame back out of the encoder, so the escape survives the round
+    // trip with a zero-length scratch on both sides.
+    var buffer: [128]u8 = undefined;
+    var writer = json.Writer.init(&buffer);
+    try encodeOutcome(outcome, &writer);
+    try testing.expectEqualStrings(
+        \\{"error":{"code":-1,"message":"a\nb"}}
+    , writer.written());
+
+    // A message carrying a byte that is not text is still refused on the way
+    // in, which is what makes the zero-length buffer safe here rather than
+    // merely cheap.
+    try testing.expectError(error.InvalidUtf8, decodeOutcome(
+        "{\"error\":{\"code\":-1,\"message\":\"a\xffb\"}}",
+        &none,
+    ));
+}
+
+test "an inner error name spelled with an escape is read, and a long one is stepped over" {
+    const none: [0]u8 = .{};
+    var buffer: [256]u8 = undefined;
+
+    // The name is compared as bytes, so `\u0063ode` *is* the `code` this shape
+    // requires and the object is accepted with a zero-length scratch. Before
+    // the raw-key walk the encoder had nowhere to unescape a name into, so this
+    // was the one document `decodeOutcome` read and `encodeOutcome` refused —
+    // a proxy forwarding an outcome the peer itself had sent could not put it
+    // back on the wire.
+    const escaped =
+        \\{"error":{"\u0063ode":-32602,"\u006dessage":"unknown tool"}}
+    ;
+    const outcome = try decodeOutcome(escaped, &none);
+    try testing.expect(outcome == .@"error");
+    try testing.expectEqualStrings(
+        "{\"\\u0063ode\":-32602,\"\\u006dessage\":\"unknown tool\"}",
+        outcome.@"error".text,
+    );
+
+    var writer = json.Writer.init(&buffer);
+    try encodeOutcome(outcome, &writer);
+    // The lexeme goes back out as it arrived, escapes and all: the shape is
+    // checked, not rebuilt.
+    try testing.expectEqualStrings(escaped, writer.written());
+
+    // A name no spelling can make one of the two is an unmodelled member, and
+    // how long it decodes to is beside the point: it is stepped over rather
+    // than refused, and it is still carried in the lexeme.
+    const long_name =
+        \\{"error":{"code":-1,"message":"m","\u0076endor_data_0123456789":"ignored"}}
+    ;
+    const carried = try decodeOutcome(long_name, &none);
+    try testing.expectEqualStrings(
+        "{\"code\":-1,\"message\":\"m\",\"\\u0076endor_data_0123456789\":\"ignored\"}",
+        carried.@"error".text,
+    );
+    var long_writer = json.Writer.init(&buffer);
+    try encodeOutcome(carried, &long_writer);
+    try testing.expectEqualStrings(long_name, long_writer.written());
+
+    // The first occurrence is the one read as a value, so an invalid first
+    // `code` is refused rather than replaced by the valid one beside it. A
+    // second `code` could otherwise supply the integer the first was refused
+    // for, and the peer would learn the message was healthy.
+    try testing.expectError(error.InvalidField, decodeOutcome(
+        \\{"error":{"code":"-1","message":"m","code":-32602}}
+    , &none));
+    try testing.expectError(error.InvalidField, decodeOutcome(
+        \\{"error":{"code":-1,"message":7,"message":"m"}}
+    , &none));
+
+    // And the same first-wins rule holds when the name is spelled with an
+    // escape, because the comparison happens after the name is resolved.
+    try testing.expectError(error.InvalidField, decodeOutcome(
+        \\{"error":{"\u0063ode":"-1","message":"m","code":-32602}}
+    , &none));
+}
+
+test "an envelope name that is not valid UTF-8 is refused, and writes nothing" {
+    var buffer: [128]u8 = undefined;
+
+    // The three names are written through `json.Writer.string`, which escapes
+    // what the JSON grammar forbids and passes every other byte through. A name
+    // carrying a stray byte therefore framed a document that is well formed
+    // JSON and not valid text, which `decodeEnvelope` refuses with
+    // `InvalidUtf8`: the peer was the first to find out, and the caller was
+    // told nothing at all.
+    const stray = "to\xffp";
+
+    // Each of the three in turn, because a rule covering only one of them would
+    // leave the other two open on the very same frame.
+    var server = json.Writer.init(&buffer);
+    try testing.expectError(error.InvalidField, encodeEnvelope(.{
+        .server_id = stray,
+        .request_id = "r",
+        .inner_method = "tools/call",
+        .direction = .agent_to_provider,
+    }, &server));
+    try testing.expectEqual(@as(usize, 0), server.written().len);
+
+    var request = json.Writer.init(&buffer);
+    try testing.expectError(error.InvalidField, encodeEnvelope(.{
+        .server_id = "s",
+        .request_id = stray,
+        .inner_method = "tools/call",
+        .direction = .agent_to_provider,
+    }, &request));
+    try testing.expectEqual(@as(usize, 0), request.written().len);
+
+    var method_name = json.Writer.init(&buffer);
+    try testing.expectError(error.InvalidField, encodeEnvelope(.{
+        .server_id = "s",
+        .request_id = "r",
+        .inner_method = stray,
+        .direction = .agent_to_provider,
+    }, &method_name));
+    try testing.expectEqual(@as(usize, 0), method_name.written().len);
+
+    // And the same bytes arriving from a peer are still refused on the way in,
+    // so the two directions agree instead of one of them being the only place
+    // the fault is known.
+    var scratch: [64]u8 = undefined;
+    try testing.expectError(error.InvalidUtf8, decodeEnvelope(
+        "{\"serverId\":\"to\xffp\",\"requestId\":\"r\",\"method\":\"m\"}",
+        &scratch,
+        null,
+    ));
 }

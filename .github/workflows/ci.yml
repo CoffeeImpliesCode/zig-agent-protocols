@@ -1,24 +1,19 @@
 # Continuous integration for zig-agent-proto.
 #
-# This runs the half of the house gate that a pinned Zig toolchain can
-# reproduce on any machine: `zig fmt --check`, `zig build`, `zig build test` in
-# Debug and again in ReleaseSafe, `zig ast-check`, `zig build fuzz`, `zig build
-# docs`, and the five live examples — `run`, `run-runtime`, `run-sessions`,
-# `run-http` and `run-a2a` — beside one bounded `run-bench` smoke. The
-# developer's `gate` script also runs zlint and zbc, but those are builds of
+# This runs the toolchain half of the house gate on Linux and macOS:
+# formatting, installation, tests in all four optimization modes, AST checks,
+# reproducible property seeds, documentation, five live examples and a bounded
+# benchmark smoke.
+# The developer's `gate` script also runs zlint and zbc, but those are builds of
 # personal checkouts under `~/tools`, not dependencies of this repository, so
 # CI cannot run them without vendoring an unpinned third-party build. A lint
 # gate that only exists on one machine is not a gate; those two stay a
 # developer-side check.
 #
-# The two interoperability participants are built and installed here, because
-# they are executables of this repository, and they are not driven here. Their
-# peers are pinned Python SDKs declared in `devenv.nix` and read at run time
-# from a pin file; reproducing that environment on a runner would mean
-# installing third-party packages this workflow does not pin, which is the
-# thing the rest of this file refuses to do. Those exchanges are run where the
-# SDK is declared, and the report they produce is checked against captured
-# wire bytes.
+# CI builds all four interoperability participants. SDK exchanges run through
+# the declared devenv interpreters, not an unpinned pip resolver on these runners.
+# Compilation and participant unit tests do not establish SDK interoperability.
+# Captured exchanges provide that separate evidence.
 name: CI
 
 on:
@@ -49,67 +44,46 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
 
-    env:
-      # CI owns both caches, in the checkout, and names them here rather than
-      # inheriting an answer from elsewhere. `devenv.nix` deliberately puts a
-      # developer's caches on approved per-account scratch mounts outside the
-      # checkout — node-local physical volumes first, approved NFS as a
-      # fallback — because a build is fast there and a rename survives, and
-      # because the interoperability peers refuse a shared temporary
-      # directory by name. So there is no shared layout to match on purpose:
-      # a cache written by a developer belongs to that machine's scratch
-      # root, and restoring it here would write to a path no step of this
-      # job should use. This one is the runner's.
-      ZIG_GLOBAL_CACHE_DIR: .zig-global-cache
-      # The local cache beside the global one, named rather than left to zig's
-      # `$PWD/.zig-cache` default so the directory this workflow creates, the
-      # directory `actions/cache` saves, and the directory the toolchain
-      # writes are the same one by construction.
-      ZIG_LOCAL_CACHE_DIR: .zig-cache
-
     steps:
       - name: Check out the repository
         uses: actions/checkout@v4
 
-      # Every socket this build binds and every temporary file the toolchain
-      # writes belongs to this job, in a directory the runner owns and empties
-      # between jobs. `$RUNNER_TEMP` is that directory on both runners here and
-      # is neither `/tmp` nor `/var/tmp` on either of them; the socket names are
-      # rendered out of `TMPDIR` and refuse a directory the machine shares with
-      # every other user, so a step that did not set it would fail later, inside
-      # a test, with the reason two steps away.
-      #
-      # The Zig caches are named in the `env` block above and are created here
-      # too, before the toolchain download rather than by whichever step first
-      # needs them, so a cache save restores into a directory that exists.
+      # Keep temporary files, both Zig caches and installed artifacts outside
+      # the checkout. RUNNER_TEMP is caller-owned local storage on these runners.
+      # Refuse shared system temporary directories rather than silently using one.
       - name: Initialize this job's temporary and cache directories
         run: |
           set -euo pipefail
-          scratch="$RUNNER_TEMP/zig-agent-proto/tmp"
-          case "$scratch" in
+          test -d "$RUNNER_TEMP" && test -O "$RUNNER_TEMP" && test ! -L "$RUNNER_TEMP"
+          scratch_root="$(realpath "$RUNNER_TEMP")/zig-agent-proto"
+          case "$scratch_root" in
             /tmp | /tmp/* | /var/tmp | /var/tmp/*)
-              echo "RUNNER_TEMP resolved to the system temporary directory: $scratch" >&2
+              echo "RUNNER_TEMP resolved to shared system storage: $scratch_root" >&2
               exit 1
               ;;
           esac
-          mkdir -p "$scratch" "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
+          umask 077
+          scratch="$scratch_root/tmp"
+          local_cache="$scratch_root/zig-local-cache"
+          global_cache="$scratch_root/zig-global-cache"
+          install="$scratch_root/install"
+          mkdir -p "$scratch" "$local_cache" "$global_cache" "$install"
           echo "temporary area: $scratch"
-          # TMP and TEMP are read by nothing here, but a tool the build invokes
-          # may read either, and leaving one of them pointing at a system
-          # directory while the other points here is worse than setting all
-          # three to the same answer.
           {
             echo "TMPDIR=$scratch"
             echo "TMP=$scratch"
             echo "TEMP=$scratch"
+            echo "ZIG_LOCAL_CACHE_DIR=$local_cache"
+            echo "ZIG_GLOBAL_CACHE_DIR=$global_cache"
+            echo "ZIG_INSTALL_PREFIX=$install"
           } >> "$GITHUB_ENV"
 
       - name: Restore the Zig caches
         uses: actions/cache@v4
         with:
           path: |
-            .zig-cache
-            .zig-global-cache
+            ${{ env.ZIG_LOCAL_CACHE_DIR }}
+            ${{ env.ZIG_GLOBAL_CACHE_DIR }}
           # The manifest is the key because it carries the toolchain pin and
           # the dependency set. Source contents are not part of the key:
           # Zig hashes them itself, so an edit under `src/` reuses this cache
@@ -199,16 +173,21 @@ jobs:
         run: zig fmt --check .
 
       - name: zig build
-        run: zig build
+        run: zig build --prefix "$ZIG_INSTALL_PREFIX"
 
       - name: zig build test
         run: zig build test
 
-      # Decoders here index caller-owned buffers by offsets the tests
-      # compute. Debug mode lets an out-of-range index wrap or pass, so the
-      # second pass is the one that would catch it.
+      # ReleaseSafe preserves runtime checks while the optimizer transforms code.
+      # ReleaseFast and ReleaseSmall must preserve valid-input behavior without them.
       - name: zig build test (ReleaseSafe)
         run: zig build test -Doptimize=ReleaseSafe
+
+      - name: zig build test (ReleaseFast)
+        run: zig build test -Doptimize=ReleaseFast
+
+      - name: zig build test (ReleaseSmall)
+        run: zig build test -Doptimize=ReleaseSmall
 
       - name: zig ast-check
         run: |
@@ -225,13 +204,14 @@ jobs:
       - name: zig build run
         run: zig build run
 
-      # The property and differential harness is the only check that survives
-      # an input nobody hand-wrote, so a build without it is a build that only
-      # proves what it already assumed. It runs in Debug, where an
-      # out-of-bounds index is a trap, and the default seed is fixed so a
-      # failure on CI is reproducible from the log.
-      - name: zig build fuzz
-        run: zig build fuzz
+      # Fixed, distinct seeds make failures reproducible and cover more than one
+      # generated corpus. Keep runtime safety enabled for the property harness.
+      - name: zig build fuzz (reproducible seeds)
+        run: |
+          set -euo pipefail
+          for seed in 0 1 18446744073709551615; do
+            zig build fuzz -Dfuzz-seed="$seed" -Dfuzz-iterations=20000
+          done
 
       # The runtime layer's end-to-end proof: a real client and a real server
       # exchanging frames over a real socket. Without it, CI would only ever
@@ -270,4 +250,4 @@ jobs:
         run: zig build run-bench -- --mode all --iterations 4 --samples 3
 
       - name: zig build docs
-        run: zig build docs
+        run: zig build docs --prefix "$ZIG_INSTALL_PREFIX"

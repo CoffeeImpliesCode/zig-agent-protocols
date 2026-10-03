@@ -27,20 +27,128 @@ HTTP transport over a loopback port, and `zig build run-a2a` discovers an A2A
 agent through its card and sends three unary `SendMessage` calls to the
 endpoint that card advertises. Together the five are the end-to-end proof that
 the codec and the runtime work together on real transport bytes.
-`zig build run-bench` runs the bounded benchmarks described below, and
-`zig build interop-mcp` and `zig build interop-a2a` build only the two
-participants an independent SDK peer starts. `zig build test` runs the unit
-tests, the golden vectors decoded from the specifications' own worked examples,
-the loopback tests that drive two real connections, the test blocks carried by
-the examples, each benchmark module as a root of its own, `testio` and both
-interoperability participants — thirteen roots in all, each built as its own
-module instance, so nothing is compiled twice.
+`zig build run-bench` runs the bounded benchmarks described below.
+The `interop-mcp`, `interop-mcp-current`, `interop-a2a` and `interop-acp`
+build steps install four participants without starting their SDK peers.
+`zig build test` registers fifteen roots: unit tests, golden vectors, live
+loopback tests, four socket-driven examples, the benchmark driver, both benchmark
+modules, `testio` and all four interoperability participants.
+Each root shares its module instance with the corresponding executable.
 `zig build fuzz` runs the property and differential harness,
 which generates hostile input and checks it against a reference parser. The
 house gate is `gate`, from `devenv shell`. Development conventions are in
 [`AGENTS.md`](AGENTS.md). [CI](.github/workflows/ci.yml) runs the same
 toolchain steps, the property harness, all five demonstrations and one bounded
 benchmark smoke, on Linux and on macOS.
+
+## Native package use
+
+Use the `zig-agent-proto` module with stable Zig **0.16.0**. Add the package with
+`zig fetch --save <archive-or-url>`, then import its registered module:
+
+```zig
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    const dependency = b.dependency("zig_agent_proto", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const executable = b.addExecutable(.{
+        .name = "consumer",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    executable.root_module.addImport("zig-agent-proto", dependency.module("zig-agent-proto"));
+    b.installArtifact(executable);
+}
+```
+
+The dependency key must match the key in your `build.zig.zon`.
+This `src/main.zig` uses the borrowing codec without a heap or executor:
+
+```zig
+const std = @import("std");
+const proto = @import("zig-agent-proto");
+
+pub fn main() !void {
+    const input = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/list\"}";
+    var scratch: [128]u8 = undefined;
+    const request = try proto.jsonrpc.decodeRequest(input, &scratch);
+    var output: [256]u8 = undefined;
+    const response = try proto.conn.respond(request, "{\"tools\":[]}", &output);
+    var response_scratch: [128]u8 = undefined;
+    const decoded = try proto.jsonrpc.decode(response, &response_scratch);
+    std.debug.assert(decoded.kind == .response);
+    std.debug.assert(std.mem.eql(u8, decoded.result.?, "{\"tools\":[]}"));
+}
+```
+
+The input, scratch and output are separate regions. Keep each region unchanged
+while a returned value borrows it. Failed decoding returns no value and may
+dirty scratch. Failed encoding returns no slice and may dirty output.
+These borrowed values own no cleanup.
+
+Runtime users also own the backend, transport and task group. Keep reader,
+writer, Conn and callback contexts at stable addresses while tasks use them.
+Use `Io.Group.concurrent` for a blocking pump. On failure, cancel and join the
+group before releasing its storage. Close Conn and shut down the transport
+before closing the stream. Conn does not perform that transport cleanup.
+An HTTP exchange requires exactly one close after successful construction.
+Do not close an exchange whose constructor failed.
+
+The package includes this README, `PROTOCOLS.md`, `ARCHITECTURE.md` and
+`SPEC-DECISIONS.md`. The research corpus and development instructions require
+the checkout. The installed static archive exports no C ABI. A successful
+archive build does not analyze every lazy public function body.
+
+### API contract corrections
+
+- JSON round trips preserve modeled values and represented presence, not
+  original whitespace, member order or escape spelling. Encoding stabilizes
+  after the first normalization. Carried opaque JSON retains its bytes.
+- `conn.Error.EncodeBufferTooSmall` now means local encoding storage shortage.
+  `ResponseTooLarge` means only an inbound response exceeded result storage.
+  `InvalidMessage` means an invalid constructed JSON-RPC value.
+- A canceled Conn response wait returns `Canceled`, releases its slot and
+  leaves the connection usable. The peer may already have executed the request.
+  Conn performs no automatic replay.
+- Conn validates raw params through the JSON-RPC encoder. Params must be one
+  object, array or literal null. A null slice omits params. Raw newlines remain
+  `Framing` errors, including whitespace around literal null.
+- A failed internal-error response write now closes Conn and stops the pump.
+  The pump does not dispatch another request after its writer has failed.
+- `Conn.lastEncodedLen` and `nextId` now require `*Conn` for synchronization.
+  They remain connection-wide snapshots. Exclude other encoders before using a
+  length to slice your output. An id snapshot does not reserve that id.
+- MCP `inputRequired` rejects malformed, trailing or non-object request maps
+  and invalid UTF-8 state text before writing. MCP HTTP POST checks reject
+  body/decode-scratch overlap before decoding.
+- JSON-RPC and bridge preflight validate constructed text and raw body shape.
+  JSON-RPC error data, MCP and A2A opaque JSON, and ACP permission tool calls
+  are checked at their actual nesting depth. ACP v2 capability encoding rejects
+  paths without the `capabilities.` root rather than changing their meaning.
+  ACP capability encoding refuses a set nested deeper than any decode can
+  produce as `error.InvalidField` before the first byte, which leaves
+  `error.BufferTooSmall` meaning only a short output buffer. The budget is the
+  document's, so each writer charges the containers around the capability
+  object: a capability object on its own admits `json.max_depth - 1` presence
+  objects, and an `initialize` body, which carries the object as a member,
+  admits `json.max_depth - 2`. Both decide every refusal before the first byte
+  of that writer's output, so a refused set leaves the caller's buffer
+  untouched.
+  Missing v2 initialization info is refused before either body builder writes.
+- Some protocol encoders use the unchecked `json.Writer.string` primitive.
+  Their attached docs require valid UTF-8 caller text. Decoded strings already
+  meet that precondition. Do not mistake a caller precondition for a checked refusal.
+- Attached API docs define cursor transitions, arena resets, borrow origins,
+  callback validity, default ownership and logical-versus-byte failure residue.
+  Constructor checks do not replace per-call alias or lifetime preconditions.
 
 ## The A2A `1.0` slice
 
@@ -154,9 +262,12 @@ size: a baseline for a later candidate measured the same way. They are not a
 claim about this library's speed on any other host, and nothing they report is
 a claim about MCP or A2A peer behaviour.
 
-The Conn workload owns its task group and cancels or joins it before closing
-the listener. Each reader pump closes its own stream. The HTTP workload joins
-its local group before the group storage expires.
+The Conn workload owns both socket descriptors and its task group. A reader
+pump never closes the stream that its caller can still write. Teardown marks
+the connection dead and shuts down the stream to wake blocked reads; the owner
+joins or cancels all readers and writers, then closes each descriptor once and
+closes the listener. The HTTP workload joins its local group before the group
+storage expires.
 
 The peer-hang-up negative control answers at most one request. Once it requests
 shutdown, its reader stops answering later requests even if the owner task has
@@ -164,28 +275,82 @@ not run yet. Scheduling the owner late cannot turn that fault into a successful
 measurement. The regression checks this window without sleeps and verifies
 `PeerEnded` and one descriptor release per side over a real connection.
 
+### Local baseline comparison, 2026-10-04
+
+The baseline is `ecec22e0c51159fc16eaa065cef7bbebee217942`; the candidate includes
+the API-conformance and descriptor-ownership repairs. Both used pinned Zig
+`0.16.0`, ReleaseSafe, the same x86_64 Linux host and CPU affinity, with no
+concurrent builds. Runtime order was baseline/candidate/candidate/baseline,
+then candidate/baseline/baseline/candidate. Each process measured five windows
+of 1,000 iterations. Codec used three repeats of five windows of 20,000
+iterations per version.
+
+| Workload | Baseline median | Candidate median | Change |
+| --- | ---: | ---: | ---: |
+| Codec accepted-row decode and encode | 1.328 µs | 1.296 µs | −2.4% |
+| Conn round trip | 29.349 µs | 30.645 µs | +4.4% |
+| HTTP first valid event, connect excluded | 54.242 µs | 60.384 µs | +11.3% |
+
+These are medians of whole-run means, not the window quantiles the driver
+prints. The runtime slowdowns are observed results, not a regression-free
+claim. The earlier, shorter sequential comparison was noisier and remains
+part of the evidence; this balanced comparison does not establish causation.
+
+All codec repeats agreed on the literal corpus digest, rejection classes,
+decoded and encoded byte counts, scratch use and correctness oracle. The
+measured codec phases requested no executor or page allocations. Every runtime
+process requested 15,058 executor allocations totalling 2,548,816 bytes,
+with a 482-byte peak and zero bytes remaining after executor shutdown; both
+versions matched. Page-allocator traffic also matched: 14,075 requests totalling
+1,844,838,400 bytes, with a 2,359,296-byte peak. Requested bytes are cumulative
+traffic, not resident memory. The probe's DebugAllocator affects those figures.
+Whole-process high-water RSS ranged from 2,332 to 3,560 KiB for runtime,
+and was 2,144 KiB for baseline codec and 2,208 KiB for candidate codec.
+The probe does not count direct `smp_allocator` mappings, thread stacks,
+kernel socket buffers or private allocator backings.
+
+
 ## Interoperability with pinned SDKs
 
 The library keeps its zero-dependency guarantee because the peers that make an
 exchange real are development processes outside it.
-`zig build interop-mcp` and `zig build interop-a2a` build two participants —
-`zig-agent-proto-mcp-interop` and `zig-agent-proto-a2a-interop` — that the
-Python supervisors in `test/interop/` start by their installed path. Those two
-steps build only; the exchange itself is driven by the `interop-mcp` and
-`interop-a2a` scripts from `devenv shell`, which run `mcp_peer.py --role
-supervise` and `a2a_peer.py --role zig-interop` against those binaries.
+Four supervisors run independent SDKs against installed Zig participants:
 
-Both SDKs come from `devenv.nix` and from nothing else: `python3Packages.mcp`
-at `1.29.0`, the newest revision whose own `LATEST_PROTOCOL_VERSION` is exactly
-the `2025-11-25` this repository pins, and `a2a-sdk` `1.2.1` built from the
-exact PyPI release, because the nixpkgs revision `devenv.lock` pins carries the
-`0.3` line whose methods are `message/send` and `tasks/get` where `1.0` uses
-`SendMessage` and `GetTask`. There is no `pip install`, no `uv` and no
-imperative system installation anywhere in this repository. The versions,
-digests and API facts each peer depends on are recorded in
-[`test/interop/sdk-pins.json`](test/interop/sdk-pins.json), which both peers
-read and check themselves against before they run, so a drifted environment is
-a refused run rather than a claim nobody verified.
+| Build step and `devenv` script | Protocol | Independent peer |
+| --- | --- | --- |
+| `interop-mcp` | MCP `2025-11-25` stdio | `mcp` `1.29.0` |
+| `interop-mcp-current` | MCP `2026-07-28` | `mcp` `2.3.0` with `mcp-types` `2.3.0` |
+| `interop-a2a` | A2A `1.0` unary JSON-RPC HTTP, both directions | `a2a-sdk` `1.2.1` |
+| `interop-acp` | ACP wire `1` stdio | `agent-client-protocol` `1.0.0rc2` |
+
+Each `zig build interop-*` step builds only. From `devenv shell`, the matching
+script starts the SDK and drives the exchange. `interop-acp --protocol-version 2`
+selects the SDK's experimental `schema-v2.0.0-alpha.5` runtime.
+The ACP SDK is a prerelease. Wire 2 remains explicitly gated, with no fallback.
+Neither ACP run claims an upstream implementation of the RFD `mcp/message` binding.
+
+`devenv.nix` declares every SDK. Separate interpreters keep incompatible MCP
+package versions apart. The locked nixpkgs supplies the older MCP version.
+Exact published artifacts supply SDK versions absent from that package set.
+There is no `pip install`, `uv` resolver or imperative system installation.
+[`test/interop/sdk-pins.json`](test/interop/sdk-pins.json) records versions,
+digests and API facts. Each peer checks its installed SDK before it starts children.
+
+Current MCP uses `server/discover`, not the previous revision's `initialize`
+handshake. Its supervisor compares the client's decoded supported-version list,
+discovery instructions, `ttlMs` and `cacheScope` with captured SDK output.
+The participant report schema is `/2`; the redundant, locally generated
+`envelope_protocol_version` report member is removed. Envelope proof comes from
+every captured request, not a second copy of the revision pin.
+The retry repeats both reserved per-request envelope keys in `params._meta`.
+The independent SDK rejects a retry that carries only client capabilities.
+The ACP peer checks initialization, session creation, prompt updates and a
+permission request. Updates must name the issued session, and the client's
+decoded text-update variant must match the capture. The stable fixture sends
+`agent_message_chunk`; the explicitly selected draft SDK sends
+`user_message_chunk`. Its client answers `cancelled`. The captured nested
+outcome must carry no `optionId`, and the SDK's parsed outcome must also show
+non-consent.
 
 The A2A participant is a CLI with a required role, and each role refuses flags it
 does not take. `zig-agent-proto-a2a-interop --role client --base-url URL
@@ -197,26 +362,22 @@ of readiness before it accepts any. `zig-agent-proto-mcp-interop` takes the
 SDK's own stdio pipes and runs the `2025-11-25` sequence itself; `mcp_peer.py
 --role serve` is the other end of those pipes.
 
-The evidence a run produces is a capture rather than a self-report. The MCP
-participant's standard output carries only wire frames; the A2A server prints
-one readiness line there, while its HTTP wire crosses the supervisor's relay.
-Reports go to the file `--report-file` names, and the supervisor checks them
-against the captured bytes. A capture asked for by name is kept as evidence; a
-generated one is removed when the run ends. Every peer starts
-its children in their own process groups and reaps them on success, on failure
-and on timeout, and the MCP participant closes the connection and exits so the
-SDK sees end of file and shuts down on its own. This repository documents how
-to run an exchange; whether one succeeded is a fact about that run and the
-capture it kept, not a claim made here.
+The evidence is captured wire data, not only a participant report.
+Stdio participants use stdout only for wire frames. The A2A server prints
+an HTTP readiness line, then exchanges bytes through the supervisor's relay.
+Reports go to `--report-file`, and supervisors compare them with captured bytes.
+Use `--work-dir` to keep the capture and reports. `--deadline` bounds the whole run,
+including readiness and the first stdio frame. A missing or truncated capture fails.
+The supervisors must reap their own children without signalling unrelated processes.
+The command and its captured reports establish whether that run passed.
 
 ## Working on a node
 
 This repository declares its environment and never installs one. Nothing here
 is installed imperatively: no `pip install`, no `uv`, no system or development
-package, no root. `devenv.nix` declares the tools, the scratch layout and one
-Python interpreter carrying both interoperability SDKs, and `devenv.lock` pins
-the nixpkgs revision it evaluates against. `devenv shell` enters that
-environment; `.envrc` carries the same choice to direnv users.
+package, no root. `devenv.nix` declares tools, scratch paths and isolated SDK
+interpreters. `devenv.lock` pins the package set. `devenv shell` enters that
+environment, and `.envrc` selects the same paths for direnv users.
 
 Some nodes cannot host Nix natively — `/nix` is not writable and the account
 holds no capabilities — and there `nix` and `devenv` are run inside an
@@ -227,10 +388,9 @@ its store paths, and nothing here asserts that a particular node has one. What
 the repository owes the environment is the part it controls, and that is
 `devenv.nix` together with the pin file.
 
-The interpreter the interoperability peers import is the Nix package built by
-`devenv.nix` from the revision `devenv.lock` pins, and the versions and hashes
-are recorded in
-[`test/interop/sdk-pins.json`](test/interop/sdk-pins.json).
+The SDK interpreters are Nix packages declared in `devenv.nix`.
+[`test/interop/sdk-pins.json`](test/interop/sdk-pins.json) records their versions
+and publisher digests. Neither shell entry nor a peer runs a package resolver.
 
 ### Scratch layout
 
@@ -258,33 +418,47 @@ One root, and every path derived from it:
   inherited value naming either, or a removed path, is replaced rather
   than kept.
 
-Two defaults are worth knowing. `TMPDIR` is where an interoperability
-peer puts its work directory, because `test/interop/mcp_peer.py` creates it
-there and removes it when the run ends; a run given `--work-dir` writes
-there instead, and that capture is evidence rather than a temporary file.
-`ZIG_AGENT_PROTO_SDK_PINS` names the pin file both peers read and check
-themselves against, so a run cannot quietly test something else.
+`TMPDIR` is where a peer creates its private work directory. Without
+`--work-dir`, cleanup uses `tools/safe-rm-dir.sh`; a refusal retains the directory
+and fails the run. A named work directory retains its capture and reports.
+
+Guest artifact and image work directories also use this policy. Before
+decompression or guest launch, `tools/guest_storage.py` calls
+`safe-rm-dir.sh --check`: the same ownership, mount and live-use checks,
+without deletion. An unreadable same-UID process can therefore prevent a guest
+run before it starts. Publication uses a same-filesystem hard link from an
+owned regular staged file and refuses an existing destination; cleanup never
+uses an unchecked rename or unlink as a fallback.
+
+Guest shutdown uses `tools/guest_process.py` for both terminal and ordinary
+pipe children. Its batch finalizer finishes verified teardown before reporting
+pending cancellation, so an interrupt cannot leave the second child running
+after the first has stopped. The process guard resolves a bare executable
+against the child's environment and records its absolute path before launch;
+an explicit executable alias remains distinct from the process's argument list.
+
+`ZIG_AGENT_PROTO_SDK_PINS` selects the pin file every peer checks before launch.
 
 ### Checkpoint cleanup
 
-- **Delete only what this project owns and can rebuild.** That is
-  `<root>/build-cache`, `<root>/cache`, the contents of `<root>/tmp` and
-  `<root>/xdg-data`, `zig-out/`, `.devenv/` and `codedb.snapshot`. Nothing
-  outside `<root>` and the sandbox is touched: not `/tmp`, not `/var/tmp`,
-  not another account's directory, not another project's scratch. A
-  `zig-agent-proto` directory this checkout did not create is not this
-  project's to delete.
+- **Ownership is necessary, not permission to delete.** Clean only artifacts
+  this run created. Preserve user files, toolchains, Nix stores and named
+  evidence. Candidate cache directories are not safe merely because they
+  belong to this account.
 - **Keep what re-fetching it would cost.** `<root>/zig-cache/p` holds the
   pinned Zig toolchain the shim unpacked. The Nix store behind a node's
   sandbox is the same kind of thing, and `nix store gc` is the bounded way to
   shrink it rather than a reason to remove it.
-- **Clean up what a run left behind.** Each peer starts every child in its
-  own process group and reaps the group on success, on failure and on
-  timeout, so a leftover socket or directory in `<root>/tmp` belongs to a
-  run that was killed outright, and that is safe to remove.
-- **Keep only the proof a claim needs.** A capture asked for by name is
-  evidence and is kept; the generated ones are temporary files and are not.
-  One of the former is enough.
+- **Verify live use before cleanup.** `tools/safe-rm-dir.sh` checks UID,
+  symlinks, mounts, cwd, descriptors and mappings. An unreadable live process
+  owned by this account is a refusal, not evidence that the tree is unused.
+  Retain the tree and the exact refusal; never fall back to `rm -rf`.
+- **Verify identity before signals.** The peer guard checks full argv, UID,
+  start time, process group and ancestry before TERM. It repeats those checks
+  before KILL and confirms exit. A leftover process or socket is not safe by name.
+- **Keep the verification evidence.** Preserve named captures, reports and
+  failing-before/passing-after proof. Remove only this run's disposable
+  scaffolding after the same ownership, mount and liveness checks pass.
 
 ## A report that cannot be delivered is a failure, not a clean run
 
@@ -344,8 +518,8 @@ the built-in list, so `devenv.nix` carries the whole of it. That list is the
 tool's four defaults plus `/.zig-global-cache/`, which the default
 `/zig-global-cache/` does not match and which holds an unpacked Zig toolchain in
 this checkout — 1938 `.zig` files of its own. With it, what `zig fmt --check`
-and the four analyzers see is exactly the thirty files this repository owns:
-`build.zig`, twenty-seven under `src/` and two under `test/`. Nothing is deleted
+and the four analyzers see is exactly the thirty-two project files:
+`build.zig`, twenty-nine under `src/` and two under `test/`. Nothing is deleted
 to get there. The caches stay where they are and the gate stops reading them,
 which is the difference between a file list that follows the sources and one
 that follows the build state.
@@ -384,6 +558,13 @@ that covers it are for. What the wrapper adds is that the waiver is narrow,
 attributable to one named line of source, and impossible to extend by editing
 a rule list.
 
+The wrapper also names the governing `build.zig`, so zbc can resolve named
+module imports. A source-only input list otherwise prevents that lookup.
+The analyzer's `unresolved-import-lookups` counter counts memoized unsuccessful
+resolver attempts, not missing modules. Compiler-provided `std` and generated
+options contribute to it even when compilation succeeds.
+The wrapper explains a nonzero counter and lists named imports without suppressing findings.
+
 Everything else is a refusal, and a refusal fails the run rather than explaining
 itself in a warning: analyzer output that is not a JSON array of findings, a
 finding missing a field, a severity outside `error` and `warning`, an empty
@@ -401,6 +582,15 @@ Raw analyzer access is unchanged: `zbc` on `PATH` is the analyzer, and
 `ZBC=zbc zig-gate` runs the gate exactly as the host tool ships. The wrapper is
 Python standard library only, it is development tooling like the peers, and the
 library keeps its zero-dependency guarantee because no Zig file imports it.
+
+An analyzer crash is a refused check, not a clean report. The local follow-up
+on 2026-10-04 found that the external `~/tools/zbc` build aborts in
+`arraybuffer-slice-without-pin`: its `declOf` returns a `FnProto` whose parameter
+slice borrows a local one-element array, and a later parameter walk reads a
+stale node index. The raw crash and the strict wrapper refusal are retained.
+The external checkout is intentionally unchanged; repairing it was excluded
+by the user. No repository rule is disabled to make that analyzer run.
+
 `pytest test/gate_analysis_test.py` and `test/gate_zlint_test.py` pin both
 wrappers' decisions against controlled analyzer output; `gate` runs them in one
 invocation, with the cache provider off and the fixture root on the approved
@@ -508,9 +698,9 @@ is never a test pass. Known runtime failures remain failures, so this audit
 correctly exits nonzero on the evidence below rather than reporting a green
 matrix.
 
-The last complete audit on this host compiled all 53 targets and reported:
+An earlier thirteen-root audit on this host compiled all 53 targets and reported:
 twenty Linux rows `pass` at 736 executed tests each, both Windows rows
-executed and failed, and 31 rows `build_only`. The optional
+executed and failed, and 31 rows `build_only`. Those are historical counts. The optional
 `devenv --profile cross-audit shell` adds Wasmtime so the `wasm32-wasi` row
 executes as well; it cannot pass, for the reasons the next paragraph records.
 
@@ -518,8 +708,8 @@ Windows under Wine executes the suite and fails it. `x86_64-windows` reaches
 the failures as real errors from the pinned `std`: AF_UNIX listening returns
 `error.AddressFamilyUnsupported` from `netListenUnixWindows`, and the AFD bind
 returns `error.Unexpected NTSTATUS=0xc00000cb (BAD_DEVICE_TYPE)`.
-`x86-windows` is worse than a failure: every one of its thirteen roots exits
-with code 1 and prints no result at all, which the summary records as
+In that run, every one of the `x86-windows` target's thirteen roots exited
+with code 1 and printed no result at all, which the summary records as
 `no_test_results` rather than as zero tests. WASI under Wasmtime 48.0.1 runs
 and fails on socket and concurrency: `584 pass, 33 fail` in the library root
 alone, plus failing `http`, `a2a`, `loopback`, `runtime` and `bench-runtime`
@@ -527,18 +717,17 @@ roots, where the expected `error.ConcurrencyUnavailable` arrives as
 `error.SocketFailed`. None of these is repaired by disabling tests, by
 shrinking the roots, or by changing the library's `std.Io` contract.
 
-`cross-test.bsd.profile.sh` is the third profile: the same thirteen test roots
+`cross-test.bsd.profile.sh` is the third profile: all fifteen current test roots
 run inside full-system guests instead of under a user-mode emulator, for the
-eighteen BSD rows it registers today — three FreeBSD (`x86_64`, `aarch64`,
-`riscv64`), nine NetBSD (`x86_64`, `aarch64`, `aarch64_be`, `arm`, `armeb`,
-`powerpc`, `x86`, `mips`, `mipsel`) and six OpenBSD (`x86_64`, `x86`, `aarch64`,
-`riscv64`, `powerpc`, `powerpc64`). It exports the binaries through
-`zig build test-artifacts`, and its manifest is the build's single suite
-registry, so a guest runs exactly the roots `zig build test` runs and a green
-guest row reports the same 736 executed tests. A row is not runnable unless
-its driver registers it: the OpenBSD `armv7` and `loongson64` sets and the
-Loongson PMON firmware are pinned in `devenv.nix` for boot work that has not
-produced a registered row, and they are not claimed as coverage.
+twenty-two rows it registers — six FreeBSD (`x86_64`, `aarch64`, `riscv64`,
+`arm`, `powerpc64`, `powerpc64le`), nine NetBSD (`x86_64`, `aarch64`,
+`aarch64_be`, `arm`, `armeb`, `powerpc`, `x86`, `mips`, `mipsel`) and seven
+OpenBSD (`x86_64`, `x86`, `aarch64`, `arm`, `riscv64`, `powerpc`, `powerpc64`).
+It exports binaries through `zig build test-artifacts` and uses the build's
+single suite registry, so a guest must run the same roots as `zig build test`.
+A registered row is runnable; it is not evidence of a passing guest.
+Loongson PMON and `loongson64` sets remain declared preparation inputs without
+a registered test row.
 
 ```sh
 devenv --profile bsd-cross shell
@@ -552,11 +741,11 @@ stays read-only. Tests run from writable guest scratch, since
 `std.testing.tmpDir` creates `.zig-cache` relative to the working directory.
 The receipt reader refuses a missing or repeated root, a failed exit, skipped
 tests, a zero-test root and an incomplete transcript before it reports executed
-passage, so a green guest row is thirteen complete receipts and not a partial
+passage, so a green current guest row is fifteen complete receipts, not a partial
 log.
 
-Completed guest evidence on this host is narrower than the matrix, and the
-difference is the point. `x86_64-freebsd` and `aarch64-freebsd` each pass all
+The following completed guest evidence predates the current fifteen-root registry.
+In that thirteen-root run, `x86_64-freebsd` and `aarch64-freebsd` each passed all
 thirteen roots for 736 executed tests. `riscv64-freebsd` boots and runs all
 thirteen, and fails: the library root completes 425 of 617 tests and then
 segfaults inside `conn.test.a call cancelled while it waits gives its slot
@@ -588,6 +777,59 @@ repackaged from the `.deb` with `autoPatchelfHook` and glibc and declared
 `meta.platforms = [ "x86_64-linux" ]`. The optional `bsd-cross` host is
 therefore an x86_64 Linux host today: that bound is stated, not waived, and no
 macOS or other-host support is claimed for it.
+
+### Local conformance follow-up, 2026-10-04
+
+- All fifteen native roots passed 792 tests in each of Debug, ReleaseSafe,
+  ReleaseFast and ReleaseSmall.
+- All twenty required Linux targets ran those same fifteen roots and passed
+  792 tests each. The original `aarch64_be-linux` descriptor race is fixed;
+  the reader no longer closes a stream its caller can still write.
+- A real `Threaded.concurrent_limit = .nothing` socket test proves that a
+  refused reader spawn hangs up before returning, wakes the peer with EOF
+  and leaves descriptor closure to the owner after the join. Removing the
+  hang-up fails the regression before the peer read can block.
+- Fourteen property runs covered seven seeds in Debug and ReleaseSafe,
+  with 20,000 iterations and all 22 property checks in each configuration.
+- Independent SDK exchanges passed for previous MCP, current MCP, A2A in
+  both directions, stable ACP and explicitly selected draft ACP. Twelve
+  captured-wire/report mutations that the old supervisors accepted are now
+  refused. Eight controlled stdio replays also exercised both ACP versions:
+  wrong-session updates and an empty first text followed by a nonempty text
+  produced four false successes before the repair and four failed exits after it.
+  These fault replays are not claimed as additional SDK exchanges.
+- Formatting and AST checks passed for all 32 project Zig files. The strict
+  zlint wrapper reported no open finding and retained 48 exact-statement
+  manual reviews. The external zbc crash above prevents a clean analyzer gate.
+
+The current full support-table audit compiled all 53 targets. Twenty Linux
+rows passed at 792 tests each; both Windows rows and WASI remained failures,
+and 30 rows were compile-only. WASI executed 791 tests, with 731 passes,
+60 failures and one existing skip. The x86_64 Wine row executed 791 tests,
+with 740 passes, 51 failures and one existing skip; all failures were Unix
+socket or AFD operations. The x86 Wine row produced no test results from any
+of its fifteen roots. Neither failed execution nor a missing runner is a pass.
+
+All twenty-two current BSD exports compiled all fifteen roots: every compiler
+log reports `33/33 steps succeeded`. Artifact preparation then refused to
+proceed because the storage guard could not read a same-UID, non-dumpable SSH
+process's working directory. No guest started. The outer runner groups that
+preparation with compilation and labels the rows `compiler_failed`; the logs
+distinguish a successful compiler from a refused preflight. Earlier
+thirteen-root guest results do not establish current fifteen-root execution.
+
+The declared Python gate run reported 135 passes, 16 failures and one
+existing locale skip. All sixteen failures were storage/proc-visibility
+refusals, not unchecked deletions. The skipped German-locale case passed
+separately using the host's already available locale and interpreter; that
+does not turn the declared gate into a pass. Checked cleanup also refused,
+so the task's scratch evidence remains in place rather than being removed
+through an unchecked fallback.
+
+This is not certification of another `std.Io` backend. The unmodified pinned
+`std.Io.Uring` consumer fails to compile because its directory error sets
+omit `ReadOnlyFileSystem`; its socket vtable is also unimplemented. No second
+Threaded instance or global standard-library patch stands in for that proof.
 
 ### What a green gate is not a claim about
 

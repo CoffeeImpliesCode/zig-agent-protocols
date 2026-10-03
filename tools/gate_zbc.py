@@ -27,6 +27,29 @@ came out empty because an exclusion matched everything. Findings in a valid
 report are printed even when the annotation is refused. An unreadable report or
 unexpected analyzer status fails before findings can be interpreted.
 
+Two things about the run itself are this file's business rather than the
+analyzer's. The first is the source list. A named import is answered by
+reading the `build.zig` that wires it, and the analyzer only looks for one
+while walking up from a directory it was given: handed `src/*.zig` without
+the checkout's `build.zig`, the walk starts inside `src/`, stops at the
+source boundary, never reads the wiring, and every named import degrades
+silently to an unknown type while the run still reports its findings. This
+wrapper therefore names the governing `build.zig` to the analyzer whenever
+the checkout has one and the caller's list does not, because that is what
+puts the checkout root among the directories the walk starts from. Nothing
+else about the list changes, and a file list that was empty is refused
+before this wrapper adds anything to it.
+
+The second is the analyzer's own `unresolved-import-lookups=N` summary. It
+is not a count of missing imports: it counts distinct per-file lookups of a
+named import that build wiring did not answer, one per file and module
+name, and `std` is one per file that reaches a qualified std name because
+the type engine resolves `std` from the toolchain `zig env` reports rather
+than from `build.zig`. A nonzero count is therefore explained here, with the
+names the analyzed sources spell and whoever can answer each, and never
+adjudicated: it stays nonzero in a tree where nothing is wrong, so refusing
+on it would fail every run over a number that is not a defect.
+
 Standard library only. This is development tooling; no Zig file imports it and
 the library keeps its zero-dependency guarantee.
 
@@ -60,6 +83,16 @@ REQUIRED_CITATIONS = ("enterContainer", "max_depth")
 SEVERITIES = ("error", "warning")
 REQUIRED_FIELDS = ("path", "rule_id", "severity", "start", "message")
 
+# The checkout's governing build file: the only document that says which root
+# a named import stands for, and the one the analyzer reads while walking up
+# from a directory it was given.
+GOVERNING_BUILD_FILE = "build.zig"
+# Names the compiler answers itself. `std` comes from the toolchain `zig env`
+# reports, the others from the compilation, so no build file wires them and
+# the analyzer's own wiring lookup cannot answer them by design.
+COMPILER_PROVIDED_MODULES = frozenset({"std", "builtin", "root", "compiler"})
+MAX_REPORTED_MODULES = 20
+
 DEFAULT_TIMEOUT_SECONDS = 900
 MAX_REPORTED_OPEN = 100
 MAX_FORWARDED_STDERR_LINES = 20
@@ -70,6 +103,10 @@ EXIT_REFUSED = 2
 
 MARKER_RE = re.compile(r"^//\s*gate-reviewed-zbc-next-line:\s*(\S+)\s*$")
 RECURSIVE_CALL_RE = re.compile(r"\bself\.skipValue\(")
+IMPORT_STRING_RE = re.compile(r'@import\(\s*"([^"\\]+)"')
+UNRESOLVED_LOOKUPS_RE = re.compile(r"\bunresolved-import-lookups=(\d+)")
+MODULE_WIRING_CALL_RE = re.compile(r'\badd(?:Module|Import|Options)\s*\(\s*"([^"]+)"')
+MODULE_WIRING_ENTRY_RE = re.compile(r'\.name\s*=\s*"([^"]+)"')
 
 
 class Refusal(Exception):
@@ -104,6 +141,9 @@ def adjudicate_run(argv: list[str]) -> int:
         )
     analyzer = resolve_analyzer()
     root = resolve_root()
+    # The caller's own list is judged for emptiness first: a refusal that this
+    # wrapper could fill in would be a refusal it invented.
+    files = with_governing_build_file(root, files)
     report, status, analyzer_stderr = run_analyzer(analyzer, files, forwarded)
     findings = parse_findings(report)
     if status == 1 and not findings:
@@ -115,6 +155,7 @@ def adjudicate_run(argv: list[str]) -> int:
     decisions, refusals = adjudicate(findings, annotations, sources)
 
     forward_analyzer_stderr(analyzer_stderr)
+    report_unresolved_imports(analyzer_stderr, sources, root)
     print_report(findings, decisions)
     for message in refusals:
         print(f"zbc: refusing to judge this run: {message}", file=sys.stderr)
@@ -151,6 +192,39 @@ def split_arguments(argv: list[str]) -> tuple[list[str], list[str]]:
             files.append(argument)
         index += 1
     return files, forwarded
+
+
+def with_governing_build_file(root: str, files: list[str]) -> list[str]:
+    """The analyzer's source list, with the checkout's build file named in it.
+
+    A named import is answered by reading the `build.zig` that wires it, and
+    the analyzer looks for one only while walking up from a directory it was
+    given. Handed `src/*.zig` without that file, every source root it derives
+    is inside `src/`, the walk stops where the source boundary does, and no
+    wiring is ever read: each named import then answers "unknown type", the
+    rules fall back to their conservative branch, and the run still reports
+    its findings, so the loss is invisible in the report. Naming the file is
+    what puts the checkout root among the roots the walk starts from, and it
+    is the only side of this seam that can restore the wiring.
+
+    Nothing else about the list changes: the file is added when the checkout
+    has one and the caller's list does not name it, under the same relative
+    name the checkout uses, however it was spelled on the way in. A list this
+    wrapper was handed empty has already been refused before it gets here.
+    """
+    if not os.path.isfile(os.path.join(root, GOVERNING_BUILD_FILE)):
+        return files
+    if any(names_build_file(root, requested) for requested in files):
+        return files
+    return [GOVERNING_BUILD_FILE, *files]
+
+
+def names_build_file(root: str, requested: str) -> bool:
+    """Whether the checkout's build file is what this argument names."""
+    try:
+        return relative_within(root, requested) == GOVERNING_BUILD_FILE
+    except ValueError:
+        return False
 
 
 def resolve_analyzer() -> str:
@@ -204,7 +278,7 @@ def run_analyzer(
     command = [analyzer, "--format=json", *forwarded, *files]
     try:
         completed = subprocess.run(
-            command, capture_output=True, timeout=timeout_seconds()
+            command, capture_output=True, cwd=resolve_root(), timeout=timeout_seconds()
         )
     except subprocess.TimeoutExpired as error:
         raise Refusal(
@@ -486,6 +560,99 @@ def forward_analyzer_stderr(text: str) -> None:
             "line(s) not shown",
             file=sys.stderr,
         )
+
+
+def report_unresolved_imports(
+    stderr: str, sources: dict[str, list[str]], root: str
+) -> None:
+    """What the analyzer's unresolved-import counter counts, and who answers a name.
+
+    The counter is a total, not a finding and not a defect in this checkout:
+    it counts distinct per-file lookups of a named import that build wiring did
+    not answer, one per file and module name. `std` is one per file that reaches
+    a qualified std name, because the type engine resolves `std` from the
+    toolchain `zig env` reports and never from `build.zig`, so the analyzer's
+    wiring lookup cannot answer it even when nothing is wrong. A tree with no
+    unresolved imports at all is not the normal state of a healthy checkout,
+    and failing on this number would fail every run over a counter, so the run
+    is not failed on it; what it gets instead is the number's meaning and the
+    names the analyzed sources actually spell, grouped by whoever can answer
+    each one. The analyzer reports no per-edge list, so these names are the
+    edges the run depended on and not a claim about which ones it looked up.
+    """
+    match = UNRESOLVED_LOOKUPS_RE.search(stderr)
+    if match is None or int(match.group(1)) == 0:
+        return
+    wired = wired_modules(root)
+    names = named_imports(sources)
+    groups = (
+        ("compiler-provided", [n for n in names if n in COMPILER_PROVIDED_MODULES]),
+        (
+            "wired by build.zig",
+            [n for n in names if n not in COMPILER_PROVIDED_MODULES and n in wired],
+        ),
+        (
+            "named but not wired by build.zig",
+            [n for n in names if n not in COMPILER_PROVIDED_MODULES and n not in wired],
+        ),
+    )
+    print(
+        f"zbc: analyzer unresolved-import-lookups={match.group(1)} is not a "
+        "count of missing imports:",
+        file=sys.stderr,
+    )
+    print(
+        "zbc:   distinct per-file lookups of a named import that build wiring "
+        "did not answer.",
+        file=sys.stderr,
+    )
+    for label, group in groups:
+        print(f"zbc:   {label}: {listed(group)}", file=sys.stderr)
+
+
+def named_imports(sources: dict[str, list[str]]) -> list[str]:
+    """The module names the analyzed sources import by name rather than by path.
+
+    A relative import names a file beside the importer and is resolved against
+    it; this is the other kind, the one that has to be answered by the build.
+    """
+    names: set[str] = set()
+    for lines in sources.values():
+        for line in lines:
+            for name in IMPORT_STRING_RE.findall(line):
+                if name and not name.startswith(".") and not name.endswith(".zig"):
+                    names.add(name)
+    return sorted(names)
+
+
+def wired_modules(root: str) -> set[str]:
+    """The names the governing `build.zig` wires with a literal call.
+
+    `addModule`, `addImport`, `addOptions` and literal `.name` import entries
+    declare bindings. An options module can be generated while its import name
+    remains explicit. This reports those names, not whether the analyzer can
+    load a generated file. Comments and computed names are not claimed.
+    """
+    path = os.path.join(root, GOVERNING_BUILD_FILE)
+    try:
+        with open(path, encoding="utf-8") as build:
+            text = build.read()
+    except (OSError, UnicodeDecodeError):
+        return set()
+    wired: set[str] = set()
+    for line in text.splitlines():
+        code = line.split("//", 1)[0]
+        wired.update(MODULE_WIRING_CALL_RE.findall(code))
+        wired.update(MODULE_WIRING_ENTRY_RE.findall(code))
+    return wired
+
+
+def listed(names: list[str]) -> str:
+    """A bounded list, so one pathological source cannot print without end."""
+    shown = names[:MAX_REPORTED_MODULES]
+    if len(names) > MAX_REPORTED_MODULES:
+        return ", ".join(shown) + f", {len(names) - MAX_REPORTED_MODULES} more"
+    return ", ".join(shown) or "none"
 
 
 def refuse(message: str) -> int:

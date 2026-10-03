@@ -1,14 +1,15 @@
 # Runtime architecture
 
-How the higher-level layer is built on top of the codec, and why. The codec
-(`src/json.zig` through `src/bridge.zig`) is settled and unchanged; this records
-the decisions for the runtime that sits above it.
+The runtime above the codec, its execution capability and its caller costs.
+`PROTOCOLS.md` remains the wire authority; attached API docs define lifetimes,
+validation boundaries and failure residue.
 
 ## 1. Target `std.Io`, never a concrete backend
 
-Every runtime entry point takes `io: std.Io` as a parameter. Nothing in the
-library names `std.Io.Threaded` except the examples and the tests, and no
-library type stores an `Io` that it did not receive.
+Runtime operations use caller-supplied `std.Io`, passed directly or retained by
+the object or reader/writer constructed with it. `Conn.init` stores its `io`
+for synchronization; Stdio adapters retain theirs. No library layer constructs
+an executor. Only examples and tests select `std.Io.Threaded`.
 
 The reasons, in the order they actually bind:
 
@@ -19,17 +20,19 @@ The reasons, in the order they actually bind:
   behind it is that *any operation which may block control flow or introduce
   non-determinism goes through the interface*. Taking it as a parameter is what
   makes the code reusable rather than welded to one executor.
-- **It is the dependency-injection move, and that is deliberate.** The same rule
-  produced the container migration: an allocator is not stored in a struct, it
-  is passed to the methods that need it. `Io` follows the same pattern for
-  execution. A connection that hard-coded a loop would be a connection that
-  cannot be driven by a test loop.
-- **It keeps the backends interchangeable.** `std.Io` has `Threaded` (complete),
-  `Evented` (experimental), `Uring`/`Kqueue`/`Dispatch` (proof of concept) and
-  `failing` (for tests). Code written against the interface runs on all of them.
-- **It costs one parameter.** The accepted price is "interface coloring": a
-  blocking-looking function still takes `io`, so a purely computational helper
-  does not. That is a smaller cost than losing the backend choice.
+- **Capabilities remain caller-owned.** Passing `io` or retaining the capability
+  supplied to a constructor does not transfer backend ownership. The backend
+  must outlive all objects and tasks that use it. An HTTP client remains a
+  borrowed consumer object, including its allocator and connection pool.
+- **Interface compatibility is not backend certification.** A backend must
+  implement streaming reads/writes, mutexes, conditions, cancellation and
+  independent concurrent tasks used by the selected transport. The reference
+  tests use `Threaded`; this repository does not prove these paths under zio,
+  Evented, Uring, Kqueue or Dispatch.
+- **Capability placement follows use.** Pure codecs take no `io`. Conn methods
+  use its stored capability; interfaces that already carry execution need no
+  duplicate parameter. A2A HTTP cross-checks its explicit `io` against the
+  borrowed client's capability instead of pretending they can disagree.
 
 ## 2. No new dependencies
 
@@ -60,17 +63,16 @@ the reference backend for tests and examples, and the interface is the contract.
 outlives a call belongs to a group. `defer group.cancel(io)` covers early
 returns and is a no-op after a successful join. There is no detached work.
 
-A connection owns no group and starts no task. The caller holds the group,
-spawns `Conn.pump` on it, and awaits or cancels it; `Conn` holds the reader's
-buffers and nothing else about the executor. That is the same choice as taking
-`io: std.Io` by parameter rather than storing it: the executor belongs to the
-caller.
+A connection owns no group and starts no task. The caller spawns `Conn.pump` on
+its group and joins or cancels that group. Conn retains the caller's `Io`
+capability for locks and condition waits, not ownership of the executor. Reader,
+writer, buffers, callbacks and backend state must outlive the tasks.
 
-The reader's lifetime is bounded by two things the caller can both observe.
-`Conn.close` marks the connection dead, and `pump` tests that flag rather than
-reading forever, so closing a connection ends its reader instead of only
-declaring it unusable. The caller must await or cancel the group before releasing
-the buffers its tasks borrow.
+`Conn.close` marks the connection dead, and `pump` tests that flag. The caller
+also shuts down the transport to wake a blocked read. It must then join or
+cancel every task that reads or writes the stream before closing the
+descriptor or releasing borrowed storage. A reader returning does not prove
+that its caller has finished writing the same descriptor.
 
 Blocking socket peers, readers and deadline races use `concurrent`, not `async`.
 `Io.Group.async` may run its task inline when `Threaded` reaches its async limit,
@@ -136,10 +138,10 @@ result is a wrong answer rather than an error: the comparison simply fails and
 the handler takes the branch that names an absent method.
 
 `conn.Handler.call` takes `(ctx, frame, decode_scratch, answer)`. The decode
-region holds anything the reader unescaped; the answer region holds the
-envelope. A `Request` may borrow the frame or the decode region and the
-envelope may borrow either, and all of it dies when the handler returns because
-the connection owns both and overwrites them for the next request.
+region holds decoded strings and the answer region holds the envelope.
+A Request may borrow frame or scratch only for the callback invocation. A
+returned envelope stays live through the synchronous write immediately after
+the callback; the next decode or buffer reuse invalidates those bytes.
 
 Three consequences, in the order they bind:
 
@@ -215,7 +217,32 @@ built this way, not a second statement of what it must do.
 
 ## 7. What this buys
 
-A consumer picks the executor, not the library. The same connection code runs
-under `std.Io.Threaded` in the test suite, under whatever `init.io` provides in
-a server binary, and under zio in an application that wants io_uring with
-work-stealing, with no change to this repository.
+A consumer chooses the executor, not the library. Current runtime tests and
+examples exercise `std.Io.Threaded`. Applications may supply another compatible
+backend, but that requires evidence for the operations they use; interface
+matching alone is not a passed transport test.
+
+## 8. Caller resource and failure ledger
+
+| Boundary | Retained or returned resource | Cost and cleanup |
+| --- | --- | --- |
+| Decoder | Input/scratch/arena borrows in the returned model | Keep live and unchanged; failure may dirty scratch or consume arena capacity. No free/deinit is owned by the value. |
+| Encoder | Caller writer/output | Valid source values and non-overlapping writable extent; failed logical writes can leave dirty backing bytes. Discard the failed encoding. |
+| Conn | Reader/writer pointers, four Config regions, callback context, `Io` | Stable addresses, one independent pump, caller group; separate per-call buffers. Close, shut down transport, join/cancel, then release storage. |
+| Session | Borrowed Conn and negotiated state | Conn outlives session; session mutation is not an independent concurrency guarantee. Apply its admission rules before outbound use. |
+| HTTP exchange | Live standard HTTP request and caller buffers | Arm only on successful construction, keep address/storage fixed, close exactly once before backend teardown. |
+| A2A binding | URI borrowed from card body or scratch | Retain that backing storage and card arena until the client no longer uses the binding. |
+
+Conn metadata is connection-wide: `lastEncodedLen` is a synchronized snapshot,
+not a per-task receipt; exclude other encoders before using it to slice your own
+buffer. `nextId` observes but does not reserve an id. A canceled response wait
+returns `Canceled`, releases its slot and leaves Conn usable. The request may
+already have executed. An outbound shortage is `EncodeBufferTooSmall`, not
+`ResponseTooLarge`; the latter means an inbound answer exceeded result storage.
+Neither response overflow nor cancellation authorizes automatic replay.
+
+Configuration overlap/empty-region checks are recoverable construction errors.
+Other documented alias and stable-address rules are caller preconditions.
+Assertions diagnose specified misuse in Debug/ReleaseSafe, not in unchecked
+ReleaseFast/ReleaseSmall. No unchecked mode makes a lifetime violation safe.
+

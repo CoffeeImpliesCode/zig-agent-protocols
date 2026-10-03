@@ -10,10 +10,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // The library is a module first: a protocol contract is consumed by
-    // importers, not linked as a binary. The static artifact exists so that
-    // `zig build` produces a checkable proof of compilation and so that a
-    // C-ABI consumer has something to link.
+    // Consumers use the native Zig module below. Keep the static packaging
+    // artifact, but it exports no C ABI and does not force analysis of every
+    // lazy function body. Tests and executable consumers exercise those bodies.
     const lib_mod = b.addModule("zig-agent-proto", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -204,6 +203,40 @@ pub fn build(b: *std.Build) void {
         "Build the participant for the independent A2A SDK exchange",
     ).dependOn(&install_a2a_interop.step);
 
+    const mcp_current_interop_mod = b.createModule(.{
+        .root_source_file = b.path("src/mcp_current_interop.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    mcp_current_interop_mod.addImport("zig-agent-proto", lib_mod);
+    const mcp_current_interop = b.addExecutable(.{
+        .name = "zig-agent-proto-mcp-current-interop",
+        .root_module = mcp_current_interop_mod,
+    });
+    const install_mcp_current_interop = b.addInstallArtifact(mcp_current_interop, .{});
+    b.getInstallStep().dependOn(&install_mcp_current_interop.step);
+    b.step(
+        "interop-mcp-current",
+        "Build the participant for the current MCP SDK exchange",
+    ).dependOn(&install_mcp_current_interop.step);
+
+    const acp_interop_mod = b.createModule(.{
+        .root_source_file = b.path("src/acp_interop.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    acp_interop_mod.addImport("zig-agent-proto", lib_mod);
+    const acp_interop = b.addExecutable(.{
+        .name = "zig-agent-proto-acp-interop",
+        .root_module = acp_interop_mod,
+    });
+    const install_acp_interop = b.addInstallArtifact(acp_interop, .{});
+    b.getInstallStep().dependOn(&install_acp_interop.step);
+    b.step(
+        "interop-acp",
+        "Build the participant for the independent ACP SDK exchange",
+    ).dependOn(&install_acp_interop.step);
+
     // running
 
     const run_cmd = b.addRunArtifact(demo);
@@ -316,6 +349,10 @@ pub fn build(b: *std.Build) void {
     const run_a2a_interop_tests = b.addRunArtifact(a2a_interop_tests);
     const mcp_interop_tests = b.addTest(.{ .root_module = mcp_interop_mod });
     const run_mcp_interop_tests = b.addRunArtifact(mcp_interop_tests);
+    const mcp_current_interop_tests = b.addTest(.{ .root_module = mcp_current_interop_mod });
+    const run_mcp_current_interop_tests = b.addRunArtifact(mcp_current_interop_tests);
+    const acp_interop_tests = b.addTest(.{ .root_module = acp_interop_mod });
+    const run_acp_interop_tests = b.addRunArtifact(acp_interop_tests);
 
     const test_step = b.step(
         "test",
@@ -346,9 +383,18 @@ pub fn build(b: *std.Build) void {
         .{ .name = "a2a", .binary = a2a_example_tests, .run = run_a2a_example_tests },
         .{ .name = "a2a-interop", .binary = a2a_interop_tests, .run = run_a2a_interop_tests },
         .{ .name = "mcp-interop", .binary = mcp_interop_tests, .run = run_mcp_interop_tests },
+        .{
+            .name = "mcp-current-interop",
+            .binary = mcp_current_interop_tests,
+            .run = run_mcp_current_interop_tests,
+        },
+        .{ .name = "acp-interop", .binary = acp_interop_tests, .run = run_acp_interop_tests },
     };
     var manifest = std.ArrayList(u8).empty;
     for (suites) |suite| {
+        // std.testing.tmpDir is relative to cwd, not --cache-dir. Keep fixture
+        // writes in the caller's cache rather than beside the source checkout.
+        suite.run.setCwd(.{ .cwd_relative = b.cache_root.path.? });
         test_step.dependOn(&suite.run.step);
         const install = b.addInstallArtifact(suite.binary, .{
             .dest_dir = .{ .override = .prefix },
@@ -392,6 +438,7 @@ pub fn build(b: *std.Build) void {
         .root_module = testkit_mod,
     });
     const run_testkit_tests = b.addRunArtifact(testkit_tests);
+    run_testkit_tests.setCwd(.{ .cwd_relative = b.cache_root.path.? });
 
     const fuzz_step = b.step("fuzz", "Run the property and differential harness");
     fuzz_step.dependOn(&run_testkit_tests.step);

@@ -74,18 +74,32 @@
 //! on. [`Client.init`] and [`Client.sendMessage`] both take the `io` for that
 //! reason and for no other.
 //!
-//! Nothing is retained past the call that produced it. A [`Reply`] and a
-//! [`Discovery`] borrow the buffers they were decoded from and expire when those
-//! are reused, which is why `DiscoveryBuffers.body` and the card arena must
-//! outlive the binding and the client: `Binding.uri` is the advertised URL
-//! itself, so a card body written over takes the endpoint with it.
+//! Nothing here copies on the caller's behalf: no returned value owns bytes of
+//! its own. What a call hands back is a borrow, and a borrow lives until the
+//! memory behind it is written again, not until the call returns. A [`Reply`]
+//! borrows the buffers it was decoded from; a [`Discovery`] borrows the card
+//! body and its arena, and through it a [`Binding`] and every [`Client`] built
+//! on one do too. That is why `DiscoveryBuffers.body` and the card arena must
+//! outlive the client: `Binding.uri` is the advertised URL itself, so a card
+//! body written over takes the endpoint with it.
 //!
 //! The server's buffers are pairwise disjoint and `serve` proves it with
 //! `conn.overlaps`, because each one is live at the same time as the answer
 //! written over the next. `payload_out` is where the handler's answer is
 //! composed and `envelope_out` is where the frame carrying it is written, and
 //! the frame splices the first into the second, so one array behind both would
-//! write the answer over itself.
+//! write the answer over itself. That proof is an assertion: live in `Debug`
+//! and `ReleaseSafe`, compiled out in `ReleaseFast` and `ReleaseSmall`.
+//!
+//! # One request per call
+//!
+//! [`serve`] reads one head, answers it, and returns whether it answered one.
+//! The bool is not a statement about the connection: whether another request may
+//! follow is decided from the peer's own `Connection` and from this request's
+//! framing, and a body that could not be drained takes it away. So the loop a
+//! caller writes is "call again while it answered, hang up when it did not", and
+//! a refusal counts as an answer — a `404` and a `405` are both a reply this
+//! server wrote.
 //!
 //! # Scratch is reused exactly once
 //!
@@ -308,6 +322,11 @@ fn requestFailure(err: anyerror) Error {
 
 /// The endpoint a client will speak to, borrowed from the card that published
 /// it.
+///
+/// It owns nothing and has no teardown, and it may be copied freely: a copy
+/// names the same text on the same peer. `uri` holds slices into the card body
+/// the caller decoded, so that body and its arena must outlive every copy and
+/// every [`Client`] built from one.
 pub const Binding = struct {
     /// The advertised URL, with its path and its query exactly as written. It
     /// borrows the card's own text, so the body it was decoded from must outlive
@@ -358,6 +377,11 @@ pub fn select(card: a2a.AgentCard) Error!Binding {
 // --- Discovery -----------------------------------------------------------------
 
 /// Every buffer one discovery needs.
+///
+/// `transfer` and `body` must be different memory: the reader stages chunk data
+/// through the first into the second, so one array behind both has a card
+/// written over the bytes it is being copied out of. The rest are read and
+/// written one at a time.
 pub const DiscoveryBuffers = struct {
     /// Where `std.http` stages a chunked body. It must not be empty.
     transfer: []u8,
@@ -387,6 +411,15 @@ pub const Discovery = struct {
 ///
 /// The card's text, this scratch and the arena must all outlive the returned
 /// binding and any client built from it, because the binding is that text.
+///
+/// The request is released before this returns, and nothing else is: every
+/// buffer keeps whatever the peer sent, so an error leaves the caller with a
+/// reusable buffer and no card. `error.BadStatus` is a peer that answered
+/// something other than a card, and `error.BufferTooSmall` is the caller's own
+/// storage rather than a fact about the peer's document.
+///
+/// This blocks on the socket for as long as the peer takes. No cancellation
+/// point is inspected here, so a cancelled `Io` arrives as `error.Transport`.
 pub fn discover(
     io: Io,
     http_client: *wire.Client,
@@ -499,10 +532,14 @@ pub const Outcome = union(enum) {
 /// failure status is refused rather than reported, so an outcome here is either
 /// the peer's own error or a success the peer's status agreed with.
 ///
-/// Every slice borrows the buffers the call was given, and none is retained past
-/// them.
+/// Every slice borrows the buffers the call was given, and none of them outlives
+/// the buffer it points into: reuse that buffer and the reply is over.
 pub const Reply = struct {
+    /// The status the peer answered with. Kept beside the outcome rather than
+    /// folded into it, because the two come from different places.
     status: wire.Status,
+    /// What the peer said: a typed answer, or the JSON-RPC error it refused
+    /// the call with. A peer error is a successful return here, not a fault.
     outcome: Outcome,
 };
 
@@ -524,6 +561,20 @@ pub const SendBuffers = struct {
 };
 
 /// A client for one advertised A2A endpoint.
+///
+/// It owns nothing and has no teardown. The borrowed `std.http.Client` carries
+/// the allocator, the `Io` and the connection pool, and all three stay the
+/// consumer's; the endpoint is a [`Binding`] whose slices borrow the card text
+/// the caller decoded, so that text and its arena must outlive this client; and
+/// every buffer a call needs is handed in per call. Closing the borrowed
+/// client is the consumer's, not this type's.
+///
+/// One `Client` owns one id space and is used by one thread at a time:
+/// `sendMessage` takes `*Client` and advances `next_id` without a lock, so two
+/// threads sharing one would hand the same id to two calls. Nor may a `Client`
+/// be copied once it is in use: a copy carries its own `next_id`, and the two
+/// would mint the same ids and could not tell each other's answers apart. A
+/// caller that wants concurrency gives each thread its own.
 pub const Client = struct {
     /// Borrowed, and it must outlive this client: its allocator, its executor
     /// and its connection pool all belong to the consumer.
@@ -532,6 +583,10 @@ pub const Client = struct {
     binding: Binding,
     /// The next id this client will use. Monotonic from one, and zero once the
     /// space is exhausted, which is how a wrapped id is kept impossible.
+    ///
+    /// It is this client's own and is not synchronized, and a copy of the
+    /// struct carries its own; both are why the type is not shared and not
+    /// copied. A caller that sets it by hand takes over the id space with it.
     next_id: i64 = 1,
 
     /// Bind to `binding`, using the borrowed client's executor.
@@ -539,6 +594,13 @@ pub const Client = struct {
     /// A binding a caller built by hand rather than one `select` returned is
     /// checked here and not trusted, because this client is about to POST to it
     /// and a URL it cannot speak is a configuration fault with a name.
+    ///
+    /// `io` must be the executor the borrowed client carries; the two are
+    /// compared with an assertion rather than an error, which is live in
+    /// `Debug` and `ReleaseSafe` and compiled out in `ReleaseFast` and
+    /// `ReleaseSmall`. Nothing is opened, allocated or retained here, so there
+    /// is nothing to release and nothing that can block. `binding.uri` keeps
+    /// borrowing the card text, which must outlive the returned client.
     pub fn init(io: Io, http_client: *wire.Client, binding: Binding) Error!Client {
         assertExecutor(io, http_client);
         if (!std.ascii.eqlIgnoreCase(binding.uri.scheme, "http") and
@@ -568,6 +630,21 @@ pub const Client = struct {
     /// substitution and no default. It carries `Content-Type` and `Accept` of
     /// `application/json` and the `A2A-Version` header bound to the selected
     /// interface's `Major.Minor`, and no MCP header of any kind.
+    ///
+    /// The returned [`Reply`] makes no copy of its own: every slice in it
+    /// borrows `buffers.body`, `buffers.scratch` or `arena`, and each is live
+    /// until the caller writes the buffer behind it again, not merely until
+    /// this call returns.
+    ///
+    /// On a failure the request has been written and the connection released,
+    /// and every buffer keeps what it held: nothing is left for the caller to
+    /// release, and `error.BufferTooSmall` is the caller's own storage rather
+    /// than a fact about the peer. The call is not retried, because its id is
+    /// spent either way.
+    ///
+    /// This blocks on the socket for as long as the peer takes. No cancellation
+    /// point is inspected here, so a cancelled `Io` arrives as
+    /// `error.Transport`.
     ///
     /// Each call takes a new id even when a later step of the same call fails,
     /// and a call is never retried. A redirect is refused rather than followed:
@@ -691,21 +768,61 @@ pub const Client = struct {
 /// nothing is copied on the way out. It must not borrow any of
 /// [`ServerBuffers`], which `serve` writes over.
 pub const Handler = struct {
-    /// The handler's own state, passed back unchanged.
+    /// The handler's own state, passed back unchanged. Null reaches `call` as
+    /// null; this module never reads it and never frees it.
     ctx: ?*anyopaque = null,
     /// The `1.0` `SendMessage` handler. A failure is returned to the caller of
     /// `serve` and never answered as a result: this transport cannot name a
     /// cause only the handler knows, and the caller owns the hang-up.
+    ///
+    /// It is called at most once per `serve`, inline on the thread that called
+    /// it, before that call returns, and only for a message this server
+    /// dispatched. It must not call back into `serve` on this server: the
+    /// request it would read is the one being answered, and `std.http` allows
+    /// one reply per head.
+    ///
+    /// `request` borrows the caller's [`ServerBuffers.body`] and
+    /// `payload_scratch`, and the content arena, and it is live for this call
+    /// only: the next `serve` decodes over all three again. A handler that
+    /// keeps a slice of it keeps bytes the next call overwrites. The `Outcome`
+    /// it returns is validated and written before `serve` returns, and it may
+    /// borrow the handler's own storage.
+    ///
+    /// `io` is passed through from `serve`; no executor equality check is made
+    /// on this server path. Its backend must stay alive through `serve` and the
+    /// callback. A callback that retains the capability extends that keepalive.
     call: *const fn (?*anyopaque, Io, a2a.SendMessageRequest) anyerror!Outcome,
 };
 
 /// Every buffer one served request needs.
 ///
-/// The first six are pairwise disjoint, and `serve` proves it with
-/// `conn.overlaps`: each is live at the same time as the answer written over the
-/// next, and the frame splices the payload out of one into the other. A caller
-/// that hands one array for two of them has a handler writing its answer over
-/// the bytes it is reading the request from.
+/// **All seven must be pairwise disjoint**, and [`serve`] proves it with
+/// `conn.overlaps` before a request is read. The pairs are not a preference:
+/// each one is a pair that is live at the same time as the answer written over
+/// the next, and the frame splices the payload out of one into the other. A
+/// caller that hands one array for two of them has a handler writing its answer
+/// over the bytes it is reading the request from.
+///
+/// - `payload_out` and `envelope_out` against `body`, `envelope_scratch`,
+///   `payload_scratch` and `base64`. The typed request the handler is given
+///   borrows the two body regions and the two scratches, and the arena, so all
+///   of them are still live while the answer is encoded into `payload_out` and
+///   the frame that splices it is written into `envelope_out`.
+/// - `payload_out` against `envelope_out`, the splice itself.
+/// - `transfer` against `body`: the reader stages chunk data through the first
+///   into the second, and a drain after a short read uses them both again.
+/// - `envelope_scratch` against `payload_scratch`, so the envelope's own
+///   unescaped strings are not overwritten by the typed decode that follows it.
+///
+/// The check is an assertion, so it is live in `Debug` and `ReleaseSafe` and is
+/// compiled out in `ReleaseFast` and `ReleaseSmall`. A caller that hands two
+/// regions sharing a byte gets a trap where the check is compiled in, and in
+/// the two modes that remove it an answer is composed over the request it was
+/// composed from.
+///
+/// A zero-length region is no region: `conn.overlaps` ignores one, so an empty
+/// field costs nothing here. Every other field has to be non-empty for the work
+/// it names, and `transfer` is the one that says so here.
 pub const ServerBuffers = struct {
     /// Where `std.http` stages a chunked body. It must not be empty.
     transfer: []u8,
@@ -1224,12 +1341,25 @@ fn answerCall(session: *Session) !void {
     try session.respond(frame.written(), status, &headers);
 }
 
-/// Answer one request on `server`, or report that the peer hung up.
+/// Answer one request on `server`, or report that there was none to answer.
 ///
-/// False is returned only for a clean hang-up between requests, which is how a
-/// connection ends. A half-sent request is not that, and a peer that began one
-/// and did not finish it is reported as a malformed request rather than as a
-/// connection that closed politely.
+/// The returned bool says **whether this call answered a request**, not
+/// whether the connection can be used again. `true` means a request head was
+/// read and a reply was written for it, whatever that reply was — the card, a
+/// result, a refusal, a `405`, or a `404`. `false` means no head was read, so
+/// nothing was answered and the connection is finished for this caller.
+///
+/// Reusability is decided elsewhere and is not reported: it comes from the
+/// peer's own `Connection` header and from this request's framing, and a body
+/// that could not be drained lowers it.
+///
+/// A caller that needs to know may keep its own rule, and the safe one is: call
+/// again after a `true`, and hang up after a `false`, an error, or a `true`
+/// this caller knows left the connection closed.
+///
+/// A half-sent request is not a hang-up, and a peer that began one and did not
+/// finish it is reported as a malformed request rather than as a connection
+/// that closed politely.
 ///
 /// Two endpoints are served and no third is invented: the well-known path
 /// answers the card, and the endpoint is exactly the target the caller
@@ -1243,8 +1373,15 @@ fn answerCall(session: *Session) !void {
 /// the handler knows or turning it into a transport fault, and both are lies
 /// about what happened.
 ///
-/// One request is answered per call. A caller that wants the next one on the
-/// same connection calls again until this returns false.
+/// One request is answered per call, and a caller that wants the next one on
+/// the same connection calls again until this returns false. Nothing is
+/// allocated and nothing is released here: the buffers and the arena keep what
+/// they held, the reply has already been written, and the caller closes the
+/// connection itself.
+///
+/// This blocks on the socket for as long as the peer takes. The check that
+/// [`ServerBuffers`] requires is an assertion, live in `Debug` and
+/// `ReleaseSafe` and compiled out in `ReleaseFast` and `ReleaseSmall`.
 pub fn serve(
     io: Io,
     server: *wire.Server,
@@ -1254,13 +1391,14 @@ pub fn serve(
     buffers: ServerBuffers,
     arena: *a2a.ContentArena,
 ) !bool {
-    // Every one of these is live at the same time as the answer written over the
-    // next, and the frame splices the payload out of one into the other, so a
-    // caller that hands one array for two of them has a handler writing its
-    // answer over the bytes it is reading the request from. `conn.overlaps` is
-    // the predicate every other disjointness check in this repository uses, and
-    // an assert and not an error: these are the caller's own buffers, and no peer
-    // can have arranged them.
+    // Every pair of these seven, which is what the doc on `ServerBuffers` says
+    // and why: the handler's request borrows the body and the two scratches
+    // while its answer is composed and framed, and the frame splices the
+    // payload out of one into the other. `conn.overlaps` is the predicate
+    // every other disjointness check in this repository uses, and an assert and
+    // not an error: these are the caller's own buffers, and no peer can have
+    // arranged them. It is live in `Debug` and `ReleaseSafe` and compiled out
+    // in `ReleaseFast` and `ReleaseSmall`.
     const regions = [_][]const u8{
         buffers.transfer,
         buffers.body,

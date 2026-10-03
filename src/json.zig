@@ -26,6 +26,16 @@
 //! Nesting is bounded. An adversarial peer can send `[[[[[...` forever, and a
 //! recursive skip would turn that into a stack overflow, which is a crash and
 //! not a decode error. `max_depth` turns it into `error.LimitExceeded`.
+//!
+//! The published surface is [`Reader`], [`Writer`], [`base64`],
+//! [`memberText`] and [`max_depth`]; every other name here is implementation
+//! behind those. Reading one member out of a document is
+//!
+//!     var reader = Reader.init(input);
+//!     const text = reader.memberRaw("name", &scratch) catch unreachable;
+//!
+//! Every buffer is the caller's and nothing here owns anything, so there is no
+//! teardown to call and no allocation to release.
 
 const std = @import("std");
 const root = @import("root.zig");
@@ -67,18 +77,53 @@ pub const max_depth = 64;
 /// `skipValue` and `rawValue` need no scratch and take none, so stepping over
 /// a member the decoder does not model can never consume the region a modelled
 /// member is about to be given.
+///
+/// [`Reader.nextKeyRaw`] is the third step that needs none: a member name a
+/// caller only compares against a spelling it already holds is handed back as
+/// the peer's own bytes, validated and undecoded, so a document full of escaped
+/// names in members nobody models costs no buffer at all.
+///
+/// `input` and the scratch buffer must not overlap. The escaped path copies
+/// out of `input` into `scratch` as it goes, so two buffers sharing bytes have
+/// the copy overwrite the bytes it has yet to read. Nothing checks this in any
+/// optimize mode — it is a precondition on the caller — and a caller handing
+/// one buffer to both roles has to size it as the union of both.
 pub const Reader = struct {
+    /// The document. It has to stay alive and unmodified for the life of the
+    /// reader, and it must not overlap the scratch buffer handed to `string`.
     input: []const u8,
+    /// The cursor. Writable, because the reader it composes with is the
+    /// caller's: a body decoded from a nested value is a second `Reader` over
+    /// that text rather than a rewind of this one.
     pos: usize = 0,
+    /// Containers currently open, bounded by [`max_depth`]. Writable for the
+    /// same reason `pos` is, so a caller can charge a spliced body for the
+    /// containers the frame around it already holds: a body that lands inside
+    /// one frame object starts at one.
     depth: u32 = 0,
     /// High-water mark of the scratch buffer: the first byte not yet handed to
     /// a decoded string.
+    ///
+    /// Writable for the same reason `depth` is. A caller that hands one
+    /// scratch buffer to a second `Reader` over a spliced body copies the
+    /// outer reader's mark into this one, so the body decodes above the
+    /// regions the frame already handed out instead of over them. The buffer
+    /// behind the mark must then be the same one for the life of both readers:
+    /// this is an index into that buffer, not a byte count.
     bump: usize = 0,
+
     /// Whether the container open at each depth has yielded a member or an
     /// element yet. Indexed by `depth`, which `enterContainer` bounds by
     /// `max_depth`, so the array is never indexed out of range.
     has_member: [max_depth + 1]bool = [_]bool{false} ** (max_depth + 1),
 
+    /// A reader positioned at the first byte of `input`.
+    ///
+    /// `input` is borrowed, not copied, and has to stay alive and unmodified
+    /// for as long as this reader is used. A fresh reader is at depth zero
+    /// with no container open, so `beginObject` or `beginArray` may be called
+    /// on it directly. Reading costs no scratch until a string carrying an
+    /// escape is reached.
     pub fn init(input: []const u8) Reader {
         return .{ .input = input };
     }
@@ -214,6 +259,13 @@ pub const Reader = struct {
         return error.MalformedJson;
     }
 
+    /// Advance `pos` over the four bytes JSON calls whitespace, and stop at the
+    /// first byte that is not one of them.
+    ///
+    /// It moves the cursor rather than only reading it, so a caller that needs
+    /// the position it had asks `peek` before calling this. Nothing else is
+    /// touched, no scratch is spent, and it cannot fail. Every value-taking
+    /// method here calls it first, so a caller never has to.
     pub fn skipWhitespace(self: *Reader) void {
         while (self.pos < self.input.len) : (self.pos += 1) {
             switch (self.input[self.pos]) {
@@ -231,7 +283,12 @@ pub const Reader = struct {
         self.pos += 1;
     }
 
-    /// True when the reader has consumed everything but trailing whitespace.
+    /// True when nothing but whitespace is left in the document.
+    ///
+    /// It is not a pure query: it leaves `pos` at the end of the input, which
+    /// is where a document this reader has finished reading ends. A caller
+    /// that asks and then reads another value is reading past the end, and
+    /// `Truncated` is what it gets.
     pub fn atEnd(self: *Reader) bool {
         self.skipWhitespace();
         return self.pos >= self.input.len;
@@ -243,11 +300,24 @@ pub const Reader = struct {
     /// `max_depth` on any path. A caller that reads the error as "stop
     /// descending" and carries on indexes `has_member[depth]`, and an
     /// increment first would leave that one past the end of the array.
+    ///
+    /// Paired with [`Reader.leaveContainer`], which is where the level is
+    /// given back. The two are the caller's bracket discipline: nothing here
+    /// checks that they are balanced, so a decoder that descends twice and
+    /// rises once leaves the reader one level deeper than the document, and
+    /// every container it opens after that spends a level it does not have.
     pub fn enterContainer(self: *Reader) DecodeError!void {
         if (self.depth >= max_depth) return error.LimitExceeded;
         self.depth += 1;
     }
 
+    /// Give back one level of [`Reader.enterContainer`].
+    ///
+    /// The level is only given back above zero, so a caller whose rise and fall
+    /// do not balance cannot drive `depth` under and have every later
+    /// container refused. The closing byte itself was consumed by the `next`
+    /// method that reported the end of the container; nothing here looks for
+    /// it, and calling this does not read the document.
     pub fn leaveContainer(self: *Reader) void {
         if (self.depth > 0) self.depth -= 1;
     }
@@ -465,6 +535,12 @@ pub const Reader = struct {
         return self.input[start..self.pos];
     }
 
+    /// Read `true` or `false`.
+    ///
+    /// The cursor advances over the exact literal and over nothing else, so a
+    /// truncated `true` is `error.MalformedJson` rather than a false read. No
+    /// scratch is spent: the result is a tag and there is no slice to hand
+    /// back.
     pub fn boolean(self: *Reader) DecodeError!bool {
         self.skipWhitespace();
         if (self.consumeLiteral("true")) return true;
@@ -472,6 +548,12 @@ pub const Reader = struct {
         return self.fail();
     }
 
+    /// Read the literal `null` and return nothing.
+    ///
+    /// A member carrying this is present, and an absent member is a different
+    /// fact, so a caller that has to tell the two asks for this rather than
+    /// treating a leading `n` as nothing there. The cursor advances over the
+    /// exact four bytes, and no scratch is spent.
     pub fn nullLiteral(self: *Reader) DecodeError!void {
         self.skipWhitespace();
         if (!self.consumeLiteral("null")) return self.fail();
@@ -613,7 +695,14 @@ pub const Reader = struct {
         }
     }
 
-    /// Begin an object and report whether it is empty.
+    /// Begin an object and report whether it was empty.
+    ///
+    /// An empty object is reported `true` with both braces already consumed and
+    /// the container level given back, so there is no key left to read and
+    /// `nextKey` is not called on it. Anything else is reported `false` with
+    /// the cursor on its first key, and the caller reads members with
+    /// [`Reader.nextKey`] until that returns null, which is the call that
+    /// consumes the closing brace and gives the level back.
     pub fn beginObject(self: *Reader) DecodeError!bool {
         try self.expect('{');
         try self.enterContainer();
@@ -630,24 +719,78 @@ pub const Reader = struct {
         return false;
     }
 
-    /// Read the next member key of an object opened by `beginObject`.
+    /// Read the next member key of an object opened by `beginObject`, or null
+    /// at its closing brace.
     ///
-    /// Returns null at the closing brace, which the caller consumes. A comma is
-    /// consumed here, so a caller that ignores an unknown key simply calls
-    /// `skipValue` and loops.
+    /// Null consumes the `}` and gives the container level back, so the call
+    /// that returns null is the one that ends the object; nothing is left for
+    /// the caller to consume. A separating comma is consumed here too, so a
+    /// caller that ignores a key it does not model simply calls `skipValue`
+    /// and loops.
+    ///
+    /// The key is unescaped before it is returned, so a name carrying an
+    /// escape spends scratch and a zero-length buffer is `error.BufferTooSmall`
+    /// on it. A plain key borrows `input` and costs nothing.
     pub fn nextKey(self: *Reader, scratch: []u8) DecodeError!?[]const u8 {
+        if (!try self.openKey()) return null;
+        const key = try self.string(scratch);
+        try self.expect(':');
+        self.has_member[self.depth] = true;
+        return key;
+    }
+
+    /// The next member key of an object opened by `beginObject` as the bytes it
+    /// arrived as, or null at the closing brace.
+    ///
+    /// This is [`Reader.nextKey`] with the key left as the peer's spelling
+    /// rather than decoded into a scratch buffer: quotes and escapes included,
+    /// borrowed from `input` and costing no scratch however long the name is.
+    /// Everything else is the same walk — the closing brace and the container
+    /// level, the separating comma, the colon, and the per-container
+    /// first-member flag — so the two cannot disagree about where one member
+    /// ends and the next begins.
+    ///
+    /// A caller that compares a name against a fixed spelling it already holds
+    /// is the case this is for. Decoding a name it does not model spends a
+    /// region of the caller's buffer on a value nothing keeps, and refusing one
+    /// for want of scratch would fail a document this library reads perfectly
+    /// well. `{"jsonrpc":"2.0","id":1,"\u0069d":1}` carries an `id` this
+    /// reports as bytes, and a decoder that wanted the name would compare it
+    /// itself.
+    ///
+    /// The name is still validated in full: a bad escape, a control character,
+    /// a truncated lexeme, an unpaired surrogate and a byte sequence that is
+    /// not UTF-8 are the faults [`Reader.string`] reports for the same string,
+    /// and are reported here as the same faults. The only thing this does not
+    /// do is hand back a name the caller can compare without decoding it, and
+    /// `error.BufferTooSmall` is therefore not among its errors.
+    pub fn nextKeyRaw(self: *Reader) DecodeError!?[]const u8 {
+        if (!try self.openKey()) return null;
+        const start = self.pos;
+        try self.skipString();
+        const key = self.input[start..self.pos];
+        try self.expect(':');
+        self.has_member[self.depth] = true;
+        return key;
+    }
+
+    /// Everything a member key needs before the name itself: report the closing
+    /// brace and give the container level back, or consume the separator that
+    /// has to be there and report that a member follows.
+    ///
+    /// Both key walks open with this, which is what keeps their agreement about
+    /// commas, the brace and the level a property of the code rather than of
+    /// two copies of it.
+    fn openKey(self: *Reader) DecodeError!bool {
         self.skipWhitespace();
         const byte = self.peek() orelse return error.Truncated;
         if (byte == '}') {
             self.pos += 1;
             self.leaveContainer();
-            return null;
+            return false;
         }
         try self.takeSeparator(byte);
-        const key = try self.string(scratch);
-        try self.expect(':');
-        self.has_member[self.depth] = true;
-        return key;
+        return true;
     }
 
     /// Consume the comma that separates two members or elements.
@@ -666,11 +809,16 @@ pub const Reader = struct {
         } else if (byte == ',') return self.fail();
     }
 
-    /// Step over the elements of an array opened here.
+    /// Begin an array and report whether it was empty.
     ///
-    /// Returns an empty slice for `[]`, otherwise the element count. The caller
-    /// then reads elements with `nextArrayElement` and finishes with
-    /// `endArray`.
+    /// The return is the same fact `beginObject` reports and not a count: `[]`
+    /// is reported `true` with the bracket consumed and the level given back,
+    /// so the caller reads no element at all. Anything else is reported `false`
+    /// with the cursor on its first element, and the caller calls
+    /// [`Reader.nextArrayElement`] before each element and until it returns
+    /// false, which is the call that consumes the `]` and gives the level
+    /// back. There is no separate end step: this and the object path end the
+    /// same way.
     pub fn beginArray(self: *Reader) DecodeError!bool {
         try self.expect('[');
         try self.enterContainer();
@@ -684,7 +832,12 @@ pub const Reader = struct {
         return false;
     }
 
-    /// Returns true when another element follows, false at `]`.
+    /// Whether another element follows, or false at the closing bracket.
+    ///
+    /// False consumes the `]` and gives the container level back, so it is the
+    /// call that ends the array and no element is read after it. True leaves
+    /// the cursor on the element itself, and consumes the separating comma,
+    /// so an element needs no separator handling of its own.
     pub fn nextArrayElement(self: *Reader) DecodeError!bool {
         self.skipWhitespace();
         const byte = self.peek() orelse return error.Truncated;
@@ -796,22 +949,49 @@ pub const Reader = struct {
 
 /// A JSON writer over a caller-owned buffer.
 ///
-/// Every write either fits or reports `error.BufferTooSmall` with the buffer
-/// untouched, so a caller can size a buffer, retry on failure, and grow it
-/// without the writer having allocated anything.
+/// Every write either fits or reports `error.BufferTooSmall`, so a caller can
+/// size a buffer, retry on failure and grow it without the writer having
+/// allocated anything.
+///
+/// What a failure preserves is the logical length: `written()` reports the
+/// same prefix, byte for byte, after a failed write as before it. Bytes past
+/// that prefix may have been overwritten on the way, so the guarantee a caller
+/// holds is about the message it has written and not about memory it never
+/// wrote into.
+///
+/// Sources passed to `slice` and `string` must not overlap `buffer`. This
+/// caller precondition is unchecked in every optimize mode; failure is not
+/// reported as an encoding error.
 ///
 /// Every method returns the one `EncodeError` from `root.zig`, not a set of
 /// this module's own, so a caller can catch a failure from any protocol
 /// encoder in the same place.
 pub const Writer = struct {
+    /// The caller's buffer, borrowed for the whole life of the writer. It has
+    /// to stay alive and unmodified for as long as it is read through `written`.
     buffer: []u8,
+    /// How many bytes of `buffer` are written. Writable, because a protocol
+    /// encoder records a mark before it writes and rewinds to it when a write
+    /// fails part way: `jsonrpc.encode` and `bridge.encodeEnvelope` both do,
+    /// and neither can do it through a method.
     len: usize = 0,
 
+    /// A writer over `buffer` with nothing written yet.
+    ///
+    /// `buffer` is the writer's whole storage: it is borrowed, not copied, and
+    /// has to stay alive for as long as the writer is used. `len` starts at
+    /// zero, so `written()` is empty and the caller reads its bytes back out of
+    /// `buffer` rather than out of the writer.
     pub fn init(buffer: []u8) Writer {
         return .{ .buffer = buffer };
     }
 
-    /// The bytes written so far.
+    /// The bytes written so far, as a prefix of `buffer`.
+    ///
+    /// It borrows `buffer`, so the next write invalidates it. After a failed
+    /// write it is the same prefix as before the call, which is what makes a
+    /// size, retry and grow loop correct; the bytes behind it are not promised
+    /// to be the ones they were.
     pub fn written(self: *const Writer) []const u8 {
         return self.buffer[0..self.len];
     }
@@ -822,12 +1002,30 @@ pub const Writer = struct {
         return self.buffer.len - self.len;
     }
 
+    /// Append one byte as it stands, or `error.BufferTooSmall` having written
+    /// none.
+    ///
+    /// Nothing here is checked against the JSON grammar. This is the raw
+    /// primitive a protocol encoder composes a message out of, and a byte that
+    /// is not legal where it lands is the caller's framing decision, not
+    /// something this can refuse without modelling every document a caller may
+    /// be writing.
     pub fn byte(self: *Writer, char: u8) EncodeError!void {
         if (self.len >= self.buffer.len) return error.BufferTooSmall;
         self.buffer[self.len] = char;
         self.len += 1;
     }
 
+    /// Append `bytes` as they stand, or `error.BufferTooSmall` having written
+    /// none.
+    ///
+    /// The bound is settled before the first byte is copied, so a refusal
+    /// leaves the prefix already written exactly as it was. As with
+    /// [`Writer.byte`] nothing here is JSON, and that is what lets a member
+    /// this library does not model reach the wire with its own spelling
+    /// intact rather than rebuilt from a shape that could not hold it.
+    /// `bytes` must not overlap `buffer`; this is unchecked in every optimize
+    /// mode.
     pub fn slice(self: *Writer, bytes: []const u8) EncodeError!void {
         if (self.remaining() < bytes.len) return error.BufferTooSmall;
         @memcpy(self.buffer[self.len..][0..bytes.len], bytes);
@@ -837,16 +1035,20 @@ pub const Writer = struct {
     /// Write a JSON string literal, quotes included, with the escapes JSON
     /// requires and none it does not.
     ///
-    /// The write is all-or-nothing. A caller that gets `error.BufferTooSmall`
-    /// can grow the buffer and call again without first rewinding, which is the
-    /// only way a retry loop around this is worth writing.
-    ///
-    /// `text` must be valid UTF-8. Every byte the grammar forbids is escaped
-    /// and every other byte passes through, so a value carrying a stray byte
-    /// produces a literal this module's own reader refuses. Nothing here
-    /// checks: PROTOCOLS.md section 2.1 makes a value that could not have been
-    /// decoded a programming error, and every string that arrives here from a
-    /// decode is already validated.
+    /// The write is all-or-nothing in the sense that matters to a retry: on
+    /// `error.BufferTooSmall` the length is back where it was, so the caller can
+    /// grow the buffer and call again without rewinding. The bytes past that
+    /// length are not restored, and a caller that kept its own copy of them has to
+    /// have written it before the call.
+    /// `text` must be valid UTF-8, and that is the caller's obligation rather than
+    /// a check here. Every byte the grammar forbids is escaped and every other
+    /// byte passes through, so a `text` carrying a stray byte produces a literal
+    /// this module's own [`Reader.string`] then refuses with `error.InvalidUtf8`
+    /// on the far side of the wire. Nothing enforces the precondition in any
+    /// optimize mode: PROTOCOLS.md section 2 makes a value that could not have
+    /// been decoded a programming error, and every string arriving here from a
+    /// decode is already validated as UTF-8.
+    /// `text` must also be disjoint from `buffer`, unchecked in every mode.
     pub fn string(self: *Writer, text: []const u8) EncodeError!void {
         const mark = self.len;
         self.writeString(text) catch |err| {
@@ -1061,6 +1263,8 @@ pub const base64 = struct {
     /// [`encodedLen`] for an `input` of that length. A buffer shorter than that
     /// is `error.BufferTooSmall` with nothing written, so a caller may size,
     /// retry and grow without this having allocated anything.
+    /// Input and output regions must be disjoint, unchecked in every optimize
+    /// mode. The returned bytes borrow `output` until its next write.
     pub fn encode(input: []const u8, output: []u8, alphabet: Alphabet) EncodeError![]const u8 {
         // The whole result is sized before the first byte is written, so a
         // refusal leaves the caller's buffer exactly as it was handed over
@@ -1105,12 +1309,18 @@ pub const base64 = struct {
 
     /// Decode `input` into `output` in `alphabet`, returning a prefix of it.
     ///
-    /// `output` must hold [`decodedLen`] for `input`, which is never more than
-    /// this writes, and a shorter one is `error.BufferTooSmall` rather than a
-    /// truncated value. A character outside the alphabet, a group whose length
-    /// is not four, a group carrying fewer than two digits, a pad anywhere
-    /// but the tail of the final group, a character after a pad, and digits
-    /// that reach no byte without being zero are all `error.InvalidField`.
+    /// `decodedLen(input.len)` is an upper bound; padding can make the actual
+    /// result smaller. Capacity is checked per group. An output too short for
+    /// the actual decoded bytes is `error.BufferTooSmall`.
+    /// A character outside the alphabet, a group whose length is not four, a
+    /// group carrying fewer than two digits, misplaced padding and nonzero
+    /// discarded bits are `error.InvalidField`.
+    ///
+    /// Either error can leave previously decoded groups in `output`; discard
+    /// those bytes because no result length is returned. The current group is
+    /// checked before its bytes are written. Input and output must be disjoint,
+    /// unchecked in every optimize mode. A successful result borrows `output`
+    /// until its next write.
     pub fn decode(input: []const u8, output: []u8, alphabet: Alphabet) DecodeError![]const u8 {
         if (input.len % 4 != 0) return error.InvalidField;
         var out: usize = 0;
@@ -1321,6 +1531,54 @@ test "the depth bound holds on the failure path too" {
     for (0..max_depth) |_| try testing.expect(!try reader.beginObject());
     try testing.expectError(error.LimitExceeded, reader.beginObject());
     try testing.expectEqual(@as(u32, max_depth), reader.depth);
+}
+
+test "a reader adopted over a spliced body is charged for the containers it lands inside" {
+    // `depth` and `bump` are writable, and a caller decoding a body out of a
+    // frame it is already holding does exactly this: one reader over the
+    // frame and a second over the body, sharing one scratch buffer. Neither
+    // effect below is visible from the shape of the two fields.
+
+    // The bound is charged from the depth the caller set, because the body
+    // lands inside containers the frame already holds. A body nesting
+    // `max_depth` deep is exactly what a reader at depth zero accepts, and it
+    // is refused here — which is the same verdict a decoder reaches a level
+    // earlier when it meets the body inside the frame, so the two sides agree
+    // on what this library carries.
+    var text: [max_depth * 2 + 1]u8 = undefined;
+    @memset(text[0..max_depth], '[');
+    text[max_depth] = '0';
+    @memset(text[max_depth + 1 ..], ']');
+
+    var at_zero = Reader.init(&text);
+    try at_zero.skipValue("");
+
+    var adopted = Reader.init(&text);
+    adopted.depth = 1;
+    try testing.expectError(error.LimitExceeded, adopted.skipValue(""));
+    // `skipValue` unwinds its container count on refusal. Its cursor still
+    // advanced, so the failed value needs a new reader before retrying.
+    try testing.expectEqual(@as(u32, 1), adopted.depth);
+
+    // One scratch buffer for both readers, so the body's escapes land above
+    // the region the frame already handed out. Both decoded strings are alive
+    // at once and neither overwrote the other: a second reader starting its
+    // own mark at zero would have rewritten the first, and no assertion would
+    // have said so.
+    var scratch: [16]u8 = undefined;
+    var frame = Reader.init("{\"a\":\"x\\ny\"}");
+    try testing.expect(!try frame.beginObject());
+    try testing.expectEqualStrings("a", (try frame.nextKey(&scratch)).?);
+    const outer = try frame.string(&scratch);
+    const mark = frame.bump;
+    try testing.expect(mark != 0);
+
+    var body = Reader.init("\"b\\tc\"");
+    body.bump = mark;
+    const inner = try body.string(&scratch);
+    try testing.expectEqualStrings("b\tc", inner);
+    try testing.expectEqualStrings("x\ny", outer);
+    try testing.expectEqual(mark + inner.len, body.bump);
 }
 
 test "skipValue steps over a whole mixed document" {

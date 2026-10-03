@@ -1,5 +1,5 @@
 # Executed coverage for the house gate, not a compile-only target count.
-# Every row passed the complete thirteen-binary test step under Zig 0.16.0.
+# Every row must execute the complete fifteen-binary test step under Zig 0.16.0.
 # The declared Nix environment supplies QEMU; missing runners are failures.
 # The full published support table remains in cross-test.full.profile.sh.
 # That audit records unavailable runners and failed Wine execution explicitly.

@@ -118,6 +118,25 @@ const testio = @import("testio");
 
 const Io = std.Io;
 
+/// What a session on either side can refuse, and what each refusal is about.
+///
+/// Every member below is decided from the call itself — the method name, the
+/// version, the capability paths, the caller's own regions — and never from a
+/// peer's answer, so a caller can repair every one of them without a round trip.
+/// The rest of the set is [`conn.Error`], and that is where a peer that answers
+/// with an error, a transport that fails, a task that is cancelled and a
+/// response that does not fit are reported.
+///
+/// Four of them name a caller region rather than a protocol fault, and the
+/// repair differs for each. `error.BufferTooSmall` is a builder here refusing
+/// to write: nothing is returned and nothing is sent, but the region holds a
+/// prefix that is not a body. `error.EncodeBufferTooSmall` is the connection's,
+/// for a frame that did not fit the region it was composed into.
+/// `error.ResponseTooLarge` is the inbound direction, an answer that did not fit
+/// the region it was copied into, with no body returned.
+/// `error.OverlappingBuffers` is not a size at all: two regions the caller
+/// passed share a byte, the call stops before anything is written or sent, and
+/// doubling a buffer fixes nothing.
 pub const Error = error{
     /// The method is not in the pinned version's registry at all, so the other
     /// version removed it or never had it.
@@ -176,9 +195,20 @@ pub const Error = error{
     /// `initialize` result without a usable `protocolVersion` lands here: there
     /// is no version to pin, and inventing one is what the pin exists to stop.
     NotAResult,
-    /// A caller-supplied buffer was too small. Every builder here reports the
-    /// failure rather than returning the bytes it managed to emit, so a short
-    /// buffer can never leave a half-written approval in the caller's memory.
+    /// A caller region was too small for what was being composed into it.
+    ///
+    /// Nothing is returned and nothing is sent, and the region is not left as
+    /// it was found: a builder writes until it runs out of room, so `out` holds
+    /// a prefix of the body or the frame it was composing. That prefix is not a
+    /// body, is not returned to anybody, and the caller discards it.
+    ///
+    /// Two refusals here are made before the first byte is written and so leave
+    /// no prefix behind: [`error.UnknownPermissionOption`], because an
+    /// approval for an option this request never offered must not exist in
+    /// memory even as half a string, and [`error.MissingInfo`] for the same
+    /// reason one level up. Every other path that reports this tag has written
+    /// something, and the rule is about what is returned rather than about what
+    /// the region holds.
     BufferTooSmall,
 } || conn.Error;
 
@@ -189,10 +219,18 @@ pub const Error = error{
 /// False at every version, for the reasons in the module doc. This is a
 /// statement about this session and not about ACP: `acp.permitsBatch` reports
 /// what the specification allows and returns true at v2. The two are allowed to
-/// disagree, and a transport obeys this one.
+/// disagree, and a transport obeys this one — it is the constant
+/// [`classifyFrame`] reads, so flipping it is what makes this session accept
+/// arrays, and nothing else in the tree has a second copy of the answer.
 pub const accepts_batches = false;
 
-/// What a transport must do with one frame.
+/// What a transport must do with one frame, and what it writes for it.
+///
+/// One arm per answer rather than a bool, because the answers are three
+/// different frames: a batch array and a value that is not an object share
+/// `-32600`, a frame that is not JSON is `-32700`, and each of the two carries
+/// a null id. A transport that answers one arm with another's body tells the
+/// peer a fault it did not have.
 pub const FrameAction = enum {
     /// A single JSON-RPC object. Hand it to the connection.
     dispatch,
@@ -220,6 +258,11 @@ pub const FrameAction = enum {
 /// and at v2 it is a value this session declines, and the answer to "what do I
 /// put on the wire" is the same byte string either way. A caller that wants the
 /// specification's opinion as well has `acp.permitsBatch`.
+///
+/// Reads `frame` and borrows nothing, allocates nothing, takes no scratch and
+/// cannot fail: a frame of any width is decided from its own bytes. A `.value`
+/// arm covers everything the framer can hand over, and one member the framer
+/// already rejected never reaches here.
 pub fn classifyFrame(frame: []const u8) FrameAction {
     const trimmed = std.mem.trim(u8, frame, " \t\r\n");
     if (trimmed.len == 0) return .refuse_parse;
@@ -269,6 +312,14 @@ pub fn classifyFrame(frame: []const u8) FrameAction {
 /// A builder cannot produce this one. Every other answer in the tree is an
 /// answer to a `jsonrpc.Request`, and a frame that is a batch, a value that is
 /// not an object, or is not JSON at all is not one.
+///
+/// `out` must be large enough for the whole body; `error.BufferTooSmall` leaves
+/// it holding a prefix of one, which is not a frame and which no transport may
+/// send. `.dispatch` is `error.InvalidField`, and it is not a size: there is no
+/// body for a frame this connection accepts, and writing a "refusal" for one
+/// would double-answer a request the handler is already answering.
+///
+/// The result borrows `out` and is invalidated by the next write to it.
 pub fn refusalBody(action: FrameAction, out: []u8) root.EncodeError![]const u8 {
     const code: []const u8, const message: []const u8 = switch (action) {
         .dispatch => return error.InvalidField,
@@ -303,6 +354,18 @@ pub const Shape = enum {
 /// and because a caller assembling a dispatch table wants the same answer this
 /// layer would give.
 ///
+/// Every refusal here is decided from the arguments alone: no connection is
+/// reached, nothing is allocated, nothing is written and nothing can block. A
+/// caller may therefore run it on a table of names to build its dispatch, and
+/// the answer for a name does not change between two calls with the same
+/// arguments.
+///
+/// The order the checks run in is the order a caller meets them: the registry,
+/// then the side, then the arity, then `authMethods`, then the capability
+/// gates. A name that fails two of them reports the earlier one, so
+/// `error.WrongSide` for a client method reached from an agent says the side
+/// rather than the arity the name would also fail.
+///
 /// `target` is the side the method *lives on*, which is how the registries spell
 /// it: an `agentMethods` entry is called by the client on the agent, so a client
 /// passes `.agent`, and a `clientMethods` entry is the other way round. A method
@@ -314,6 +377,12 @@ pub const Shape = enum {
 /// mean unsupported for every gated method. `auth_methods` is whether the peer
 /// sent a non-empty `authMethods` array, which is what gates `auth/login` and
 /// `auth/logout` at v2.
+///
+/// The returned [`acp.MethodInfo`] is a value out of the registry, so it is
+/// valid for as long as the registry is and needs no release. The error set is
+/// [`Error`] in full, so a caller that switches on the tags reaches branches
+/// this function cannot produce; the four above are the only ones it can, and
+/// all four are decided before a wire.
 pub fn checkCall(
     version: acp.WireVersion,
     method: []const u8,
@@ -351,6 +420,19 @@ pub fn checkCall(
 /// way, so a walk that copied every path would hand the gate a capability the
 /// peer answered `false` on, and `session/load` would go to an agent that said
 /// in its own `initialize` that it does not serve it. One walk, one predicate.
+///
+/// Nothing is copied: every path in the result borrows the entry it came from,
+/// and the entry borrows the region the decode filled. All of it — `out`, the
+/// entries, and whatever those borrow — must therefore stay alive and
+/// unmodified for as long as any session gates on the returned list, and
+/// [`Client.setAgentCapabilities`] stores the handle rather than a copy of it.
+///
+/// `out.len` is the bound on how many paths the set can name, and a set with
+/// more of them than that is `error.BufferTooSmall` with the entries written so
+/// far left in place — never a truncated list. A truncated list would be a gate
+/// that refuses a capability the peer did advertise, with nothing to tell the
+/// caller which one was dropped; a caller that sizes `out` from the entry count
+/// of the set cannot reach this at all.
 pub fn capabilityPaths(
     set: acp.CapabilitySet,
     out: [][]const u8,
@@ -361,7 +443,31 @@ pub fn capabilityPaths(
 // --- The client side ----------------------------------------------------------
 
 /// A client bound to one negotiated wire version.
+///
+/// Holds the connection every call goes out on, the pin every gate below is
+/// decided against, and two borrowed lists of capability paths. It allocates
+/// nothing, retains nothing past a call and releases nothing: the caller keeps
+/// the connection, the path slices, the entries they borrow from and every
+/// region it hands over, alive and unmodified for as long as this session is
+/// used.
+///
+/// Copying one copies the pin, the connection pointer and the two list handles,
+/// so both copies drive the same connection and both are decided against the
+/// same pin. Two copies are therefore not two sessions with two sets of gates:
+/// a path one of them records is seen by the other, and neither needs a lock of
+/// its own — what concurrent use does need is the connection's own rule, that
+/// two tasks may call at once and each call brings its own `out` and `result`.
 pub const Client = struct {
+    /// The connection every call goes out on. Borrowed: the caller owns it,
+    /// keeps it alive, and this session neither closes it nor re-initialises
+    /// it. The `std.Io` backend the connection borrows, and the reader and
+    /// writer it borrows from that, are the caller's too and must outlive this
+    /// session's use of them.
+    ///
+    /// A call blocks on this connection, so what a caller may do concurrently
+    /// is the connection's rule: two tasks may call at once, and a handler the
+    /// connection runs inline on its reader task must not make an outbound call
+    /// on the same connection.
     connection: *conn.Conn,
     /// The version this session speaks. Set by `init` to the version the client
     /// asks for, and replaced by the one the agent answered with, so every later
@@ -371,40 +477,89 @@ pub const Client = struct {
     /// [`capabilityPaths`]. `initialize` does not fill this in: it reports the
     /// agent's capability object in [`Handshake.capabilities`] and leaves the
     /// recording to [`setAgentCapabilities`], because the paths a client keeps
-    /// are the caller's own. Empty means every gated method is refused.
+    /// and the regions they borrow from are the caller's own storage. Borrowed
+    /// for the session's life and read at every gate rather than cached.
+    ///
+    /// Empty is the answer before `initialize` has run and the answer when the
+    /// agent advertised nothing: PROTOCOLS.md 6.5 makes omission mean
+    /// unsupported, so every gated method is refused rather than sent to be
+    /// rediscovered. A list is not a proof of anything else — it says which
+    /// methods are permitted, not what this agent can do inside one.
     agent_capabilities: []const []const u8 = &.{},
     /// Whether the agent advertised a non-empty `authMethods`, which is what
     /// makes `auth/login` and `auth/logout` callable at v2.
+    ///
+    /// `initialize` sets this from the answer, and only there: a caller that
+    /// never runs the handshake has it false, so those two methods are refused.
+    /// It is one boolean rather than a list because the gate is the emptiness of
+    /// the array and nothing else — v1 gives `authMethods` a schema default of
+    /// `[]`, and `null`, `[]` and an absent member are all "nothing offered".
     auth_methods: bool = false,
     /// The capability paths *this* client advertised in its own `initialize`
-    /// request, as produced by [`capabilityPaths`]. Used only to decide what the
-    /// agent may call here, so a client never answers a method whose capability
-    /// it never claimed.
+    /// request, as produced by [`capabilityPaths`]. Read only by
+    /// [`Client.accepts`], so a client never answers a method whose capability
+    /// it never claimed. Borrowed for the session's life, and empty by default
+    /// for the same reason [`Client.agent_capabilities`] is: a client that
+    /// never records them serves the ungated methods only.
+    ///
+    /// These paths are what this side claimed, not what the peer may assume of
+    /// it. Nothing here widens them: a method gated on a capability this list
+    /// does not carry is refused even when the peer sent it.
     client_capabilities: []const []const u8 = &.{},
 
+    /// A client that speaks `version` over `connection` until a handshake
+    /// replaces the pin.
+    ///
+    /// `connection` is borrowed rather than owned, and neither it nor the
+    /// `std.Io` backend behind it is reached for here: nothing is allocated,
+    /// nothing is registered, and this cannot fail. The caller keeps all of it
+    /// alive.
+    ///
+    /// Both capability lists and `auth_methods` keep their defaults, which
+    /// refuse every gated method and both `auth/*` calls. That is the right
+    /// state for a session that has not run `initialize` yet, and it is also
+    /// the state a session whose handshake failed is left in.
     pub fn init(connection: *conn.Conn, version: acp.WireVersion) Client {
         return .{ .connection = connection, .version = version };
     }
 
     /// The version number for the wire.
+    ///
+    /// The number the `initialize` request and every later frame spell, so a
+    /// caller composing a message by hand can read the same value this session
+    /// gates on. It changes with the pin, so a caller that caches it must
+    /// re-read it after a handshake that downgraded.
     pub fn versionNumber(self: Client) u16 {
         return self.version.number();
     }
 
     /// Record the capability paths the agent advertised.
     ///
-    /// Borrowed: the slices must outlive the session. Pass the result of
+    /// Borrowed: the list handle is stored and nothing is copied. Every path it
+    /// names must stay alive and unmodified, together with the entries they
+    /// borrow from, for as long as this session is used — pass the result of
     /// [`capabilityPaths`] over the entries decoded from the `initialize`
     /// response and keep both.
+    ///
+    /// Replacing the list is a caller decision with a timing: the previous one
+    /// may be released only once no further gate will read it, and an empty
+    /// list is not a reset to "anything permitted" but to refusing every gated
+    /// method again.
     pub fn setAgentCapabilities(self: *Client, paths: []const []const u8) void {
         self.agent_capabilities = paths;
     }
 
     /// Record the capability paths this client advertised.
     ///
-    /// Borrowed: the slices must outlive the session. Pass the result of
+    /// Borrowed: the list handle is stored and nothing is copied, on the same
+    /// terms as [`Client.setAgentCapabilities`]. Pass the result of
     /// [`capabilityPaths`] over the entries decoded from the same capability
     /// object the client sent in `initialize`.
+    ///
+    /// This list is what the agent's calls are gated against, so recording paths
+    /// this client never advertised in its own `initialize` is the one way to
+    /// make [`Client.accepts`] admit a method the peer has no claim to have
+    /// been offered.
     pub fn setClientCapabilities(self: *Client, paths: []const []const u8) void {
         self.client_capabilities = paths;
     }
@@ -416,6 +571,28 @@ pub const Client = struct {
     /// usually wants the message, and collapsing "the peer answered with an
     /// error" into a Zig error would make a remote `-32601` and a local
     /// `error.NotPermitted` indistinguishable at the call site.
+    ///
+    /// `params` is spliced into the frame verbatim, so a newline in it is
+    /// `error.Framing` and leaves the connection usable; nothing here checks
+    /// that it parses, which is the framer's and the peer's business.
+    ///
+    /// The three regions must be pairwise distinct: `out` receives the encoded
+    /// frame while `params` is still being spliced into it, and `result` is
+    /// where the reader copies the answer. One region for two of them is
+    /// `error.OverlappingBuffers`, refused after the gate and before the
+    /// connection is reached.
+    ///
+    /// Blocks until the agent answers, the transport fails, the connection
+    /// closes or the calling task is cancelled. `error.Canceled` arrives
+    /// unchanged, with the frame already written, its id spent and the pending
+    /// slot returned, so the session stays usable — but the agent may already
+    /// have run the call, so whether to send it again is the caller's policy and
+    /// not something this layer decides or recommends. `error.ResponseTooLarge`
+    /// is the same question asked the other way: the agent answered and the
+    /// answer did not fit, so `result` holds as much of it as fitted, no body
+    /// is returned, and re-sending the call re-runs it.
+    ///
+    /// `body` borrows `result` and is invalidated by the next write to it.
     pub fn request(
         self: *Client,
         method: []const u8,
@@ -424,11 +601,25 @@ pub const Client = struct {
         out: []u8,
     ) Error!conn.Response {
         _ = try self.gate(method, .request);
-        const answer = try self.connection.call(method, try requireObject(params), result, out);
+        const object = try requireObject(params);
+        // The gate and the shape check have both passed and nothing has been
+        // written, which is where the regions are compared: `params` is spliced
+        // into the frame `out` receives while `result` is where the reader
+        // copies the answer, so one region for two of them composes a call out
+        // of the very values it is sending.
+        const regions = [_][]const u8{ result, out, object orelse "" };
+        if (anyOverlap(&regions)) return error.OverlappingBuffers;
+        const answer = try self.connection.call(method, object, result, out);
         return .{ .body = answer.body, .error_code = answer.error_code };
     }
 
     /// Notify an agent method, gated locally.
+    ///
+    /// The gate, the shape check and the region check are `Client.request`'s, so
+    /// every refusal that method states is reachable here with one fewer region:
+    /// `out` must not share a byte with `params`, and that is the only pair a
+    /// notification has. Nothing waits for an answer, so no `error.Canceled` is
+    /// reachable and a peer that never replies costs this call nothing.
     pub fn notify(
         self: *Client,
         method: []const u8,
@@ -436,7 +627,11 @@ pub const Client = struct {
         out: []u8,
     ) Error!void {
         _ = try self.gate(method, .notification);
-        return self.connection.notify(method, try requireObject(params), out);
+        const object = try requireObject(params);
+        // The only pair here: the frame is written while `params` is read.
+        const regions = [_][]const u8{ out, object orelse "" };
+        if (anyOverlap(&regions)) return error.OverlappingBuffers;
+        return self.connection.notify(method, object, out);
     }
 
     /// Run the `initialize` handshake and pin the session to its outcome.
@@ -459,6 +654,47 @@ pub const Client = struct {
     /// unescape a key of the answer is `error.BufferTooSmall` and not
     /// `error.NotAResult`, because the agent sent a version and the fault is
     /// the caller's buffer.
+    ///
+    /// Four regions are live at once here and three of them are written: the
+    /// params body is composed into `params_out` from `info` and
+    /// `capabilities`, the frame goes into `out`, and the answer is read out of
+    /// `result` with `scratch` holding the unescaped keys of that read. One
+    /// region for two of them — including `info` or `capabilities` inside
+    /// `params_out` — is `error.OverlappingBuffers`, refused after the gate and
+    /// before the first byte, so nothing is sent on that path either.
+    ///
+    /// Exactly what each outcome changes on the session, because the fields
+    /// above are the gate for every later call and a caller that keeps using a
+    /// session whose handshake did not land is sending names to an agent that
+    /// agreed to nothing:
+    ///
+    /// - A `requested` this library does not implement is
+    ///   `error.MethodNotInVersion`, and nothing changes: no pin, no
+    ///   `auth_methods`, no capability list. Nothing is sent.
+    /// - A gate refusal against the version being asked for changes nothing
+    ///   either, and nothing is sent.
+    /// - An agent that answered with an error changes nothing. The refusal is
+    ///   reported in the `Handshake` with a null `version` and a null
+    ///   `capabilities`, and the session still holds whatever version `init`
+    ///   was given — which is why the null `version` is the only thing that
+    ///   says the handshake did not happen.
+    /// - An answer carrying a version this library speaks replaces `version`
+    ///   and records `auth_methods` from that answer, whatever it says.
+    ///   `agent_capabilities` is not touched: the paths are the caller's to
+    ///   derive from [`Handshake.capabilities`] and record.
+    /// - An answer carrying a version it does not speak leaves `version` exactly
+    ///   as it was and clears `agent_capabilities` to empty, so every gated
+    ///   method is refused even for a session that had been given paths before
+    ///   this call. `auth_methods` is still recorded: it was read out of a
+    ///   member this layer understands.
+    ///
+    /// Blocks for one answer. `error.Canceled` arrives as it does everywhere
+    /// else — the frame has gone out and its id is spent — and the pin is
+    /// unchanged, because nothing was read out of an answer that never came.
+    /// Whether the handshake may simply be run again is the caller's decision:
+    /// an agent that already answered this id knows nothing about a second one,
+    /// and one that did not answer is entitled to treat a repeat as a new
+    /// session.
     pub fn initialize(
         self: *Client,
         requested: u16,
@@ -476,6 +712,22 @@ pub const Client = struct {
         // a session that checked against its stale pin would be deciding the
         // handshake with a version the handshake is about to replace.
         _ = try checkCall(asked, "initialize", .request, .agent, &.{}, false);
+        // Four regions are live at once and three of them are written: the
+        // params body is composed from `info` and `capabilities` into
+        // `params_out`, the frame goes into `out`, and the answer is read out
+        // of `result` with `scratch` holding the unescaped keys of that read.
+        // One region for two of them is a handshake sent over the values it was
+        // composed from, so it is refused here — after the gate, before the
+        // first byte and before the connection is reached.
+        const regions = [_][]const u8{
+            result,
+            out,
+            params_out,
+            scratch,
+            info orelse "",
+            capabilities orelse "",
+        };
+        if (anyOverlap(&regions)) return error.OverlappingBuffers;
 
         const params = try initializeParams(asked, requested, info, capabilities, params_out);
         const answer = try self.connection.call("initialize", params, result, out);
@@ -501,6 +753,11 @@ pub const Client = struct {
 
     /// The gate check this session applies, exposed so a caller can ask whether a
     /// call would be refused before it spends a buffer on it.
+    ///
+    /// Every refusal is [`checkCall`]'s, reached through this session's own pin,
+    /// capability paths and `auth_methods`: nothing is allocated, no connection
+    /// is reached, and the answer is the same one every call on this session
+    /// gets until a handshake or a setter changes one of those three.
     pub fn gate(self: Client, method: []const u8, shape: Shape) Error!acp.MethodInfo {
         return checkCall(
             self.version,
@@ -526,6 +783,17 @@ pub const Client = struct {
     /// them as requests refuses every frame the protocol sends them on. The
     /// same question [`Client.gate`] answers on the outbound side, and this is
     /// that question on the inbound one.
+    ///
+    /// The `authMethods` gate does not apply here. That array says what the
+    /// agent implements so a client can authenticate to it, and PROTOCOLS.md
+    /// 6.4 makes it the agent's baseline obligation rather than a client
+    /// capability; `auth/login` and `auth/logout` are the only two methods it
+    /// gates, and both are agent methods a client calls.
+    ///
+    /// False is every refusal collapsed into one answer, which is the right
+    /// shape for a dispatcher that only needs to route. A caller that wants to
+    /// tell a client method from a request on a notification name asks
+    /// [`checkCall`] and switches on the tag.
     pub fn accepts(self: Client, method: []const u8, shape: Shape) bool {
         _ = checkCall(
             self.version,
@@ -539,7 +807,14 @@ pub const Client = struct {
     }
 };
 
-/// What `initialize` settled on.
+/// What `initialize` settled on, and a value with nothing in it to release.
+///
+/// `body` borrows the result region the caller passed to
+/// [`Client.initialize`] and `capabilities` borrows `body`, so both die with
+/// that region — which is why the capability object is decoded into its own
+/// storage before the region is reused for the next call. Copying a `Handshake`
+/// copies the handles and not the bytes, so a copy has the same lifetime as the
+/// original and needs no release of its own.
 pub const Handshake = struct {
     /// The version both sides speak, or null when nothing was agreed: the agent
     /// refused, or answered with a version this library cannot speak.
@@ -556,20 +831,62 @@ pub const Handshake = struct {
     /// `body`.
     capabilities: ?[]const u8,
     /// Whether the agent advertised a non-empty `authMethods`.
+    ///
+    /// False is the reading of the member rather than a claim about the agent:
+    /// an absent member, an explicit `null` and `[]` all mean no method was
+    /// offered, and v1 gives the member a schema default of `[]`. It is what
+    /// gates `auth/login` and `auth/logout` at v2, so a caller that leaves it
+    /// false refuses both rather than guessing that the agent would accept a
+    /// login it never named.
     auth_methods: bool,
 };
 
 // --- The agent side -----------------------------------------------------------
 
 /// An agent bound to one negotiated wire version.
+///
+/// The other half of [`Client`], holding the connection the agent answers on,
+/// the pin every gate below is decided against, and the borrowed list of paths
+/// the client advertised. It allocates nothing, retains nothing past a call and
+/// releases nothing: the caller keeps the connection, the `std.Io` backend
+/// behind it, the path slices and every region it hands over, alive for as long
+/// as this session is used.
+///
+/// Not threadsafe, and the reason is the shape of the work rather than a
+/// missing lock: an agent answers inbound requests from a handler the
+/// connection runs inline on its reader task, and [`Agent.negotiate`] is the
+/// one method that writes the pin. Two tasks serving one agent would race on
+/// `version` and on the path list, so a caller serving from several tasks gives
+/// each its own `Agent` over its own connection. Two tasks may still make
+/// outbound calls on one agent, each with its own `out` and `result`, because
+/// that is the connection's rule rather than this type's.
 pub const Agent = struct {
+    /// The connection every call goes out on. Borrowed: the caller owns it,
+    /// keeps it alive, and this session neither closes it nor re-initialises
+    /// it. The `std.Io` backend the connection borrows, and the reader and
+    /// writer it borrows from that, are the caller's too.
     connection: *conn.Conn,
     /// The version this session speaks, pinned by `negotiate`.
     version: acp.WireVersion,
     /// The client's advertised capability paths, as produced by
-    /// [`capabilityPaths`]. Empty means every gated client method is refused.
+    /// [`capabilityPaths`]. Borrowed for the session's life and read at every
+    /// gate rather than cached, so every path and every entry it borrows from
+    /// must stay alive and unmodified as long as this session is used.
+    ///
+    /// Empty means the client advertised nothing, which PROTOCOLS.md 6.5 makes
+    /// mean unsupported for every gated client method: an agent that never
+    /// records them serves the ungated methods only and refuses the rest rather
+    /// than answering on a capability the client never claimed.
     client_capabilities: []const []const u8 = &.{},
 
+    /// An agent that speaks `version` on `connection` until `negotiate`
+    /// replaces the pin.
+    ///
+    /// `connection` is borrowed rather than owned and nothing is reached for
+    /// here: nothing is allocated, nothing is registered, and this cannot fail.
+    /// The capability list keeps its default, which refuses every gated client
+    /// method — the right state for an agent whose `initialize` has not been
+    /// read yet.
     pub fn init(connection: *conn.Conn, version: acp.WireVersion) Agent {
         return .{ .connection = connection, .version = version };
     }
@@ -577,6 +894,11 @@ pub const Agent = struct {
     /// Record the capability paths the client advertised.
     ///
     /// Borrowed: the slices must outlive the session.
+    ///
+    /// The list handle is stored and nothing is copied, on the same terms as
+    /// [`Client.setAgentCapabilities`]: the previous list may be released only
+    /// once no further gate will read it, and an empty list is a return to
+    /// refusing every gated client method rather than a permission.
     pub fn setClientCapabilities(self: *Agent, paths: []const []const u8) void {
         self.client_capabilities = paths;
     }
@@ -593,6 +915,16 @@ pub const Agent = struct {
     /// `unsupported` leave the session on the version it was built with and
     /// report `error.NotPermitted`: there is no version to pin, and pinning the
     /// client's own number would claim the agent speaks something it does not.
+    ///
+    /// `supported` is read and borrowed for the length of the call, so a caller
+    /// may pass a literal or a local array. The pin is the only thing written:
+    /// [`Agent.client_capabilities`] is untouched on every path, including the
+    /// two that fail, so a caller that recorded the client's paths before
+    /// negotiating has them still afterwards.
+    ///
+    /// Nothing is sent and nothing can block: the rule is decided from the two
+    /// arguments, and the frame that reports the outcome is the caller's to
+    /// compose.
     pub fn negotiate(
         self: *Agent,
         requested: u16,
@@ -613,6 +945,24 @@ pub const Agent = struct {
     /// is built here rather than spliced by the caller: at v1 the capabilities and
     /// the implementation travel in `agentCapabilities` and `agentInfo`, and at v2
     /// both are `capabilities` and `info`, with `info` required.
+    ///
+    /// `info`, `capabilities` and `auth_methods` are the caller's own JSON and
+    /// are spliced verbatim, so `out` must not share a byte with any of them:
+    /// one region for two is `error.OverlappingBuffers`, refused before the
+    /// first byte is composed.
+    ///
+    /// `auth_methods` is spliced as written rather than inspected here. What
+    /// matters about it is its emptiness on the other side — that is what gates
+    /// `auth/login` — so an agent that implements no login passes null and
+    /// omits the member, and one that implements some passes the array it wants
+    /// read. Nothing here checks that the array holds objects a client can
+    /// authenticate with.
+    ///
+    /// Two refusals leave `out` untouched, because both are decided before the
+    /// first byte: `error.MissingInfo` at v2 with no `info`, and the overlap
+    /// above. Every `error.BufferTooSmall` leaves `out` holding a prefix of the
+    /// body — not a body, and nothing is sent — which the caller discards. The
+    /// result borrows `out` and is invalidated by the next write to it.
     pub fn initializeBody(
         self: Agent,
         info: ?[]const u8,
@@ -620,6 +970,15 @@ pub const Agent = struct {
         auth_methods: ?[]const u8,
         out: []u8,
     ) Error![]const u8 {
+        // Every member below is the caller's own text spliced into `out` while
+        // `out` is written, so one region for two of them is a body quoting
+        // bytes the writer has moved under itself. Refused before the first
+        // byte is composed, which is what leaves `out` untouched on this path.
+        if (conn.overlaps(out, info orelse "")) return error.OverlappingBuffers;
+        if (conn.overlaps(out, capabilities orelse "")) return error.OverlappingBuffers;
+        if (conn.overlaps(out, auth_methods orelse "")) return error.OverlappingBuffers;
+        if (self.version == .draft and info == null) return error.MissingInfo;
+
         const caps_member: []const u8 = if (self.version == .stable)
             "agentCapabilities"
         else
@@ -643,11 +1002,6 @@ pub const Agent = struct {
             writer.slice(info_member) catch return error.BufferTooSmall;
             writer.slice("\":") catch return error.BufferTooSmall;
             writer.slice(value) catch return error.BufferTooSmall;
-        } else if (self.version == .draft) {
-            // v2 requires `info` in the response as well as in the request, and
-            // this is the one place the difference is not the client's problem to
-            // discover.
-            return error.MissingInfo;
         }
         if (auth_methods) |value| {
             writer.slice(",\"authMethods\":") catch return error.BufferTooSmall;
@@ -664,6 +1018,18 @@ pub const Agent = struct {
     /// usually wants the message, and collapsing "the peer answered with an
     /// error" into a Zig error would make a remote `-32601` and a local
     /// `error.NotPermitted` indistinguishable at the call site.
+    ///
+    /// The regions, the shape check, the blocking and the cancellation are
+    /// [`Client.request`]'s, and this method answers them the same way: `out`,
+    /// `result` and `params` must be pairwise distinct or the call is
+    /// `error.OverlappingBuffers` before the connection is reached; a cancelled
+    /// wait returns `error.Canceled` with the frame written and its id spent,
+    /// and whether the client may be asked again is the caller's decision
+    /// because it may already have run the call.
+    ///
+    /// `body` borrows `result`. One thing differs and it is the gate: this is
+    /// the capability *the client* advertised, so an agent that never records
+    /// them can call every ungated method and no gated one.
     pub fn request(
         self: *Agent,
         method: []const u8,
@@ -672,7 +1038,12 @@ pub const Agent = struct {
         out: []u8,
     ) Error!conn.Response {
         _ = try self.gate(method, .request);
-        const answer = try self.connection.call(method, try requireObject(params), result, out);
+        const object = try requireObject(params);
+        // As on the client side: the gate and the shape check have passed and
+        // nothing has been written, which is where the regions are compared.
+        const regions = [_][]const u8{ result, out, object orelse "" };
+        if (anyOverlap(&regions)) return error.OverlappingBuffers;
+        const answer = try self.connection.call(method, object, result, out);
         return .{ .body = answer.body, .error_code = answer.error_code };
     }
 
@@ -700,18 +1071,34 @@ pub const Agent = struct {
     /// never chose, so the call stops here rather than sending a request whose
     /// answer it may not be able to read.
     ///
-    /// `params` is the third region and is written while `permission` is still
-    /// borrowed from `request_scratch`: the body quotes the option ids the
-    /// answer is then checked against, so one buffer for both builds a request
-    /// out of the ids it is about to compare, and the answer may match a
-    /// mangled entry. All three pairs are refused for the reason the first one
-    /// is, and refused before a byte goes out.
+    /// All five regions must be pairwise distinct, and the two the connection
+    /// adds are in the rule too: `params` is written while `permission` is still
+    /// borrowed from `request_scratch`, because the body quotes the option ids
+    /// the answer is then checked against; `out` is written while that body is
+    /// spliced into it; and `result` is where the answer lands and
+    /// `outcome_scratch` is where that answer is read. One region for two of
+    /// them is [`PermissionDecision.unreadable`] carrying
+    /// `error.InvalidField`, refused before a byte goes out — an exchange whose
+    /// answer cannot be read is not one worth starting.
     ///
     /// An outcome this library cannot parse is [`PermissionDecision.unreadable`]
     /// and not a Zig error, so the two-arm `switch` PROTOCOLS.md 6.6 requires
     /// still fails to compile without an `unreadable` arm. A client that
     /// answered with a JSON-RPC error is `unreadable` too: an error object
     /// carries no outcome, and reading one as an approval would be inventing it.
+    ///
+    /// Blocking, cancellation and the residue are [`Client.request`]'s, with the
+    /// permission's own answer as the body: this call waits for the user, so a
+    /// cancelled wait is `error.Canceled` after the request has gone out and its
+    /// id is spent, and whether to ask again is the caller's decision — a user
+    /// may have been shown the prompt either way.
+    ///
+    /// A Zig error from here is a failure to send or to receive, never an
+    /// answer: the two the connection can raise while waiting, `error.Transport`
+    /// and `error.ConnectionClosed`, mean the client is gone, and
+    /// `error.Canceled` means this task no longer wants to know. Every refusal of
+    /// the answer itself is the `unreadable` arm, so a caller cannot mistake one
+    /// for the other by catching the wrong thing.
     pub fn requestPermission(
         self: *Agent,
         permission: *const acp.PermissionRequest,
@@ -726,9 +1113,20 @@ pub const Agent = struct {
         // from `request_scratch`, and it is `findOption` that compares the two
         // afterwards. One buffer for a scratch and for `params` is the same
         // fault one buffer for both scratches is, one step earlier.
-        const shared = conn.overlaps(request_scratch, outcome_scratch) or
-            conn.overlaps(params, request_scratch) or
-            conn.overlaps(params, outcome_scratch);
+        //
+        // `result` and `out` are the two the connection adds: the body is
+        // spliced into the frame while it is written, and the answer is copied
+        // out of `result` into nothing at all. Five regions, none of them
+        // shareable with another, and one pair checked here rather than ten —
+        // all of them before a byte goes out, because an exchange whose answer
+        // cannot be read is not one worth starting.
+        const shared = anyOverlap(&[_][]const u8{
+            result,
+            out,
+            params,
+            request_scratch,
+            outcome_scratch,
+        });
         if (shared) return .{ .unreadable = error.InvalidField };
         const body = try permissionParams(permission, params);
         const answer = try self.request("session/request_permission", body, result, out);
@@ -736,6 +1134,11 @@ pub const Agent = struct {
     }
 
     /// Notify a client method, gated locally.
+    ///
+    /// [`Client.notify`]'s contract with one fewer region: `out` must not share a
+    /// byte with `params`, and that is the only pair a notification has.
+    /// Nothing waits for an answer, so no `error.Canceled` is reachable from
+    /// here.
     pub fn notify(
         self: *Agent,
         method: []const u8,
@@ -743,7 +1146,11 @@ pub const Agent = struct {
         out: []u8,
     ) Error!void {
         _ = try self.gate(method, .notification);
-        return self.connection.notify(method, try requireObject(params), out);
+        const object = try requireObject(params);
+        // The only pair here: the frame is written while `params` is read.
+        const regions = [_][]const u8{ out, object orelse "" };
+        if (anyOverlap(&regions)) return error.OverlappingBuffers;
+        return self.connection.notify(method, object, out);
     }
 
     /// Whether a method the client called is one this agent serves at the pinned
@@ -755,6 +1162,13 @@ pub const Agent = struct {
     /// are two of them that are notifications, so asking about them as requests
     /// refuses the frames the protocol sends them on. The same question
     /// [`Agent.gate`] answers, as a bool.
+    ///
+    /// The gate is the capability the client advertised and not the
+    /// `authMethods` this agent offered, for the reason [`Agent.gate`] gives.
+    /// False is every refusal collapsed into one answer, which is what a
+    /// dispatcher needs and what hides the difference: a caller that wants to
+    /// tell a client method from a request on a notification name asks
+    /// [`checkCall`] and switches on the tag.
     pub fn accepts(self: Agent, method: []const u8, shape: Shape) bool {
         _ = self.gate(method, shape) catch return false;
         return true;
@@ -762,6 +1176,19 @@ pub const Agent = struct {
 
     /// The gate check this session applies, exposed so a caller can ask whether a
     /// call would be refused before it spends a buffer on it.
+    ///
+    /// Every refusal is [`checkCall`]'s, read through this session's pin and the
+    /// client's advertised paths: nothing is allocated, no connection is
+    /// reached, and the answer is stable until a handshake or
+    /// [`Agent.setClientCapabilities`] changes one of those two.
+    ///
+    /// The `authMethods` gate is passed open, and that is deliberate rather than
+    /// an omission: that array says what the *agent* implements so a client can
+    /// authenticate to it, and PROTOCOLS.md 6.4 makes it the agent's baseline
+    /// obligation rather than a capability a client advertises. The two methods
+    /// it gates are `auth/login` and `auth/logout`, and both are agent methods a
+    /// client calls — an agent refusing its own login would refuse the call it
+    /// exists to answer.
     pub fn gate(self: Agent, method: []const u8, shape: Shape) Error!acp.MethodInfo {
         return checkCall(
             self.version,
@@ -786,6 +1213,12 @@ pub const Agent = struct {
 /// caller can reach without naming an option, and no arm meaning "the caller did
 /// not care". [`autoDecide`] exists so a policy with no decision to make has
 /// somewhere to go, and where it goes is `cancelled`.
+///
+/// A value with nothing in it to release. The `.selected` arm borrows the id,
+/// so those bytes must stay alive and unmodified until [`answerPermission`] has
+/// written its body — normally for as long as the request is alive, since the
+/// id a caller names is usually one the request offered. Copying an answer
+/// copies the handle and not the bytes.
 pub const PermissionAnswer = union(enum) {
     /// `{"outcome":"cancelled"}`. The specification requires this answer to every
     /// permission request still pending when a `session/cancel` arrives, and it
@@ -804,6 +1237,12 @@ pub const PermissionAnswer = union(enum) {
 /// here, and an absent outcome has no way to become the argument of an answer.
 /// That is the same rule a `switch` over `grants` and `cancelled` already
 /// enforces on the decision, restated in the type of what a caller passes on.
+///
+/// A value with nothing in it to release and nothing it borrows: both arms are
+/// a bool and a tag. It is the only shape an answer may take, which is what
+/// makes [`PermissionDecision.unreadable`] unable to become consent — see
+/// [`answerPermissionRequest`], which is the entry point that takes this and
+/// the one that refuses a grant for want of an option id.
 pub const ReadableOutcome = union(enum) {
     /// The client chose an option this request offered, and that option's `kind`
     /// resolves to whether it grants.
@@ -827,9 +1266,28 @@ pub const PermissionDecision = union(enum) {
     cancelled,
     /// The outcome is not one this library can read, or names something the
     /// request never offered, or names an option whose `kind` has no `grants`
-    /// because it is a v2 catch-all. Carries the reason.
+    /// because it is a v2 catch-all, or the caller's own regions were not fit to
+    /// read it with. Carries the reason, and the reason says whose fault it is:
+    ///
+    /// - `error.BufferTooSmall` is the caller's own shortage and the only arm a
+    ///   retry can fix: one of the two scratch regions could not hold the
+    ///   unescaped members of an answer that is otherwise perfectly readable.
+    ///   Nothing about the peer is wrong, and the same body read with a larger
+    ///   region may well be a grant.
+    /// - `error.InvalidField` is a malformed answer, an `optionId` this request
+    ///   never offered, or two of the caller's regions sharing a byte. The first
+    ///   two are the peer's; the third is the wiring fault this function exists
+    ///   to refuse, and it is what a caller sees when it hands one buffer over
+    ///   for two roles.
+    /// - `error.MissingField` is an answer with no `outcome` member at all.
+    /// - `error.UnknownTag` is an outcome or an option `kind` this library does
+    ///   not define: a real value of the schema that this build cannot resolve
+    ///   to a direction, which is why it is neither a grant nor a refusal.
     ///
     /// Never `grants = true`, and there is no way to make it so from the wire.
+    /// An agent that treats this arm as a refusal has obeyed PROTOCOLS.md 6.6
+    /// exactly; an agent that retries it is retrying its own shortage, not the
+    /// peer's answer.
     unreadable: root.DecodeError,
     /// The arms an agent may act on, or null when the outcome was unreadable.
     ///
@@ -885,7 +1343,17 @@ pub fn readOutcome(
     request_scratch: []u8,
     outcome_scratch: []u8,
 ) PermissionDecision {
-    if (conn.overlaps(request_scratch, outcome_scratch)) {
+    // Three regions are live here and all three must stay apart: the answer is
+    // read while its members are unescaped into `outcome_scratch`, and the
+    // option ids the answer names are compared against ids the request
+    // borrowed from `request_scratch`. One region for two of them is the
+    // escape-offset hazard this function exists to refuse rather than resolve,
+    // so it is one tag for all three pairs and it is refused before a byte of
+    // the answer is read.
+    if (conn.overlaps(request_scratch, outcome_scratch) or
+        conn.overlaps(body, request_scratch) or
+        conn.overlaps(body, outcome_scratch))
+    {
         return .{ .unreadable = error.InvalidField };
     }
     const outcome_text = json.memberText(body, "outcome", outcome_scratch) orelse
@@ -921,6 +1389,19 @@ pub fn answerPermission(
     answer: PermissionAnswer,
     out: []u8,
 ) Error![]const u8 {
+    // The chosen id is compared against the ids this request offered, and the
+    // answer quotes it into `out` while that comparison reads it. An `out`
+    // inside the region those ids are borrowed from compares a moving id with
+    // itself, so the check runs before a byte is written — which is what makes
+    // `error.UnknownPermissionOption` below the only way this call can leave an
+    // approval unwritten.
+    const options: []const acp.PermissionOption = switch (request.*) {
+        .stable => |value| value.options,
+        .draft => |value| value.options,
+    };
+    for (options) |option| {
+        if (conn.overlaps(out, option.option_id)) return error.OverlappingBuffers;
+    }
     const outcome: acp.PermissionOutcome = switch (answer) {
         .cancelled => .cancelled,
         .selected => |option_id| selected: {
@@ -954,11 +1435,27 @@ pub fn answerPermission(
 /// two builders writes, and the agent that receives it reads `unreadable`
 /// rather than an approval. A caller holding an option id answers with
 /// [`answerPermission`] and [`conn.respond`], which is the path that can grant.
+///
+/// Exactly one region of the request must stay clear of `out`, and it is the
+/// id. An integer id is a value and the frame may echo it from anywhere; a
+/// string id borrows the frame or the region the transport decoded it from, and
+/// the builder writes the envelope's opening bytes into `out` before reading it
+/// back, so a string id inside `out` is echoed from bytes the writer has
+/// already moved and the peer reads punctuation where its own id should be.
+/// One such overlap is `error.OverlappingBuffers`, refused before a byte is
+/// written. The method name and the params are not read by this frame and
+/// impose nothing.
+///
+/// A frame that does not fit is `error.EncodeBufferTooSmall`, and `out` then
+/// holds a prefix that is not a frame: nothing is returned and nothing is sent,
+/// so an answer this call could not write is not left in the caller's region for
+/// a handler to send by accident. The result borrows `out`.
 pub fn answerPermissionRequest(
     request: jsonrpc.Request,
     decision: ReadableOutcome,
     out: []u8,
 ) conn.Error![]const u8 {
+    if (idOverlaps(request.id, out)) return error.OverlappingBuffers;
     return switch (decision) {
         .cancelled => try conn.respond(
             request,
@@ -977,9 +1474,36 @@ pub fn answerPermissionRequest(
 }
 
 /// A caller policy that may auto-decide a permission request.
+///
+/// A value with nothing in it to release: `ctx` is the caller's own pointer and
+/// `decide` is a function pointer, so copying a policy copies the two handles
+/// and shares whatever `ctx` points at. Nothing here is retained past
+/// [`autoDecide`].
 pub const Policy = struct {
+    /// Passed to `decide` unchanged, or null. The caller owns whatever it points
+    /// at and keeps it alive across every [`autoDecide`] call that can reach this
+    /// policy; `null` reaches the callback as `null`, which is a context the
+    /// callback chose rather than a missing owner.
     ctx: ?*anyopaque = null,
-    /// The option id the policy chose, or null for no decision.
+    /// The option id the policy chose, or null for no decision. Null means "no
+    /// decision", which [`autoDecide`] turns into a cancellation rather than
+    /// into a pass — the two are different facts and an auto-decider that
+    /// conflates them approves by accident. Null on the field is the same answer
+    /// with no callback run at all.
+    ///
+    /// The callback runs synchronously inside [`autoDecide`], on the thread that
+    /// called it, before that call returns. `ctx` is valid for exactly that
+    /// window and `request` is borrowed for it: both must be live on entry, and
+    /// neither may be kept afterwards. It may call back into the session it is
+    /// answering, because `autoDecide` holds no state of its own; it must not
+    /// mutate `request`, whose option ids are what its answer is checked against
+    /// a moment later.
+    ///
+    /// The returned id must stay alive until the caller has written the answer
+    /// with [`answerPermission`], and [`answerPermission`] checks it against the
+    /// options *this* request offered — so an id from another request, or one
+    /// spelled slightly differently, is `error.UnknownPermissionOption` rather
+    /// than an approval for the option nearest to it.
     decide: ?*const fn (
         ctx: ?*anyopaque,
         request: *const acp.PermissionRequest,
@@ -992,6 +1516,17 @@ pub const Policy = struct {
 /// decision produces [`PermissionAnswer.cancelled`], because "the policy did not
 /// fire" and "the policy allowed this" are different facts, and collapsing them is
 /// how an auto-decider ends up approving.
+///
+/// The answer is not checked against `request` here, and that is the caller's
+/// side of the bargain: this returns what the policy named, and
+/// [`answerPermission`] refuses an id this request never offered. Nothing is
+/// allocated, nothing is retained and nothing can fail — the callback's own
+/// answer is the whole result.
+///
+/// `request` is borrowed for the length of the call and is handed to the
+/// callback unchanged. A callback that keeps a pointer into it is holding a
+/// borrow on the agent's own request storage, which outlives this call and not
+/// the caller that started it.
 pub fn autoDecide(
     policy: Policy,
     request: *const acp.PermissionRequest,
@@ -1021,6 +1556,7 @@ fn initializeParams(
     capabilities: ?[]const u8,
     out: []u8,
 ) Error![]const u8 {
+    if (version == .draft and info == null) return error.MissingInfo;
     const caps_member: []const u8 = if (version == .stable)
         "clientCapabilities"
     else
@@ -1044,8 +1580,6 @@ fn initializeParams(
         writer.slice(info_member) catch return error.BufferTooSmall;
         writer.slice("\":") catch return error.BufferTooSmall;
         writer.slice(value) catch return error.BufferTooSmall;
-    } else if (version == .draft) {
-        return error.MissingInfo;
     }
     writer.byte('}') catch return error.BufferTooSmall;
     return writer.written();
@@ -1291,6 +1825,37 @@ fn requireObject(params: ?[]const u8) error{ParamsNotAnObject}!?[]const u8 {
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
     if (trimmed.len == 0 or trimmed[0] != '{') return error.ParamsNotAnObject;
     return value;
+}
+
+/// Whether any two of `regions` share a byte.
+///
+/// [`conn.overlaps`] answers one pair, and the buffer rules on this file's
+/// public methods are about five regions at a time — a permission exchange
+/// alone is three. Checking the pairs one at a time leaves the ones nobody
+/// remembered with no diagnostic and with an answer that is wrong rather than
+/// absent, which is the fault class this library spends the most code on
+/// refusing.
+fn anyOverlap(regions: []const []const u8) bool {
+    for (regions, 0..) |region, at| {
+        for (regions[at + 1 ..]) |other| {
+            if (conn.overlaps(region, other)) return true;
+        }
+    }
+    return false;
+}
+
+/// Whether `id` borrows a byte of the region a frame is written into.
+///
+/// The two arms of [`jsonrpc.Id`] are not alike here. An integer id is a value,
+/// so a frame may echo it from anywhere. A string id borrows the frame or the
+/// region the transport decoded it from, and every builder here echoes it after
+/// writing the envelope's opening bytes — so a string id inside the output
+/// region is echoed from bytes the writer has already moved.
+fn idOverlaps(id: jsonrpc.Id, out: []const u8) bool {
+    return switch (id) {
+        .integer => false,
+        .string => |text| conn.overlaps(text, out),
+    };
 }
 
 // --- Tests --------------------------------------------------------------------
@@ -1808,6 +2373,198 @@ test "one buffer for params and a scratch is refused before a byte is sent" {
     }
 }
 
+test "one buffer for the answer and a scratch is refused before a byte is sent" {
+    // `result` is where the answer lands and `outcome_scratch` is where the
+    // reader unescapes that answer's members, so one region for both is an
+    // outcome decoded over the bytes it was decoded from — and the option id it
+    // writes is one the request borrowed from `request_scratch`, so the grant
+    // it resolves is a grant the client never chose. The connection is
+    // `undefined` for the reason the tests above give: the refusal is before
+    // the agent reaches it.
+    var agent: Agent = .{ .connection = undefined, .version = .stable };
+    var options: [1]acp.PermissionOption = undefined;
+    var request_scratch: [512]u8 = undefined;
+    const request = try decodeRequest(.stable, permission_params, &options, &request_scratch);
+    var out: [256]u8 = undefined;
+    var params: [512]u8 = undefined;
+    var outcome_scratch: [256]u8 = undefined;
+
+    const reason: root.DecodeError = error.InvalidField;
+    const into_answer = try agent.requestPermission(
+        &request,
+        &request_scratch,
+        &out,
+        &params,
+        &request_scratch,
+        &outcome_scratch,
+    );
+    switch (into_answer) {
+        .unreadable => |err| try testing.expectEqual(reason, err),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(?ReadableOutcome, null), into_answer.readable());
+
+    // And the same answer region as the frame, which the connection writes
+    // while the request body is still being read out of `params`.
+    var answer: [512]u8 = undefined;
+    const into_frame = try agent.requestPermission(
+        &request,
+        &answer,
+        &answer,
+        &params,
+        &request_scratch,
+        &outcome_scratch,
+    );
+    switch (into_frame) {
+        .unreadable => |err| try testing.expectEqual(reason, err),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "an answer read through the buffer it arrived in is refused" {
+    // `body` is the whole answer, in the caller's own region, and this read
+    // unescapes its members into a scratch while the answer is still being
+    // read. The option id carries an escape, so one region for both writes an
+    // option id over the answer's own bytes and `findOption` compares one id
+    // with itself — a grant nobody chose.
+    var options: [1]acp.PermissionOption = undefined;
+    var request_scratch: [512]u8 = undefined;
+    const request = try decodeRequest(.stable, permission_params, &options, &request_scratch);
+    const answer =
+        "{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"\\u0079es\"}}";
+    var body: [512]u8 = undefined;
+    @memcpy(body[0..answer.len], answer);
+
+    const decision = readOutcome(
+        body[0..answer.len],
+        &request,
+        &request_scratch,
+        body[0..answer.len],
+    );
+    switch (decision) {
+        .unreadable => |err| try testing.expectEqual(@as(root.DecodeError, error.InvalidField), err),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(?ReadableOutcome, null), decision.readable());
+}
+
+test "a call or a body whose regions share a byte is refused before the wire" {
+    // The connections are `undefined` on purpose: every one of these refusals
+    // happens before the session reaches a connection, so a caller that got
+    // past one would fault here rather than frame a request over the values the
+    // frame is composed from.
+    const params_text = "{\"sessionId\":\"s1\"}";
+    var result: [512]u8 = undefined;
+    var out: [512]u8 = undefined;
+    @memcpy(out[0..params_text.len], params_text);
+
+    var client: Client = .{ .connection = undefined, .version = .stable };
+    // `params` is spliced into the frame the connection writes while it is
+    // still reading it.
+    try testing.expectError(
+        error.OverlappingBuffers,
+        client.request("session/new", out[0..params_text.len], &result, &out),
+    );
+    // The frame and the answer in one region: the connection writes the
+    // request while its reader copies the response in.
+    try testing.expectError(
+        error.OverlappingBuffers,
+        client.request("session/new", params_text, &result, &result),
+    );
+    // A notification has no answer at all, so its only pair is the same one.
+    try testing.expectError(
+        error.OverlappingBuffers,
+        client.notify("session/cancel", out[0..params_text.len], &out),
+    );
+    // The agent's own outbound call, whose gate is what the client advertised
+    // rather than what the agent did.
+    var agent: Agent = .{ .connection = undefined, .version = .stable };
+    try testing.expectError(
+        error.OverlappingBuffers,
+        agent.request("session/request_permission", out[0..params_text.len], &result, &out),
+    );
+    try testing.expectError(
+        error.OverlappingBuffers,
+        agent.notify("session/update", out[0..params_text.len], &out),
+    );
+}
+
+test "an initialize whose regions share a byte is refused before the wire" {
+    // Four regions are live at once here and three of them are written: the
+    // params body is composed from `info` and `capabilities` into
+    // `params_out`, the frame goes into `out`, and the answer is read out of
+    // `result` with `scratch` holding the unescaped keys of that read.
+    var client: Client = .{ .connection = undefined, .version = .stable };
+    var result: [1024]u8 = undefined;
+    var out: [1024]u8 = undefined;
+    var params_out: [512]u8 = undefined;
+    var scratch: [512]u8 = undefined;
+    const info = "{\"name\":\"client\"}";
+
+    // The info object inside the region the params body is written into.
+    try testing.expectError(
+        error.OverlappingBuffers,
+        client.initialize(1, params_out[0..info.len], "{}", &result, &out, &params_out, &scratch),
+    );
+    // The frame and the params body it splices, which is the pair a caller that
+    // composed in place arrives at.
+    try testing.expectError(
+        error.OverlappingBuffers,
+        client.initialize(1, info, "{}", &result, &out, out[0..256], &scratch),
+    );
+    // The answer and the scratch that reads it.
+    try testing.expectError(
+        error.OverlappingBuffers,
+        client.initialize(1, info, "{}", &result, &scratch, &params_out, &scratch),
+    );
+}
+
+test "an agent body composed over its own members is refused" {
+    // Every member here is the caller's own text spliced into `out` while it is
+    // written, so one region for both is a body quoting bytes that have moved
+    // under the writer. Nothing here reaches a connection either: a response
+    // body is composed from three values and refused on the first fault among
+    // them.
+    var agent: Agent = .{ .connection = undefined, .version = .stable };
+    var out: [512]u8 = undefined;
+    const info = "{\"name\":\"agent\"}";
+    @memcpy(out[0..info.len], info);
+    try testing.expectError(
+        error.OverlappingBuffers,
+        agent.initializeBody(out[0..info.len], null, null, &out),
+    );
+
+    @memcpy(out[0..2], "{}");
+    try testing.expectError(
+        error.OverlappingBuffers,
+        agent.initializeBody(null, out[0..2], null, &out),
+    );
+    try testing.expectError(
+        error.OverlappingBuffers,
+        agent.initializeBody(null, null, out[0..2], &out),
+    );
+}
+
+test "an answer composed over the option ids it is checked against is refused" {
+    // The option id carries an escape, so it is borrowed from the scratch rather
+    // than from the fixture, and an answer written into that scratch quotes an
+    // id the writer is moving under itself. `answerPermission` reaches no
+    // connection, so this refusal is the whole of what a caller gets back.
+    var options: [1]acp.PermissionOption = undefined;
+    var request_scratch: [512]u8 = undefined;
+    const request = try decodeRequest(
+        .stable,
+        "{\"sessionId\":\"s1\",\"toolCall\":{},\"options\":[" ++
+            "{\"optionId\":\"\\u0079es\",\"name\":\"Yes\",\"kind\":\"allow_once\"}]}",
+        &options,
+        &request_scratch,
+    );
+    try testing.expectError(
+        error.OverlappingBuffers,
+        answerPermission(&request, .{ .selected = "yes" }, request_scratch[0..128]),
+    );
+}
+
 test "a v2 catch-all option kind is unreadable, not a grant and not a refusal" {
     var options: [2]acp.PermissionOption = undefined;
     const source = "{\"sessionId\":\"s1\",\"title\":\"Run\",\"subject\":null,\"options\":[" ++
@@ -1941,10 +2698,12 @@ test "the answer frame is the connection's, and it refuses a grant it cannot nam
     const decision = readOutcome(refused, &request, &request_scratch, &outcome_scratch);
     try testing.expectEqual(@as(?ReadableOutcome, null), decision.readable());
 
-    // A short buffer is the caller's own fault, and it is reported rather than
-    // leaving half an answer behind.
+    // A short region is the caller's own fault, and it is the outbound tag:
+    // `answerPermissionRequest` composes the whole frame, so the frame that did
+    // not fit is `EncodeBufferTooSmall`. Nothing is sent, `out` holds a prefix
+    // that is not a frame, and no half-answer is left to be sent by mistake.
     try testing.expectError(
-        error.ResponseTooLarge,
+        error.EncodeBufferTooSmall,
         answerPermissionRequest(call, .cancelled, out[0..8]),
     );
 }
@@ -2128,7 +2887,9 @@ test "an initialize is shaped by the version it asks for" {
         "{\"protocolVersion\":2,\"capabilities\":{\"session\":{}},\"info\":{\"name\":\"a\"}}",
         v2,
     );
+    @memset(&out, 0xa5);
     try testing.expectError(error.MissingInfo, initializeParams(.draft, 2, null, null, &out));
+    try testing.expectEqualSlices(u8, &([_]u8{0xa5} ** out.len), &out);
 }
 
 test "an agent answers initialize in its own version's spelling" {
@@ -2166,10 +2927,12 @@ test "an agent answers initialize in its own version's spelling" {
         v2_body,
     );
     // v2 requires `info` in the response as well as in the request.
+    @memset(&out, 0xa5);
     try testing.expectError(
         error.MissingInfo,
         v2.initializeBody(null, "{\"session\":{}}", null, &out),
     );
+    try testing.expectEqualSlices(u8, &([_]u8{0xa5} ** out.len), &out);
 }
 
 test "a downgrade is read in the version the agent answered with" {
@@ -2364,8 +3127,11 @@ test "a batch frame is refused loudly, at either version" {
     try testing.expectEqual(@as(i32, -32600), refusal.rpc_error.?.code);
     try testing.expectEqualStrings("Invalid Request", refusal.rpc_error.?.message);
     // And it is a value this library holds rather than text it happens to
-    // write: PROTOCOLS.md section 2 asks for `encode(decode(b)) == b`, and the
-    // bytes come back the same way round, member for member.
+    // write. What matters here is presence and value, not spelling: the null id
+    // comes back as an explicit `null` rather than as an absent member, which
+    // is the whole distinction `conn.Conn.setOrphanHandler` exists to keep, and
+    // the code and the message come back as the two members an `error` carries
+    // rather than as one lexeme.
     var again: [128]u8 = undefined;
     var writer = json.Writer.init(&again);
     try jsonrpc.encode(refusal, &writer);
@@ -2635,28 +3401,25 @@ const Endpoint = struct {
     reader: Io.net.Stream.Reader = undefined,
     // SAFETY: `adopt` assigns it, and `open` runs `adopt` before it lends `writer.interface` away.
     writer: Io.net.Stream.Writer = undefined,
-    // SAFETY: `adopt` assigns it; only a path that ran `adopt` reaches the reads of it.
-    stream: Io.net.Stream = undefined,
-    // SAFETY: `open` assigns it before it sets `pumping`, and only a pumping endpoint reads it.
+    /// The descriptor this endpoint owns, and the proof that it owns one.
+    ///
+    /// `adopt` and `open` both store it, `open` before it can refuse, so a
+    /// caller that gives up on a refusal still holds the descriptor it has to
+    /// release. `release` stores `null` before it closes, because a second
+    /// `shutdown` on a released descriptor is `EBADF` and the standard library
+    /// reports that as a programmer bug by aborting the process. An option
+    /// rather than an `undefined` field because the owner releases every
+    /// endpoint after the join, and one that was never opened owns nothing.
+    stream: ?Io.net.Stream = null,
+    // SAFETY: `open` assigns it before it sets `connected`, and only a connected endpoint reads it.
     connection: conn.Conn = undefined,
-    /// Whether this endpoint's descriptor is gone already.
-    ///
-    /// The task that owns the endpoint hangs up itself, and the pump hangs up
-    /// after it, so the two can both reach for the same stream.
+    /// Whether [`open`] built a connection over `stream`, which it sets once
+    /// `conn.Conn.init` hands one back. [`adopt`] leaves it false: a transport
+    /// that only writes has no connection, and a hang-up reads this field
+    /// before it calls into one.
+    connected: bool = false,
+    /// Whether this endpoint has been hung up already.
     closed: bool = false,
-    /// Whether a task reads this endpoint, which [`open`] sets and [`adopt`]
-    /// does not.
-    ///
-    /// It decides who releases the descriptor: the pump when there is one,
-    /// because it is the only task that reads it, and the caller when there is
-    /// not. See [`hangUp`].
-    pumping: bool = false,
-    /// Whether the descriptor has been released.
-    ///
-    /// Read before every syscall on the stream, because a second `shutdown` on
-    /// a released descriptor is `EBADF`, and the standard library reports that
-    /// as a programmer bug by aborting the process.
-    released: bool = false,
 
     /// Take the stream and hand it to a connection over `Side`'s buffers.
     ///
@@ -2683,15 +3446,14 @@ const Endpoint = struct {
             .decode_scratch = &self.side.decode_scratch,
             .answer = &self.side.answer,
         });
+        self.connected = true;
         if (handler) |h| self.connection.setHandler(h);
         if (orphan) |h| self.connection.setOrphanHandler(h);
-        // A blocking reader needs concurrency; `async` may run it inline.
-        // Publish ownership before spawning, but give it back on refusal.
-        self.pumping = true;
-        group.concurrent(io, pump, .{self}) catch |err| {
-            self.pumping = false;
-            return err;
-        };
+        // A blocking reader needs concurrency; `async` may run it inline. A
+        // refused spawn leaves the descriptor with this endpoint and no reader
+        // on it, which the owner releases like any other one: `hangUp` shuts it
+        // down so the peer is not left on a socket nobody will answer.
+        try group.concurrent(io, pump, .{self});
     }
 
     /// Take the stream and its two interfaces, with no connection over them.
@@ -2706,75 +3468,75 @@ const Endpoint = struct {
         self.writer = Io.net.Stream.Writer.init(stream, io, &self.writer_buffer);
     }
 
-    /// Hang up: stop the reader, wake it, and let the descriptor go once.
+    /// Hang up: tell the reader to stop, wake it, and leave the descriptor to
+    /// the owner.
     ///
-    /// `shutdown` before `close`: closing a descriptor does not interrupt a read
-    /// already blocked on it, so the peer's pump would sit on an open
-    /// description and the group would never finish.
+    /// `shutdown` before anything else, and no `close` here at all. Closing a
+    /// descriptor does not interrupt a read already blocked on it, so a hang-up
+    /// that only closed would leave the pump sitting on an open description and
+    /// the group would never finish; `shutdown` is what makes the next read
+    /// return zero bytes and the loop leave.
     ///
-    /// Who closes the descriptor depends on whether anything reads it, and the
-    /// pump is the only task that may when there is one. `conn.pump` asks again
-    /// after a read of zero bytes, and a local `shutdown` makes the next read
-    /// return exactly that, so a caller that released the descriptor under a
-    /// live pump would have that pump read a freed descriptor: the standard
-    /// library aborts on `EBADF` inside `netReadPosix`, before the pump's own
-    /// `catch` can see an error, and the whole test binary dies instead of the
-    /// test failing. Telling the connection first is what makes the loop stop —
-    /// the pump leaves at its next turn and closes the stream on its way out,
-    /// after the last read that can touch it.
+    /// The pump is not the only task on this socket, and never was. Both
+    /// directions of the permission exchange write on it: the agent's task
+    /// sends its request from its own body, and the client answers on the very
+    /// task that is reading. A reader that released the descriptor on its way
+    /// out would take it away from a write in flight, and the standard library
+    /// aborts the process on the `EBADF` that follows rather than returning an
+    /// error the pump's own `catch` could see. [`release`] is the owner's, and
+    /// runs once every task has joined.
     ///
-    /// An endpoint opened with [`adopt`] has no pump, so nothing else would
-    /// release the descriptor and this call does.
+    /// An endpoint adopted with [`adopt`] has neither a connection nor a
+    /// reader, and needs neither from this call: the shutdown is what tells the
+    /// peer its socket is finished, and the owner closes it after the join.
+    ///
+    /// Best effort, and nothing is lost by it: the reader has already been told
+    /// to stop, and a `shutdown` that cannot be sent means the peer is already
+    /// gone. This call returns nothing and its caller is a task, so a failure
+    /// has nowhere to propagate.
     fn hangUp(self: *Endpoint, io: Io) void {
         if (self.closed) return;
         self.closed = true;
-        // Every call below is a syscall on the descriptor, and a `shutdown` on
-        // a released one is `EBADF`, which aborts the process rather than
-        // returning. A pump that already let it go is the end of this.
-        if (self.released) return;
-        if (self.pumping) {
-            self.connection.close();
-            // Best effort, and nothing is lost by it: the reader has already
-            // been told to stop, the pump closes the descriptor on its way
-            // out, and a `shutdown` here has nothing left to interrupt. There
-            // is also nowhere to report a failure to, because this call is
-            // already returning and `close` below is not reachable from here.
-            // gate-reviewed-zlint-next-statement: suppressed-errors
-            // ziglint-ignore: Z026
-            // zwanzig-disable-next-line: empty-catch-engine
-            self.stream.shutdown(io, .both) catch {};
-            return;
-        }
-        self.release(io);
-    }
-
-    /// Release the descriptor once, and only on a stream that still has one.
-    fn release(self: *Endpoint, io: Io) void {
-        if (self.released) return;
-        self.released = true;
-        // Best effort for the same reason as in `hangUp`: the descriptor is
-        // closed on the next line whatever this returns, and the only caller
-        // that reaches here through a pump has already seen the end of the
-        // stream.
+        const stream = self.stream orelse return;
+        if (self.connected) self.connection.close();
         // gate-reviewed-zlint-next-statement: suppressed-errors
         // ziglint-ignore: Z026
         // zwanzig-disable-next-line: empty-catch-engine
-        self.stream.shutdown(io, .both) catch {};
-        self.stream.close(io);
+        stream.shutdown(io, .both) catch {};
     }
 
-    /// Drive the connection, then release the descriptor it drained.
+    /// Release the descriptor once, and only on a stream this endpoint still
+    /// owns.
     ///
-    /// A pump that returns has seen the end of the stream, and a descriptor left
-    /// to the process at exit is one the peer has nothing to shut down: in the
-    /// permission exchange the serving side hangs up and then waits for the
-    /// group, so a pump that only returned would leave the group waiting on a
-    /// descriptor nobody had released. `release` is idempotent, so a descriptor
-    /// a `hangUp` already let go of is not closed twice, and this is the only
-    /// caller that closes one after the last read that could touch it.
+    /// The owner calls this after the group has been joined or cancelled, never
+    /// before and never from a task a live reader runs beside. By then every
+    /// task that could read or write the socket has returned, and the two
+    /// syscalls below are the last any of them will see of it.
+    ///
+    /// `shutdown` before `close`, and best effort before both. Nothing is
+    /// blocked on the descriptor any more, so the shutdown only tells the peer
+    /// the exchange is over; the close releases the number whether or not that
+    /// reached it.
+    fn release(self: *Endpoint, io: Io) void {
+        const stream = self.stream orelse return;
+        self.stream = null;
+        // gate-reviewed-zlint-next-statement: suppressed-errors
+        // ziglint-ignore: Z026
+        // zwanzig-disable-next-line: empty-catch-engine
+        stream.shutdown(io, .both) catch {};
+        stream.close(io);
+    }
+
+    /// Drive the connection until it is told to stop, and stop there.
+    ///
+    /// It takes the endpoint rather than the connection because that is what
+    /// `open` spawns it with, and because what it does *not* do is the point:
+    /// the descriptor is the owner's to release. This task is the only one that
+    /// reads the stream, but it is not the only one that uses it — the handler
+    /// it runs answers on this very task — so it leaves the release to an owner
+    /// that has joined this task and every other one first.
     fn pump(self: *Endpoint) void {
         self.connection.pump();
-        self.release(self.connection.io);
     }
 };
 
@@ -3009,7 +3771,13 @@ test "a client negotiates and gates against an agent over a real socket" {
     // A join that reported a fault is this exchange's fault too: both tasks
     // return nothing, so nothing else would put it in front of the assertions
     // below and the test would read a silent failure as a clean one.
-    group.await(io) catch {
+    const joined = group.await(io);
+    // Every task has returned, so both endpoints may let go of their streams.
+    // A release before this point would take a socket away from a pump still
+    // reading it or a caller still writing its next request on it.
+    agent_endpoint.release(io);
+    client_endpoint.release(io);
+    joined catch {
         state.failed = true;
     };
 
@@ -3068,7 +3836,12 @@ test "an agent reads a permission outcome a client returned over a real socket" 
     try group.concurrent(io, PermissionServer.run, .{&serving});
     // As above: the join's own failure belongs in the outcome the assertions
     // below read.
-    group.await(io) catch {
+    const joined = group.await(io);
+    // As above: the join is what makes this owner the only task left on either
+    // descriptor, and the releases are what hand them back.
+    agent_endpoint.release(io);
+    client_endpoint.release(io);
+    joined catch {
         state.failed = true;
     };
 
@@ -3123,7 +3896,13 @@ test "a peer running this library is told of a refusal it sent with a null id" {
     try group.concurrent(io, RefusingClient.run, .{&listening});
     // This exchange has no outcome struct of its own to record a fault in, so
     // the join's error is the test's own and is reported as one.
-    try group.await(io);
+    const joined = group.await(io);
+    // As above, and the refused side is in it too: it took its descriptor with
+    // `adopt` and never started a reader over it, so the join is the first
+    // moment at which closing it cannot race anything.
+    agent_endpoint.release(io);
+    client_endpoint.release(io);
+    try joined;
 
     // Told once, with the code and the message the peer actually wrote rather
     // than with a guess at which request it belonged to. There is no such
@@ -3479,8 +4258,9 @@ const RefusingServer = struct {
     fn run(self: *RefusingServer) void {
         const stream = self.server.accept(self.io) catch return;
         self.endpoint.adopt(self.io, stream);
-        // Every path out of here releases the descriptor, because a client
-        // waiting on a refusal is waiting on a socket this side holds.
+        // Every path out of here hangs the socket up, because a client waiting
+        // on a refusal is waiting on a socket this side holds. The close itself
+        // belongs to the owner, which reaches it after the group has joined.
         defer self.endpoint.hangUp(self.io);
 
         var out: [128]u8 = undefined;
@@ -3488,8 +4268,8 @@ const RefusingServer = struct {
         framing.writeFrame(body, &self.endpoint.writer.interface) catch return;
         self.endpoint.writer.interface.flush() catch return;
         // The client's reader has the frame by the time the hook fires, and
-        // closing before that would race a reader that has not looked at the
-        // bytes yet.
+        // hanging the socket up before that would leave a reader that has not
+        // looked at the bytes yet with a peer that has nothing left to send.
         self.seen.wait();
     }
 };

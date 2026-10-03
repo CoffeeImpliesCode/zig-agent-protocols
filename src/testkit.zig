@@ -11,35 +11,16 @@
 //!
 //! ## What it asserts, and why each one is not a tautology
 //!
-//! - **Round-trip stability, in bytes.** The two `bridge` encoders are the
-//!   ones whose output this harness compares byte for byte against a
-//!   prediction rather than member by member: the bytes the *input* says each
-//!   of them owes are predicted from that input, and the prediction is
-//!   compared against what the encoder wrote. One more comparison sits in the
-//!   same family and is the exception rather than the rule:
-//!   [`roundTripA2aEmpty`] compares `a2a.encodeEmpty` against `{}`, which is
-//!   the canonical form of every document `a2a.decodeEmpty` accepts, so it is
-//!   the one `a2a` codec here compared as bytes and every other one member by
-//!   member. A comparison of decoded members is blind to a member the
-//!   encoder dropped: a decoder that accepted an ACP carrier `_meta` beside a
-//!   result, and an encoder that wrote no `_meta` back, left a value whose
-//!   members still compared equal, so `encode(decode(b)) != b` went unnoticed
-//!   for the life of the repository. The expected bytes are never read back
-//!   off a decoder, since a check whose two sides come from one walk is the
-//!   same check with more steps. The comparison is against the canonical form
-//!   and not against `b` itself: member order and insignificant whitespace are
-//!   two ways a document can differ without losing anything, and a harness
-//!   that failed on legal input would be a harness people turn off. A member
-//!   the schema does not define is dropped by the encoder on purpose, so it is
-//!   outside the prediction too, and the check covers exactly the members the
-//!   protocol defines. A member the input spells twice is written once, from
-//!   the first occurrence, because that is the one every decoder in this
-//!   library keeps; the prediction applies the same rule for the same reason,
-//!   and `test "the prediction and the decoder resolve a repeated member the
-//!   same way"` fails in either direction the two ever part company.
-//!   Re-decoding into the buffer the first decode wrote into would compare
-//!   memory the second decode has already overwritten, which is how this kind
-//!   of test passes for the wrong reason.
+//! - **Wire-value and stable encoding.** Round trips compare modeled values
+//!   using separate decode storage. JSON-RPC also re-encodes its first output
+//!   and compares the bytes, so normalization must reach a stable spelling.
+//!   The bridge checks use an independent canonical prediction from input.
+//!   This catches represented raw members that a lossy decode/encode pair
+//!   could both omit. The prediction preserves opaque lexemes and presence,
+//!   not surrounding whitespace, modeled order or escape spelling. It applies
+//!   first-wins duplicates and the decoder's stated unmodeled-member policy.
+//!   `roundTripA2aEmpty` compares with `{}`, the canonical empty model.
+//!   No replay writes over bytes still borrowed by the first decoded value.
 //! - **`requiredScratchLen` is an upper bound, and an exact one.** The
 //!   generated walk is handed a buffer of exactly the length that function
 //!   reports, so a document that decodes must decode. A count that
@@ -2773,18 +2754,22 @@ fn roundTripJsonRpc(
     // a harness buffer that is too small, and returning it fails the test
     // rather than quietly skipping the round trip.
     try jsonrpc.encode(message, &writer);
-    try expectSameMessage(message, try jsonrpc.decode(writer.written(), scratch));
+    const replayed = try jsonrpc.decode(writer.written(), scratch);
+    try expectSameMessage(message, replayed);
+    var stable_buffer: [encode_buf_len]u8 = undefined;
+    var stable_writer = json.Writer.init(&stable_buffer);
+    try jsonrpc.encode(replayed, &stable_writer);
+    try std.testing.expectEqualStrings(writer.written(), stable_writer.written());
     stats.round_trips += 1;
 }
 
 /// Encode the envelope, compare the bytes, then compare the members.
 ///
-/// The two are separate properties and the first is the one that matters. The
-/// byte comparison is what PROTOCOLS.md section 2 states, and it is the only
-/// one that can see a member the encoder dropped, because a decoder that
-/// never returned it cannot fail a comparison of its own output against
-/// itself. The member comparison is narrower and is kept because it names the
-/// member that went wrong instead of printing two escaped documents.
+/// The independent canonical prediction catches represented opaque members
+/// that a lossy decoder and encoder could both omit. It also checks raw lexeme
+/// preservation under PROTOCOLS.md section 2. The member comparison names the
+/// value that differs. Neither check requires original surrounding whitespace,
+/// order or escape spelling to survive.
 fn roundTripEnvelope(
     input: []const u8,
     envelope: bridge.Envelope,

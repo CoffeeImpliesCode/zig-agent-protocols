@@ -113,17 +113,27 @@ const Io = std.Io;
 /// and folding them into the wire error set would let a caller mistake a dead
 /// socket for a peer speaking a protocol this library does not implement.
 pub const Error = error{
-    /// The transport failed: the socket closed or the read errored. The
-    /// connection is dead and cannot be reused.
+    /// A write or flush failed. Delivery may be partial; the connection is
+    /// marked dead and cannot be reused.
     Transport,
-    /// A call waited for an answer that cannot arrive, because the connection
-    /// closed first. The fault is the peer's, not ours.
+    /// The waiting call was canceled. Its slot is released; the connection
+    /// stays usable. The request may already have executed at the peer.
+    Canceled,
+    /// The connection closed before an answer arrived. Local close, peer EOF
+    /// and transport read failure all reach this condition.
     ConnectionClosed,
     /// More outstanding requests than the caller's table has slots. Nothing
     /// was sent, so the caller's id sequence is untouched.
     TooManyPending,
-    /// The response did not fit the caller's result buffer.
+    /// An inbound response did not fit `call`'s result buffer. The request was
+    /// sent and may have executed; the slot is released and no body is returned.
     ResponseTooLarge,
+    /// A locally encoded message did not fit its output buffer. Nothing is
+    /// sent; output bytes may be dirty. A call's reserved id is not reused.
+    EncodeBufferTooSmall,
+    /// A constructed message has invalid UTF-8, invalid raw JSON or an invalid
+    /// JSON-RPC field combination. Nothing is sent; growing a buffer cannot fix it.
+    InvalidMessage,
     /// A frame did not fit the caller's frame buffer.
     FrameTooLarge,
     /// The message carries a raw newline, so writing it would split one
@@ -152,6 +162,9 @@ pub const Error = error{
 };
 
 /// What a peer answered to a request.
+///
+/// Copies share the caller's result bytes. Keep that storage alive and do not
+/// reuse it while reading this response; no cleanup or allocation is owned here.
 pub const Response = struct {
     /// The `result` member as raw JSON when the peer answered, or the whole
     /// `error` object re-serialised into this buffer when the peer refused:
@@ -189,6 +202,15 @@ pub const Response = struct {
 /// request that returns one is answered with an internal error, because a
 /// peer left waiting on a request that already arrived is worse than an
 /// answer it did not want. See the module doc for why this runs inline.
+///
+/// The function and `ctx` are borrowed. Keep the context at a stable address
+/// through its last invocation; null `ctx` is passed through unchanged. A null
+/// function declines all frames. Calls run synchronously on the one pump task.
+/// `frame` borrows the framer and is valid only during this invocation;
+/// `decode_scratch` and `answer` borrow Config storage and must not be retained.
+/// Do not reenter `call` or `pump` on this connection. A returned answer must
+/// stay readable through the following synchronous write; it may borrow either
+/// supplied region or other storage that the callback owner keeps alive.
 pub const Handler = struct {
     ctx: ?*anyopaque = null,
     call: ?*const fn (
@@ -249,13 +271,11 @@ pub const Handler = struct {
 /// one.** There is no `Conn.stream`, and the three things one would have to
 /// answer are all unanswered here on purpose.
 ///
-/// - **Where a value stays valid.** Every slice in the message borrows the
-///   reader's decode region, so it is live for this call and for nothing
-///   after it. The next frame is decoded over it, so a consumer that keeps
-///   the message keeps no bytes at all.
-/// - **What a slow consumer does.** Nothing is queued and no buffer is
-///   kept, so there is nothing to fall behind on: a consumer that is not
-///   running when a frame arrives misses that frame.
+/// - **Where a value stays valid.** Message strings borrow the frame or decode
+///   scratch; raw JSON lexemes borrow the frame. Both are valid only during
+///   the callback. Copy bytes into independent storage to retain them.
+/// - **What a slow consumer does.** The callback runs synchronously and blocks
+///   the pump; no queue, backpressure buffer or concurrent delivery is added.
 /// - **When it stops.** Nothing marks an end. A consumer cannot tell a
 ///   subscription the peer finished from a peer that hung up from a
 ///   connection this one closed, because the next thing to arrive is either
@@ -271,6 +291,11 @@ pub const Handler = struct {
 /// deliver that answer is the very task now waiting for it. The pending table
 /// is unlocked before it runs, so a consumer that blocks blocks the reader
 /// and the reader is the only thing that can deliver it anything further.
+///
+/// The function and optional `ctx` are borrowed until the last invocation.
+/// Keep the context alive at a stable address; null is passed through. A null
+/// function drops unmatched responses. The callback may read synchronized
+/// metadata or close the connection, but must not reenter `call` or `pump`.
 pub const OrphanHandler = struct {
     ctx: ?*anyopaque = null,
     call: ?*const fn (ctx: ?*anyopaque, message: jsonrpc.Message) void = null,
@@ -292,6 +317,11 @@ pub const OrphanHandler = struct {
 /// A caller that hands a refusal object here writes it inside a result, and
 /// the peer reads a failure as an answer; the framing cannot see that, because
 /// it is a well-formed result member carrying the caller's own text.
+///
+/// Inputs must stay readable for this call and must not overlap `out`.
+/// `InvalidMessage` rejects an invalid request/result; `EncodeBufferTooSmall`
+/// reports local storage shortage. Either failure returns no slice and may
+/// leave dirty output bytes. No I/O, blocking or allocation occurs here.
 pub fn respond(request: jsonrpc.Request, result: []const u8, out: []u8) Error![]const u8 {
     var writer = json.Writer.init(out);
     jsonrpc.encodeResponse(request, result, null, &writer) catch |err| return encodeFailure(err);
@@ -303,6 +333,10 @@ pub fn respond(request: jsonrpc.Request, result: []const u8, out: []u8) Error![]
 /// Separate from [`respond`] so a refusal is a value a caller passes here and
 /// never a member a builder has to be told to emit. `object.data` is carried
 /// when it is set, and omitted when it is not.
+///
+/// The request, message text and raw `data` must be valid and must not overlap
+/// `out`; all are read during this call only. The returned slice borrows `out`
+/// until it is reused. Errors and dirty-output residue match `respond`.
 pub fn errorResponse(request: jsonrpc.Request, object: jsonrpc.Error, out: []u8) Error![]const u8 {
     var writer = json.Writer.init(out);
     jsonrpc.encodeResponse(request, null, object, &writer) catch |err| return encodeFailure(err);
@@ -322,46 +356,11 @@ pub fn methodNotFound(request: jsonrpc.Request, out: []u8) Error![]const u8 {
     }, out);
 }
 
-/// The one place a `jsonrpc` encode failure becomes an `Error`.
-///
-/// `jsonrpc` reports a short `out` as `error.BufferTooSmall`, which is not a
-/// member of `Error`, and this layer has always reported that as
-/// [`error.ResponseTooLarge`]. Writing it out at every call site let one of
-/// them be a size fault and another a different one; there is now one.
-///
-/// `error.InvalidField` and `error.UnknownTag` name a body the encoder refuses,
-/// and a caller told `ResponseTooLarge` about one of those would grow a buffer
-/// and try again forever. Neither can reach a wrapper, and the reason is in the
-/// code underneath rather than in this switch:
-///
-/// - `json.Writer` has three write methods and every failure in all three is
-///   `BufferTooSmall`. `byte` and `slice` return it from their bounds check;
-///   `string` propagates `writeString`, whose every failure is a `byte`, a
-///   `slice`, or a `bufPrint` that is itself mapped to `BufferTooSmall`. The
-///   set it declares is wider than the set it returns, and nothing in
-///   `json.zig` produces the other two members at all.
-/// - `json.Writer.string` escapes every byte the JSON grammar forbids and
-///   checks nothing, so a message carrying one — or a byte that is not UTF-8 —
-///   is written through rather than refused. There is no `InvalidField` to be
-///   had for a body it cannot carry, because it never refuses one.
-/// - `jsonrpc.writeId` and `jsonrpc.writeErrorObject` add no failure of their
-///   own over those three methods but a `bufPrint` already mapped to
-///   `BufferTooSmall`, and `encodeResponse`'s own `InvalidField` is the
-///   one-of rule, which a builder satisfies before the rule is checked.
-///
-/// So one member can fire and the other two cannot, which is why `Error` is not
-/// widened with a member nothing produces, and why all three answer the same
-/// value here. That is right while the proof above holds and wrong the moment
-/// it stops: a caller told its buffer is short about a body it cannot encode
-/// grows the buffer and tries again forever. A test pins the closure — a
-/// message the JSON grammar cannot carry is written through, not refused — and
-/// fails the day it opens, which is when the two answers have to be told apart
-/// and `Error` has to carry the difference.
+/// Keep local storage shortage distinct from an invalid constructed message.
 fn encodeFailure(err: root.EncodeError) Error {
     return switch (err) {
-        error.BufferTooSmall => error.ResponseTooLarge,
-        error.InvalidField => error.ResponseTooLarge,
-        error.UnknownTag => error.ResponseTooLarge,
+        error.BufferTooSmall => error.EncodeBufferTooSmall,
+        error.InvalidField, error.UnknownTag => error.InvalidMessage,
     };
 }
 
@@ -389,15 +388,18 @@ pub fn overlaps(a: []const u8, b: []const u8) bool {
 }
 
 /// One outstanding request awaiting its answer.
+///
+/// Storage belongs to the caller but Conn owns its live state under its mutex.
+/// `Conn.init` initializes undefined storage. Do not read, mutate or copy live
+/// slots from another task. `result` borrows one call's buffer until that call
+/// releases the slot. A snapshot after all tasks finish owns no resources.
 pub const Slot = struct {
     id: i64 = 0,
     used: bool = false,
     answered: bool = false,
-    /// True when the answer did not fit `result` and the caller must retry
-    /// with a larger buffer. The slot is released either way, so the
-    /// connection does not leak it: every path out of `call` frees the slot
-    /// it claimed, including a request that never went out and a wait that
-    /// failed.
+    /// True when the inbound answer did not fit `result`. The request may have
+    /// executed, so this does not authorize replay. Conn releases the slot and
+    /// reports `ResponseTooLarge`; it returns no partial response.
     overflowed: bool = false,
     is_error: bool = false,
     error_code: i32 = 0,
@@ -409,7 +411,26 @@ pub const Slot = struct {
 };
 
 /// A live connection over a framed, byte-oriented transport.
+///
+/// Construct with `init`; do not assemble or mutate its state fields directly.
+/// The connection retains the `io` capability and borrows its backend,
+/// `reader`, `writer` and all `Config` storage. Keep the backend and borrowed
+/// storage alive until the last use of the connection, including `close` and
+/// the metadata getters, and until all calls and the pump have ended.
+/// Reader and writer addresses must stay fixed. Once tasks hold `*Conn`, do not
+/// move or copy the connection; its mutexes and slot table name one live state.
+///
+/// Concurrent calls and notifications are supported with separate caller
+/// buffers. Run exactly one `pump`, on independent execution, and install
+/// callbacks before it starts. Metadata getters are synchronized snapshots,
+/// not per-call receipts. `close` changes state but owns no task or transport:
+/// shut down the transport, join or cancel the caller-owned group, then release
+/// transport and buffers. There is no `deinit` and no per-message allocation.
 pub const Conn = struct {
+    /// Executor capability copied by `init`, not ownership of its provider.
+    /// Every operation that locks uses this stored capability. Its backend must
+    /// outlive the last operation on this connection; do not use the connection
+    /// after that backend is deinitialized.
     io: Io,
     reader: *Io.Reader,
     writer: *Io.Writer,
@@ -462,17 +483,15 @@ pub const Conn = struct {
     closed: bool = false,
     /// Set when the peer sent a frame the caller's frame buffer cannot hold.
     ///
-    /// The reason a connection died: a peer that hung up and a peer that
-    /// overflowed our buffer are different faults, and only one of them is
-    /// ours. Written before `close`, whose lock and broadcast are what make
-    /// the write visible, and read in `call`, where it decides which of the two
-    /// errors a caller gets.
+    /// Published with `closed` under `state_mutex`; a later local close does
+    /// not replace the reason. Waiting calls read it under that same lock to
+    /// distinguish an oversized peer frame from other closure.
     peer_frame_too_large: bool = false,
     /// Serialises writes. Two tasks may call at once, and a frame interleaved
     /// with another is two malformed frames on the wire.
     write_mutex: Io.Mutex = .init,
-    /// Guards the pending table, `closed`, `peer_frame_too_large`, `next_id`
-    /// and the waiting condition.
+    /// Guards the pending table, `closed`, `peer_frame_too_large`, `next_id`,
+    /// `last_encoded_len` and the waiting condition.
     ///
     /// Taken uncancelable everywhere it is taken. Every section is short and
     /// holds nothing that blocks, and the one place a task may be cancelled
@@ -483,6 +502,10 @@ pub const Conn = struct {
     state_mutex: Io.Mutex = .init,
     wake: Io.Condition = .init,
 
+    /// Borrowed storage for one connection. All four regions must be nonempty
+    /// and pairwise disjoint; `init` checks this before changing any slot.
+    /// Keep the regions alive and exclusively managed by this connection until
+    /// its tasks finish. Sizes are caller policy, not protocol defaults.
     pub const Config = struct {
         /// Assembles frames, and is the buffer a frame is read out of as well
         /// as written into. Must be large enough for the largest message the
@@ -505,6 +528,11 @@ pub const Conn = struct {
     /// `init` is the only place that can see them: by the time a peer has sent
     /// anything, a buffer with no room and a pair of regions that overlap look
     /// the same as a peer being difficult.
+    ///
+    /// Borrows the interfaces, their backend capability and all configured
+    /// storage. Success clears every pending slot and retains these references;
+    /// failure changes no slot and acquires no transport ownership. `io` must
+    /// serve the interfaces and outlive all operations. Init does no I/O.
     pub fn init(io: Io, reader: *Io.Reader, writer: *Io.Writer, config: Config) Error!Conn {
         // Refused before anything is written, so a caller's pending table is
         // left exactly as it was handed over rather than half-initialised by a
@@ -609,28 +637,49 @@ pub const Conn = struct {
         self.orphan = handler;
     }
 
-    /// The length of the request or notification most recently written into
-    /// a caller's encode buffer.
+    /// Length of the last successfully encoded call or notification.
     ///
-    /// One field serves the whole connection, so it has one issuer: read it
-    /// on the task that made the most recent `call` or `notify`, and nowhere
-    /// else. Two tasks may call at once, and a read after the other task's
-    /// call reports a length for a frame this task did not write.
-    pub fn lastEncodedLen(self: *const Conn) usize {
+    /// A synchronized connection-wide snapshot, not a receipt for this task.
+    /// To slice your own `out`, exclude other issuers from encoding until this
+    /// read. Failed encoding leaves the previous length unchanged. This takes
+    /// a short uncancelable state lock and performs no I/O.
+    pub fn lastEncodedLen(self: *Conn) usize {
+        self.state_mutex.lockUncancelable(self.io);
+        defer self.state_mutex.unlock(self.io);
         return self.last_encoded_len;
     }
 
-    /// The id the next request will carry. Reported so a caller can predict
-    /// and test the id sequence rather than having to parse the wire.
-    pub fn nextId(self: *const Conn) i64 {
+    /// Snapshot of the next request id; this does not reserve it.
+    ///
+    /// Another caller may consume the id before your call. Takes a short
+    /// uncancelable state lock and performs no I/O.
+    pub fn nextId(self: *Conn) i64 {
+        self.state_mutex.lockUncancelable(self.io);
+        defer self.state_mutex.unlock(self.io);
         return self.next_id;
     }
 
     /// Send a request and wait for its response.
     ///
-    /// `params` is the raw JSON of the `params` member, or null to omit it.
-    /// `out` receives the encoded request, so a proxy or a log can have the
-    /// exact bytes. `result` receives the answer and is returned borrowed.
+    /// `params` is one JSON object, array or literal null; a null slice omits
+    /// the member. Whitespace around literal null is normalized. Raw newlines
+    /// are refused with `Framing`; invalid JSON or UTF-8 is `InvalidMessage`.
+    /// `out` receives the request and `result` receives the response.
+    ///
+    /// All arguments must remain alive until return. Writable `out` and `result`
+    /// must be disjoint from each other, from readable method/params bytes, from
+    /// the four Config regions and from interface buffers. Each concurrent
+    /// operation needs its own writable regions. These per-call alias rules are
+    /// caller preconditions, not checks performed by `init`.
+    ///
+    /// Blocks on writing and on a response; the independent pump must run.
+    /// A canceled condition wait returns `Canceled` without closing. Writer
+    /// cancellation is erased by `Io.Writer` to a write failure and returns
+    /// `Transport`. Delivery and remote effects may already have occurred on
+    /// cancellation, closure, transport failure or `ResponseTooLarge`; no retry
+    /// is performed. Encode failures send nothing but consume the reserved id.
+    /// Output/result bytes may be dirty on any error; no response borrow is
+    /// returned. On success `Response.body` borrows `result` until its reuse.
     ///
     /// Every path out of here gives the slot it claimed back, including a
     /// request that never went out, a connection that died under it and a
@@ -685,7 +734,7 @@ pub const Conn = struct {
             // this task already holds.
             self.wake.wait(self.io, &self.state_mutex) catch {
                 releaseLocked(opened.slot);
-                return error.Transport;
+                return error.Canceled;
             };
         }
         if (!opened.slot.answered) {
@@ -704,15 +753,16 @@ pub const Conn = struct {
 
     /// Send a notification: a method with no id, which expects no answer.
     ///
-    /// A frame that did not go out is reported, never swallowed. `params` is
-    /// spliced into the message verbatim, so a newline in it is enough to
-    /// break the framing, and `error.Framing` says so without condemning a
-    /// transport that is working. A write that fails for any other reason
-    /// marks the connection dead, because a task blocked in `call` on it would
-    /// otherwise wait on a writer that cannot write.
+    /// Uses the same params, lifetime and buffer-separation rules as `call`,
+    /// without a result buffer or id reservation. It blocks only on writing;
+    /// success means locally written and flushed, not acknowledged by the peer.
+    /// `InvalidMessage`, `EncodeBufferTooSmall` and `Framing` send nothing and
+    /// keep the connection usable. A write failure, including cancellation
+    /// erased by `Io.Writer`, returns `Transport` and marks it dead. Output
+    /// bytes may be dirty on failure and stay caller-owned on success.
     pub fn notify(self: *Conn, method: []const u8, params: ?[]const u8, out: []u8) Error!void {
         if (self.isClosed()) return error.Closed;
-        const encoded = self.encodeNotification(method, params, out) catch return error.ResponseTooLarge;
+        const encoded = try self.encodeNotification(method, params, out);
         self.writeFrame(encoded) catch |err| {
             if (err == error.Transport) self.close();
             return err;
@@ -733,6 +783,11 @@ pub const Conn = struct {
     /// [`close`] is the decision, and shutting the transport down and then
     /// closing it, and awaiting or cancelling the group, is still the
     /// caller's.
+    ///
+    /// Run on `Io.Group.concurrent`, not `async`, so waiting cannot execute
+    /// inline on a caller that still needs to send. Reader errors, EOF and
+    /// cancellation represented by its `Io.Reader` close the connection and
+    /// return no error value. Join or cancel this task before releasing buffers.
     pub fn pump(self: *Conn) void {
         while (!self.isClosed()) {
             // Take every complete frame before asking for more bytes, or a
@@ -751,12 +806,15 @@ pub const Conn = struct {
                 // A frame fills the buffer and still has no newline in it, so
                 // the delimiter is not coming and the frame will never fit.
                 // Dropping the buffer and reading on would not recover: the
-                // tail of this frame is still on the wire, and it would be
-                // read as the start of the next one. The connection ends here,
-                // and the reason is recorded so a task waiting in `call` can be
-                // told that the fault was ours.
-                self.peer_frame_too_large = true;
-                self.close();
+                // tail of this frame is still on the wire. End the connection
+                // and publish its reason with closure in one lock section.
+                self.state_mutex.lockUncancelable(self.io);
+                if (!self.closed) {
+                    self.peer_frame_too_large = true;
+                    self.closed = true;
+                    self.wake.broadcast(self.io);
+                }
+                self.state_mutex.unlock(self.io);
                 return;
             }
             // `readVec`, not `readSliceShort`: the latter means "fill this
@@ -950,21 +1008,12 @@ pub const Conn = struct {
             .code = @intFromEnum(jsonrpc.StandardError.internal_error),
             .message = "this peer could not serve the request",
         }, self.answer) catch return;
-        // Best-effort, and deliberately so. `refuse` is the last thing this
-        // layer does on a path that has already reported its own fault:
-        // `dispatch` has named the handler's failure through the envelope
-        // above and has already closed the connection when that failure was
-        // the transport's. This function returns nothing, so there is no
-        // caller left to hand an error to and no failure state of its own to
-        // update. What a write here can fail on is a writer that cannot
-        // write, and the next read reports that by ending the connection
-        // whatever this one does with it. `error.Framing` is not a fault
-        // these bytes can have: the envelope is the shared builder's and
-        // carries no raw newline, and a short `answer` was returned above.
-        // gate-reviewed-zlint-next-statement: suppressed-errors
-        // ziglint-ignore: Z026
-        // zwanzig-disable-next-line: empty-catch-engine
-        self.writeFrame(body) catch {};
+        // A handler fault does not excuse a failed transport write. Wake
+        // pending calls and stop the pump rather than waiting for another
+        // read to discover a writer that already failed.
+        self.writeFrame(body) catch |err| {
+            if (err == error.Transport) self.close();
+        };
     }
 
     /// The peer's error object, written into the caller's result buffer.
@@ -1006,11 +1055,12 @@ pub const Conn = struct {
 
     /// Mark the connection dead and release everyone waiting on it.
     ///
-    /// Every task blocked in [`call`] is released with
-    /// [`error.ConnectionClosed`], and a [`pump`] running on this connection
-    /// returns at its next frame boundary instead of routing and answering on
-    /// a connection it has been told is dead. Idempotent, and legal from any
-    /// task, including a handler: closing is not a refusal, and a caller that
+    /// Waiting calls wake. Unless their wait is canceled, they report
+    /// `error.FrameTooLarge` if the pump already recorded an oversized peer
+    /// frame, otherwise `error.ConnectionClosed`. A `pump` returns at its next
+    /// frame boundary instead of routing on a dead connection. Idempotent and
+    /// legal from any task, including a handler: closing is not a refusal, and
+    /// a caller that
     /// hangs up mid-answer still leaves the peer with the answers already
     /// written.
     ///
@@ -1113,20 +1163,17 @@ pub const Conn = struct {
         params: ?[]const u8,
         out: []u8,
     ) Error![]const u8 {
-        var writer = json.Writer.init(out);
-        writer.slice("{\"jsonrpc\":\"2.0\",\"id\":") catch |err| return encodeFailure(err);
-        var id_buffer: [24]u8 = undefined;
-        const id_text = std.fmt.bufPrint(&id_buffer, "{d}", .{id}) catch
-            return error.ResponseTooLarge;
-        writer.slice(id_text) catch |err| return encodeFailure(err);
-        writer.slice(",\"method\":") catch |err| return encodeFailure(err);
-        writer.string(method) catch |err| return encodeFailure(err);
         if (params) |text| {
-            writer.slice(",\"params\":") catch |err| return encodeFailure(err);
-            writer.slice(text) catch |err| return encodeFailure(err);
+            if (std.mem.indexOfScalar(u8, text, '\n') != null) return error.Framing;
         }
-        writer.byte('}') catch |err| return encodeFailure(err);
-        self.last_encoded_len = writer.len;
+        var writer = json.Writer.init(out);
+        jsonrpc.encode(.{
+            .kind = .request,
+            .id = .{ .integer = id },
+            .method = jsonrpc.Method.split(method),
+            .params = rpcParams(params),
+        }, &writer) catch |err| return encodeFailure(err);
+        self.recordEncodedLen(writer.len);
         return writer.written();
     }
 
@@ -1136,16 +1183,29 @@ pub const Conn = struct {
         params: ?[]const u8,
         out: []u8,
     ) Error![]const u8 {
-        var writer = json.Writer.init(out);
-        writer.slice("{\"jsonrpc\":\"2.0\",\"method\":") catch |err| return encodeFailure(err);
-        writer.string(method) catch |err| return encodeFailure(err);
         if (params) |text| {
-            writer.slice(",\"params\":") catch |err| return encodeFailure(err);
-            writer.slice(text) catch |err| return encodeFailure(err);
+            if (std.mem.indexOfScalar(u8, text, '\n') != null) return error.Framing;
         }
-        writer.byte('}') catch |err| return encodeFailure(err);
-        self.last_encoded_len = writer.len;
+        var writer = json.Writer.init(out);
+        jsonrpc.encode(.{
+            .kind = .notification,
+            .method = jsonrpc.Method.split(method),
+            .params = rpcParams(params),
+        }, &writer) catch |err| return encodeFailure(err);
+        self.recordEncodedLen(writer.len);
         return writer.written();
+    }
+
+    fn recordEncodedLen(self: *Conn, len: usize) void {
+        self.state_mutex.lockUncancelable(self.io);
+        defer self.state_mutex.unlock(self.io);
+        self.last_encoded_len = len;
+    }
+
+    fn rpcParams(params: ?[]const u8) jsonrpc.Params {
+        const text = params orelse return .absent;
+        if (std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "null")) return .null_value;
+        return .{ .value = text };
     }
 };
 
@@ -1224,11 +1284,14 @@ const Recorder = struct {
 
     fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
         const self: *Recorder = @fieldParentPtr("writer", w);
-        if (data.len == 0) return 0;
+        const vector_count = data.len;
+        if (vector_count == 0) return 0;
         var count: usize = 0;
-        for (data[0 .. data.len - 1]) |bytes| count += try self.copy(bytes);
+        const prefix = data[0 .. vector_count - 1];
+        for (prefix) |bytes| count += try self.copy(bytes);
+        const last = data[prefix.len];
         var i: usize = 0;
-        while (i < splat) : (i += 1) count += try self.copy(data[data.len - 1]);
+        while (i < splat) : (i += 1) count += try self.copy(last);
         if (self.gate) |event| {
             self.gate = null;
             event.set(self.io);
@@ -1556,6 +1619,66 @@ test "a notification whose params carry a newline is a framing fault, and the co
     try testing.expect(!connection.closed);
 }
 
+test "local encode refusals do not write or kill the connection" {
+    var frame_buffer: [256]u8 = undefined;
+    var pending: [2]Slot = undefined;
+    var decode_scratch: [128]u8 = undefined;
+    var answer: [128]u8 = undefined;
+    var out: [128]u8 = undefined;
+    var result: [128]u8 = undefined;
+    var sent: [256]u8 = undefined;
+    var reader = Io.Reader.fixed("");
+    var writer = Io.Writer.fixed(&sent);
+    var connection = try Conn.init(testing.io, &reader, &writer, .{
+        .frame_buffer = &frame_buffer,
+        .pending = &pending,
+        .decode_scratch = &decode_scratch,
+        .answer = &answer,
+    });
+
+    try testing.expectError(error.EncodeBufferTooSmall, connection.notify("tools/list", null, out[0..1]));
+    try testing.expectError(error.EncodeBufferTooSmall, connection.call("tools/list", null, &result, out[0..1]));
+    try testing.expectError(error.InvalidMessage, connection.notify("tools/call", "{\"x\":1}tail", &out));
+    try testing.expectError(error.InvalidMessage, connection.call("tools/call", "42", &result, &out));
+    try testing.expectError(error.InvalidMessage, connection.notify("\xff", null, &out));
+    try testing.expectError(error.Framing, connection.notify("tools/list", "null\n", &out));
+    try testing.expectEqual(@as(usize, 0), writer.buffered().len);
+    for (pending) |slot| try testing.expect(!slot.used);
+
+    try connection.notify("tools/list", " null ", &out);
+    var decoded_scratch: [128]u8 = undefined;
+    const decoded = try jsonrpc.decode(out[0..connection.lastEncodedLen()], &decoded_scratch);
+    try testing.expectEqual(jsonrpc.Kind.notification, decoded.kind);
+    try testing.expect(decoded.params == .null_value);
+}
+
+test "response builders distinguish invalid values from short storage" {
+    var scratch: [128]u8 = undefined;
+    const request = try jsonrpc.decodeRequest(
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/list\"}",
+        &scratch,
+    );
+    var out: [256]u8 = undefined;
+    try testing.expectError(error.InvalidMessage, respond(request, "{}tail", &out));
+    try testing.expectError(error.InvalidMessage, errorResponse(request, .{
+        .code = -32601,
+        .message = "\xff",
+    }, &out));
+    try testing.expectError(error.InvalidMessage, errorResponse(request, .{
+        .code = -32601,
+        .message = "unknown",
+        .data = "{",
+    }, &out));
+    const bytes = try errorResponse(request, .{
+        .code = -32601,
+        .message = "line\nbreak\x07end",
+        .data = "{\"why\":\"unknown\"}",
+    }, &out);
+    const decoded = try jsonrpc.decode(bytes, &scratch);
+    try testing.expectEqualStrings("line\nbreak\x07end", decoded.rpc_error.?.message);
+    try testing.expectEqualStrings("{\"why\":\"unknown\"}", decoded.rpc_error.?.data.?);
+}
+
 test "a notification that did not go out is reported, and it takes the connection with it" {
     // A notification whose write failed looked delivered, and the connection
     // stayed open, so a task blocked in `call` waited for an answer on a writer
@@ -1627,7 +1750,7 @@ test "a call cancelled while it waits gives its slot back" {
     // one the failed wait produced rather than one still being written.
     group.cancel(io);
 
-    try testing.expectError(error.Transport, caller.answer.?);
+    try testing.expectError(error.Canceled, caller.answer.?);
     // The slot the call claimed is free again, and the connection is still
     // the one it was: nothing about a cancelled wait kills it.
     for (connection.slots) |slot| try testing.expect(!slot.used);
@@ -2146,6 +2269,38 @@ test "a request whose handler failed is answered with an error" {
     try testing.expect(connection.closed);
 }
 
+test "a failed internal-error write ends the pump before another request" {
+    const State = struct {
+        calls: usize = 0,
+
+        fn handle(ctx: ?*anyopaque, _: []const u8, _: []u8, _: []u8) Error!?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            return error.InvalidMessage;
+        }
+    };
+    var frame_buffer: [512]u8 = undefined;
+    var pending: [2]Slot = undefined;
+    var decode_scratch: [256]u8 = undefined;
+    var answer: [256]u8 = undefined;
+    var reader = Io.Reader.fixed(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"first\"}\n" ++
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"second\"}\n",
+    );
+    var writer = Io.Writer.failing;
+    var connection = try Conn.init(testing.io, &reader, &writer, .{
+        .frame_buffer = &frame_buffer,
+        .pending = &pending,
+        .decode_scratch = &decode_scratch,
+        .answer = &answer,
+    });
+    var state: State = .{};
+    connection.setHandler(.{ .ctx = &state, .call = State.handle });
+    connection.pump();
+    try testing.expectEqual(@as(usize, 1), state.calls);
+    try testing.expect(connection.closed);
+}
+
 test "an answer carrying a raw newline is the handler's fault, and the connection survives it" {
     // `error.Framing` names the caller's own bytes, and the doc says the
     // transport stays usable, because these same bytes fail the same way
@@ -2324,16 +2479,16 @@ test "a short out is refused by every builder, and writes nothing to send" {
     // exactly as the caller handed it over.
     var untouched: [1]u8 = undefined;
     untouched[0] = 'Z';
-    try testing.expectError(error.ResponseTooLarge, respond(request, "{}", untouched[0..0]));
+    try testing.expectError(error.EncodeBufferTooSmall, respond(request, "{}", untouched[0..0]));
     try testing.expectEqual(@as(u8, 'Z'), untouched[0]);
 
     // Room for a prefix and not for the frame. The error is the guarantee: the
     // writer never advances past a write it refused, so what is left in the
     // buffer is a prefix, and a caller using `try` never sees it.
     var out: [8]u8 = undefined;
-    try testing.expectError(error.ResponseTooLarge, respond(request, "{\"ok\":true}", &out));
-    try testing.expectError(error.ResponseTooLarge, errorResponse(request, refusal, &out));
-    try testing.expectError(error.ResponseTooLarge, methodNotFound(request, &out));
+    try testing.expectError(error.EncodeBufferTooSmall, respond(request, "{\"ok\":true}", &out));
+    try testing.expectError(error.EncodeBufferTooSmall, errorResponse(request, refusal, &out));
+    try testing.expectError(error.EncodeBufferTooSmall, methodNotFound(request, &out));
 }
 
 test "a result and a refusal never share a frame" {
@@ -2367,74 +2522,6 @@ test "a result and a refusal never share a frame" {
     // unwritten answer looks like to a handler that only checks the error.
     try testing.expect(result.len != 0);
     try testing.expect(refusal.len != 0);
-}
-
-test "a message the grammar cannot carry is written through, not refused" {
-    // `encodeFailure` answers every member of `root.EncodeError` with the one
-    // `Error` member for a short buffer, and this is what stops that from being
-    // wrong. It holds only while a message the encoder cannot carry is written
-    // through rather than refused: a caller told its buffer is short about a
-    // body it cannot encode grows the buffer and tries again forever, so the
-    // day a `json.Writer` check refuses one, the two answers have to be told
-    // apart and `Error` has to carry the difference. The `try` below is what
-    // fails on that day, because the wrapper would return an error and this
-    // expects a frame.
-    var scratch: [128]u8 = undefined;
-    const request = try jsonrpc.decodeRequest(
-        "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/list\"}",
-        &scratch,
-    );
-    var out: [128]u8 = undefined;
-
-    // A control byte the grammar forbids, which is escaped, and a byte that is
-    // not UTF-8 at all, which is not. `writeString` escapes the first kind and
-    // passes the second through, so the frame carries a literal this library's
-    // own reader will refuse — and the wrapper reported no error on the way,
-    // which is the whole of what `encodeFailure` depends on.
-    const hostile = try errorResponse(
-        request,
-        .{ .code = -32601, .message = "line\nbreak\x07end\xff" },
-        &out,
-    );
-    try testing.expect(std.mem.indexOf(
-        u8,
-        hostile,
-        "\"message\":\"line\\nbreak\\u0007end",
-    ) != null);
-    // The last three bytes, read off the writers rather than counted. The
-    // message's own closing quote, then the brace that closes the error object
-    // — `jsonrpc.writeErrorObject` writes it, because the object is a member —
-    // then the brace that closes the frame, which `jsonrpc.encodeResponse`
-    // writes. `jsonrpc.encode` writes the same pair for a whole `Message`, so
-    // the two agree and no answer in the tree is a brace short.
-    try testing.expectEqual(@as(u8, 0xff), hostile[hostile.len - 4]);
-    try testing.expectEqualStrings("}}", hostile[hostile.len - 2 ..]);
-
-    // A refusal that fits reports nothing at all, which is the other half of
-    // the same rule: the two cases are one answer, not two.
-    const plain = try errorResponse(
-        request,
-        .{ .code = -32601, .message = "no such method" },
-        &out,
-    );
-    try testing.expectEqualStrings(
-        "{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":-32601," ++
-            "\"message\":\"no such method\"}}",
-        plain,
-    );
-
-    // `data` travels the same way, spliced, so a refusal carrying one is not a
-    // body this layer refuses either.
-    const carried = try errorResponse(request, .{
-        .code = -32601,
-        .message = "no such method",
-        .data = "{\"why\":\"unknown\"}",
-    }, &out);
-    try testing.expectEqualStrings(
-        "{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":-32601," ++
-            "\"message\":\"no such method\",\"data\":{\"why\":\"unknown\"}}}",
-        carried,
-    );
 }
 
 test "a buffer with no room is refused before the first message" {
