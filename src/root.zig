@@ -16,13 +16,20 @@
 //!   - [`json`]     — the borrowing reader and fixed-buffer writer under them.
 //!
 //! Above the codec sit [`framing`], [`conn`] and [`stdio`] for a byte
-//! transport, [`http`] for the Streamable HTTP one, and a session layer per
-//! protocol: [`mcp_session`], [`acp_session`] and [`bridge_session`].
+//! transport, [`http`] for the MCP Streamable HTTP one and [`a2a_http`] for
+//! the A2A `1.0` unary JSON-RPC binding over `std.http`, and a session layer
+//! per MCP and ACP protocol: [`mcp_session`], [`acp_session`] and
+//! [`bridge_session`].
 //!
-//! Two modules under `src/` are deliberately not re-exported. `testkit.zig` is
-//! the property and differential harness, which the `fuzz` step compiles as its
-//! own root so its generated documents never reach a consumer's build. The four
-//! example roots are executables rather than library surface.
+//! Four modules under `src/` are deliberately not re-exported here.
+//! `testkit.zig` is the property and differential harness, which the `fuzz`
+//! step compiles as its own root so its generated documents never reach a
+//! consumer's build. `testio.zig` is the shared test executor, which the build
+//! adds to this module as the named import `testio`, and `bench_codec.zig` and
+//! `bench_runtime.zig` are the two benchmark modules, which the `run-bench`
+//! driver reaches as named imports of its own. The eight other roots under
+//! `src/` are programs rather than library surface: five demonstrations, the
+//! two interoperability participants and the benchmark driver.
 //!
 //! Encoding contract, from PROTOCOLS.md section 2:
 //!
@@ -30,8 +37,12 @@
 //!     because every byte on these wires is attacker-controlled input.
 //!   - Encoding is the exact inverse: `decode(encode(x)) == x` and
 //!     `encode(decode(b)) == b` for every accepted input.
-//!   - Nothing allocates. The caller supplies every buffer; slices borrow from
-//!     the caller's memory and nothing is retained past the call.
+//!   - Nothing in a codec, framing, connection or session path allocates. The
+//!     caller supplies every buffer; slices borrow from the caller's memory
+//!     and nothing is retained past the call. The one allocator a consumer can
+//!     meet is the one its own borrowed `std.http.Client` carries, which the
+//!     standard library spends on that client's connection pool, and no
+//!     protocol byte in this library is ever composed out of it.
 //!   - Unknown enum tags and unknown method names are errors, never a silent
 //!     fallback, so a peer speaking a newer revision cannot crash an older one.
 
@@ -48,6 +59,7 @@ pub const mcp_session = @import("mcp_session.zig");
 pub const acp_session = @import("acp_session.zig");
 pub const bridge_session = @import("bridge_session.zig");
 pub const http = @import("http.zig");
+pub const a2a_http = @import("a2a_http.zig");
 pub const framing = @import("framing.zig");
 pub const stdio = @import("stdio.zig");
 

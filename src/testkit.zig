@@ -18,9 +18,9 @@
 //!   compared against what the encoder wrote. One more comparison sits in the
 //!   same family and is the exception rather than the rule:
 //!   [`roundTripA2aEmpty`] compares `a2a.encodeEmpty` against `{}`, which is
-//!   the canonical form of every document `a2a.decodeEmpty` accepts, so the
-//!   twenty `a2a` codecs are one byte comparison and nineteen member
-//!   comparisons. A comparison of decoded members is blind to a member the
+//!   the canonical form of every document `a2a.decodeEmpty` accepts, so it is
+//!   the one `a2a` codec here compared as bytes and every other one member by
+//!   member. A comparison of decoded members is blind to a member the
 //!   encoder dropped: a decoder that accepted an ACP carrier `_meta` beside a
 //!   result, and an encoder that wrote no `_meta` back, left a value whose
 //!   members still compared equal, so `encode(decode(b)) != b` went unnoticed
@@ -80,7 +80,7 @@
 //!   divergence behind the same leading zero is reported rather than
 //!   absorbed. A whole document carrying a leading zero is not a whole
 //!   document excused.
-//! - **The A2A vocabulary comes from the A2A tables.** The twenty `a2a`
+//! - **The A2A vocabulary comes from the A2A tables.** The `a2a`
 //!   codecs are table driven: every message carries a `fields` table of
 //!   `{number, json, zig_name}` that `a2a.assertFieldTable` checks against the
 //!   struct at comptime, and those tables are where the member names those
@@ -181,13 +181,14 @@ const max_doc_len = 512;
 const encode_buf_len = 2 * max_doc_len + 256;
 
 // --- The storage the arena-taking decoders write into -------------------------
-//
-// Nineteen decoders take a caller-owned array rather than a `scratch` alone:
-// the eleven content-half `a2a` codecs take a `ContentArena`, the eight
-// discovery-half ones a `CardArena`, and the six typed `mcp` results take an
-// out-array and a `VerbatimStore`. Sizing them is the whole of the decision,
-// and it has one failure mode at each end:
-//
+
+// Decoders with caller-owned storage use `ContentArena`, `CardArena`,
+// `VerbatimStore`, or output arrays. `decodeListTasksResponse` needs both a
+// top-level task array and a shared `ContentArena`.
+// `decodeListTaskPushNotificationConfigsResponse` needs only a configuration
+// array and scratch. The bounds below size each region. A bound has two failure
+// modes:
+
 // - Too small, and every document is refused. The refusal arrives before the
 //   decoder reaches the rule it is supposed to be checked against, so the
 //   trailing-byte assertion never fires, the round trip never runs, and the
@@ -197,7 +198,7 @@ const encode_buf_len = 2 * max_doc_len + 256;
 // - Too large, and nothing at all is proven about the bound: every document
 //   decodes whether or not the caller sized its storage correctly, which is
 //   the question `BufferTooSmall` exists to answer.
-//
+
 // So every array below is sized from what the document itself implies. The
 // one fact every bound rests on is [`max_doc_len`]: `Doc.push` and
 // `Doc.pushByte` saturate rather than grow, so no document the corpus builds
@@ -328,11 +329,14 @@ const mcp_prompt_messages_capacity = repeatedCapacity(45);
 /// `""` is two, for `supportedVersions`.
 const mcp_versions_capacity = repeatedCapacity(2);
 
-// The two decoders that take one caller-sized array and no arena. Both used to
-// declare a bare `[16]` at the call site, which put them outside this section
-// and outside the counter that is supposed to prove the bounds here are bounds:
-// a `BufferTooSmall` from either was a bare `stats.refused += 1`, so a harness
-// that had mis-sized them would have been green.
+// The three decoders that take one caller-sized array and no arena. The first
+// two used to declare a bare `[16]` at the call site, which put them outside
+// this section and outside the counter that is supposed to prove the bounds
+// here are bounds: a `BufferTooSmall` from either was a bare
+// `stats.refused += 1`, so a harness that had mis-sized them would have been
+// green. The third is a list response, and the two array-valued bounds below
+// are here for the same reason: the tasks it nests share the content arena, so
+// the array of tasks is the one thing about it a caller has to size itself.
 
 /// The accepted output modes of a `SendMessageConfiguration`.
 ///
@@ -355,6 +359,75 @@ const output_modes_capacity = repeatedCapacity(2);
 /// schema refusals rather than a truncated list of choices a caller would act
 /// on.
 const permission_options_capacity = repeatedCapacity(35);
+
+/// The tasks a `ListTasksResponse` can carry.
+///
+/// `{"id":"a","status":{"state":"TASK_STATE_FAILED"}}` is forty-nine, and four
+/// rules set that number rather than a count of members: `id` must be there and
+/// must not be empty, `status` must be there, `state` must be there, and
+/// `state` is a ProtoJSON enum whose only spelling this decoder takes is the
+/// full proto name, of which the shortest is the seventeen character
+/// `TASK_STATE_FAILED`. `TASK_STATE_UNSPECIFIED` is five bytes longer and is
+/// the name a derivation reaches for first, which is the whole of why the
+/// number beside this comment once stood at fifty-four: a bound taken from the
+/// first enum name a reader thinks of is a guess about a name rather than a
+/// measurement of the element.
+///
+/// A numeric spelling is the shorter one by far — `"state":0` is nine bytes
+/// where the name is nineteen, so the element would be thirty-nine — and it is
+/// refused rather than short, for the reason that decides the number here:
+/// `readTaskStatus` reads the member with `reader.string`, which fails on
+/// anything but a quoted lexeme. The integer a ProtoJSON peer is entitled to
+/// send is a wrong JSON type in this library, so it cannot shorten the
+/// element, and a bound derived as though it could would be short for the one
+/// place it matters.
+///
+/// The two shorter element spellings are refused rather than short as well,
+/// and both are named because the ProtoJSON null rule is the next thing an
+/// author reaches for. `{}` is a task with no `id`, so it is a missing field;
+/// a `null` element is not an object at all, so it is a wrong JSON type
+/// rather than a defaulted element. Only the whole member takes a null as a
+/// default, and that settles how many elements there are rather than how long
+/// one is.
+///
+/// Forty-nine and forty-nine, rather than a measured minimum beside a lower
+/// guess, because this one is exact once the state name is counted correctly:
+/// there is no rule here whose outcome a shorter element could turn on, so the
+/// two numbers coincide and naming only one is the honest form of the rule
+/// [`repeatedCapacity`] states. The envelope is left out of the arithmetic for
+/// the same reason, and that is the safe direction to leave it out in: the
+/// fifty-eight bytes `{"tasks":[…],"nextPageToken":"","pageSize":0,` +
+/// `"totalSize":0}` spends are what keep the nine of these a document of at
+/// most `max_doc_len` can carry below the ten this bound holds.
+const list_tasks_capacity = repeatedCapacity(49);
+
+/// The configurations a `ListTaskPushNotificationConfigsResponse` can carry.
+///
+/// `{"url":"a"}` is eleven. `url` is the one member
+/// `readTaskPushNotificationConfig` will not do without and will not take
+/// empty, because an empty URL is not a webhook, and every other member is
+/// optional — so this is the whole of the element rather than the part of it
+/// the schema requires. `{}` is a missing field before it is anything else,
+/// and the null rule above is the same one.
+///
+/// Eleven and eleven, for the same reason as the forty-nine above, and left
+/// without the envelope for the same reason: the thirty-three bytes
+/// `{"configs":[…],"nextPageToken":""}` spends are what keep the forty a
+/// document of at most `max_doc_len` can carry below the forty-two this bound
+/// holds.
+const list_push_configs_capacity = repeatedCapacity(11);
+
+// Neither list response has an arena of its own, and that is why the two
+// bounds above are the whole of what this pair adds to [`Storage`].
+
+// A nested task is the same `readTask` walk a whole `Task` document opens: its
+// parts, artifacts, history and bytes come out of the content arena rather
+// than out of an array of its own, so the tasks a list response fills are the
+// one element list the caller has to size here. Sharing the arena can only
+// make the document larger than the one the arena's own derivations were
+// measured against — the envelope adds bytes and takes none of the arena's
+// room — so those bounds still hold and are deliberately not re-derived for a
+// document that nests.
 
 /// How many members one document can carry that no shape names.
 ///
@@ -421,7 +494,7 @@ const Storage = struct {
     prompt_messages_again: [mcp_prompt_messages_capacity]mcp.PromptMessage,
     versions_again: [mcp_versions_capacity][]const u8,
 
-    /// The caller's `VerbatimStore` array, for the six typed MCP results. One
+    /// The caller's `VerbatimStore` array, for the seven typed MCP results. One
     /// for the whole document rather than one per result: the store is filled
     /// across the document and each decoded object keeps the sub-slice that
     /// belongs to it, which is what `mcp.VerbatimStore.since` is for.
@@ -461,6 +534,21 @@ const Storage = struct {
     /// is finished with before the second is decoded.
     permission_options: [permission_options_capacity]acp.PermissionOption,
     output_modes: [output_modes_capacity][]const u8,
+
+    /// The two caller arrays the A2A list responses fill, and the `_again`
+    /// halves beside them for the reason the rest of this struct gives: the
+    /// first decode's elements are the values the comparison is about, and a
+    /// re-decode sharing one array would overwrite them.
+    ///
+    /// The nested tasks and the configurations both point into storage of their
+    /// own rather than into an arena, and the tasks beside them point into
+    /// `content_bytes` through the content arena, which is why the re-decode
+    /// takes `content_again` as well: the bytes the encoder re-spells as
+    /// base64 are read out of the first arena while the second one is filling.
+    list_tasks: [list_tasks_capacity]a2a.Task,
+    list_push_configs: [list_push_configs_capacity]a2a.TaskPushNotificationConfig,
+    list_tasks_again: [list_tasks_capacity]a2a.Task,
+    list_push_configs_again: [list_push_configs_capacity]a2a.TaskPushNotificationConfig,
 
     content: a2a.ContentArena,
     content_again: a2a.ContentArena,
@@ -545,6 +633,7 @@ fn escaped(text: []const u8, out: []u8) []const u8 {
 
 /// A byte buffer that saturates instead of overflowing.
 const Doc = struct {
+    // SAFETY: `slice` hands out `bytes[0..len]`, and `push`/`pushByte` write the run before `len`.
     bytes: [max_doc_len]u8 = undefined,
     len: usize = 0,
 
@@ -711,6 +800,16 @@ const member_names = [_][]const u8{
 /// asserted over, and listing its table anyway would put names in the
 /// vocabulary that reach nothing.
 ///
+/// The two list responses are here for the same reason as the rest of the table
+/// and are covered by the check the first paragraph names: both are in
+/// [`battery_codec_names`], and [`expectEveryBatteryCodecReached`] measures
+/// that the corpus fed each one something it accepts, so the claim is measured
+/// rather than asserted. Listing their tables is also what makes the seeds
+/// beside them load-bearing rather than decorative: a rename shape that cannot
+/// spell `tasks`, `configs`, `totalSize` or `nextPageToken` is a mutation that
+/// cannot move a required member of either response, and the names they add to
+/// the vocabulary are the only way `renameMember` reaches those four.
+///
 /// `a2a.PartContent` is beside `a2a.Part` and not inside it, and that is not
 /// tidiness. `Part.fields[0]` is the `oneof` itself and carries no member
 /// name, so the four arms are rows of `PartContent`'s table and of no other;
@@ -724,8 +823,10 @@ const a2a_codec_messages = [_]type{
     a2a.SubscribeToTaskRequest,
     a2a.GetTaskPushNotificationConfigRequest,
     a2a.DeleteTaskPushNotificationConfigRequest,
+    a2a.ListTaskPushNotificationConfigsResponse,
     a2a.ListTaskPushNotificationConfigsRequest,
     a2a.GetExtendedAgentCardRequest,
+    a2a.ListTasksResponse,
     a2a.ListTasksRequest,
     a2a.AuthenticationInfo,
     a2a.TaskPushNotificationConfig,
@@ -768,16 +869,16 @@ const a2a_codec_messages = [_]type{
 /// needs to remember what it has already emitted.
 const a2a_field_row_count = blk: {
     var rows: usize = 0;
-    for (a2a_codec_messages) |T| {
-        for (T.fields) |entry| {
+    for (a2a_codec_messages) |message| {
+        for (message.fields) |entry| {
             if (entry.json != null) rows += 1;
         }
     }
     break :blk rows;
 };
 
-/// Write the ProtoJSON names the twenty A2A codecs compare into `out` and
-/// return how many there are.
+/// Write the ProtoJSON names the A2A codecs compare into `out` and return how
+/// many there are.
 ///
 /// The names come from the `fields` tables `a2a.zig` derives every Zig field
 /// name from, so they cannot drift: a renamed member is a new row in that
@@ -788,13 +889,12 @@ const a2a_field_row_count = blk: {
 fn collectA2aMemberNames(out: [][]const u8) usize {
     // The quota, for the same reason the reachability test below has one: this
     // runs at comptime because the two tables above are built from it, and it
-    // compares every row of twenty tables against the whole hand-written table
-    // and against everything it has already emitted.
+    // compares every row of every table against the whole hand-written table
     @setEvalBranchQuota(100_000);
     var seen: [member_names.len + a2a_field_row_count][]const u8 = undefined;
     var count: usize = 0;
-    for (a2a_codec_messages) |T| {
-        for (T.fields) |entry| {
+    for (a2a_codec_messages) |message| {
+        for (message.fields) |entry| {
             const name = entry.json orelse continue;
             var known = false;
             for (member_names) |existing| {
@@ -818,7 +918,7 @@ const a2a_member_name_count = blk: {
     break :blk collectA2aMemberNames(scratch[0..]);
 };
 
-/// The member names the twenty A2A codecs branch on, read out of their tables.
+/// The member names the A2A codecs branch on, read out of their tables.
 ///
 /// Derived rather than transcribed, for the reason in the module comment: the
 /// table a decoder branches on and the table it is written from are then one
@@ -921,7 +1021,7 @@ const hostile_alphabet = [_]u8{
 /// says why that needed one.
 ///
 /// The tail is the A2A half, then the MCP results, and they are the reason the
-/// thirty-nine `a2a` codecs and the eight `mcp` ones are in the battery at all.
+/// `a2a` codecs and the `mcp` results are in the battery at all.
 /// A decoder the corpus only ever sees through random keys is a decoder whose
 /// required-member rules are asserted over a handful of documents in the whole
 /// run, and whose arms nothing else reaches: `id` and `location` together are
@@ -1141,7 +1241,54 @@ const seed_documents = [_][]const u8{
         "\"instructions\":\"hi\"}",
     "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
         "\"params\":{\"inputResponses\":{\"r\":{}}}}",
+
+    // The two A2A list responses, and three seeds each rather than one. A
+    // reach bit that is set once says the corpus fed the decoder something; it
+    // does not say the decoder saw the shapes that make its members tell each
+    // other apart, and a list response has more of them than any other message
+    // in the half: a required repeated member that may be empty, a required
+    // string that may be empty, two required integers, and two optional
+    // members where an absent member and an empty one are different documents.
+    // So the empty form and the populated form of each are here, and the third
+    // carries escapes — the members whose round trip is a byte question rather
+    // than a presence one — beside a nested message, a nested artifact and a
+    // `Part.raw`, which is the only document in the corpus that decodes a task
+    // with all three under it. The last of the six also spells
+    // `"authentication":null`, which is the one spelling `claimMember` and an
+    // absent member agree on and an encoder must not write back.
+
+    // Appended rather than inserted for the reason the `_meta` seeds give: the
+    // hand-written tests name seeds by index.
+    "{\"tasks\":[],\"nextPageToken\":\"\",\"pageSize\":10,\"totalSize\":0}",
+    "{\"tasks\":[{\"id\":\"task-1\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}," ++
+        "\"contextId\":\"ctx-1\"},{\"id\":\"task-2\"," ++
+        "\"status\":{\"state\":\"TASK_STATE_COMPLETED\"}}]," ++
+        "\"nextPageToken\":\"tok\",\"pageSize\":2,\"totalSize\":7}",
+    "{\"tasks\":[{\"id\":\"t-\\u00e9\",\"status\":{\"state\":\"TASK_STATE_INPUT_REQUIRED\"," ++
+        "\"message\":{\"messageId\":\"m-1\",\"role\":\"ROLE_USER\"," ++
+        "\"parts\":[{\"text\":\"\\u00e9\"}]}}," ++
+        "\"artifacts\":[{\"artifactId\":\"a-1\",\"parts\":" ++
+        "[{\"raw\":\"aGVsbG8=\"}]}],\"metadata\":{\"k\":1}}]," ++
+        "\"nextPageToken\":\"\\ud83d\\ude00\",\"pageSize\":-1,\"totalSize\":1}",
+    "{\"configs\":[],\"nextPageToken\":\"\"}",
+    "{\"configs\":[{\"tenant\":\"acme\",\"id\":\"cfg-1\",\"taskId\":\"task-1\"," ++
+        "\"url\":\"https://example.com/hook\"},{\"id\":\"cfg-2\"," ++
+        "\"url\":\"https://example.com/hook-2\",\"token\":\"tok\"," ++
+        "\"authentication\":{\"scheme\":\"Bearer\",\"credentials\":\"secret\"}}]," ++
+        "\"nextPageToken\":\"tok\"}",
+    "{\"configs\":[{\"url\":\"https://example.com/\\ud83d\\ude00\"," ++
+        "\"token\":\"\\u00e9\",\"authentication\":null}]," ++
+        "\"nextPageToken\":\"\\u0041\"}",
 };
+
+/// The two seeds whose list page holds two elements, named for the one fact
+/// the hand-written tests that read them care about.
+///
+/// Every other test here names a seed by a bare index and reads a member off it.
+/// These two are read for the shape of their page rather than for a member, and
+/// a number in the middle of a test says nothing about which page it means.
+const seed_two_task_page = 76;
+const seed_two_push_config_page = 79;
 
 fn hostileByte(rng: std.Random) u8 {
     return hostile_alphabet[rng.intRangeLessThan(u8, 0, hostile_alphabet.len)];
@@ -1809,7 +1956,7 @@ fn expectSameDocumentBytes(
     var was: [2 * max_doc_len + 8]u8 = undefined;
     var want: [2 * max_doc_len + 8]u8 = undefined;
     var got: [2 * max_doc_len + 8]u8 = undefined;
-    std.debug.print(
+    std.log.warn(
         "\nround trip: the {s} encoder did not reproduce the document\n" ++
             "  input:    {s}\n  expected: {s}\n  encoded:  {s}\n",
         .{
@@ -1909,11 +2056,21 @@ const TailRule = struct {
     ///
     /// The first thirty are the codecs that predate that wave: two `mcp`
     /// results, the six `acp` decoders, the two `bridge` ones and the twenty
-    /// `a2a` codecs. The twenty-eight after them are eleven content-half A2A
-    /// codecs, eight discovery-half ones, the six typed MCP results,
-    /// `mcp.decodeCacheable` — one half of the caching pair, because the other
-    /// has no encoder by design — the `jsonrpc` request projection, and
-    /// `jsonrpc.decode` itself.
+    /// `a2a` codecs. The thirty after them are eleven content-half A2A codecs,
+    /// eight discovery-half ones, the two A2A list responses, the six typed
+    /// MCP results, `mcp.decodeCacheable` — one half of the caching pair,
+    /// because the other has no encoder by design — the `jsonrpc` request
+    /// projection, and `jsonrpc.decode` itself.
+    ///
+    /// The two list responses sit with the content half in this list rather
+    /// than with the flat one, and the reason is where their storage is rather
+    /// than which section they were written in. `decodeListTasksResponse` nests
+    /// whole tasks, so it takes the `ContentArena` and every byte a nested
+    /// `Part.raw` decodes to comes out of the same arena the rest of the
+    /// document uses. `decodeListTaskPushNotificationConfigsResponse` takes no
+    /// arena at all — a configuration carries no part and no `bytes` — so it
+    /// fills one caller array beside the scratch, which is the third of the
+    /// three decoders the storage section says takes one array and no arena.
     ///
     /// That last one is the most permissive decoder in the tree and was the one
     /// row this table did not have: its round trip is a member comparison,
@@ -1926,9 +2083,9 @@ const TailRule = struct {
     /// Every codec the battery feeds is in this table or in
     /// [`tail_rule.no_tail`], and `test "the coverage tables agree on what the
     /// battery feeds"` checks that in both directions over every row. Before
-    /// that check the thirty-eight rows this wave added were compared with
-    /// nothing at all, and two pinned counts were the only thing standing
-    /// between the tables and a codec with a reach bit and no tail rule.
+    /// that check the forty rows this wave added were compared with nothing at
+    /// all, and two pinned counts were the only thing standing between the
+    /// tables and a codec with a reach bit and no tail rule.
     round_trip: []const []const u8 = &.{
         "mcp.decodeResultType",
         "mcp.decodeInputRequiredResult",
@@ -1971,6 +2128,13 @@ const TailRule = struct {
         "a2a.decodeSendMessageRequest",
         "a2a.decodeSendMessageResponse",
         "a2a.decodeStreamResponse",
+        // The two A2A list responses, beside the content half they sit with in
+        // `a2a_codec_messages` and for the storage reason above. They are last
+        // in this table because they are the last rows the battery gained, and
+        // a name's position here is its reach bit in
+        // `Stats.reached_battery_codecs` rather than anything an author reads.
+        "a2a.decodeListTasksResponse",
+        "a2a.decodeListTaskPushNotificationConfigsResponse",
         "a2a.decodeStringList",
         "a2a.decodeSecurityRequirement",
         "a2a.decodeSecurityScheme",
@@ -2103,7 +2267,7 @@ fn expectRoundTripHasNoTail(
 ) !void {
     if (!tail) return;
     var text: [2 * max_doc_len + 8]u8 = undefined;
-    std.debug.print(
+    std.log.warn(
         "\nround trip: {s} accepted a document with a tail\n  document: {s}\n",
         .{ what, escaped(input, &text) },
     );
@@ -2172,14 +2336,15 @@ const battery_codec_names = [_][]const u8{
     "acp.decodePermissionRequest",
     "bridge.decodeEnvelope",
     "bridge.decodeOutcome",
-    // The twenty-nine this wave fed. They come after the wave's own twenty-three
+    // The thirty-one this wave fed. They come after the wave's own twenty-three
     // because that split is what the coverage test checks the shape of, and
     // because the twenty-three are the ones a reader of the history came here
     // for.
-    //
+
     // The eleven content-half A2A codecs, the eight discovery-half ones, the
-    // six typed MCP results and the caching pair, the two that take something
-    // other than a document, and `jsonrpc.decodeRequest`.
+    // two A2A list responses, the six typed MCP results and the caching pair,
+    // the two that take something other than a document, and
+    // `jsonrpc.decodeRequest`.
     "a2a.decodePartContent",
     "a2a.decodePart",
     "a2a.decodeMessage",
@@ -2213,6 +2378,13 @@ const battery_codec_names = [_][]const u8{
     "mcp.decodeCacheLeg",
     "mcp.decodeHeaderValue",
     "jsonrpc.decodeRequest",
+    // The two A2A list responses. The first nests whole tasks and so takes the
+    // `ContentArena` the content half uses; the second takes one caller array
+    // and the scratch, because a configuration carries no part and no `bytes`.
+    // Neither is a flat codec, and the storage section above is where that
+    // difference is written down rather than at either call site.
+    "a2a.decodeListTasksResponse",
+    "a2a.decodeListTaskPushNotificationConfigsResponse",
 };
 
 /// How many of [`battery_codec_names`] the first wave added, which is where
@@ -2225,14 +2397,14 @@ const battery_codec_names = [_][]const u8{
 const wave_codec_count: usize = 23;
 
 /// How many of [`battery_codec_names`] came after that wave: nine decoders that
-/// predated it and twenty-nine this one fed.
+/// predated it and thirty-one this one fed.
 ///
 /// A second constant rather than the bare `9` the assertion used to carry,
-/// because the number grew by twenty-nine and a literal would have been a place
+/// because the number grew by thirty-one and a literal would have been a place
 /// for the growth to be recorded in half. The shape check the coverage test
 /// runs is over the wave half alone, and this says how much of the table is
 /// outside it.
-const later_codec_count: usize = 38;
+const later_codec_count: usize = 40;
 
 /// Record that one of the codecs in [`battery_codec_names`] accepted something,
 /// and assert the tail rule [`tail_rule.round_trip`] says it carries.
@@ -2502,7 +2674,7 @@ fn expectEveryBatteryCodecReached(stats: *const Stats) !void {
         if (!reached and unreached == null) unreached = name;
     }
     if (unreached) |name| {
-        std.debug.print(
+        std.log.warn(
             "\ncoverage: the corpus fed '{s}' nothing it accepts\n",
             .{name},
         );
@@ -2542,6 +2714,23 @@ const Stats = struct {
     /// the outcome are two decoders and either one could go quiet alone.
     envelope_meta_round_trips: usize = 0,
     outcome_meta_round_trips: usize = 0,
+    /// Pairs of elements in a decoded list page that were compared for sharing
+    /// the bytes they borrow: the `id` of two tasks, the `url` of two
+    /// configurations.
+    ///
+    /// Both loops are empty on a page of one element, and a page of two is a
+    /// seed the corpus draws rather than a shape it builds, so a run can finish
+    /// without either body ever executing and the assertion it carries would
+    /// never have fired. A counter is what makes that visible. Not asserted in
+    /// [`runPropertyHarness`], where a non-zero count is a matter of which seed
+    /// the run happened to draw and a missing one would be a flaky failure
+    /// rather than a finding; it is asserted in `test "two elements of a list
+    /// page do not share the bytes they borrow"`, which drives both round trips
+    /// over [`seed_two_task_page`] and [`seed_two_push_config_page`] on every
+    /// run. Two counters and not one, because the two pages are two decoders and
+    /// either one could go quiet alone.
+    list_tasks_id_pairs: usize = 0,
+    list_push_configs_url_pairs: usize = 0,
     /// Documents a decoder that takes caller-owned storage refused because a
     /// caller-sized array ran out, rather than because the document was not a
     /// message of that type.
@@ -2741,9 +2930,14 @@ fn roundTripResultType(
 /// writer spliced `inputRequests` with no check, so the harness was building
 /// documents `mcp.encodeInputRequiredResult` refuses outright. A round trip
 /// that manufactures its own input is not evidence about the shipped pair.
+///
+/// A [`Storage`], for the reason the section below gives: the re-decode writes
+/// its verbatim records over the first decode's, and a pair that shared one
+/// store would be comparing a record against the record that overwrote it.
 fn roundTripInputRequiredResult(
     result: mcp.InputRequiredResult,
-    scratch: []u8,
+    storage: *Storage,
+    replay: []u8,
     out: []u8,
     stats: *Stats,
 ) !void {
@@ -2752,16 +2946,27 @@ fn roundTripInputRequiredResult(
     // than baked into each one, because `resultType` is optional, and that is
     // now the encoder's problem rather than the harness's.
     try mcp.encodeInputRequiredResult(result, &writer);
-    const again = try mcp.decodeInputRequiredResult(writer.written(), scratch);
+    const again = try mcp.decodeInputRequiredResult(
+        writer.written(),
+        storage.verbatim_again[0..],
+        replay,
+    );
     try expectSameString(result.result_type.value, again.result_type.value);
     try expectSameString(result.input_requests, again.input_requests);
     try expectSameString(result.request_state, again.request_state);
+    // The three above are the members this shape models, and they were the
+    // whole of the comparison for as long as this result had no store — which
+    // is how the pair passed while the encoder dropped every member the peer
+    // had sent and this object did not name. `Result` declares an index
+    // signature, so that member is one a peer may legally send.
+    try expectSameVerbatim(result.verbatim, again.verbatim, storage.borrow[0..]);
     stats.round_trips += 1;
 }
 
 // --- The MCP typed results, and the two decoders that take something else -----
-//
-// Six decoders take a caller-sized out-array and a `VerbatimStore`, so a round
+
+// Six of the seven take a caller-sized out-array and a `VerbatimStore` — the
+// seventh, `decodeInputRequiredResult`, takes the store alone — so a round
 // trip needs a second of both: the first decode's elements are slices into the
 // first arrays and every element decoder writes into the caller's storage, so
 // a re-decode sharing it would overwrite the values the comparison is about.
@@ -2953,10 +3158,10 @@ fn roundTripMcpToolCallResult(
     try expectSameString(result.meta, again.meta);
     try expectSameRun(
         mcp.ContentBlock,
+        expectSameContentBlock,
         result.content,
         again.content,
         storage.borrow[0..],
-        expectSameContentBlock,
     );
     try expectSameString(result.structured_content, again.structured_content);
     // A presence: absent means false and `false` means the tool failed, and
@@ -2985,7 +3190,7 @@ fn roundTripMcpToolListResult(
     try expectSameCacheable(result.cacheable, again.cacheable);
     try expectSameString(result.page.next_cursor, again.page.next_cursor);
     try expectSameString(result.meta, again.meta);
-    try expectSameRun(mcp.Tool, result.tools, again.tools, storage.borrow[0..], expectSameTool);
+    try expectSameRun(mcp.Tool, expectSameTool, result.tools, again.tools, storage.borrow[0..]);
     try expectSameVerbatim(result.verbatim, again.verbatim, storage.borrow[0..]);
     stats.round_trips += 1;
 }
@@ -3010,10 +3215,10 @@ fn roundTripMcpResourceReadResult(
     try expectSameString(result.meta, again.meta);
     try expectSameRun(
         mcp.ResourceContents,
+        expectSameResourceContents,
         result.contents,
         again.contents,
         storage.borrow[0..],
-        expectSameResourceContents,
     );
     try expectSameVerbatim(result.verbatim, again.verbatim, storage.borrow[0..]);
     stats.round_trips += 1;
@@ -3038,10 +3243,10 @@ fn roundTripMcpPromptsGetResult(
     try expectSameString(result.meta, again.meta);
     try expectSameRun(
         mcp.PromptMessage,
+        expectSamePromptMessage,
         result.messages,
         again.messages,
         storage.borrow[0..],
-        expectSamePromptMessage,
     );
     try expectSameString(result.description, again.description);
     try expectSameVerbatim(result.verbatim, again.verbatim, storage.borrow[0..]);
@@ -3126,7 +3331,7 @@ fn roundTripJsonRpcRequest(
 }
 
 // --- The ACP encoders that arrived after the battery -----------------------------
-//
+
 // Five `acp` decoders had no encoder when the trailing-byte work named them, so
 // they were named rather than asserted. Each has one now, and each is
 // re-encoded below. The pair that takes `(version, side)` ahead of the value
@@ -3390,13 +3595,13 @@ fn roundTripPermissionRequest(
     stats.round_trips += 1;
 }
 
-// --- The twenty A2A codecs ------------------------------------------------------
-//
-// One writer per pair, and one of the twenty compares bytes rather than
-// members: [`roundTripA2aEmpty`], because the canonical form of every document
+// --- The A2A codecs ------------------------------------------------------------
+
+// One writer per pair, and one of them compares bytes rather than members:
+// [`roundTripA2aEmpty`], because the canonical form of every document
 // `a2a.decodeEmpty` accepts is `{}` whatever the input spelled, and that is the
 // one case where the two sides can be told apart without a model of the
-// members. The other nineteen compare members, and the reason is the same one
+// members. The rest compare members, and the reason is the same one
 // the `bridge` comparison exists for: a member a peer sent
 // and the shape does not model is dropped by the encoder on purpose, which is
 // the stated consequence every decoder in this library records, so a byte
@@ -3613,12 +3818,108 @@ fn roundTripA2aTaskPushNotificationConfig(
     var writer = json.Writer.init(out);
     try a2a.encodeTaskPushNotificationConfig(value, &writer);
     const again = try a2a.decodeTaskPushNotificationConfig(writer.written(), replay);
-    try expectAuthenticationInfo(value.authentication, again.authentication);
-    try expectSameString(value.tenant, again.tenant);
-    try expectSameString(value.id, again.id);
-    try expectSameString(value.task_id, again.task_id);
-    try expectSameString(value.url, again.url);
-    try expectSameString(value.token, again.token);
+    try expectSameTaskPushNotificationConfig(value, again, replay);
+    stats.round_trips += 1;
+}
+
+/// Re-encode a `ListTasksResponse` and decode it into the second array and the
+/// second arena.
+///
+/// Three of the four things this pair is about are visible in the body rather
+/// than in the signature, and each is the reason the re-decode below cannot be
+/// the one every other round trip in this file writes.
+///
+/// `list_tasks_again` is its own array because the outer tasks are the one
+/// element list the caller fills rather than an arena array, and a re-decode
+/// sharing one would overwrite the elements the comparison is about.
+/// `content_again` is the arena a nested task's parts, artifacts, history and
+/// bytes come out of, and it is the second one for the reason
+/// [`roundTripA2aContent`] gives: every public `a2a` decoder resets its arena
+/// before it reads, so a re-decode into the arena the first decode filled would
+/// take the values out from under the comparison. `base64` is the caller's own
+/// buffer, distinct from `content_bytes` and from `content_bytes_again` for
+/// the reason the `Storage` field says.
+///
+/// And `replay` rather than `scratch` is the re-decode's escape buffer for the
+/// same reason everywhere else here: a decoded string borrows from the buffer
+/// it was decoded with, and handing that buffer to a second decode would
+/// overwrite the very members the comparison reads.
+fn roundTripA2aListTasksResponse(
+    value: a2a.ListTasksResponse,
+    storage: *Storage,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    const testing = std.testing;
+    var writer = json.Writer.init(out);
+    try a2a.encodeListTasksResponse(value, &writer, storage.base64[0..]);
+    const again = try a2a.decodeListTasksResponse(
+        writer.written(),
+        storage.list_tasks_again[0..],
+        &storage.content_again,
+        replay,
+    );
+    try expectSameListTasksResponse(value, again, storage.borrow[0..]);
+    // Two elements must not share the bytes their `id` borrows. A caller
+    // rewrites what it was handed in place, so one region behind two tasks is
+    // one edit away from a page that says something the peer did not, and the
+    // member comparison above cannot see it: both elements read exactly what
+    // the peer sent.
+
+    // The counter is what stops the loop from being one that quietly stopped
+    // running. It is empty on a page of one element, and the corpus reaches a
+    // page of two by drawing a seed rather than by building a shape, so a run
+    // can finish without the body ever executing; `Stats.list_tasks_id_pairs`
+    // says which happened, and it is asserted where that is certain rather than
+    // here. See the field and the test it names.
+    for (again.tasks, 0..) |task, index| {
+        for (again.tasks[index + 1 ..]) |later| {
+            try testing.expect(task.id.ptr != later.id.ptr);
+            stats.list_tasks_id_pairs += 1;
+        }
+    }
+    stats.round_trips += 1;
+}
+
+/// Re-encode a `ListTaskPushNotificationConfigsResponse` and decode it into the
+/// second array.
+///
+/// No arena and no base64 buffer, and the absence is the shape rather than an
+/// omission: a push configuration names a webhook and carries strings, so
+/// nothing under one is a `Part` and nothing is a `bytes` field. What it does
+/// have is a presence on each of its two members, so the second array is the
+/// one thing this round trip has to be careful about and the comparison below
+/// is the one that has to check it.
+fn roundTripA2aListTaskPushNotificationConfigsResponse(
+    value: a2a.ListTaskPushNotificationConfigsResponse,
+    storage: *Storage,
+    replay: []u8,
+    out: []u8,
+    stats: *Stats,
+) !void {
+    const testing = std.testing;
+    var writer = json.Writer.init(out);
+    try a2a.encodeListTaskPushNotificationConfigsResponse(value, &writer);
+    const again = try a2a.decodeListTaskPushNotificationConfigsResponse(
+        writer.written(),
+        storage.list_push_configs_again[0..],
+        replay,
+    );
+    try expectSameListTaskPushNotificationConfigsResponse(value, again, storage.borrow[0..]);
+    // The same sharing rule the task page carries, over the member every
+    // configuration must have: `url` is the one the decoder refuses to leave
+    // out and to leave empty, so two of them are two places a caller's rewrite
+    // lands. Counted for the reason the task page counts its pairs, and in its
+    // own counter rather than the same one because this is a second decoder.
+    if (again.configs) |configs| {
+        for (configs, 0..) |config, index| {
+            for (configs[index + 1 ..]) |later| {
+                try testing.expect(config.url.ptr != later.url.ptr);
+                stats.list_push_configs_url_pairs += 1;
+            }
+        }
+    }
     stats.round_trips += 1;
 }
 
@@ -3781,7 +4082,7 @@ fn roundTripA2aMutualTlsSecurityScheme(
 }
 
 // --- The A2A content half ------------------------------------------------------
-//
+
 // One driver and one `expect` per message, rather than a round trip per
 // message. Every one of the eleven content decoders has the same signature
 // and every one of their encoders has the same one, so the trip is the same
@@ -3801,10 +4102,10 @@ fn roundTripA2aMutualTlsSecurityScheme(
 /// for the decoders that take only a scratch.
 fn roundTripA2aContent(
     comptime T: type,
-    value: T,
     comptime decode: *const fn ([]const u8, *a2a.ContentArena, []u8) DecodeError!T,
     comptime encode: *const fn (T, *json.Writer, []u8) proto.EncodeError!void,
     comptime expect: anytype,
+    value: T,
     storage: *Storage,
     replay: []u8,
     out: []u8,
@@ -3821,10 +4122,10 @@ fn roundTripA2aContent(
 /// buffer because no card member is a `bytes` field.
 fn roundTripA2aCard(
     comptime T: type,
-    value: T,
     comptime decode: *const fn ([]const u8, *a2a.CardArena, []u8) DecodeError!T,
     comptime encode: *const fn (T, *json.Writer) proto.EncodeError!void,
     comptime expect: anytype,
+    value: T,
     storage: *Storage,
     replay: []u8,
     out: []u8,
@@ -3856,14 +4157,15 @@ fn expectSameStrings(first: ?[]const []const u8, second: ?[]const []const u8) !v
 /// Compare two lists of the same element type, length included.
 ///
 /// `expect_one` takes the borrow buffer as its third argument, so every
-/// element comparison has the same shape and one driver serves all nineteen
-/// codecs.
+/// element comparison has the same shape and one driver serves every codec
+/// with a repeated member — the two A2A list responses included, and the
+/// reason a bare count of them is not written here.
 fn expectSameRun(
     comptime T: type,
+    comptime expect_one: anytype,
     first: []const T,
     second: []const T,
     scratch: []u8,
-    comptime expect_one: anytype,
 ) !void {
     try std.testing.expectEqual(first.len, second.len);
     for (first, second) |one, another| try expect_one(one, another, scratch);
@@ -3879,10 +4181,10 @@ fn expectSameScopes(
     if (first) |scopes| {
         try expectSameRun(
             a2a.OAuthScope,
+            expectSameScope,
             scopes,
             second orelse return error.TestUnexpectedResult,
             scratch,
-            expectSameScope,
         );
     } else {
         try std.testing.expect(second == null);
@@ -3933,7 +4235,7 @@ fn expectSameA2aMessage(first: a2a.Message, second: a2a.Message, scratch: []u8) 
     // An enum, so a value that came back as a different tag is a peer told to
     // read the part from somebody who did not write it.
     try testing.expectEqual(first.role, second.role);
-    try expectSameRun(a2a.Part, first.parts, second.parts, scratch, expectSamePart);
+    try expectSameRun(a2a.Part, expectSamePart, first.parts, second.parts, scratch);
     try expectSameString(first.metadata, second.metadata);
     try expectSameStrings(first.extensions, second.extensions);
     try expectSameStrings(first.reference_task_ids, second.reference_task_ids);
@@ -3943,7 +4245,7 @@ fn expectSameArtifact(first: a2a.Artifact, second: a2a.Artifact, scratch: []u8) 
     try expectSameString(first.artifact_id, second.artifact_id);
     try expectSameString(first.name, second.name);
     try expectSameString(first.description, second.description);
-    try expectSameRun(a2a.Part, first.parts, second.parts, scratch, expectSamePart);
+    try expectSameRun(a2a.Part, expectSamePart, first.parts, second.parts, scratch);
     try expectSameString(first.metadata, second.metadata);
     try expectSameStrings(first.extensions, second.extensions);
 }
@@ -3975,10 +4277,10 @@ fn expectSameTask(first: a2a.Task, second: a2a.Task, scratch: []u8) !void {
     if (first.artifacts) |artifacts| {
         try expectSameRun(
             a2a.Artifact,
+            expectSameArtifact,
             artifacts,
             second.artifacts orelse return error.TestUnexpectedResult,
             scratch,
-            expectSameArtifact,
         );
     } else {
         try std.testing.expect(second.artifacts == null);
@@ -3986,15 +4288,33 @@ fn expectSameTask(first: a2a.Task, second: a2a.Task, scratch: []u8) !void {
     if (first.history) |history| {
         try expectSameRun(
             a2a.Message,
+            expectSameA2aMessage,
             history,
             second.history orelse return error.TestUnexpectedResult,
             scratch,
-            expectSameA2aMessage,
         );
     } else {
         try std.testing.expect(second.history == null);
     }
     try expectSameString(first.metadata, second.metadata);
+    // A byte comparison cannot say a borrowed lexeme is a value. A reader that
+    // over-captured and an encoder that spliced the same over-captured region
+    // back agree with each other byte for byte and still hand a caller a
+    // `metadata` that is not a JSON value at all, so only re-reading it says
+    // otherwise. This is the check [`expectSamePartContent`] makes of
+    // `PartContent.data`, and it belongs here rather than in the list round
+    // trip: this is the one `Task` comparison, so a bare task, a send-message
+    // answer, a stream event and a list page are all covered by one line
+    // instead of the list page being covered and the other three not.
+
+    // `second` rather than `first` because a re-decoded member borrows the
+    // document the encoder wrote, so the lexeme walked here is the one a caller
+    // re-parses after a round trip; `scratch` rather than the buffer either side
+    // was decoded with, because that buffer is where the lexeme lives and the
+    // reader reads into its own.
+    if (second.metadata) |text| {
+        try std.testing.expect(borrowAccepts(text, scratch));
+    }
 }
 
 fn expectSameTaskStatusUpdateEvent(
@@ -4023,6 +4343,32 @@ fn expectSameTaskArtifactUpdateEvent(
     try expectSameString(first.metadata, second.metadata);
 }
 
+/// One `TaskPushNotificationConfig`, and the third comparison of the same six
+/// members in this file until this one existed.
+///
+/// A list response fills an array of them, an optional configuration nests one
+/// and a bare configuration decodes on its own, so three call sites want this
+/// and one of them wanting it twice is how the fields drift apart: a member
+/// added to the struct and to two of the three comparisons is a round trip
+/// that passes for the codec that dropped it. `scratch` is taken and ignored
+/// for the reason [`expectSameScope`] takes it, so one shape serves
+/// [`expectSameRun`] and a direct call alike — and it is `[]const u8` rather
+/// than `[]u8` so that the optional wrapper below can hand it `&.{}` without
+/// inventing a buffer for a comparison that reads nothing.
+fn expectSameTaskPushNotificationConfig(
+    first: a2a.TaskPushNotificationConfig,
+    second: a2a.TaskPushNotificationConfig,
+    scratch: []const u8,
+) !void {
+    _ = scratch;
+    try expectSameString(first.tenant, second.tenant);
+    try expectSameString(first.id, second.id);
+    try expectSameString(first.task_id, second.task_id);
+    try expectSameString(first.url, second.url);
+    try expectSameString(first.token, second.token);
+    try expectAuthenticationInfo(first.authentication, second.authentication);
+}
+
 fn expectSamePushConfig(
     first: ?a2a.TaskPushNotificationConfig,
     second: ?a2a.TaskPushNotificationConfig,
@@ -4032,12 +4378,62 @@ fn expectSamePushConfig(
         return;
     };
     const other = second orelse return error.TestUnexpectedResult;
-    try expectSameString(config.tenant, other.tenant);
-    try expectSameString(config.id, other.id);
-    try expectSameString(config.task_id, other.task_id);
-    try expectSameString(config.url, other.url);
-    try expectSameString(config.token, other.token);
-    try expectAuthenticationInfo(config.authentication, other.authentication);
+    try expectSameTaskPushNotificationConfig(config, other, &.{});
+}
+
+/// Every member of a `ListTasksResponse`.
+///
+/// The four are not four comparisons of a kind, and the reasons are the point:
+/// `tasks` is a required repeated member that may be empty, so an encoder that
+/// dropped the member and one that wrote `[]` would both have nothing to show
+/// for it and the length alone says which; `nextPageToken` is required and may
+/// be empty, and `""` is the last page rather than an absent member, so the
+/// comparison is over the string and not over its length; and the two integers
+/// are compared as integers because a decoder that parsed `"50"` into an `i32`
+/// and back would be right about the value and wrong about the bytes, and the
+/// bytes are what a peer reads next.
+///
+/// Every task is compared by [`expectSameTask`], which is the whole
+/// comparison: an element list the harness re-derived here would be a second
+/// reading of a `Task`, and a second reading is how a member of it stops being
+/// compared in one place and not the other.
+fn expectSameListTasksResponse(
+    first: a2a.ListTasksResponse,
+    second: a2a.ListTasksResponse,
+    scratch: []u8,
+) !void {
+    try expectSameRun(a2a.Task, expectSameTask, first.tasks, second.tasks, scratch);
+    try expectSameString(first.next_page_token, second.next_page_token);
+    try std.testing.expectEqual(first.page_size, second.page_size);
+    try std.testing.expectEqual(first.total_size, second.total_size);
+}
+
+/// Every member of a `ListTaskPushNotificationConfigsResponse`.
+///
+/// Both members are presences, and on this response the presence is the whole
+/// of the distinction: `{"configs":[],"nextPageToken":""}` is the last page
+/// with nothing on it, and `{}` is a response that never said either. An
+/// encoder that defaulted the empty list to an absent member, or the empty
+/// token to an absent member, would satisfy a length comparison and change the
+/// document a peer reads, so each is compared as a presence and the token is
+/// compared as the string it is rather than as its length.
+fn expectSameListTaskPushNotificationConfigsResponse(
+    first: a2a.ListTaskPushNotificationConfigsResponse,
+    second: a2a.ListTaskPushNotificationConfigsResponse,
+    scratch: []u8,
+) !void {
+    if (first.configs) |configs| {
+        try expectSameRun(
+            a2a.TaskPushNotificationConfig,
+            expectSameTaskPushNotificationConfig,
+            configs,
+            second.configs orelse return error.TestUnexpectedResult,
+            scratch,
+        );
+    } else {
+        try std.testing.expect(second.configs == null);
+    }
+    try expectSameString(first.next_page_token, second.next_page_token);
 }
 
 fn expectSameSendMessageConfiguration(
@@ -4129,10 +4525,10 @@ fn expectSameSecurityRequirement(
     if (first.schemes) |schemes| {
         try expectSameRun(
             a2a.SecurityRequirementEntry,
+            expectSameRequirementEntry,
             schemes,
             second.schemes orelse return error.TestUnexpectedResult,
             scratch,
-            expectSameRequirementEntry,
         );
     } else {
         try std.testing.expect(second.schemes == null);
@@ -4161,10 +4557,10 @@ fn expectSameAgentCapabilities(
     if (first.extensions) |extensions| {
         try expectSameRun(
             a2a.AgentExtension,
+            expectSameExtension,
             extensions,
             second.extensions orelse return error.TestUnexpectedResult,
             scratch,
-            expectSameExtension,
         );
     } else {
         try std.testing.expect(second.extensions == null);
@@ -4208,10 +4604,10 @@ fn expectSameAgentSkill(first: a2a.AgentSkill, second: a2a.AgentSkill, scratch: 
     if (first.security_requirements) |requirements| {
         try expectSameRun(
             a2a.SecurityRequirement,
+            expectSameSecurityRequirement,
             requirements,
             second.security_requirements orelse return error.TestUnexpectedResult,
             scratch,
-            expectSameSecurityRequirement,
         );
     } else {
         try std.testing.expect(second.security_requirements == null);
@@ -4287,14 +4683,14 @@ fn expectSameOAuthFlows(
             try expectSameString(value.authorization_url, other.authorization_url);
             try expectSameString(value.token_url, other.token_url);
             try expectSameString(value.refresh_url, other.refresh_url);
-            try expectSameRun(a2a.OAuthScope, value.scopes, other.scopes, scratch, expectSameScope);
+            try expectSameRun(a2a.OAuthScope, expectSameScope, value.scopes, other.scopes, scratch);
             try testing.expectEqual(value.pkce_required, other.pkce_required);
         },
         .client_credentials => |value| {
             const other = second.client_credentials;
             try expectSameString(value.token_url, other.token_url);
             try expectSameString(value.refresh_url, other.refresh_url);
-            try expectSameRun(a2a.OAuthScope, value.scopes, other.scopes, scratch, expectSameScope);
+            try expectSameRun(a2a.OAuthScope, expectSameScope, value.scopes, other.scopes, scratch);
         },
         .implicit => |value| {
             const other = second.implicit;
@@ -4316,7 +4712,7 @@ fn expectSameOAuthFlows(
             );
             try expectSameString(value.token_url, other.token_url);
             try expectSameString(value.refresh_url, other.refresh_url);
-            try expectSameRun(a2a.OAuthScope, value.scopes, other.scopes, scratch, expectSameScope);
+            try expectSameRun(a2a.OAuthScope, expectSameScope, value.scopes, other.scopes, scratch);
         },
     }
 }
@@ -4338,10 +4734,10 @@ fn expectSameAgentCard(first: a2a.AgentCard, second: a2a.AgentCard, scratch: []u
     // back in another order is a peer told a different deployment is preferred.
     try expectSameRun(
         a2a.AgentInterface,
+        expectSameAgentInterface,
         first.supported_interfaces,
         second.supported_interfaces,
         scratch,
-        expectSameAgentInterface,
     );
     if (first.provider) |provider| {
         try expectSameAgentProvider(
@@ -4358,10 +4754,10 @@ fn expectSameAgentCard(first: a2a.AgentCard, second: a2a.AgentCard, scratch: []u
     if (first.security_schemes) |schemes| {
         try expectSameRun(
             a2a.SecuritySchemeEntry,
+            expectSameSchemeEntry,
             schemes,
             second.security_schemes orelse return error.TestUnexpectedResult,
             scratch,
-            expectSameSchemeEntry,
         );
     } else {
         try std.testing.expect(second.security_schemes == null);
@@ -4369,24 +4765,24 @@ fn expectSameAgentCard(first: a2a.AgentCard, second: a2a.AgentCard, scratch: []u
     if (first.security_requirements) |requirements| {
         try expectSameRun(
             a2a.SecurityRequirement,
+            expectSameSecurityRequirement,
             requirements,
             second.security_requirements orelse return error.TestUnexpectedResult,
             scratch,
-            expectSameSecurityRequirement,
         );
     } else {
         try std.testing.expect(second.security_requirements == null);
     }
     try expectSameStrings(first.default_input_modes, second.default_input_modes);
     try expectSameStrings(first.default_output_modes, second.default_output_modes);
-    try expectSameRun(a2a.AgentSkill, first.skills, second.skills, scratch, expectSameAgentSkill);
+    try expectSameRun(a2a.AgentSkill, expectSameAgentSkill, first.skills, second.skills, scratch);
     if (first.signatures) |signatures| {
         try expectSameRun(
             a2a.AgentCardSignature,
+            expectSameSignature,
             signatures,
             second.signatures orelse return error.TestUnexpectedResult,
             scratch,
-            expectSameSignature,
         );
     } else {
         try std.testing.expect(second.signatures == null);
@@ -4498,8 +4894,8 @@ test "requiredScratchLen is exact for a message holding two escaped strings" {
 
     var scratch: [measured]u8 = undefined;
     const message = try jsonrpc.decode(text, &scratch);
-    const id = message.id.?.string;
-    const reported = message.rpc_error.?.message;
+    const id = (message.id orelse return error.TestUnexpectedResult).string;
+    const reported = (message.rpc_error orelse return error.TestUnexpectedResult).message;
     try expectDisjointRegions(&scratch, &.{ id, reported });
     try testing.expectEqualStrings("a\nb", id);
     try testing.expectEqualStrings("c\nd", reported);
@@ -4519,7 +4915,7 @@ test "the round-trip prediction is the encoder's byte order" {
     // The expected bytes below are written out by hand, so a prediction that
     // lost the carrier `_meta`, moved it, or re-escaped the spliced `params`
     // disagrees with a literal rather than with another piece of the harness.
-    //
+
     // Every document here is deliberately not in the order the encoder writes
     // and carries whitespace beside every member. A prediction compared
     // against the input rather than against the canonical form would fail on
@@ -4592,7 +4988,7 @@ test "the prediction and the decoder resolve a repeated member the same way" {
     // comparison could not see a peer appending a second `serverId` and being
     // forwarded somewhere the first reader would not have sent it, and the
     // meta-test pinned last-wins as the expected answer.
-    //
+
     // Each case below carries the bytes written out by hand, and both sides
     // are compared against them. So this fails in either direction: a decoder
     // that goes back to last-wins fails on the encoder comparison, and a
@@ -4884,12 +5280,17 @@ fn exerciseEveryDecoder(
         stats.refused += 1;
     }
 
-    if (mcp.decodeInputRequiredResult(input, scratch)) |result| {
+    if (mcp.decodeInputRequiredResult(input, storage.verbatim[0..], scratch)) |result| {
         stats.accepted += 1;
         try reachedRoundTrip(stats, "mcp.decodeInputRequiredResult", input, tail);
-        try roundTripInputRequiredResult(result, replay, out, stats);
-    } else |_| {
-        stats.refused += 1;
+        try roundTripInputRequiredResult(result, storage, replay, out, stats);
+    } else |err| {
+        // Not a bare `stats.refused`: this decoder now writes into a
+        // caller-owned store, so a `BufferTooSmall` from it would be
+        // `verbatim_capacity` under-measuring rather than the document
+        // failing a rule, and it would do so by refusing every document
+        // quietly — which is what the reach bit above is there to make loud.
+        refusedWithCallerStorage(stats, err);
     }
 
     if (acp.nextFrame(input)) |frame| {
@@ -5024,12 +5425,12 @@ fn exerciseEveryDecoder(
         stats.refused += 1;
     }
 
-    // --- The twenty A2A codecs ------------------------------------------------
-    //
+    // --- The A2A codecs ------------------------------------------------------
+
     // One block per pair, and the shape is the one every other decoder here
     // has: accept or refuse, count it, refuse a tailed document if it accepted,
-    // and put the value back through its own encoder. Fourteen seeds in
-    // [`seed_documents`] exist so these twenty are reached by a real document
+    // and put the value back through its own encoder. The seeds at the end of
+    // [`seed_documents`] exist so these blocks are reached by a real document
     // rather than by a lucky draw; every block below runs on the whole corpus.
 
     if (a2a.decodeEmpty(input, scratch)) |value| {
@@ -5143,6 +5544,33 @@ fn exerciseEveryDecoder(
         stats.accepted += 1;
         try reachedRoundTrip(stats, "a2a.decodeSendMessageConfiguration", input, tail);
         try roundTripA2aSendMessageConfiguration(value, replay, out, stats);
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    // The configuration list response, beside the two decoders above that take
+    // one caller-sized array and no arena. It is a flat codec in every other
+    // respect — no arena, no `bytes`, nothing nested — and the array is the
+    // whole of what a caller has to size for it.
+    if (a2a.decodeListTaskPushNotificationConfigsResponse(
+        input,
+        storage.list_push_configs[0..],
+        scratch,
+    )) |value| {
+        stats.accepted += 1;
+        try reachedRoundTrip(
+            stats,
+            "a2a.decodeListTaskPushNotificationConfigsResponse",
+            input,
+            tail,
+        );
+        try roundTripA2aListTaskPushNotificationConfigsResponse(
+            value,
+            storage,
+            replay,
+            out,
+            stats,
+        );
     } else |err| {
         refusedWithCallerStorage(stats, err);
     }
@@ -5278,13 +5706,13 @@ fn exerciseEveryDecoder(
         }
     }
 
-    // --- The twenty-nine decoders this wave fed -------------------------------
-    //
+    // --- The thirty-one decoders this wave fed -------------------------------
+
     // One block per decoder and the shape every other block above has: accept
     // or refuse, count it, refuse a tailed document if it accepted, and put the
     // value back through its own encoder. What is different is the storage: an
     // arena the decoder resets itself, an out-array, or a `VerbatimStore`.
-    //
+
     // A refusal goes through `refusedWithCallerStorage` rather than a bare
     // increment, because a `BufferTooSmall` from one of these is the harness's
     // own sizing fault and not the decoder's answer, and the two have to be
@@ -5408,8 +5836,8 @@ fn exerciseEveryDecoder(
         stats.refused += 1;
     }
 
-    // --- The eleven A2A content-half codecs ------------------------------------
-    //
+    // --- The A2A content-half codecs -------------------------------------------
+
     // One arena for the whole corpus, which is the contract every public
     // `a2a` decoder offers: each calls `reset` before it reads, so one arena
     // serves one document at a time and a second decode overwrites the first
@@ -5421,10 +5849,10 @@ fn exerciseEveryDecoder(
         try reachedRoundTrip(stats, "a2a.decodePartContent", input, tail);
         try roundTripA2aContent(
             a2a.PartContent,
-            value,
             a2a.decodePartContent,
             a2a.encodePartContent,
             expectSamePartContent,
+            value,
             storage,
             replay,
             out,
@@ -5439,10 +5867,10 @@ fn exerciseEveryDecoder(
         try reachedRoundTrip(stats, "a2a.decodePart", input, tail);
         try roundTripA2aContent(
             a2a.Part,
-            value,
             a2a.decodePart,
             a2a.encodePart,
             expectSamePart,
+            value,
             storage,
             replay,
             out,
@@ -5457,10 +5885,10 @@ fn exerciseEveryDecoder(
         try reachedRoundTrip(stats, "a2a.decodeMessage", input, tail);
         try roundTripA2aContent(
             a2a.Message,
-            value,
             a2a.decodeMessage,
             a2a.encodeMessage,
             expectSameA2aMessage,
+            value,
             storage,
             replay,
             out,
@@ -5475,10 +5903,10 @@ fn exerciseEveryDecoder(
         try reachedRoundTrip(stats, "a2a.decodeArtifact", input, tail);
         try roundTripA2aContent(
             a2a.Artifact,
-            value,
             a2a.decodeArtifact,
             a2a.encodeArtifact,
             expectSameArtifact,
+            value,
             storage,
             replay,
             out,
@@ -5493,10 +5921,10 @@ fn exerciseEveryDecoder(
         try reachedRoundTrip(stats, "a2a.decodeTaskStatus", input, tail);
         try roundTripA2aContent(
             a2a.TaskStatus,
-            value,
             a2a.decodeTaskStatus,
             a2a.encodeTaskStatus,
             expectSameTaskStatus,
+            value,
             storage,
             replay,
             out,
@@ -5511,10 +5939,10 @@ fn exerciseEveryDecoder(
         try reachedRoundTrip(stats, "a2a.decodeTask", input, tail);
         try roundTripA2aContent(
             a2a.Task,
-            value,
             a2a.decodeTask,
             a2a.encodeTask,
             expectSameTask,
+            value,
             storage,
             replay,
             out,
@@ -5529,10 +5957,10 @@ fn exerciseEveryDecoder(
         try reachedRoundTrip(stats, "a2a.decodeTaskStatusUpdateEvent", input, tail);
         try roundTripA2aContent(
             a2a.TaskStatusUpdateEvent,
-            value,
             a2a.decodeTaskStatusUpdateEvent,
             a2a.encodeTaskStatusUpdateEvent,
             expectSameTaskStatusUpdateEvent,
+            value,
             storage,
             replay,
             out,
@@ -5547,10 +5975,10 @@ fn exerciseEveryDecoder(
         try reachedRoundTrip(stats, "a2a.decodeTaskArtifactUpdateEvent", input, tail);
         try roundTripA2aContent(
             a2a.TaskArtifactUpdateEvent,
-            value,
             a2a.decodeTaskArtifactUpdateEvent,
             a2a.encodeTaskArtifactUpdateEvent,
             expectSameTaskArtifactUpdateEvent,
+            value,
             storage,
             replay,
             out,
@@ -5565,10 +5993,10 @@ fn exerciseEveryDecoder(
         try reachedRoundTrip(stats, "a2a.decodeSendMessageRequest", input, tail);
         try roundTripA2aContent(
             a2a.SendMessageRequest,
-            value,
             a2a.decodeSendMessageRequest,
             a2a.encodeSendMessageRequest,
             expectSameSendMessageRequest,
+            value,
             storage,
             replay,
             out,
@@ -5583,10 +6011,10 @@ fn exerciseEveryDecoder(
         try reachedRoundTrip(stats, "a2a.decodeSendMessageResponse", input, tail);
         try roundTripA2aContent(
             a2a.SendMessageResponse,
-            value,
             a2a.decodeSendMessageResponse,
             a2a.encodeSendMessageResponse,
             expectSameSendMessageResponse,
+            value,
             storage,
             replay,
             out,
@@ -5601,10 +6029,43 @@ fn exerciseEveryDecoder(
         try reachedRoundTrip(stats, "a2a.decodeStreamResponse", input, tail);
         try roundTripA2aContent(
             a2a.StreamResponse,
-            value,
             a2a.decodeStreamResponse,
             a2a.encodeStreamResponse,
             expectSameStreamResponse,
+            value,
+            storage,
+            replay,
+            out,
+            stats,
+        );
+    } else |err| {
+        refusedWithCallerStorage(stats, err);
+    }
+
+    // The task list response, and the last of the content half. It is here
+    // rather than beside its request because it is not a flat codec: it fills
+    // a caller-sized array, and a `BufferTooSmall` from it is the caller's
+    // bound rather than the schema's answer, so its refusal goes through
+    // [`refusedWithCallerStorage`] and is counted on
+    // `Stats.storage_too_small` rather than as an ordinary refusal. Its
+    // sibling, which takes no arena at all, is up in the flat half beside the
+    // other two decoders that fill one caller array.
+
+    // `list_tasks` is beside the arena rather than instead of it: a nested task
+    // is the same `readTask` walk a whole `Task` document opens, so its parts,
+    // artifacts, history and bytes come out of `content` with every other
+    // content-half decoder on this document, and the outer list is the one
+    // element list this arena does not hold.
+    if (a2a.decodeListTasksResponse(
+        input,
+        storage.list_tasks[0..],
+        &storage.content,
+        scratch,
+    )) |value| {
+        stats.accepted += 1;
+        try reachedRoundTrip(stats, "a2a.decodeListTasksResponse", input, tail);
+        try roundTripA2aListTasksResponse(
+            value,
             storage,
             replay,
             out,
@@ -5615,7 +6076,7 @@ fn exerciseEveryDecoder(
     }
 
     // --- The eight A2A discovery-half codecs -----------------------------------
-    //
+
     // One `CardArena` for the whole corpus, on the same contract as the content
     // half: every public decoder in this section calls `reset` before it reads.
 
@@ -5624,10 +6085,10 @@ fn exerciseEveryDecoder(
         try reachedRoundTrip(stats, "a2a.decodeStringList", input, tail);
         try roundTripA2aCard(
             a2a.StringList,
-            value,
             a2a.decodeStringList,
             a2a.encodeStringList,
             expectSameStringList,
+            value,
             storage,
             replay,
             out,
@@ -5642,10 +6103,10 @@ fn exerciseEveryDecoder(
         try reachedRoundTrip(stats, "a2a.decodeSecurityRequirement", input, tail);
         try roundTripA2aCard(
             a2a.SecurityRequirement,
-            value,
             a2a.decodeSecurityRequirement,
             a2a.encodeSecurityRequirement,
             expectSameSecurityRequirement,
+            value,
             storage,
             replay,
             out,
@@ -5660,10 +6121,10 @@ fn exerciseEveryDecoder(
         try reachedRoundTrip(stats, "a2a.decodeSecurityScheme", input, tail);
         try roundTripA2aCard(
             a2a.SecurityScheme,
-            value,
             a2a.decodeSecurityScheme,
             a2a.encodeSecurityScheme,
             expectSameSecurityScheme,
+            value,
             storage,
             replay,
             out,
@@ -5678,10 +6139,10 @@ fn exerciseEveryDecoder(
         try reachedRoundTrip(stats, "a2a.decodeOAuthFlows", input, tail);
         try roundTripA2aCard(
             a2a.OAuthFlows,
-            value,
             a2a.decodeOAuthFlows,
             a2a.encodeOAuthFlows,
             expectSameOAuthFlows,
+            value,
             storage,
             replay,
             out,
@@ -5696,10 +6157,10 @@ fn exerciseEveryDecoder(
         try reachedRoundTrip(stats, "a2a.decodeOAuth2SecurityScheme", input, tail);
         try roundTripA2aCard(
             a2a.OAuth2SecurityScheme,
-            value,
             a2a.decodeOAuth2SecurityScheme,
             a2a.encodeOAuth2SecurityScheme,
             expectSameOAuth2Scheme,
+            value,
             storage,
             replay,
             out,
@@ -5714,10 +6175,10 @@ fn exerciseEveryDecoder(
         try reachedRoundTrip(stats, "a2a.decodeAgentCapabilities", input, tail);
         try roundTripA2aCard(
             a2a.AgentCapabilities,
-            value,
             a2a.decodeAgentCapabilities,
             a2a.encodeAgentCapabilities,
             expectSameAgentCapabilities,
+            value,
             storage,
             replay,
             out,
@@ -5732,10 +6193,10 @@ fn exerciseEveryDecoder(
         try reachedRoundTrip(stats, "a2a.decodeAgentSkill", input, tail);
         try roundTripA2aCard(
             a2a.AgentSkill,
-            value,
             a2a.decodeAgentSkill,
             a2a.encodeAgentSkill,
             expectSameAgentSkill,
+            value,
             storage,
             replay,
             out,
@@ -5750,10 +6211,10 @@ fn exerciseEveryDecoder(
         try reachedRoundTrip(stats, "a2a.decodeAgentCard", input, tail);
         try roundTripA2aCard(
             a2a.AgentCard,
-            value,
             a2a.decodeAgentCard,
             a2a.encodeAgentCard,
             expectSameAgentCard,
+            value,
             storage,
             replay,
             out,
@@ -5789,7 +6250,9 @@ fn exerciseEveryDecoder(
 /// Generate `count` documents and run every one through every decoder.
 fn runPropertyHarness(run_seed: u64, count: usize) !Stats {
     const testing = std.testing;
-    std.debug.print(
+    // `warn` and not `info`: the seed line is how a failure is reproduced from
+    // a log, so it has to survive a build that silences the quieter levels.
+    std.log.warn(
         "\nproperty harness: seed=0x{X} iterations={d}\n",
         .{ run_seed, count },
     );
@@ -5812,6 +6275,7 @@ fn runPropertyHarness(run_seed: u64, count: usize) !Stats {
     // once and reused for every document. The arenas are reset by the decoders
     // themselves, and the `_again` halves exist so a round trip's re-decode
     // cannot overwrite the value it is comparing; see [`Storage`].
+    // SAFETY: `init` assigns every arena field before the loop reads one, and nothing above touches it.
     var storage: Storage = undefined;
     storage.init();
 
@@ -5853,7 +6317,7 @@ fn runPropertyHarness(run_seed: u64, count: usize) !Stats {
     // section exists to rule out: every document refused for want of room is a
     // run that is green while checking nothing. A short run says nothing
     // either way, so it asserts nothing, for the same reason as the guards above.
-    //
+
     // Two counters and not one, because the two name different faults: this one
     // is a derivation above that did not hold, and the next is a scratch that
     // under-measured or a bound inside a library the derivations cannot see.
@@ -5868,7 +6332,7 @@ fn runPropertyHarness(run_seed: u64, count: usize) !Stats {
         try testing.expect(stats.cache_leg_original != 0);
         try testing.expect(stats.cache_leg_retry != 0);
     }
-    std.debug.print(
+    std.log.warn(
         "  documents={d} accepted={d} refused={d} round-trips={d}\n",
         .{ stats.documents, stats.accepted, stats.refused, stats.round_trips },
     );
@@ -5885,9 +6349,185 @@ test "every decoder the battery feeds is total over generated input" {
     _ = try runPropertyHarness(seed, iterations);
 }
 
+/// Write `count` copies of `element` as the array of a list response and return
+/// the document.
+///
+/// The corpus cannot build one of these: `max_doc_len` bounds what the
+/// generator writes, and the densest page there is shorter than the count that
+/// fills the caller's array. It is written here because the bound is a
+/// statement about a page, and a generator cannot make that statement about
+/// itself.
+fn writeListPage(
+    head: []const u8,
+    element: []const u8,
+    tail: []const u8,
+    count: usize,
+    out: []u8,
+) []const u8 {
+    const commas = if (count == 0) 0 else count - 1;
+    std.debug.assert(out.len >= head.len + count * element.len + commas + tail.len);
+    var len: usize = 0;
+    @memcpy(out[len..][0..head.len], head);
+    len += head.len;
+    for (0..count) |index| {
+        if (index != 0) {
+            out[len] = ',';
+            len += 1;
+        }
+        @memcpy(out[len..][0..element.len], element);
+        len += element.len;
+    }
+    @memcpy(out[len..][0..tail.len], tail);
+    len += tail.len;
+    return out[0..len];
+}
+
+test "the caller arrays hold a full page of the shortest elements and refuse one more" {
+    const testing = std.testing;
+    // A caller array sized for a repeated member is only ever as good as the
+    // shortest element that member can legally be, and for these two the
+    // shortest element is a spelling rather than a shape: one is a task whose
+    // shortest legal `state` is not the name a reader reaches for first, and
+    // the other is a webhook URL. A minimum measured from the wrong spelling is
+    // a legal page refused for want of room — a run that is green while
+    // checking nothing, which is the failure the storage section exists to
+    // rule out. The corpus cannot catch it on its own, because a document of at
+    // most `max_doc_len` carries fewer of the shortest element than the array
+    // holds, so the page that fills the array is written out here instead.
+
+    // Both directions are asserted and the second is what keeps the first
+    // honest: a page of exactly what the array holds has to decode, and one
+    // element more has to be refused rather than shortened, because a page that
+    // dropped its last task says something the peer did not.
+    var storage: Storage = undefined;
+    storage.init();
+    var scratch: [2 * max_doc_len]u8 = undefined;
+    var page: [2 * max_doc_len]u8 = undefined;
+
+    // The shortest task the schema accepts beside the shortest envelope it
+    // accepts, which is the densest task page there is.
+    const task = "{\"id\":\"a\",\"status\":{\"state\":\"TASK_STATE_FAILED\"}}";
+    const tasks = writeListPage(
+        "{\"tasks\":[",
+        task,
+        "],\"nextPageToken\":\"\",\"pageSize\":0,\"totalSize\":0}",
+        list_tasks_capacity,
+        page[0..],
+    );
+    const full = try a2a.decodeListTasksResponse(
+        tasks,
+        storage.list_tasks[0..],
+        &storage.content,
+        scratch[0..],
+    );
+    try testing.expectEqual(list_tasks_capacity, full.tasks.len);
+
+    const one_more = writeListPage(
+        "{\"tasks\":[",
+        task,
+        "],\"nextPageToken\":\"\",\"pageSize\":0,\"totalSize\":0}",
+        list_tasks_capacity + 1,
+        page[0..],
+    );
+    try testing.expectError(
+        error.BufferTooSmall,
+        a2a.decodeListTasksResponse(
+            one_more,
+            storage.list_tasks[0..],
+            &storage.content,
+            scratch[0..],
+        ),
+    );
+
+    // The same two directions for the response that takes no arena at all. Its
+    // element is the shortest of the two by a long way, so the array it fills is
+    // the one a minimum measured from the wrong element would empty first.
+    const configs = writeListPage(
+        "{\"configs\":[",
+        "{\"url\":\"a\"}",
+        "],\"nextPageToken\":\"\"}",
+        list_push_configs_capacity,
+        page[0..],
+    );
+    const listed = try a2a.decodeListTaskPushNotificationConfigsResponse(
+        configs,
+        storage.list_push_configs[0..],
+        scratch[0..],
+    );
+    try testing.expectEqual(
+        list_push_configs_capacity,
+        (listed.configs orelse return error.TestUnexpectedResult).len,
+    );
+
+    const one_config_too_many = writeListPage(
+        "{\"configs\":[",
+        "{\"url\":\"a\"}",
+        "],\"nextPageToken\":\"\"}",
+        list_push_configs_capacity + 1,
+        page[0..],
+    );
+    try testing.expectError(
+        error.BufferTooSmall,
+        a2a.decodeListTaskPushNotificationConfigsResponse(
+            one_config_too_many,
+            storage.list_push_configs[0..],
+            scratch[0..],
+        ),
+    );
+}
+
+// The pairwise sharing checks of the two list pages, run over the only two
+// documents in the corpus that can carry them.
+
+// A caller rewrites what it was handed in place, so two elements sharing one
+// region is one edit away from a page that says something the peer did not,
+// and a member comparison cannot see it: both elements read exactly what the
+// peer sent. The checks live in the two round trips, where they run over
+// whatever the corpus produces, and this is what says they ran at all: each
+// loop is empty on a page of one element, and the corpus reaches a page of two
+// by drawing one of the two seeds below rather than by building a shape, so a
+// run can finish without either body ever executing. Asserting the counters
+// here rather than in [`runPropertyHarness`] is the whole difference between a
+// property and a coin flip: the corpus draws a seed, this drives the page.
+test "two elements of a list page do not share the bytes they borrow" {
+    const testing = std.testing;
+    var storage: Storage = undefined;
+    storage.init();
+    var scratch: [max_doc_len]u8 = undefined;
+    var replay: [max_doc_len]u8 = undefined;
+    var out: [encode_buf_len]u8 = undefined;
+    var stats: Stats = .{};
+
+    // The same three steps the battery takes for these documents: read the seed
+    // into the first array with its own scratch, then let the round trip write
+    // the value out and read it back into the `_again` half beside it.
+    const page = try a2a.decodeListTasksResponse(
+        seed_documents[seed_two_task_page],
+        storage.list_tasks[0..],
+        &storage.content,
+        scratch[0..],
+    );
+    try roundTripA2aListTasksResponse(page, &storage, replay[0..], out[0..], &stats);
+    try testing.expect(stats.list_tasks_id_pairs != 0);
+
+    const listed = try a2a.decodeListTaskPushNotificationConfigsResponse(
+        seed_documents[seed_two_push_config_page],
+        storage.list_push_configs[0..],
+        scratch[0..],
+    );
+    try roundTripA2aListTaskPushNotificationConfigsResponse(
+        listed,
+        &storage,
+        replay[0..],
+        out[0..],
+        &stats,
+    );
+    try testing.expect(stats.list_push_configs_url_pairs != 0);
+}
+
 test "the generator can spell every member jsonrpc.decode branches on" {
     // Transcribed from the branches of `jsonrpc.decode` and `decodeError`.
-    //
+
     // The check is `spelledByASeed` and not "is the name in the vocabulary",
     // because membership in the vocabulary holds by construction: the nine
     // names below are the first nine rows of `member_names`, and
@@ -5901,7 +6541,7 @@ test "the generator can spell every member jsonrpc.decode branches on" {
     // documents in the whole run that happen to draw it. Each name here is one
     // `renameMember` can move, which is what "the generator can spell it" has
     // to mean to be worth asserting.
-    //
+
     // The wider table is checked in both directions by `test "every member
     // name is in a seed or listed as grammar-only"` and `test "the derived A2A
     // vocabulary is the tables the codecs are written from"`, because a
@@ -5932,7 +6572,7 @@ test "the coverage tables agree on what the battery feeds" {
     // Four tables say what this harness does, and while they agreed there was
     // no way to tell whether any of them was right. The checks below are what
     // makes disagreement a failure rather than a paragraph nobody reads.
-    //
+
     // `inline for` and a body without `continue`, `break` or `return`, for the
     // reason `test "every member name is in a seed or listed as grammar-only"`
     // gives: the loop unrolls, so a `continue` in it is comptime control flow
@@ -5950,7 +6590,7 @@ test "the coverage tables agree on what the battery feeds" {
     var misfiled: ?[]const u8 = null;
 
     // The prose around these tables quotes their sizes — "none", "the first
-    // twenty-three", "the nine after them and the twenty-nine this wave fed" —
+    // twenty-three", "the nine after them and the thirty-one this wave fed" —
     // and a count that has drifted from the number the comment states is the
     // same fault in a new place. An empty [`tail_rule.unasserted`] is the
     // strongest claim any of these tables makes, so it is the one most worth
@@ -5958,8 +6598,11 @@ test "the coverage tables agree on what the battery feeds" {
     // would otherwise leave the file claiming coverage that the guard below
     // measures and the table below contradicts.
     try testing.expectEqual(@as(usize, 0), tail_rule.unasserted.len);
-    try testing.expectEqual(@as(usize, 58), tail_rule.round_trip.len);
+    try testing.expectEqual(@as(usize, 60), tail_rule.round_trip.len);
     try testing.expectEqual(wave_codec_count + later_codec_count, battery_codec_names.len);
+    // Every row of every table here names a decoder the tree declares, and the
+    // two loops below are what say so: a row with nothing behind it is a
+    // failure in both directions rather than a name some other list excuses.
 
     // And the split the table's doc describes, by name shape rather than by
     // arithmetic: the wave's half is three `acp` rows and then twenty `a2a`
@@ -5988,7 +6631,7 @@ test "the coverage tables agree on what the battery feeds" {
 
     // Every decoder the harness re-encodes is one it feeds, or the tail rule
     // is asserting about a decoder nothing in the battery calls.
-    //
+
     // The two tables are held in locals so the membership helper below is
     // handed slices rather than arrays: a comptime array does not coerce to a
     // comptime slice on its own, and the helper is written for the slice both
@@ -6011,12 +6654,12 @@ test "the coverage tables agree on what the battery feeds" {
     // carries the trailing-byte assertion, or recorded in
     // [`tail_rule.no_tail`] with the reason it has no document whose tail a
     // round trip could lose. The wave's twenty-three were checked by the loop
-    // above and the other thirty-eight were checked by nothing at all, which
-    // is the shape the two tables recorded as drift: a decoder with a reach
-    // bit and no tail rule and no round trip, and two literal counts the only
-    // thing standing between the tables and that state. A count is something an
+    // above and the other forty were checked by nothing at all, which is the
+    // shape the two tables recorded as drift: a decoder with a reach bit and no
+    // tail rule and no round trip, and two literal counts the only thing
+    // standing between the tables and that state. A count is something an
     // author bumps; a set equality is not.
-    //
+
     // Both directions of the failure are recorded, because they are different
     // faults: a row in neither list is a codec that is fed and never checked,
     // and a row in both is one that claims a document it does not take.
@@ -6104,7 +6747,11 @@ test "every public decoder in the tree is in the battery table" {
     // The counts are a corollary of the set checks below and are checked
     // because they say something the set checks do not: equal counts with a
     // differing element on each side is a decoder renamed rather than added,
-    // which is the one difference two names in a row would hide.
+    // which is the one difference two names in two rows would hide. The
+    // battery side is the table and the tree side is measured, because the walk
+    // is comptime — a number an author remembered would go stale the moment a
+    // module grew a decoder, and a stale count asserts nothing.
+    const tree_names: []const []const u8 = tree_decoder_names[0..tree_decoder_count];
     try testing.expectEqual(battery_codec_names.len, tree_decoder_count);
 
     const battery_names: []const []const u8 = &battery_codec_names;
@@ -6113,8 +6760,10 @@ test "every public decoder in the tree is in the battery table" {
     inline for (tree_decoder_names[0..tree_decoder_count]) |name| {
         if (nameIndex(battery_names, name) == null and unfed == null) unfed = name;
     }
+    // `nameIndex` needs a comptime name, hence the unrolled loop and no
+    // `continue` in the body.
     inline for (battery_names) |name| {
-        if (!inTree(&tree_decoder_names, name) and absent == null) absent = name;
+        if (!inTree(tree_names, name) and absent == null) absent = name;
     }
 
     if (unfed) |name| {
@@ -6154,9 +6803,9 @@ test "every member name is in a seed or listed as grammar-only" {
     // name in neither place widens every mutation in the corpus and reaches no
     // rule, so this fails rather than growing. This is what holds the derived
     // half to the same promise as the hand-written one: a member an A2A
-    // message's table carries has to be spelled by a seed, and the fourteen at
-    // the end of [`seed_documents`] are what make that true.
-    //
+    // message's table carries has to be spelled by a seed, and the seeds at the
+    // end of [`seed_documents`] are what make that true.
+
     // `inline for` and not `for`, and the body carries no `continue`, no
     // `break` and no `return`. The loop unrolls, so a `continue` inside it is
     // comptime control flow in a runtime block, which Zig refuses. Take the
@@ -6198,7 +6847,7 @@ test "the previous revision resolves the three names the current one refuses" {
     // reaches it with names no table below matches; nothing else in this file
     // would notice a registry that answered the current revision's table for
     // both and refused three requests an older peer is entitled to send.
-    //
+
     // Three and not four, because the count is itself part of the claim: a
     // fourth name added to the table would be a fourth thing to check.
     try testing.expectEqual(@as(usize, 3), mcp.previous_top_level_requests.len);
@@ -6327,17 +6976,17 @@ test "the derived A2A vocabulary is the tables the codecs are written from" {
     // that there is nothing left to keep in step. This is what says so from the
     // other side: every name the harness can write as an A2A key is one a
     // decoder in [`a2a_codec_messages`] really compares, and `findField` finds
-    // it on that message and on no other of the twenty.
-    //
-    // "On no other" is the half that matters. A name several of the twenty
-    // carry is fine — `tenant` is nine — and the assertion below is that the
+    // it on that message and on no other of them.
+
+    // "On no other" is the half that matters. A name several of them carry is
+    // fine — `tenant` is one — and the assertion below is that the
     // set the generator uses and the set the tables carry are the same set,
     // checked from the tables rather than from a list.
     var missing_from_a_table: ?[]const u8 = null;
     for (a2a_member_names) |name| {
         var found = false;
-        inline for (a2a_codec_messages) |T| {
-            if (a2a.findField(T, name) != null) found = true;
+        inline for (a2a_codec_messages) |message| {
+            if (a2a.findField(message, name) != null) found = true;
         }
         if (!found) missing_from_a_table = name;
     }
@@ -6350,8 +6999,8 @@ test "the derived A2A vocabulary is the tables the codecs are written from" {
     // member the corpus cannot spell, which is the drift the derivation was
     // supposed to remove rather than introduce.
     var dropped: ?[]const u8 = null;
-    inline for (a2a_codec_messages) |T| {
-        for (T.fields) |entry| {
+    inline for (a2a_codec_messages) |message| {
+        for (message.fields) |entry| {
             const name = entry.json orelse continue;
             var known = false;
             for (vocabulary_member_names) |existing| {
@@ -6777,8 +7426,12 @@ fn hasLeadingZero(input: []const u8) bool {
             continue;
         }
         if (byte == '0' and pos + 1 < input.len and isDigitByte(input[pos + 1])) {
-            const opens = pos == 0 or
-                std.mem.indexOfScalar(u8, number_start_bytes, input[pos - 1]) != null;
+            // `or` short-circuits, so the right operand is evaluated only when
+            // `pos` is one or more; the loop guard above proves `pos <
+            // input.len` on every path that reaches this line, so `pos - 1` is
+            // a valid index on exactly the paths it is read.
+            // zwanzig-disable-next-line: slice-bounds-engine
+            const opens = pos == 0 or std.mem.indexOfScalar(u8, number_start_bytes, input[pos - 1]) != null;
             if (opens) return true;
         }
         pos += 1;

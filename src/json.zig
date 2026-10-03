@@ -566,6 +566,14 @@ pub const Reader = struct {
                     // front of it to separate and is rejected here.
                     try self.skipString();
                     try self.expect(':');
+                    // `skipValue` recurses here, and the bound is
+                    // `enterContainer`: both container arms call it before they
+                    // descend, and it refuses a container past `max_depth`
+                    // with `error.LimitExceeded` before the depth is spent,
+                    // so this call cannot outrun the stack. AGENTS.md records
+                    // the recursion finding as advisory for exactly this
+                    // reason, and a test covers the bound.
+                    // gate-reviewed-zbc-next-line: recursive-parse-fn-without-stack-check
                     try self.skipValue(scratch);
                     self.skipWhitespace();
                     const next = self.peek() orelse return error.Truncated;
@@ -706,6 +714,81 @@ pub const Reader = struct {
         return self.input[start..self.pos];
     }
 
+    /// The raw JSON text of the member `name` in the object at the cursor,
+    /// with the faults attached.
+    ///
+    /// This is the walk [`memberText`] performs, in the form a caller that
+    /// has to tell the faults apart can use: the same members, the same
+    /// first-wins rule, the same stopping point, and the `DecodeError` a
+    /// signature with no error set cannot carry.
+    ///
+    /// ## What comes back
+    ///
+    /// Null when the object carries no member of that name at this level, and
+    /// the member's own bytes when it does. A string keeps its quotes and its
+    /// escapes, a nested object or array comes back whole, and a literal
+    /// `null` comes back as those four bytes rather than as an absent member:
+    /// a peer that wrote `"capabilities": null` and a peer that wrote no
+    /// `capabilities` are two facts. The slice borrows `self.input`, so the
+    /// answer copies nothing and costs no memory the caller did not hand
+    /// over already.
+    ///
+    /// ## Which errors are the caller's
+    ///
+    /// `error.BufferTooSmall` is the caller's own shortage and nothing else. A
+    /// key carrying an escape is unescaped before its name can be compared
+    /// with `name`, so a buffer too narrow for one is reported as what it is.
+    /// Reported as an absent member instead, the same bytes would tell a
+    /// caller the peer wrote nothing where it wrote something, which is the
+    /// one answer a caller may not invent. Every other error is a fact about
+    /// the peer's document: `MalformedJson`, `Truncated`, `InvalidUtf8`, and
+    /// `LimitExceeded`, because the object opened here spends one level of
+    /// `max_depth` and a value nested to the bound in a document this reads is
+    /// a value this refuses.
+    ///
+    /// ## The scratch
+    ///
+    /// A value never reaches `scratch`: `rawValue` and `skipValue` read an
+    /// extent and write none, so a document whose keys are all plain costs a
+    /// zero-length buffer however many escapes its values hold. What an
+    /// escaped key does take is taken from this reader and moves its
+    /// high-water mark like any other decoded string, so a caller that reads
+    /// further into this document counts those bytes too. Size the buffer
+    /// from [`requiredScratchLen`].
+    ///
+    /// ## Repeated names
+    ///
+    /// RFC 8259 section 4 says the names within an object *should* be unique,
+    /// so a repeat is a document the grammar permits and this still has to
+    /// answer for it. The first occurrence wins, for the reason
+    /// [`memberText`] gives: a later member must not be able to make a
+    /// comparison that has already failed pass. The walk returns at that
+    /// first match, so a repeat is never read — an escaped repeat costs the
+    /// caller nothing, and a fault behind the matched member is a fault this
+    /// never reaches.
+    ///
+    /// ## The reader afterwards
+    ///
+    /// The walk consumes this reader. On a match it stands just past the
+    /// member and inside the object it opened, so the remaining members are
+    /// still readable with [`nextKey`] on this same reader. On an error the
+    /// cursor is wherever the walk stopped and nothing about it means
+    /// anything, so a caller that wants another answer starts a new
+    /// [`Reader`] over the input rather than rewinding this one.
+    pub fn memberRaw(self: *Reader, name: []const u8, scratch: []u8) DecodeError!?[]const u8 {
+        // An empty object reports true because it consumed its own closing
+        // brace, so no key is left to read and no key can match.
+        if (try self.beginObject()) return null;
+        while (try self.nextKey(scratch)) |key| {
+            if (std.mem.eql(u8, key, name)) {
+                const lexeme = try self.rawValue(scratch);
+                return lexeme;
+            }
+            try self.skipValue(scratch);
+        }
+        return null;
+    }
+
     fn isDigit(byte: u8) bool {
         return byte >= '0' and byte <= '9';
     }
@@ -823,9 +906,13 @@ pub const Writer = struct {
 /// one as the other reports a refusal as an omission.
 ///
 /// A document this reader cannot parse also comes back null, because the
-/// signature carries no error set. A caller that must tell a malformed body
-/// from an absent member walks a `Reader` of its own and gets the
-/// `DecodeError`.
+/// signature carries no error set. A malformed body, a truncated one, a
+/// string that is not UTF-8, an escaped key the caller sized the scratch too
+/// narrowly for, and a nesting past the depth bound all arrive as the same
+/// answer, and a caller that has to tell them apart cannot use that one.
+/// [`Reader.memberRaw`] is where the walk below lives and reports each of
+/// them, so that is what such a caller calls. This is a reader of it over one
+/// input, not a second copy of it.
 ///
 /// Only the outer object counts. A member of that name inside a nested object
 /// or array is not a top-level member, and reporting one would hand a caller a
@@ -869,15 +956,10 @@ pub const Writer = struct {
 /// The object opened here spends one level of `max_depth`, so a value nested
 /// to the bound in a document this reads is a value this refuses.
 pub fn memberText(raw: []const u8, name: []const u8, scratch: []u8) ?[]const u8 {
+    // One walk, in [`Reader.memberRaw`], and every fault that walk reports is
+    // a fault this signature has no way to spell.
     var reader = Reader.init(raw);
-    // An empty object reports true because it consumed its own closing brace,
-    // so no key is left to read and no key can match.
-    if (reader.beginObject() catch return null) return null;
-    while (reader.nextKey(scratch) catch return null) |key| {
-        if (std.mem.eql(u8, key, name)) return reader.rawValue(scratch) catch null;
-        reader.skipValue(scratch) catch return null;
-    }
-    return null;
+    return reader.memberRaw(name, scratch) catch null;
 }
 
 /// Base64 with `=` padding: the text every protocol in this library uses when
@@ -1633,12 +1715,12 @@ test "two members read out of one object with one scratch do not overlap" {
         \\{"a":"x\ny","b":"p\tq"}
     ;
     var scratch: [16]u8 = undefined;
-    const first = memberText(text, "a", &scratch).?;
+    const first = memberText(text, "a", &scratch) orelse return error.TestUnexpectedResult;
     // Overwriting the whole buffer is what a copy into it would not survive.
     // Neither value was ever copied there, so both still hold the input's own
     // bytes with their escapes spelled out.
     @memset(scratch[0..], 0xff);
-    const second = memberText(text, "b", &scratch).?;
+    const second = memberText(text, "b", &scratch) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("\"x\\ny\"", first);
     try testing.expectEqualStrings("\"p\\tq\"", second);
     // Two runs of one input, at different offsets, so they cannot overlap each
@@ -1672,6 +1754,96 @@ test "a fault after the matched member is not read" {
     // The same fault before the member is caught, because the walk has to
     // step over it on the way there.
     try testing.expect(memberText("{\"b\":,\"a\":1}", "a", "") == null);
+}
+
+// The two tests below are the fallible walk's contract, and they are the only
+// place in this file that asks for a member with the error set attached. The
+// distinction they draw is the one `memberText` cannot draw: a key that carries
+// an escape has to be unescaped before the name can be compared, and a buffer
+// that cannot hold it is the caller's shortage rather than a fact about the
+// peer's document. Reported as an absent member, the same bytes would tell a
+// caller the peer wrote nothing where it wrote something, which is the one
+// answer a caller may not invent.
+test "an escaped key the scratch cannot hold is the caller's shortage, not an absent member" {
+    // A reader of its own for every call, because a walk that fails part
+    // way leaves it wherever it stopped and nothing here is about what a
+    // reader does after a fault.
+    const escaped = "{\"\\u0063aps\":1}";
+    // Four bytes is the decoded width of the key `caps`, and the member is
+    // there. Every width below it is the caller's own shortage, reported
+    // as such rather than as a member the peer did not write.
+    var no_room = Reader.init(escaped);
+    try testing.expectError(error.BufferTooSmall, no_room.memberRaw("caps", ""));
+    var three = Reader.init(escaped);
+    var narrow: [3]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, three.memberRaw("caps", &narrow));
+    var four = Reader.init(escaped);
+    var room: [4]u8 = undefined;
+    try testing.expectEqualStrings("1", (try four.memberRaw("caps", &room)).?);
+
+    // A key that is not the one asked for is read the same way: the name
+    // has to be unescaped before it can be compared with the one being
+    // looked for, so an unreadable key anywhere on the way to the match is
+    // the same shortage. Three bytes decode the key `a\nb`, and the member
+    // behind it is then found.
+    const beside =
+        \\{"a\nb":1,"caps":2}
+    ;
+    var beside_no_room = Reader.init(beside);
+    try testing.expectError(error.BufferTooSmall, beside_no_room.memberRaw("caps", ""));
+    var beside_room = Reader.init(beside);
+    var three_wide: [3]u8 = undefined;
+    try testing.expectEqualStrings("2", (try beside_room.memberRaw("caps", &three_wide)).?);
+
+    // An escaped VALUE is not a key, so it never reaches the buffer and the
+    // member that carries one is found with no buffer at all. A walk that
+    // spent scratch on values would report a shortage over a document whose
+    // keys are all plain.
+    var value_reader = Reader.init("{\"caps\":\"x\\ny\"}");
+    try testing.expectEqualStrings("\"x\\ny\"", (try value_reader.memberRaw("caps", "")).?);
+
+    // The same document through `memberText`, whose signature carries no
+    // error set: an unreadable key is null there, and the two answers are
+    // what tell a caller which one it asked for.
+    try testing.expect(memberText(escaped, "caps", "") == null);
+}
+
+test "the first member of a name is the answer, and the walk never reads past it" {
+    // RFC 8259 section 4 says the names within an object should be unique,
+    // so this document is grammar the library permits and a decoder still
+    // has to answer for it. Both walks answer with the first, for the
+    // reason `memberText` states: a later member cannot make a comparison
+    // that has already failed pass.
+    var reader = Reader.init("{\"a\":1,\"a\":2}");
+    try testing.expectEqualStrings("1", (try reader.memberRaw("a", "")).?);
+    try testing.expectEqualStrings("1", memberText("{\"a\":1,\"a\":2}", "a", "").?);
+
+    // The walk returns at the match, so a fault after that member is not
+    // read and the member is still the answer. `{"a":1,"b":}` is not JSON,
+    // and the member asked for is in it.
+    var tail = Reader.init("{\"a\":1,\"b\":}");
+    try testing.expectEqualStrings("1", (try tail.memberRaw("a", "")).?);
+    // The fault before the member is still a fault, because the walk has to
+    // step over it to reach the member.
+    var lead = Reader.init("{\"b\":,\"a\":1}");
+    try testing.expectError(error.MalformedJson, lead.memberRaw("a", ""));
+
+    // First-wins holds against a duplicate that is itself escaped, and it
+    // costs nothing to hold: the walk returns at the first match, so the
+    // escaped key behind it is never read and needs no scratch. A walk that
+    // compared every key before answering would spend the buffer here and
+    // report the caller's sizing over a document that asked nothing of it.
+    var escaped_duplicate = Reader.init("{\"a\":1,\"\\u0061\":2}");
+    try testing.expectEqualStrings("1", (try escaped_duplicate.memberRaw("a", "")).?);
+
+    // Only the outer object is walked, on the same terms as `memberText`: a
+    // member of that name one level down is not a top-level member.
+    var nested = Reader.init("{\"outer\":{\"a\":2}}");
+    try testing.expect(try nested.memberRaw("a", "") == null);
+    // An absent member is null and not an error, which is what tells a
+    // caller that the walk finished rather than ran out of anything.
+    var absent = Reader.init("{\"b\":1}");
+    try testing.expect(try absent.memberRaw("a", "") == null);
 }
 
 test "base64 round-trips every length mod 3 in both alphabets" {
@@ -1864,6 +2036,6 @@ test "the base64 length helpers state the bounds both directions need" {
     // A buffer sized from the bound holds what the decoder writes.
     var out: [8]u8 = undefined;
     const digits = try base64.encode("foob", &out, .standard);
-    const room = base64.decodedLen(digits.len).?;
+    const room = base64.decodedLen(digits.len) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("foob", try base64.decode(digits, out[0..room], .standard));
 }

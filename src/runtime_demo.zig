@@ -18,11 +18,22 @@
 const std = @import("std");
 const proto = @import("zig-agent-proto");
 
+/// The socket-name helper, development-only and deliberately not part of the
+/// library's public API.
+///
+/// Where a socket may be created is a property of the environment the process
+/// was handed, not something an example gets to spell out as a literal. A
+/// hardcoded `/tmp` is a directory every user on the machine shares and can
+/// write, so a name there is a rendezvous point with whatever else is running.
+const testio = @import("testio");
+
 const conn = proto.conn;
 const json = proto.json;
 const jsonrpc = proto.jsonrpc;
 const mcp = proto.mcp;
 const mcp_session = proto.mcp_session;
+
+const builtin = @import("builtin");
 
 const Io = std.Io;
 
@@ -55,19 +66,25 @@ const ToolServer = struct {
         decode_scratch: []u8,
         answer: []u8,
     ) conn.Error!?[]const u8 {
+        // The context is the `ToolServer` `Peer.run` registered beside this
+        // handler, and it is `handler`: a non-null field of a local in `main`
+        // that outlives the group join. A null would be a wiring fault in this
+        // example, and declining here would answer nothing and leave the
+        // client blocked on a frame nobody would write.
+        // zwanzig-disable-next-line: optional-unwrap
         const self: *ToolServer = @ptrCast(@alignCast(ctx.?));
         // The connection lends two regions to every request, and two things
         // are live at once: the decoded request and the answer. The decode
         // writes into the first, the answer is composed into the second, and
         // a handler need not check which one it is holding.
-        //
+
         // One region could not carry both. `jsonrpc.decode` unescapes into the
         // region it is given rather than borrowing from the frame, and the
         // escape offset `json.Reader` keeps is per reader and not per buffer,
         // so a peer that escaped its method name is enough to make the two
         // collide: the writer's first bytes land on the name the branches
         // below are about to compare.
-        //
+
         // Both regions die with this call. The connection writes the answer out
         // before it lends either of them to the next request.
         const request = jsonrpc.decodeRequest(frame, decode_scratch) catch return null;
@@ -88,15 +105,15 @@ const ToolServer = struct {
         // member as a success. An error object written inside a result
         // therefore reaches the caller as a successful call whose body happens
         // to be a refusal, with no code anywhere on the frame.
-        //
+
         // The id needs no arm of its own here either: the builder echoes it in
         // the arm it arrived in, which matters because an answer is matched by
         // id and by nothing else.
-        //
+
         // `conn.methodNotFound` would write the code and the standard's own
         // text, and this writes the method's name into the message, so a peer
         // can tell which one was refused.
-        //
+
         // The message is the one thing built here rather than handed to a
         // builder whole, and the one thing with nowhere to live. `answer` is
         // what `errorResponse` writes into, so a message kept there is the text
@@ -106,8 +123,8 @@ const ToolServer = struct {
         // has read it by the time this function returns.
         var message_buffer: [256]u8 = undefined;
         var text = json.Writer.init(&message_buffer);
-        text.slice("no handler for ") catch return standard_refusal(request, answer);
-        text.string(request.method.text) catch return standard_refusal(request, answer);
+        text.slice("no handler for ") catch return standardRefusal(request, answer);
+        text.string(request.method.text) catch return standardRefusal(request, answer);
         return conn.errorResponse(request, .{
             .code = @intFromEnum(jsonrpc.StandardError.method_not_found),
             .message = text.written(),
@@ -121,22 +138,29 @@ const ToolServer = struct {
 /// A short message is a worse answer, never no answer: a handler that declines
 /// writes nothing at all, and the peer is waiting on a request that already
 /// arrived.
-fn standard_refusal(request: jsonrpc.Request, answer: []u8) conn.Error!?[]const u8 {
+fn standardRefusal(request: jsonrpc.Request, answer: []u8) conn.Error!?[]const u8 {
     return conn.methodNotFound(request, answer) catch null;
 }
 
 /// One end of the connection: the buffers and the connection over them.
 const Side = struct {
+    // SAFETY: `open` assigns it before its first call that can fail, and both teardown paths run after it.
     io: Io = undefined,
     buffers: proto.stdio.Buffers = .{},
+    // SAFETY: `open` hands it to `Stream.Reader.init`, which refills it before every read it serves.
     reader_buffer: [4096]u8 = undefined,
+    // SAFETY: `open` hands it to `Stream.Writer.init`, which refills it before every write it serves.
     writer_buffer: [4096]u8 = undefined,
+    // SAFETY: `open` assigns it before it sets `pumping`, and only a pumping side reads it.
     connection: conn.Conn = undefined,
+    // SAFETY: `open` assigns it before `Conn.init` can refuse, so both teardown paths hold the descriptor.
     stream: Io.net.Stream = undefined,
     /// Held here rather than as locals in `open`: the connection keeps raw
     /// pointers to both interfaces, and a local would dangle the moment `open`
     /// returned.
+    // SAFETY: `open` assigns it from `Stream.Reader.init` before it lends `reader.interface` to `Conn.init`.
     reader: Io.net.Stream.Reader = undefined,
+    // SAFETY: `open` assigns it from `Stream.Writer.init` before it lends `writer.interface` to `Conn.init`.
     writer: Io.net.Stream.Writer = undefined,
     /// Whether this side has been hung up already.
     closed: bool = false,
@@ -159,7 +183,7 @@ const Side = struct {
         group: *Io.Group,
         stream: Io.net.Stream,
         handler: ?conn.Handler,
-    ) conn.Error!void {
+    ) (conn.Error || Io.ConcurrentError)!void {
         self.io = io;
         self.stream = stream;
         self.reader = Io.net.Stream.Reader.init(stream, io, &self.reader_buffer);
@@ -171,13 +195,13 @@ const Side = struct {
             self.buffers.config(),
         );
         if (handler) |h| self.connection.setHandler(h);
-        // On the group the example joins, because `Io.Group.async` does not run
-        // its task until the group is awaited or cancelled. `pumping` is set
-        // here and not before the connection: an `init` that refused leaves no
-        // pump to release the descriptor, and the caller that hangs up on that
-        // path has to.
+        // A blocking reader needs concurrency; `async` may run it inline.
+        // Publish ownership before spawning, but give it back on refusal.
         self.pumping = true;
-        group.async(io, Side.pump, .{self});
+        group.concurrent(io, Side.pump, .{self}) catch |err| {
+            self.pumping = false;
+            return err;
+        };
     }
 
     /// Read until the peer hangs up, then release the stream.
@@ -226,6 +250,14 @@ const Side = struct {
         if (self.released) return;
         if (self.pumping) {
             self.connection.close();
+            // Best effort, and nothing is lost by it: the reader has already
+            // been told to stop, the pump closes the descriptor on its way
+            // out, and a `shutdown` here has nothing left to interrupt. There
+            // is also nowhere to report a failure to, because this call is
+            // already returning and `close` below is not reachable from here.
+            // gate-reviewed-zlint-next-statement: suppressed-errors
+            // ziglint-ignore: Z026
+            // zwanzig-disable-next-line: empty-catch-engine
             self.stream.shutdown(self.io, .both) catch {};
             return;
         }
@@ -236,6 +268,13 @@ const Side = struct {
     fn release(self: *Side) void {
         if (self.released) return;
         self.released = true;
+        // Best effort for the same reason as in `hangUp`: the descriptor is
+        // closed on the next line whatever this returns, and the only caller
+        // that reaches here through a pump has already seen the end of the
+        // stream.
+        // gate-reviewed-zlint-next-statement: suppressed-errors
+        // ziglint-ignore: Z026
+        // zwanzig-disable-next-line: empty-catch-engine
         self.stream.shutdown(self.io, .both) catch {};
         self.stream.close(self.io);
     }
@@ -258,6 +297,7 @@ const answer_capacity = 4096;
 /// so the next call, which reuses the connection's result buffer, cannot
 /// overwrite what this one returned.
 const Answer = struct {
+    // SAFETY: `take` copies the body in before it sets `len`; `text` slices those bytes and `len` starts at 0.
     body: [answer_capacity]u8 = undefined,
     len: usize = 0,
     /// The peer's JSON-RPC error code, or 0 when the call succeeded.
@@ -294,7 +334,7 @@ const Peer = struct {
     side: *Side,
     handler: *ToolServer,
 
-    fn run(self: *@This()) void {
+    fn run(self: *Peer) void {
         const stream = self.server.accept(self.io) catch return;
         // A side that could not be opened hangs its end up rather than
         // returning quietly: the pump never started, so nothing else would
@@ -325,17 +365,18 @@ const Client = struct {
     /// The last request as it went on the wire. The current revision has no
     /// handshake, so this is where the `_meta` wrapper carrying the client
     /// capabilities becomes visible.
+    // SAFETY: `keepEncoded` copies the request in before it sets `last_sent_len`, which starts at 0.
     last_sent: [2048]u8 = undefined,
     last_sent_len: usize = 0,
     /// The error that ended the exchange, or null when it completed.
     failure: ?[:0]const u8 = null,
 
     /// Record the last request as it went on the wire.
-    fn remember(self: *@This(), encoded: []const u8) void {
+    fn remember(self: *Client, encoded: []const u8) void {
         keepEncoded(&self.last_sent, &self.last_sent_len, encoded);
     }
 
-    fn run(self: *@This()) void {
+    fn run(self: *Client) void {
         const stream = self.address.connect(self.io) catch {
             self.failure = "the socket would not connect";
             return;
@@ -347,7 +388,7 @@ const Client = struct {
         // a read on a descriptor nobody closed, and the join never returned.
         // Ahead of the open for the same reason: a side with no connection is
         // a path out of this task too, and it already holds a descriptor.
-        //
+
         // What it stops is this side's pump; it does not close this side's
         // descriptor. See `Side.hangUp` for why that is the one thing a task
         // other than the reader may not do.
@@ -386,7 +427,7 @@ const Client = struct {
         // A method the revision has and this server does not, asked for before
         // the tool call so that the last frame the client writes is the one
         // worth showing: a `_meta` wrapper around the caller's own members.
-        //
+
         // The answer is a refusal, and it is read as one. `error_code` is what
         // says so; the body is the error object the server sent, and a reader
         // that kept only the body would call this a successful call.
@@ -437,16 +478,59 @@ fn printAnswer(out: *Io.Writer, method: []const u8, answer: *const Answer) !void
     }
 }
 
+/// The tags this file's two socket names are rendered under.
+///
+/// Each call site passes its own tag, and `testio.socketPath` adds a nonce of
+/// its own, so two runs in one temporary directory never land on one name.
+/// Distinct tags per call site are what the two literal prefixes used to do:
+/// the example's socket and this file's test socket stay apart even when one
+/// run picks the directory the other is using.
+const example_tag: u64 = 0x5171_0001;
+const runtime_test_tag: u64 = 0x5171_0002;
+
+/// Remove the socket file this process bound, and say nothing about why it
+/// stayed.
+///
+/// Teardown runs while `main` is unwinding or a test is already failing, so an
+/// unlink that fails has nowhere to report to and reporting it would replace
+/// the failure that got here. The unlink before `listen` refuses every error
+/// but the absence of the file, so nothing about this file's own behaviour is
+/// hidden by the ignore.
+fn unlinkSocket(io: Io, path: []const u8) void {
+    // The unlink is teardown while the process is unwinding, so a failure has
+    // nowhere to report and reporting it would replace the real failure.
+    // gate-reviewed-zlint-next-statement: suppressed-errors
+    // ziglint-ignore: Z026
+    // zwanzig-disable-next-line: empty-catch-engine
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     var out_buffer: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &out_buffer);
     const out = &stdout.interface;
-    defer stdout.flush() catch {};
+    // Whether this run's last flush has already been made, so the report is
+    // written once and a write that failed is not written again.
+    var final_flush_attempted = false;
+    errdefer {
+        if (!final_flush_attempted) {
+            // Best effort, and only while `main` unwinds. This exists so the
+            // lines the run already printed reach the reader beside the error
+            // that got here, and that error is the one this must not replace.
+            // The flush at the end of this function is what reports a report
+            // that could not be written, and the guard above is set before it,
+            // so nothing here repeats that attempt.
+            // gate-reviewed-zlint-next-statement: suppressed-errors
+            // ziglint-ignore: Z026
+            // zwanzig-disable-next-line: empty-catch-engine
+            stdout.flush() catch {};
+        }
+    }
 
     try out.print("zig-agent-proto runtime example\n\n", .{});
-    try out.print("  zig       {s}\n", .{@tagName(@import("builtin").cpu.arch)});
+    try out.print("  zig       {s}\n", .{@tagName(builtin.cpu.arch)});
     try out.print("  mcp       {s} (pinned)\n", .{mcp.latest_protocol_version});
     try out.print("  a2a       1.0.0\n", .{});
     try out.print("  acp       1 (v2 gated)\n\n", .{});
@@ -458,17 +542,29 @@ pub fn main(init: std.process.Init) !void {
     // A real socket, so this is the same code path a subprocess would take
     // over a pipe. stdio is the normative ACP transport and one of the two MCP
     // ones; a socket exercises the identical framing and JSON-RPC.
-    var path_buffer: [128]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buffer, "/tmp/zig-agent-proto-example-{d}.sock", .{
-        std.os.linux.getpid(),
-    });
-    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    //
+    // The name is not a literal. `testio.socketPath` borrows the `TMPDIR` this
+    // process was given and refuses one the machine shares with every other
+    // user, so the socket lands in an area this run owns. The buffer is sized
+    // from `Io.net.UnixAddress.max_len` because that is the length
+    // `UnixAddress.init` refuses, and a `TMPDIR` too long to leave room for the
+    // name is reported rather than rendered into a path that cannot be bound.
+    var path_buffer: [Io.net.UnixAddress.max_len]u8 = undefined;
+    const path = try testio.socketPath(io, init.minimal.environ, &path_buffer, example_tag);
+    // A socket file left by a killed run would make `listen` fail. Only its
+    // absence is the outcome this call is written for; any other is a real
+    // fault and is reported here rather than becoming a `listen` error that
+    // says less about it.
+    std.Io.Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
 
     var address = try Io.net.UnixAddress.init(path);
     var server = try address.listen(io, .{});
     defer {
         server.deinit(io);
-        std.Io.Dir.cwd().deleteFile(io, path) catch {};
+        unlinkSocket(io, path);
     }
 
     var server_side: Side = .{};
@@ -478,26 +574,29 @@ pub fn main(init: std.process.Init) !void {
     // One group drives both ends. Two would deadlock: the client blocks waiting
     // for an answer only the peer's task can produce.
     var group: Io.Group = .init;
-    var peer = Peer{
+    defer group.cancel(io);
+    var peer: Peer = .{
         .io = io,
         .group = &group,
         .server = &server,
         .side = &server_side,
         .handler = &tools,
     };
-    var client = Client{
+    var client: Client = .{
         .io = io,
         .group = &group,
         .address = &address,
         .side = &client_side,
     };
 
-    group.async(io, Peer.run, .{&peer});
-    group.async(io, Client.run, .{&client});
-    // Join, do not cancel: cancelling here would stop both tasks before they
-    // ran. The client hangs up on every path out of its task, the peer's pump
-    // sees end of file, and both pumps return on their own.
-    group.await(io) catch {};
+    try group.concurrent(io, Peer.run, .{&peer});
+    try group.concurrent(io, Client.run, .{&client});
+    // Await normal completion; the defer cancels only on an early exit.
+    // The client hangs up on every path; both pumps then return.
+    //
+    // Joined with `try` because a join that reported a fault is this step's own
+    // fault, and the check below reads a client flag rather than the join.
+    try group.await(io);
 
     // Reached, not hung on. A client that returned without releasing its end
     // left the join above waiting on a pump that could not end, and the name
@@ -520,6 +619,13 @@ pub fn main(init: std.process.Init) !void {
     const wire = client.last_sent[0..client.last_sent_len];
     try out.print("\nlast request on the wire:\n  {s}\n", .{wire});
     try out.print("server handled {d} request(s)\n", .{tools.calls});
+    // The report, flushed once here. Every line above was still buffered, so
+    // a reader given none of them was told nothing about a run that finished,
+    // and that is returned as a failure rather than swallowed into a zero exit
+    // status over output nobody received. The guard is set first, so the
+    // unwinding path above does not attempt this same flush a second time.
+    final_flush_attempted = true;
+    try stdout.flush();
 }
 
 const testing = std.testing;
@@ -574,18 +680,23 @@ test "the exchange drains, and a refusal the server sent reaches the client as a
     defer threaded.deinit();
     const io = threaded.io();
 
-    var path_buffer: [128]u8 = undefined;
-    const path = try std.fmt.bufPrint(
-        &path_buffer,
-        "/tmp/zig-agent-proto-runtime-test-{d}.sock",
-        .{std.os.linux.getpid()},
-    );
-    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var path_buffer: [Io.net.UnixAddress.max_len]u8 = undefined;
+    // The same kind of name the example's `main` renders, out of the same
+    // environment this test binary was given, so a machine with no usable
+    // `TMPDIR` fails here for the reason it would fail there rather than only
+    // beside the literal `/tmp` path this line used to spell out.
+    const path = try testio.socketPath(io, testing.environ, &path_buffer, runtime_test_tag);
+    // As in `main`: only the absence of the file is the outcome this call is
+    // written for, and any other is reported rather than swallowed.
+    std.Io.Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
     var address = try Io.net.UnixAddress.init(path);
     var listener = try address.listen(io, .{});
     defer {
         listener.deinit(io);
-        std.Io.Dir.cwd().deleteFile(io, path) catch {};
+        unlinkSocket(io, path);
     }
 
     var server_side: Side = .{};
@@ -593,22 +704,24 @@ test "the exchange drains, and a refusal the server sent reaches the client as a
     var tools: ToolServer = .{};
 
     var group: Io.Group = .init;
-    var peer = Peer{
+    defer group.cancel(io);
+    var peer: Peer = .{
         .io = io,
         .group = &group,
         .server = &listener,
         .side = &server_side,
         .handler = &tools,
     };
-    var client = Client{
+    var client: Client = .{
         .io = io,
         .group = &group,
         .address = &address,
         .side = &client_side,
     };
-    group.async(io, Peer.run, .{&peer});
-    group.async(io, Client.run, .{&client});
-    group.await(io) catch {};
+    try group.concurrent(io, Peer.run, .{&peer});
+    try group.concurrent(io, Client.run, .{&client});
+    // Joined with `try` for the reason given in `main`.
+    try group.await(io);
 
     try testing.expect(client.failure == null);
     // Three requests reached the server, and the refusal is one of them: the
@@ -639,7 +752,8 @@ test "a method the server does not have is refused beside the result, not inside
     var decode_scratch: [4096]u8 = undefined;
     var answer: [4096]u8 = undefined;
     const frame = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"resources/list\"}";
-    const reply = (try ToolServer.handle(&server, frame, &decode_scratch, &answer)).?;
+    const reply = (try ToolServer.handle(&server, frame, &decode_scratch, &answer)) orelse
+        return error.DeclinedARequest;
 
     var check: [512]u8 = undefined;
     const message = try jsonrpc.decode(reply, &check);
@@ -664,7 +778,8 @@ test "a string id is answered in the arm it arrived in" {
     var decode_scratch: [4096]u8 = undefined;
     var answer: [4096]u8 = undefined;
     const frame = "{\"jsonrpc\":\"2.0\",\"id\":\"call-7\",\"method\":\"tools/list\"}";
-    const reply = (try ToolServer.handle(&server, frame, &decode_scratch, &answer)).?;
+    const reply = (try ToolServer.handle(&server, frame, &decode_scratch, &answer)) orelse
+        return error.DeclinedARequest;
 
     var check: [512]u8 = undefined;
     const message = try jsonrpc.decode(reply, &check);
@@ -692,7 +807,8 @@ test "a method written with an escape is answered as the method it decodes to" {
     // refusal branch instead, silently, and no assertion inside the handler
     // would say so.
     const frame = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools\\/list\"}";
-    const reply = (try ToolServer.handle(&server, frame, &decode_scratch, &answer)).?;
+    const reply = (try ToolServer.handle(&server, frame, &decode_scratch, &answer)) orelse
+        return error.DeclinedARequest;
 
     var check: [512]u8 = undefined;
     const message = try jsonrpc.decode(reply, &check);

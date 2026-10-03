@@ -509,7 +509,7 @@ pub const Conn = struct {
         // Refused before anything is written, so a caller's pending table is
         // left exactly as it was handed over rather than half-initialised by a
         // connection that was never built.
-        //
+
         // A buffer with no room is a connection that cannot work, and the first
         // message or the first call is a poor place to hear about it. Named one
         // at a time so the error says which buffer the caller sized wrong.
@@ -522,7 +522,7 @@ pub const Conn = struct {
         // task that calls. A shared byte is the one fault this pair of names
         // exists to make impossible, and the one fault a caller cannot see:
         // the connection runs, the answers come back, and they are wrong.
-        //
+
         // `decode_scratch` against `answer`: the escape offset `json.Reader`
         // keeps is per reader and not per buffer, so a second reader decoding
         // a string with an escape starts at offset 0 again and writes over
@@ -543,7 +543,7 @@ pub const Conn = struct {
         if (overlaps(table, config.answer)) return error.OverlappingBuffers;
 
         // Every slot starts free.
-        //
+
         // The array is storage this type now owns, and a caller that declares
         // it `undefined` — which is what every buffer in this library is
         // declared as — has not built a table of free slots. In ReleaseSafe
@@ -763,7 +763,7 @@ pub const Conn = struct {
             // buffer completely", so it would block waiting for the remaining
             // kilobytes of a frame that has already fully arrived. This one
             // performs a single read and reports end of stream as an error.
-            //
+
             // A count of zero is not the end of the stream. The standard says
             // so in as many words, and a reader in positional mode over a pipe
             // returns zero because it falls back to streaming, which is the
@@ -892,7 +892,7 @@ pub const Conn = struct {
         // `bridge_session.zig`, `runtime_demo.zig`, `sessions_demo.zig`,
         // `http_demo.zig`, `http.zig`'s own test driver, and
         // `test/loopback_test.zig`. That list is why it is written down.
-        //
+
         // `decode_scratch` is the region the reader has just classified the
         // frame in, and lending it out is safe because the classification is
         // made by then and nothing here reads the message again.
@@ -950,6 +950,20 @@ pub const Conn = struct {
             .code = @intFromEnum(jsonrpc.StandardError.internal_error),
             .message = "this peer could not serve the request",
         }, self.answer) catch return;
+        // Best-effort, and deliberately so. `refuse` is the last thing this
+        // layer does on a path that has already reported its own fault:
+        // `dispatch` has named the handler's failure through the envelope
+        // above and has already closed the connection when that failure was
+        // the transport's. This function returns nothing, so there is no
+        // caller left to hand an error to and no failure state of its own to
+        // update. What a write here can fail on is a writer that cannot
+        // write, and the next read reports that by ending the connection
+        // whatever this one does with it. `error.Framing` is not a fault
+        // these bytes can have: the envelope is the shared builder's and
+        // carries no raw newline, and a short `answer` was returned above.
+        // gate-reviewed-zlint-next-statement: suppressed-errors
+        // ziglint-ignore: Z026
+        // zwanzig-disable-next-line: empty-catch-engine
         self.writeFrame(body) catch {};
     }
 
@@ -985,7 +999,7 @@ pub const Conn = struct {
         // the framing module uses. A caller's `params` blob is spliced in
         // verbatim, and reporting that as a transport failure would call a
         // healthy connection dead and invite a retry that fails identically.
-        if (std.mem.indexOfScalar(u8, bytes, framing.delimiter) != null) return error.Framing;
+        if (std.mem.findScalar(u8, bytes, framing.delimiter) != null) return error.Framing;
         framing.writeFrame(bytes, self.writer) catch return error.Transport;
         self.writer.flush() catch return error.Transport;
     }
@@ -1232,6 +1246,19 @@ const Recorder = struct {
     }
 };
 
+/// The fixture a handler was handed, unwrapped.
+///
+/// Every fixture below is wired to its context by the test that declares it,
+/// on the same `.ctx = &state` line as the handler is installed, and none of
+/// them is installed without one. A null context is a test wired wrong rather
+/// than anything a peer can bring about, and no member of [`Error`] would say
+/// what a caller should do about one, so the unwrap those four handlers
+/// share is written down once here rather than copied into each of them.
+fn fixture(comptime T: type, ctx: ?*anyopaque) *T {
+    // zwanzig-disable-next-line: optional-unwrap
+    return @ptrCast(@alignCast(ctx.?));
+}
+
 /// Answers every request with a fixed envelope, and counts the requests it
 /// saw, so a test can tell a dispatched frame from a dropped one.
 const FixedAnswer = struct {
@@ -1242,7 +1269,7 @@ const FixedAnswer = struct {
     /// region it writes is named `answer`; `decode_scratch` is left unnamed
     /// because nothing here touches it.
     fn handle(ctx: ?*anyopaque, _: []const u8, _: []u8, answer: []u8) Error!?[]const u8 {
-        const self: *FixedAnswer = @ptrCast(@alignCast(ctx.?));
+        const self = fixture(FixedAnswer, ctx);
         self.calls += 1;
         const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
         @memcpy(answer[0..body.len], body);
@@ -1279,13 +1306,15 @@ const Orphaned = struct {
     /// be one of this connection's, so it is a response to nothing here.
     named: bool = false,
     code: i32 = 0,
+    // SAFETY: `told` copies into it and sets `message_len` before any read of `[0..message_len]`.
     message: [64]u8 = undefined,
     message_len: usize = 0,
+    // SAFETY: `told` copies into it and sets `result_len` before any read of `[0..result_len]`.
     result: [64]u8 = undefined,
     result_len: usize = 0,
 
     fn told(ctx: ?*anyopaque, message: jsonrpc.Message) void {
-        const self: *Orphaned = @ptrCast(@alignCast(ctx.?));
+        const self = fixture(Orphaned, ctx);
         self.calls += 1;
         self.id_null = message.id_null;
         if (message.id) |named| switch (named) {
@@ -1352,7 +1381,7 @@ const Newlinier = struct {
     const whole = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}";
 
     fn handle(ctx: ?*anyopaque, _: []const u8, _: []u8, answer: []u8) Error!?[]const u8 {
-        const self: *Newlinier = @ptrCast(@alignCast(ctx.?));
+        const self = fixture(Newlinier, ctx);
         self.calls += 1;
         const body: []const u8 = if (self.calls == 1) split else whole;
         @memcpy(answer[0..body.len], body);
@@ -1367,7 +1396,7 @@ const Closer = struct {
     calls: usize = 0,
 
     fn handle(ctx: ?*anyopaque, _: []const u8, _: []u8, answer: []u8) Error!?[]const u8 {
-        const self: *Closer = @ptrCast(@alignCast(ctx.?));
+        const self = fixture(Closer, ctx);
         self.calls += 1;
         if (self.calls == 1) {
             self.connection.close();
@@ -1386,7 +1415,7 @@ const Caller = struct {
     out: []u8,
     answer: ?(Error!Response) = null,
 
-    fn run(self: *@This()) void {
+    fn run(self: *Caller) void {
         self.answer = self.connection.call(
             "tools/call",
             "{\"name\":\"echo\"}",
@@ -1406,7 +1435,7 @@ const GatedCaller = struct {
     caller: *Caller,
     gate: *Io.Event,
 
-    fn run(self: *@This()) void {
+    fn run(self: *GatedCaller) void {
         self.gate.waitUncancelable(self.caller.connection.io);
         self.caller.run();
     }
@@ -1458,7 +1487,7 @@ test "a read of nothing is not the end of the stream" {
     var decode_scratch: [256]u8 = undefined;
     var answer: [256]u8 = undefined;
     var out_buffer: [256]u8 = undefined;
-    var source = Scripted{
+    var source: Scripted = .{
         .io = testing.io,
         .bytes = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/list\"}\n",
         .silent_reads = 1,
@@ -1575,15 +1604,15 @@ test "a call cancelled while it waits gives its slot back" {
     var result: [256]u8 = undefined;
     var sent: [256]u8 = undefined;
     // A reader with nothing to say, so nothing ever answers the request.
-    var source = Scripted{ .io = io, .bytes = "" };
-    var recorder = Recorder{ .io = io, .sent = &sent };
+    var source: Scripted = .{ .io = io, .bytes = "" };
+    var recorder: Recorder = .{ .io = io, .sent = &sent };
     var connection = try Conn.init(io, &source.reader, &recorder.writer, .{
         .frame_buffer = &frame_buffer,
         .pending = &pending,
         .decode_scratch = &decode_scratch,
         .answer = &answer,
     });
-    var caller = Caller{ .connection = &connection, .result = &result, .out = &out };
+    var caller: Caller = .{ .connection = &connection, .result = &result, .out = &out };
 
     // The owner of a connection returns early for a reason of its own and
     // runs the `errdefer group.cancel(io)` its spawned tasks are under, which
@@ -1592,7 +1621,8 @@ test "a call cancelled while it waits gives its slot back" {
     // point in `call` that can observe a cancelation, so the slot is always
     // claimed by the time one arrives.
     var group: Io.Group = .init;
-    group.async(io, Caller.run, .{&caller});
+    defer group.cancel(io);
+    try group.concurrent(io, Caller.run, .{&caller});
     // `cancel` returns once the task has finished, so the answer below is the
     // one the failed wait produced rather than one still being written.
     group.cancel(io);
@@ -1634,25 +1664,27 @@ test "a call whose write failed takes the connection with it" {
     // not reach the writer until the waiting call's request is already there,
     // so which of the two is second is not left to the scheduler.
     var gate: Io.Event = .unset;
-    var recorder = Recorder{ .io = io, .sent = &sent, .gate = &gate };
+    var recorder: Recorder = .{ .io = io, .sent = &sent, .gate = &gate };
     var connection = try Conn.init(io, &reader, &recorder.writer, .{
         .frame_buffer = &frame_buffer,
         .pending = &pending,
         .decode_scratch = &decode_scratch,
         .answer = &answer,
     });
-    var waiter = Caller{ .connection = &connection, .result = &waiter_result, .out = &waiter_out };
-    var breaker = Caller{
+    var waiter: Caller = .{ .connection = &connection, .result = &waiter_result, .out = &waiter_out };
+    var breaker: Caller = .{
         .connection = &connection,
         .result = &breaker_result,
         .out = &breaker_out,
     };
-    var breaker_task = GatedCaller{ .caller = &breaker, .gate = &gate };
+    var breaker_task: GatedCaller = .{ .caller = &breaker, .gate = &gate };
 
     var waiter_group: Io.Group = .init;
-    waiter_group.async(io, Caller.run, .{&waiter});
+    defer waiter_group.cancel(io);
+    try waiter_group.concurrent(io, Caller.run, .{&waiter});
     var breaker_group: Io.Group = .init;
-    breaker_group.async(io, GatedCaller.run, .{&breaker_task});
+    defer breaker_group.cancel(io);
+    try breaker_group.concurrent(io, GatedCaller.run, .{&breaker_task});
 
     // Awaiting the call whose write fails first: it returns only after the
     // fault has been reported and the connection marked dead, so what the
@@ -1700,22 +1732,28 @@ test "a table with no room for the call leaves the id sequence alone" {
     var refused_out: [256]u8 = undefined;
     var refused_result: [256]u8 = undefined;
     var sent: [512]u8 = undefined;
-    var source = Scripted{ .io = io, .bytes = "" };
+    var source: Scripted = .{ .io = io, .bytes = "" };
     var gate: Io.Event = .unset;
-    var recorder = Recorder{ .io = io, .sent = &sent, .gate = &gate };
+    var recorder: Recorder = .{ .io = io, .sent = &sent, .gate = &gate };
     var connection = try Conn.init(io, &source.reader, &recorder.writer, .{
         .frame_buffer = &frame_buffer,
         .pending = &pending,
         .decode_scratch = &decode_scratch,
         .answer = &answer,
     });
-    var caller = Caller{ .connection = &connection, .result = &result, .out = &out };
+    var caller: Caller = .{ .connection = &connection, .result = &result, .out = &out };
 
     // `var`, because `Future.cancel` takes the future by mutable pointer: the
     // cancelation request is delivered at the call's wait and the slot is
     // freed on that task's own path, which is what the loop below reads.
-    var parked = io.async(Caller.run, .{&caller});
-    gate.wait(io) catch {};
+    var parked = try io.concurrent(Caller.run, .{&caller});
+    defer parked.cancel(io);
+    // The gate is the ordering this test is about: the parked call has reached
+    // the writer and the recorder set it. `wait` fails only on a cancelation,
+    // and nothing cancels this task, so a failure is the ordering itself gone
+    // wrong and is reported as one rather than stepped over to assert below on
+    // a call that had not written yet.
+    try gate.wait(io);
 
     // The parked call took the first id, so the next one will be the second.
     try testing.expectEqual(@as(i64, 2), connection.nextId());
@@ -1750,27 +1788,28 @@ test "a peer error too large for the result buffer is reported, not read as an a
     var result: [8]u8 = undefined;
     var sent: [256]u8 = undefined;
     var gate: Io.Event = .unset;
-    var source = Scripted{
+    var source: Scripted = .{
         .io = io,
         .bytes = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601," ++
             "\"message\":\"no such method\"}}\n",
         .gate = &gate,
     };
-    var recorder = Recorder{ .io = io, .sent = &sent, .gate = &gate };
+    var recorder: Recorder = .{ .io = io, .sent = &sent, .gate = &gate };
     var connection = try Conn.init(io, &source.reader, &recorder.writer, .{
         .frame_buffer = &frame_buffer,
         .pending = &pending,
         .decode_scratch = &decode_scratch,
         .answer = &answer,
     });
-    var caller = Caller{ .connection = &connection, .result = &result, .out = &out };
+    var caller: Caller = .{ .connection = &connection, .result = &result, .out = &out };
 
     // Both tasks on one group, because the call blocks on an answer only the
     // pump can deliver.
     var group: Io.Group = .init;
-    group.async(io, Caller.run, .{&caller});
-    group.async(io, pumpTask, .{&connection});
-    group.await(io) catch {};
+    defer group.cancel(io);
+    try group.concurrent(io, Caller.run, .{&caller});
+    try group.concurrent(io, pumpTask, .{&connection});
+    try group.await(io);
 
     try testing.expectError(error.ResponseTooLarge, caller.answer.?);
     // The slot is released either way, so the table does not leak it.
@@ -1803,27 +1842,28 @@ test "a peer error is a refusal, and `failed` is what says so" {
     var result: [256]u8 = undefined;
     var sent: [256]u8 = undefined;
     var gate: Io.Event = .unset;
-    var source = Scripted{
+    var source: Scripted = .{
         .io = io,
         .bytes = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601," ++
             "\"message\":\"no such method\"}}\n",
         .gate = &gate,
     };
-    var recorder = Recorder{ .io = io, .sent = &sent, .gate = &gate };
+    var recorder: Recorder = .{ .io = io, .sent = &sent, .gate = &gate };
     var connection = try Conn.init(io, &source.reader, &recorder.writer, .{
         .frame_buffer = &frame_buffer,
         .pending = &pending,
         .decode_scratch = &decode_scratch,
         .answer = &answer,
     });
-    var caller = Caller{ .connection = &connection, .result = &result, .out = &out };
+    var caller: Caller = .{ .connection = &connection, .result = &result, .out = &out };
 
     var group: Io.Group = .init;
-    group.async(io, Caller.run, .{&caller});
-    group.async(io, pumpTask, .{&connection});
-    group.await(io) catch {};
+    defer group.cancel(io);
+    try group.concurrent(io, Caller.run, .{&caller});
+    try group.concurrent(io, pumpTask, .{&connection});
+    try group.await(io);
 
-    const replied = try caller.answer.?;
+    const replied = try (caller.answer orelse return error.TestUnexpectedResult);
     try testing.expect(replied.failed());
     try testing.expectEqual(@as(?i32, -32601), replied.error_code);
     // The body carries the error object and not a result, which is precisely
@@ -1856,27 +1896,28 @@ test "a peer's error data reaches the caller" {
     var result: [256]u8 = undefined;
     var sent: [256]u8 = undefined;
     var gate: Io.Event = .unset;
-    var source = Scripted{
+    var source: Scripted = .{
         .io = io,
         .bytes = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32602," ++
             "\"message\":\"Invalid params\",\"data\":{\"tool\":\"nope\"}}}\n",
         .gate = &gate,
     };
-    var recorder = Recorder{ .io = io, .sent = &sent, .gate = &gate };
+    var recorder: Recorder = .{ .io = io, .sent = &sent, .gate = &gate };
     var connection = try Conn.init(io, &source.reader, &recorder.writer, .{
         .frame_buffer = &frame_buffer,
         .pending = &pending,
         .decode_scratch = &decode_scratch,
         .answer = &answer,
     });
-    var caller = Caller{ .connection = &connection, .result = &result, .out = &out };
+    var caller: Caller = .{ .connection = &connection, .result = &result, .out = &out };
 
     var group: Io.Group = .init;
-    group.async(io, Caller.run, .{&caller});
-    group.async(io, pumpTask, .{&connection});
-    group.await(io) catch {};
+    defer group.cancel(io);
+    try group.concurrent(io, Caller.run, .{&caller});
+    try group.concurrent(io, pumpTask, .{&connection});
+    try group.await(io);
 
-    const replied = try caller.answer.?;
+    const replied = try (caller.answer orelse return error.TestUnexpectedResult);
     try testing.expectEqual(@as(?i32, -32602), replied.error_code);
     // Every member of the object the peer sent, in the order PROTOCOLS.md 3.1
     // gives them and with `data` spliced the way the wire carried it.
@@ -1909,14 +1950,14 @@ test "a refusal whose id is null is told to the application, not dropped" {
     // The refusal first and the answer the call is waiting for second. A frame
     // with no id must consume no slot and wake nobody, and only a call that is
     // still answered afterwards shows that it did not.
-    var source = Scripted{
+    var source: Scripted = .{
         .io = io,
         .bytes = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600," ++
             "\"message\":\"Invalid Request\"}}\n" ++
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n",
         .gate = &gate,
     };
-    var recorder = Recorder{ .io = io, .sent = &sent, .gate = &gate };
+    var recorder: Recorder = .{ .io = io, .sent = &sent, .gate = &gate };
     var connection = try Conn.init(io, &source.reader, &recorder.writer, .{
         .frame_buffer = &frame_buffer,
         .pending = &pending,
@@ -1926,11 +1967,12 @@ test "a refusal whose id is null is told to the application, not dropped" {
     var state: Orphaned = .{};
     connection.setOrphanHandler(.{ .ctx = &state, .call = Orphaned.told });
 
-    var caller = Caller{ .connection = &connection, .result = &result, .out = &out };
+    var caller: Caller = .{ .connection = &connection, .result = &result, .out = &out };
     var group: Io.Group = .init;
-    group.async(io, Caller.run, .{&caller});
-    group.async(io, pumpTask, .{&connection});
-    group.await(io) catch {};
+    defer group.cancel(io);
+    try group.concurrent(io, Caller.run, .{&caller});
+    try group.concurrent(io, pumpTask, .{&connection});
+    try group.await(io);
 
     // Told once, with what the peer actually said rather than with a guess at
     // which request it belonged to. `id_null` is what says which of the three
@@ -1953,7 +1995,7 @@ test "a refusal whose id is null is told to the application, not dropped" {
 
     // The call behind the refusal is untouched by it: the frame matched no
     // slot, so it woke no caller and took none.
-    const replied = try caller.answer.?;
+    const replied = try (caller.answer orelse return error.TestUnexpectedResult);
     try testing.expect(!replied.failed());
     try testing.expectEqualStrings("{\"ok\":true}", replied.body);
 }
@@ -1982,13 +2024,13 @@ test "a response on a call that has already returned is told to the application"
     var result: [256]u8 = undefined;
     var sent: [256]u8 = undefined;
     var gate: Io.Event = .unset;
-    var source = Scripted{
+    var source: Scripted = .{
         .io = io,
         .bytes = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"uri\":\"first\"}}\n" ++
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"uri\":\"second\"}}\n",
         .gate = &gate,
     };
-    var recorder = Recorder{ .io = io, .sent = &sent, .gate = &gate };
+    var recorder: Recorder = .{ .io = io, .sent = &sent, .gate = &gate };
     var connection = try Conn.init(io, &source.reader, &recorder.writer, .{
         .frame_buffer = &frame_buffer,
         .pending = &pending,
@@ -1998,15 +2040,16 @@ test "a response on a call that has already returned is told to the application"
     var state: Orphaned = .{};
     connection.setOrphanHandler(.{ .ctx = &state, .call = Orphaned.told });
 
-    var caller = Caller{ .connection = &connection, .result = &result, .out = &out };
+    var caller: Caller = .{ .connection = &connection, .result = &result, .out = &out };
     var group: Io.Group = .init;
-    group.async(io, Caller.run, .{&caller});
-    group.async(io, pumpTask, .{&connection});
-    group.await(io) catch {};
+    defer group.cancel(io);
+    try group.concurrent(io, Caller.run, .{&caller});
+    try group.concurrent(io, pumpTask, .{&connection});
+    try group.await(io);
 
     // The caller got the first response, so the stream started and the call
     // is over. The second is nobody's, and it says so by being told.
-    const replied = try caller.answer.?;
+    const replied = try (caller.answer orelse return error.TestUnexpectedResult);
     try testing.expect(!replied.failed());
     try testing.expectEqualStrings("{\"uri\":\"first\"}", replied.body);
 
@@ -2035,7 +2078,7 @@ test "a response with a string id is told to the application, not dropped" {
     var decode_scratch: [256]u8 = undefined;
     var answer: [256]u8 = undefined;
     var out_buffer: [512]u8 = undefined;
-    var source = Scripted{
+    var source: Scripted = .{
         .io = testing.io,
         .bytes = "{\"jsonrpc\":\"2.0\",\"id\":\"sub-1\",\"result\":{\"uri\":\"a\"}}\n",
     };
@@ -2074,7 +2117,7 @@ test "a request whose handler failed is answered with an error" {
     var decode_scratch: [256]u8 = undefined;
     var answer: [256]u8 = undefined;
     var out_buffer: [512]u8 = undefined;
-    var source = Scripted{
+    var source: Scripted = .{
         .io = testing.io,
         .bytes = "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/list\"}\n" ++
             "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n",
@@ -2118,7 +2161,7 @@ test "an answer carrying a raw newline is the handler's fault, and the connectio
     var out_buffer: [512]u8 = undefined;
     // Two requests in one read, so the second is in the framer's buffer when
     // the first is answered.
-    var source = Scripted{
+    var source: Scripted = .{
         .io = testing.io,
         .bytes = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n" ++
             "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n",
@@ -2159,7 +2202,7 @@ test "a closed connection stops its reader" {
     var decode_scratch: [256]u8 = undefined;
     var answer: [256]u8 = undefined;
     var out_buffer: [512]u8 = undefined;
-    var source = Scripted{
+    var source: Scripted = .{
         .io = testing.io,
         .bytes = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n" ++
             "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n",
@@ -2206,20 +2249,21 @@ test "a frame the frame buffer cannot hold ends the connection, and a call says 
     var sent: [256]u8 = undefined;
     // A peer that never sends the delimiter, and sends more of it than the
     // frame buffer can hold.
-    var source = Scripted{ .io = io, .bytes = "x" ** 200 };
-    var recorder = Recorder{ .io = io, .sent = &sent };
+    var source: Scripted = .{ .io = io, .bytes = "x" ** 200 };
+    var recorder: Recorder = .{ .io = io, .sent = &sent };
     var connection = try Conn.init(io, &source.reader, &recorder.writer, .{
         .frame_buffer = &frame_buffer,
         .pending = &pending,
         .decode_scratch = &decode_scratch,
         .answer = &answer,
     });
-    var caller = Caller{ .connection = &connection, .result = &result, .out = &out };
+    var caller: Caller = .{ .connection = &connection, .result = &result, .out = &out };
 
     var group: Io.Group = .init;
-    group.async(io, Caller.run, .{&caller});
-    group.async(io, pumpTask, .{&connection});
-    group.await(io) catch {};
+    defer group.cancel(io);
+    try group.concurrent(io, Caller.run, .{&caller});
+    try group.concurrent(io, pumpTask, .{&connection});
+    try group.await(io);
 
     try testing.expectError(error.FrameTooLarge, caller.answer.?);
     for (connection.slots) |slot| try testing.expect(!slot.used);
@@ -2405,7 +2449,7 @@ test "a buffer with no room is refused before the first message" {
     var reader = Io.Reader.fixed("");
     var writer = Io.Writer.fixed(&.{});
 
-    var config = Conn.Config{
+    var config: Conn.Config = .{
         .frame_buffer = &frame_buffer,
         .pending = &pending,
         .decode_scratch = &decode_scratch,
@@ -2518,7 +2562,7 @@ test "a refusal is built from the frame, not from what a failed handler left" {
     var decode_scratch: [256]u8 = undefined;
     var answer: [256]u8 = undefined;
     var out_buffer: [512]u8 = undefined;
-    var source = Scripted{
+    var source: Scripted = .{
         .io = testing.io,
         .bytes = "{\"jsonrpc\":\"2.0\",\"id\":\"a\\\"b\",\"method\":\"tools/list\"}\n",
     };

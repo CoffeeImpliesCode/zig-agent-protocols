@@ -172,7 +172,7 @@ pub const Framer = struct {
     fn compact(self: *Framer) void {
         if (self.start == 0) return;
         const held = self.end - self.start;
-        if (held != 0) std.mem.copyForwards(u8, self.buffer[0..held], self.buffer[self.start..self.end]);
+        if (held != 0) @memmove(self.buffer[0..held], self.buffer[self.start..self.end]);
         self.start = 0;
         self.end = held;
     }

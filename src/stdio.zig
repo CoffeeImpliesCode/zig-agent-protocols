@@ -175,24 +175,33 @@ pub const Stdio = struct {
 /// buffers of [`conn.Conn.call`] and [`conn.Conn.notify`].
 pub const Buffers = struct {
     /// Read buffer. Bounds one read from the stream.
+    // SAFETY: `Stdio.init` refuses an empty one; the file reader reads back only bytes it filled.
     read: [4096]u8 = undefined,
     /// Write buffer. Should exceed the largest outbound frame.
+    // SAFETY: `Stdio.init` refuses an empty one; the file writer writes only the bytes it holds.
     write: [4096]u8 = undefined,
     /// Frame buffer. Bounds one inbound message.
+    // SAFETY: the framer fills it from the transport and yields only frames it has read whole.
     frame: [65536]u8 = undefined,
     /// Slots for calls that may be outstanding at once.
+    // SAFETY: `Conn.init` clears every slot to `.{}` before the table is ever read.
     pending: [16]conn.Slot = undefined,
     /// The region an inbound frame is decoded into, and the region a handler
     /// is handed to decode one into. See [`conn.Conn.decode_scratch`].
+    // SAFETY: a decode writes it before its result is read, and `Conn.init` refuses it empty.
     decode_scratch: [4096]u8 = undefined,
     /// The region a handler composes an answer into. It shares no byte with
     /// `decode_scratch`, because a handler that decoded into the region it
     /// writes its answer into has the writer's first bytes land on the value
     /// it is about to read; `conn.Conn.init` refuses a pair that overlaps.
+    // SAFETY: the handler writes the envelope it returns into it; `Conn.init` refuses it empty.
     answer: [4096]u8 = undefined,
     /// Per-call buffers for the encode and the response.
+    // SAFETY: the encoder fills it and only the slice it returns from it is read back.
     out: [8192]u8 = undefined,
+    // SAFETY: `Conn.open` reads the answer in and reads it back as `[0..slot.len]`.
     result: [8192]u8 = undefined,
+    // SAFETY: caller-written JSON spliced into the frame; only its encoded length is read.
     params: [8192]u8 = undefined,
 
     /// The four buffers the connection owns, borrowed from this struct.
@@ -225,6 +234,7 @@ test {
 /// The answer is a literal, so it outlives the handler. Its id is the
 /// request's, because a response is matched by id and by nothing else.
 const EchoAgent = struct {
+    // SAFETY: `handle` copies into it and sets `len` in the same step, and reads `[0..len]`.
     frame: [256]u8 = undefined,
     len: usize = 0,
 
@@ -233,6 +243,13 @@ const EchoAgent = struct {
     /// envelope to compose, so it needs neither. A handler that does decode
     /// writes only into the first.
     fn handle(ctx: ?*anyopaque, frame: []const u8, _: []u8, _: []u8) conn.Error!?[]const u8 {
+        // `conn.Handler.call` is a frozen signature whose context is
+        // `?*anyopaque` and whose error set is `conn.Error`, so a handler
+        // cannot report "there was no context" here without borrowing a fault
+        // this transport does not have. Every registration of this function is
+        // a `setHandler` in this file's own tests, and each hands it the
+        // agent's address, so the absent case is unreachable.
+        // zwanzig-disable-next-line: optional-unwrap
         const self: *EchoAgent = @ptrCast(@alignCast(ctx.?));
         const n = @min(frame.len, self.frame.len);
         @memcpy(self.frame[0..n], frame[0..n]);

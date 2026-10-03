@@ -14,9 +14,9 @@
 //! drops a write that fails rather than reporting it. Nothing here goes to
 //! stderr; a section that failed is reported inline and the run continues.
 //!
-//! Every literal below is taken from a specification. Where a case is a
-//! failure, the demo prints the error it got, because the error a hostile peer
-//! provokes is as much a part of the contract as a success.
+//! Inputs use the specifications' worked examples or member tables. Failure
+//! cases print the decoder's error; constructed list pages demonstrate the
+//! caller-owned storage and the corresponding encoders.
 
 const std = @import("std");
 const proto = @import("zig-agent-proto");
@@ -49,6 +49,7 @@ fn showEverySection(out: *std.Io.Writer) !void {
     showThePermissionSafetyRule(out) catch |err| report(out, "showThePermissionSafetyRule", err);
     parseA2AVersions(out) catch |err| report(out, "parseA2AVersions", err);
     showA2AFieldNames(out) catch |err| report(out, "showA2AFieldNames", err);
+    roundTripA2aPages(out) catch |err| report(out, "roundTripA2aPages", err);
     separateBridgeErrors(out) catch |err| report(out, "separateBridgeErrors", err);
     showThatHostileInputIsAnError(out) catch |err|
         report(out, "showThatHostileInputIsAnError", err);
@@ -58,6 +59,11 @@ fn showEverySection(out: *std.Io.Writer) !void {
 /// write cannot be reported: it is the reporting, and there is nothing above
 /// this call to return an error to.
 fn report(out: *std.Io.Writer, section: []const u8, err: anyerror) void {
+    // Best-effort: this call *is* the reporting. The write has no way to report
+    // its own failure, there is no caller above this to return an error to,
+    // and the same writer is already the stream that failed.
+    // ziglint-ignore: Z026
+    // zwanzig-disable-next-line: empty-catch-engine
     out.print("\n!! {s} failed: {s}\n", .{ section, @errorName(err) }) catch {};
 }
 
@@ -82,14 +88,21 @@ fn decodeAnMcpRequest(out: *std.Io.Writer) !void {
     var scratch: [json.Reader.requiredScratchLen(text)]u8 = undefined;
     const message = try jsonrpc.decode(text, &scratch);
     try out.print("  kind      {s}\n", .{@tagName(message.kind)});
-    try out.print("  id        {d}\n", .{message.id.?.integer});
+    // Every literal below is written out in full, so a member that came back
+    // empty is a fault in the decode rather than a fact about the wire: each
+    // section's caller prints the error and the run continues, which is the
+    // report any other failure in a section gets, so this is reported rather
+    // than unwrapped.
+    const id = message.id orelse return error.MissingMember;
+    try out.print("  id        {d}\n", .{id.integer});
+    const method = message.method orelse return error.MissingMember;
     try out.print("  method    {s}  (category '{s}', action '{s}')\n", .{
-        message.method.?.text,
-        message.method.?.category,
-        message.method.?.action,
+        method.text,
+        method.category,
+        method.action,
     });
 
-    const info = try mcp.lookupMethod(.current, message.method.?.text);
+    const info = try mcp.lookupMethod(.current, method.text);
     try out.print("  resolved  direction={s} cacheable={} mrtr={}\n", .{
         @tagName(info.direction),
         info.cacheable,
@@ -102,8 +115,8 @@ fn decodeAnMcpRequest(out: *std.Io.Writer) !void {
     try jsonrpc.encode(message, &writer);
     const again = try jsonrpc.decode(writer.written(), &scratch);
     try out.print("  round trip id {d} method {s}: {s}\n", .{
-        again.id.?.integer,
-        again.method.?.text,
+        (again.id orelse return error.MissingMember).integer,
+        (again.method orelse return error.MissingMember).text,
         if (again.kind == message.kind) "identical" else "DIFFERENT",
     });
 }
@@ -147,9 +160,12 @@ fn decodeAnMrtrResult(out: *std.Io.Writer) !void {
     // a client answers this result with the body it re-encoded.
     var verbatim: [((raw.len + 1) / 6)]mcp.VerbatimMember = undefined;
     const result = try mcp.decodeInputRequiredResult(raw, &verbatim, &scratch);
-    try out.print("  resultType   {s}\n", .{result.result_type.value.?});
+    try out.print("  resultType   {s}\n", .{result.result_type.value orelse return error.MissingMember});
     try out.print("  requests     present={}\n", .{result.input_requests != null});
-    try out.print("  requestState {s}  (carried, not parsed)\n", .{result.request_state.?});
+    try out.print(
+        "  requestState {s}  (carried, not parsed)\n",
+        .{result.request_state orelse return error.MissingMember},
+    );
     try out.print("  MRTR allowed on tools/call: {}\n", .{mcp.permitsMrtr("tools/call")});
     try out.print("  MRTR allowed on tools/list: {}\n", .{mcp.permitsMrtr("tools/list")});
 }
@@ -196,13 +212,14 @@ fn roundTripAStdioStream(out: *std.Io.Writer) !void {
         index += 1;
         var scratch: [256]u8 = undefined;
         const message = try jsonrpc.decode(frame.bytes, &scratch);
+        const method = message.method orelse return error.MissingMember;
         try out.print("  frame {d}: {s} {s} (terminated={})\n", .{
             index,
             @tagName(message.kind),
-            message.method.?.text,
+            method.text,
             !frame.unterminated,
         });
-        const info = try acp.lookupMethod(.stable, message.method.?.text);
+        const info = try acp.lookupMethod(.stable, method.text);
         try out.print("          side={s} notification={}\n", .{
             @tagName(info.side),
             info.notification,
@@ -322,9 +339,47 @@ fn showA2AFieldNames(out: *std.Io.Writer) !void {
     }
 
     try out.print("\n  findField, the question a decoder asks of a wire name:\n", .{});
-    try showALookup(out, a2a.AgentCard, "supportedInterfaces");
-    try showALookup(out, a2a.AgentCard, "supported_interfaces");
-    try showALookup(out, a2a.SecurityScheme, "apiKeySecurityScheme");
+    try showALookup(a2a.AgentCard, "supportedInterfaces", out);
+    try showALookup(a2a.AgentCard, "supported_interfaces", out);
+    try showALookup(a2a.SecurityScheme, "apiKeySecurityScheme", out);
+}
+
+fn roundTripA2aPages(out: *std.Io.Writer) !void {
+    try heading(out, "A2A: task and push-configuration pages in caller-owned storage");
+    const task_page =
+        "{\"tasks\":[{\"id\":\"task-1\",\"status\":{\"state\":\"TASK_STATE_COMPLETED\"}}]," ++
+        "\"nextPageToken\":\"\",\"pageSize\":1,\"totalSize\":1}";
+    var tasks: [1]a2a.Task = undefined;
+    var arena = a2a.ContentArena.init(&.{}, &.{}, &.{}, &.{}, &.{});
+    var scratch: [256]u8 = undefined;
+    var encoded: [512]u8 = undefined;
+    var base64: [4]u8 = undefined;
+    const page = try a2a.decodeListTasksResponse(task_page, &tasks, &arena, &scratch);
+    try out.print("  task={s} state={s} pageSize={d} totalSize={d} nextPageToken=\"{s}\"\n", .{
+        page.tasks[0].id,
+        page.tasks[0].status.state.wireName(),
+        page.page_size,
+        page.total_size,
+        page.next_page_token,
+    });
+    var writer = json.Writer.init(&encoded);
+    try a2a.encodeListTasksResponse(page, &writer, &base64);
+    try out.print("  encoded task page: {s}\n", .{writer.written()});
+
+    var configs: [1]a2a.TaskPushNotificationConfig = undefined;
+    const config_page = try a2a.decodeListTaskPushNotificationConfigsResponse(
+        "{\"configs\":[{\"url\":\"https://example.com/hook\"}],\"nextPageToken\":\"\"}",
+        &configs,
+        &scratch,
+    );
+    const config_list = config_page.configs orelse return error.MissingMember;
+    try out.print("  config URL={s} nextPageToken=\"{s}\"\n", .{
+        config_list[0].url,
+        config_page.next_page_token orelse return error.MissingMember,
+    });
+    writer = json.Writer.init(&encoded);
+    try a2a.encodeListTaskPushNotificationConfigsResponse(config_page, &writer);
+    try out.print("  encoded config page: {s}\n", .{writer.written()});
 }
 
 /// Print what `a2a.findField` makes of one member name.
@@ -333,7 +388,7 @@ fn showA2AFieldNames(out: *std.Io.Writer) !void {
 /// and a Zig name. A name no member carries is null rather than a guess, and
 /// that null is what lets a decoder reject a name a peer got wrong: the section
 /// passes the proto's own snake_case spelling of a field that does exist.
-fn showALookup(out: *std.Io.Writer, comptime T: type, comptime name: []const u8) !void {
+fn showALookup(comptime T: type, comptime name: []const u8, out: *std.Io.Writer) !void {
     if (a2a.findField(T, name)) |index| {
         try out.print("    findField({s}, \"{s}\") = {d}\n", .{ @typeName(T), name, index });
     } else {
@@ -429,7 +484,10 @@ fn showThatHostileInputIsAnError(out: *std.Io.Writer) !void {
     const wide_message = try jsonrpc.decode(
         \\{"jsonrpc":"2.0","id":9007199254740993,"method":"m"}
     , &wide);
-    try out.print("  id 9007199254740993 survives as i64 {d}\n", .{wide_message.id.?.integer});
+    try out.print(
+        "  id 9007199254740993 survives as i64 {d}\n",
+        .{(wide_message.id orelse return error.MissingMember).integer},
+    );
 
     // The scratch a decode needs is measured from the message, not guessed.
     // A string with no escape borrows the input and costs nothing, which is
@@ -444,6 +502,6 @@ fn showThatHostileInputIsAnError(out: *std.Io.Writer) !void {
     const escaped_message = try jsonrpc.decode(escaped, &sized);
     try out.print("  escaped method needs {d} scratch bytes, decoded '{s}'\n", .{
         sized.len,
-        escaped_message.method.?.text,
+        (escaped_message.method orelse return error.MissingMember).text,
     });
 }

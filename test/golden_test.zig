@@ -61,7 +61,10 @@
 //! | `acp_permission_outcome_selected.json` | `acp-v1-v2.md` 5b, the `selected` branch of `RequestPermissionOutcome` |
 //! | `acp_permission_outcome_cancelled.json` | `acp-v1-v2.md` 5b, the `cancelled` branch |
 //! | `acp_permission_request_v1.json` | `acp-v1-v2.md` 5a and 5c, the v1 required lists |
-//! | `jsonrpc_request.json`, `jsonrpc_notification.json` | `mcp-2026-07-28.md` section 1, the JSON-RPC message table. The `progressToken` the notification carries is the one member whose placement the sources answer differently; see the note at that test |
+//! | `jsonrpc_request.json`, `jsonrpc_notification.json` | `mcp-2026-07-28.md`
+//!   section 1, the JSON-RPC message table. The `progressToken` the
+//!   notification carries is the one member whose placement the sources answer
+//!   differently; see the note at that test |
 //! | `bridge_outcome_error.json` | `acp-v1-v2.md` 10d, `-32022` inside the outcome carrier |
 //! | `bridge_outcome_result.json` | `mcp-2026-07-28-schema.md` 4, the
 //!   `CallToolResult` declaration, whose required `content` is the member this
@@ -144,6 +147,7 @@ const widest_fixture = blk: {
 /// one. A helper that runs out reports the same `BufferTooSmall` the library
 /// does rather than aliasing a region that is still in use.
 const ScratchPool = struct {
+    // SAFETY: Each region is handed to one decoder call and never reused; reads are of slices decode wrote.
     buffers: [16][256]u8 = undefined,
     used: usize = 0,
 
@@ -166,7 +170,10 @@ fn rawMember(input: []const u8, key: []const u8, scratch: []u8) DecodeError!?[]c
     var reader = json.Reader.init(input);
     if (try reader.beginObject()) return null;
     while (try reader.nextKey(scratch)) |name| {
-        if (std.mem.eql(u8, name, key)) return try reader.rawValue(scratch);
+        if (std.mem.eql(u8, name, key)) {
+            const value = try reader.rawValue(scratch);
+            return value;
+        }
         try reader.skipValue(scratch);
     }
     if (!reader.atEnd()) return error.MalformedJson;
@@ -178,7 +185,10 @@ fn stringMember(input: []const u8, key: []const u8, scratch: []u8) DecodeError!?
     var reader = json.Reader.init(input);
     if (try reader.beginObject()) return null;
     while (try reader.nextKey(scratch)) |name| {
-        if (std.mem.eql(u8, name, key)) return try reader.string(scratch);
+        if (std.mem.eql(u8, name, key)) {
+            const value = try reader.string(scratch);
+            return value;
+        }
         try reader.skipValue(scratch);
     }
     if (!reader.atEnd()) return error.MalformedJson;
@@ -193,7 +203,10 @@ fn numberMember(input: []const u8, key: []const u8, scratch: []u8) DecodeError!?
     var reader = json.Reader.init(input);
     if (try reader.beginObject()) return null;
     while (try reader.nextKey(scratch)) |name| {
-        if (std.mem.eql(u8, name, key)) return try reader.number();
+        if (std.mem.eql(u8, name, key)) {
+            const value = try reader.number();
+            return value;
+        }
         try reader.skipValue(scratch);
     }
     if (!reader.atEnd()) return error.MalformedJson;
@@ -204,7 +217,10 @@ fn booleanMember(input: []const u8, key: []const u8, scratch: []u8) DecodeError!
     var reader = json.Reader.init(input);
     if (try reader.beginObject()) return null;
     while (try reader.nextKey(scratch)) |name| {
-        if (std.mem.eql(u8, name, key)) return try reader.boolean();
+        if (std.mem.eql(u8, name, key)) {
+            const value = try reader.boolean();
+            return value;
+        }
         try reader.skipValue(scratch);
     }
     if (!reader.atEnd()) return error.MalformedJson;
@@ -216,7 +232,8 @@ fn firstArrayElement(input: []const u8, scratch: []u8) DecodeError!?[]const u8 {
     var reader = json.Reader.init(input);
     if (try reader.beginArray()) return null;
     if (!try reader.nextArrayElement()) return null;
-    return try reader.rawValue(scratch);
+    const value = try reader.rawValue(scratch);
+    return value;
 }
 
 /// The first member of an object, key and raw value together.
@@ -295,7 +312,7 @@ test "every fixture is one JSON value, as a decoder of any of them would require
 // --- The mcp-over-acp worked example ------------------------------------------
 
 test "the RFD worked example decodes as a request carrying one envelope" {
-    var pool = ScratchPool{};
+    var pool: ScratchPool = .{};
 
     // The example is the only published document for this binding, so the test
     // pins the whole chain: the JSON-RPC hop, the envelope inside its params,
@@ -306,9 +323,10 @@ test "the RFD worked example decodes as a request carrying one envelope" {
     );
     try testing.expectEqual(jsonrpc.Kind.request, message.kind);
     try testing.expectEqual(@as(?i64, 20), integerId(message.id));
-    try testing.expectEqualStrings("mcp/message", message.method.?.text);
-    try testing.expectEqualStrings("mcp", message.method.?.category);
-    try testing.expectEqualStrings("message", message.method.?.action);
+    const method = message.method orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("mcp/message", method.text);
+    try testing.expectEqualStrings("mcp", method.category);
+    try testing.expectEqualStrings("message", method.action);
 
     const envelope = try bridge.decodeEnvelope(
         message.params.value,
@@ -323,7 +341,7 @@ test "the RFD worked example decodes as a request carrying one envelope" {
     // would carry without one.
     try testing.expect(envelope.direction == .agent_to_provider);
 
-    const inner = envelope.inner_params.?;
+    const inner = envelope.inner_params orelse return error.TestUnexpectedResult;
     const info = try mcp.lookupMethod(.current, envelope.inner_method);
     try testing.expectEqualStrings("tools/call", info.name);
     try testing.expect(info.direction == .client_to_server);
@@ -349,7 +367,7 @@ test "the RFD worked example decodes as a request carrying one envelope" {
     try canonical.slice("{\"serverId\":\"project-tools:7a72\",");
     try canonical.slice("\"requestId\":\"mcp-request:a11f\",");
     try canonical.slice("\"method\":\"tools/call\",\"params\":");
-    try canonical.slice(envelope.inner_params.?);
+    try canonical.slice(inner);
     try canonical.byte('}');
     try testing.expectEqualStrings(canonical.written(), writer.written());
     // And those bytes decode back to the same envelope, so what is pinned
@@ -358,7 +376,10 @@ test "the RFD worked example decodes as a request carrying one envelope" {
     try testing.expectEqualStrings(envelope.server_id, again.server_id);
     try testing.expectEqualStrings(envelope.request_id, again.request_id);
     try testing.expectEqualStrings(envelope.inner_method, again.inner_method);
-    try testing.expectEqualStrings(envelope.inner_params.?, again.inner_params.?);
+    try testing.expectEqualStrings(
+        envelope.inner_params orelse return error.TestUnexpectedResult,
+        again.inner_params orelse return error.TestUnexpectedResult,
+    );
 
     // The same envelope with the ACP envelope `_meta` the RFD names beside
     // `serverId`. The three members are the example's own spellings and the
@@ -368,11 +389,14 @@ test "the RFD worked example decodes as a request carrying one envelope" {
     try carrier.slice("{\"serverId\":\"project-tools:7a72\",");
     try carrier.slice("\"requestId\":\"mcp-request:a11f\",");
     try carrier.slice("\"method\":\"tools/call\",\"params\":");
-    try carrier.slice(envelope.inner_params.?);
+    try carrier.slice(inner);
     try carrier.slice(",\"_meta\":{\"trace\":\"abc\"}}");
     const carried = carrier.written();
     const carried_envelope = try bridge.decodeEnvelope(carried, try pool.next(), message.id);
-    try testing.expectEqualStrings("{\"trace\":\"abc\"}", carried_envelope.meta.?);
+    try testing.expectEqualStrings(
+        "{\"trace\":\"abc\"}",
+        carried_envelope.meta orelse return error.TestUnexpectedResult,
+    );
     var carried_writer = json.Writer.init(&out);
     try bridge.encodeEnvelope(carried_envelope, &carried_writer);
     try testing.expectEqualStrings(carried, carried_writer.written());
@@ -380,12 +404,13 @@ test "the RFD worked example decodes as a request carrying one envelope" {
     // The `_meta` the example carries names the one revision the binding
     // supports, so a version the library does not implement would show up here
     // rather than at the point of use.
-    const meta = (try rawMember(inner, "_meta", try pool.next())).?;
+    const meta = (try rawMember(inner, "_meta", try pool.next())) orelse
+        return error.TestUnexpectedResult;
     const revision = (try stringMember(
         meta,
         "io.modelcontextprotocol/protocolVersion",
         try pool.next(),
-    )).?;
+    )) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings(bridge.supported_revision, revision);
 
     // The inner `elicitation/create` in a request map would be the one method
@@ -397,12 +422,13 @@ test "the RFD worked example decodes as a request carrying one envelope" {
 // --- JSON-RPC shapes -----------------------------------------------------------
 
 test "a request and a notification classify apart, and a notification re-encodes without an id" {
-    var pool = ScratchPool{};
+    var pool: ScratchPool = .{};
 
     const request = try jsonrpc.decode(fixture.jsonrpc_request, try pool.next());
     try testing.expectEqual(jsonrpc.Kind.request, request.kind);
     try testing.expectEqual(@as(?i64, 1), integerId(request.id));
-    try testing.expectEqualStrings("tools/call", request.method.?.text);
+    const method = request.method orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("tools/call", method.text);
     // `params` is carried as borrowed text, so the value the reader hands back
     // is the fixture's own bytes: the specification's indentation and member
     // order, and none of the whitespace it skipped.
@@ -417,7 +443,9 @@ test "a request and a notification classify apart, and a notification re-encodes
     const notification = try jsonrpc.decode(fixture.jsonrpc_notification, try pool.next());
     try testing.expectEqual(jsonrpc.Kind.notification, notification.kind);
     try testing.expect(notification.id == null);
-    try testing.expectEqualStrings("notifications/progress", notification.method.?.text);
+    const notification_method = notification.method orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("notifications/progress", notification_method.text);
 
     // `params` is borrowed whole, so the notification's own document is read
     // here rather than carried past the test. `progressToken` is the one
@@ -443,15 +471,17 @@ test "a request and a notification classify apart, and a notification re-encodes
             notification.params.value,
             "progressToken",
             try pool.next(),
-        )).?,
+        )) orelse return error.TestUnexpectedResult,
     );
     try testing.expectEqualStrings(
         "0.5",
-        (try numberMember(notification.params.value, "progress", try pool.next())).?,
+        (try numberMember(notification.params.value, "progress", try pool.next())) orelse
+            return error.TestUnexpectedResult,
     );
     try testing.expectEqualStrings(
         "1",
-        (try numberMember(notification.params.value, "total", try pool.next())).?,
+        (try numberMember(notification.params.value, "total", try pool.next())) orelse
+            return error.TestUnexpectedResult,
     );
 
     // A notification omits the member that would make it a request, so the
@@ -462,7 +492,10 @@ test "a request and a notification classify apart, and a notification re-encodes
     try testing.expect(std.mem.find(u8, writer.written(), "\"id\"") == null);
     const again = try jsonrpc.decode(writer.written(), try pool.next());
     try testing.expectEqual(jsonrpc.Kind.notification, again.kind);
-    try testing.expectEqualStrings("notifications/progress", again.method.?.text);
+    try testing.expectEqualStrings(
+        "notifications/progress",
+        (again.method orelse return error.TestUnexpectedResult).text,
+    );
 }
 
 // --- MCP -----------------------------------------------------------------------
@@ -484,22 +517,31 @@ fn decodeMrtr(
 }
 
 test "an input_required result carries both members and every member it does not" {
-    var pool = ScratchPool{};
+    var pool: ScratchPool = .{};
     var store: [4]mcp.VerbatimMember = undefined;
 
     const result = try decodeMrtr(fixture.mcp_mrtr_result, &store, try pool.next());
-    try testing.expectEqualStrings("input_required", result.result_type.value.?);
+    try testing.expectEqualStrings(
+        "input_required",
+        result.result_type.value orelse return error.TestUnexpectedResult,
+    );
     try testing.expect(result.result_type.known() == .input_required);
     try testing.expect(!result.result_type.isComplete());
     // Opaque and attacker-controlled: the library carries it and never reads it.
-    try testing.expectEqualStrings("eyJzdWIiOiJ1MSJ9", result.request_state.?);
+    try testing.expectEqualStrings(
+        "eyJzdWIiOiJ1MSJ9",
+        result.request_state orelse return error.TestUnexpectedResult,
+    );
 
     // `inputRequests` is a map of server-assigned keys to the three request
     // types the revision allows, so the key and the inner method are what a
     // client acts on.
-    const entry = (try firstMember(result.input_requests.?, try pool.next())).?;
+    const input_requests = result.input_requests orelse return error.TestUnexpectedResult;
+    const entry = (try firstMember(input_requests, try pool.next())) orelse
+        return error.TestUnexpectedResult;
     try testing.expectEqualStrings("e1", entry.key);
-    const method = (try stringMember(entry.value, "method", try pool.next())).?;
+    const method = (try stringMember(entry.value, "method", try pool.next())) orelse
+        return error.TestUnexpectedResult;
     try testing.expectEqualStrings("elicitation/create", method);
     const info = try mcp.lookupInputRequest(method);
     try testing.expect(info.direction == .server_to_client_mrtr_only);
@@ -563,7 +605,7 @@ test "an input_required result carries both members and every member it does not
 }
 
 test "an input_required result carrying neither optional member is refused" {
-    var pool = ScratchPool{};
+    var pool: ScratchPool = .{};
     var store: [2]mcp.VerbatimMember = undefined;
 
     // The rule is the schema's own doc comment on the interface — "At least
@@ -580,7 +622,7 @@ test "an input_required result carrying neither optional member is refused" {
 }
 
 test "the capability objects walk to every member the schema names" {
-    var pool = ScratchPool{};
+    var pool: ScratchPool = .{};
 
     // The two capability objects are the one place the revision is spelled as
     // data rather than as prose, and the deprecated members are still in the
@@ -600,7 +642,8 @@ test "the capability objects walk to every member the schema names" {
 
     // `roots` is a presence object the shape spells with no member and no
     // whitespace inside it, so the borrowed value is exactly those two bytes.
-    const roots = (try rawMember(fixture.mcp_client_capabilities, "roots", try pool.next())).?;
+    const roots = (try rawMember(fixture.mcp_client_capabilities, "roots", try pool.next())) orelse
+        return error.TestUnexpectedResult;
     try testing.expectEqualStrings("{}", roots);
 
     // `experimental` is the member whose value does carry whitespace inside
@@ -612,7 +655,7 @@ test "the capability objects walk to every member the schema names" {
         fixture.mcp_client_capabilities,
         "experimental",
         try pool.next(),
-    )).?;
+    )) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("{ \"<key>\": { } }", experimental);
 
     var sampling_keys: [4][]const u8 = undefined;
@@ -620,7 +663,7 @@ test "the capability objects walk to every member the schema names" {
         fixture.mcp_client_capabilities,
         "sampling",
         try pool.next(),
-    )).?;
+    )) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(
         @as(usize, 2),
         try memberKeys(sampling, &sampling_keys, try pool.next()),
@@ -651,7 +694,7 @@ test "the capability objects walk to every member the schema names" {
         fixture.mcp_server_capabilities,
         "resources",
         try pool.next(),
-    )).?;
+    )) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(
         @as(?bool, true),
         try booleanMember(resources, "subscribe", try pool.next()),
@@ -663,19 +706,20 @@ test "the capability objects walk to every member the schema names" {
 }
 
 test "the per-request client capabilities ride in _meta under the reserved key" {
-    var pool = ScratchPool{};
+    var pool: ScratchPool = .{};
 
     // The compatibility matrix states the normative location: from
     // `2026-07-28` the client capabilities are `params._meta[...]` on every
     // request. This fixture is that `_meta` object, and the value under the
     // key is the extension fixture the specification publishes for the Apps
     // extension.
-    const meta = (try rawMember(fixture.mcp_client_capabilities_meta, "_meta", try pool.next())).?;
+    const meta = (try rawMember(fixture.mcp_client_capabilities_meta, "_meta", try pool.next())) orelse
+        return error.TestUnexpectedResult;
     const capabilities = (try rawMember(
         meta,
         mcp.meta_key.client_capabilities,
         try pool.next(),
-    )).?;
+    )) orelse return error.TestUnexpectedResult;
 
     // The key is inside the namespace MCP reserves for itself, and the
     // extension key inside the `extensions` map is an official identifier
@@ -686,16 +730,19 @@ test "the per-request client capabilities ride in _meta under the reserved key" 
     try testing.expect(!mcp.isReservedMetaPrefix("com.example.mcp/"));
     try testing.expect(!mcp.isReservedMetaPrefix("io.modelcontextprotocolX/"));
 
-    const extensions = (try rawMember(capabilities, "extensions", try pool.next())).?;
-    const entry = (try firstMember(extensions, try pool.next())).?;
+    const extensions = (try rawMember(capabilities, "extensions", try pool.next())) orelse
+        return error.TestUnexpectedResult;
+    const entry = (try firstMember(extensions, try pool.next())) orelse
+        return error.TestUnexpectedResult;
     try testing.expectEqualStrings(mcp.extension_id.ui, entry.key);
 
     // The extension carries its own settings, and `mimeTypes` is the one the
     // Apps extension publishes.
     const mime_text = (try firstArrayElement(
-        (try rawMember(entry.value, "mimeTypes", try pool.next())).?,
+        (try rawMember(entry.value, "mimeTypes", try pool.next())) orelse
+            return error.TestUnexpectedResult,
         try pool.next(),
-    )).?;
+    )) orelse return error.TestUnexpectedResult;
     var mime_reader = json.Reader.init(mime_text);
     try testing.expectEqualStrings(
         "text/html;profile=mcp-app",
@@ -707,7 +754,7 @@ test "the per-request client capabilities ride in _meta under the reserved key" 
 // --- ACP -----------------------------------------------------------------------
 
 test "a session/new request frames, decodes, and resolves in the v1 registry" {
-    var pool = ScratchPool{};
+    var pool: ScratchPool = .{};
 
     // Stdio frames use one raw newline as a delimiter. The fixture is a
     // single-line JSON message; trim its file-ending newline before framing.
@@ -721,39 +768,46 @@ test "a session/new request frames, decodes, and resolves in the v1 registry" {
     try testing.expectEqual(@as(usize, 0), frame.rest.len);
     const message = try jsonrpc.decode(frame.bytes, try pool.next());
     try testing.expectEqual(jsonrpc.Kind.request, message.kind);
-    try testing.expectEqualStrings("session/new", message.method.?.text);
+    const method = message.method orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("session/new", method.text);
 
-    const info = try acp.lookupMethod(.stable, message.method.?.text);
+    const info = try acp.lookupMethod(.stable, method.text);
     try testing.expectEqual(acp.Side.agent, info.side);
     try testing.expect(!info.notification);
     // Baseline in both versions, so it is callable without a capability.
     try testing.expectEqualStrings("", info.gate);
     try testing.expectEqualStrings(
         "",
-        (try acp.lookupMethod(.draft, message.method.?.text)).gate,
+        (try acp.lookupMethod(.draft, method.text)).gate,
     );
 
     const params = message.params.value;
-    const cwd = (try stringMember(params, "cwd", try pool.next())).?;
+    const cwd = (try stringMember(params, "cwd", try pool.next())) orelse
+        return error.TestUnexpectedResult;
     try testing.expect(acp.isAbsolutePath(cwd));
     try testing.expectEqualStrings("/home/user/project", cwd);
 
     // The `{"type": "acp", ...}` server declaration, verbatim from the RFD.
     // The published v2 schema has no `acp` branch, so the library carries the
     // three values the draft names rather than modelling the union.
-    const servers = (try rawMember(params, "mcpServers", try pool.next())).?;
-    const server = (try firstArrayElement(servers, try pool.next())).?;
+    const servers = (try rawMember(params, "mcpServers", try pool.next())) orelse
+        return error.TestUnexpectedResult;
+    const server = (try firstArrayElement(servers, try pool.next())) orelse
+        return error.TestUnexpectedResult;
     try testing.expectEqualStrings(
         bridge.server_declaration.kind,
-        (try stringMember(server, "type", try pool.next())).?,
+        (try stringMember(server, "type", try pool.next())) orelse
+            return error.TestUnexpectedResult,
     );
     try testing.expectEqualStrings(
         bridge.server_declaration.name,
-        (try stringMember(server, "name", try pool.next())).?,
+        (try stringMember(server, "name", try pool.next())) orelse
+            return error.TestUnexpectedResult,
     );
     try testing.expectEqualStrings(
         bridge.server_declaration.server_id,
-        (try stringMember(server, "serverId", try pool.next())).?,
+        (try stringMember(server, "serverId", try pool.next())) orelse
+            return error.TestUnexpectedResult,
     );
 
     // `session/load` exists at v1 and is removed at v2, so the registry answer
@@ -766,7 +820,7 @@ test "a session/new request frames, decodes, and resolves in the v1 registry" {
 }
 
 test "a permission outcome names an option or cancels, and nothing else is approval" {
-    var pool = ScratchPool{};
+    var pool: ScratchPool = .{};
 
     const selected = try acp.decodePermissionOutcome(
         fixture.acp_permission_outcome_selected,
@@ -806,7 +860,7 @@ test "a permission outcome names an option or cancels, and nothing else is appro
 }
 
 test "the v1 permission request decodes to the choices the user is offered" {
-    var pool = ScratchPool{};
+    var pool: ScratchPool = .{};
     var options: [8]acp.PermissionOption = undefined;
 
     const decoded = try acp.decodePermissionRequest(
@@ -826,29 +880,48 @@ test "the v1 permission request decodes to the choices the user is offered" {
     // option the fixture offers.
     try testing.expectEqualStrings("opt-allow-once", request.options[0].option_id);
     try testing.expectEqualStrings("Allow once", request.options[0].name);
-    try testing.expectEqual(acp.PermissionOptionKind.allow_once, knownKind(request.options[0]).?);
+    try testing.expectEqual(
+        acp.PermissionOptionKind.allow_once,
+        knownKind(request.options[0]) orelse return error.TestUnexpectedResult,
+    );
     try testing.expectEqualStrings("opt-allow-always", request.options[1].option_id);
     try testing.expectEqualStrings("Always allow", request.options[1].name);
-    try testing.expectEqual(acp.PermissionOptionKind.allow_always, knownKind(request.options[1]).?);
+    try testing.expectEqual(
+        acp.PermissionOptionKind.allow_always,
+        knownKind(request.options[1]) orelse return error.TestUnexpectedResult,
+    );
     try testing.expectEqualStrings("opt-reject-once", request.options[2].option_id);
     try testing.expectEqualStrings("Reject", request.options[2].name);
-    try testing.expectEqual(acp.PermissionOptionKind.reject_once, knownKind(request.options[2]).?);
+    try testing.expectEqual(
+        acp.PermissionOptionKind.reject_once,
+        knownKind(request.options[2]) orelse return error.TestUnexpectedResult,
+    );
 
     // v1 is a closed `oneOf` of the kinds the schema names, so every option
     // here decodes to a known kind and `grants` answers for each one instead
     // of reporting a kind this library does not know.
-    try testing.expectEqual(true, request.options[0].grants().?);
-    try testing.expectEqual(true, request.options[1].grants().?);
-    try testing.expectEqual(false, request.options[2].grants().?);
+    try testing.expectEqual(
+        true,
+        request.options[0].grants() orelse return error.TestUnexpectedResult,
+    );
+    try testing.expectEqual(
+        true,
+        request.options[1].grants() orelse return error.TestUnexpectedResult,
+    );
+    try testing.expectEqual(
+        false,
+        request.options[2].grants() orelse return error.TestUnexpectedResult,
+    );
 
     // The `ToolCallUpdate` is carried verbatim, so the identifier the agent
     // assigned is still readable in the decoded value.
-    const call_id = (try stringMember(request.tool_call, "toolCallId", try pool.next())).?;
+    const call_id = (try stringMember(request.tool_call, "toolCallId", try pool.next())) orelse
+        return error.TestUnexpectedResult;
     try testing.expectEqualStrings("call-1", call_id);
 }
 
 test "the RFD acp capability decodes as a boolean at v1 and a presence object at v2" {
-    var pool = ScratchPool{};
+    var pool: ScratchPool = .{};
     var v1_entries: [8]acp.Capability = undefined;
     var v1_paths: [128]u8 = undefined;
     var v2_entries: [8]acp.Capability = undefined;
@@ -869,7 +942,10 @@ test "the RFD acp capability decodes as a boolean at v1 and a presence object at
     const v1_acp = findCapability(v1.entries, bridge.capability_path.v1) orelse
         return error.TestUnexpectedResult;
     try testing.expectEqual(acp.CapabilityForm.boolean, v1_acp.form);
-    try testing.expectEqual(true, v1_acp.value.?);
+    try testing.expectEqual(
+        true,
+        v1_acp.value orelse return error.TestUnexpectedResult,
+    );
     try testing.expect(v1_acp.advertised());
 
     // v2 replaced every boolean with a presence object, so the same capability
@@ -896,7 +972,7 @@ test "the RFD acp capability decodes as a boolean at v1 and a presence object at
 // --- mcp-over-acp outcomes -----------------------------------------------------
 
 test "a version mismatch inside the outcome carrier is not a binding failure" {
-    var pool = ScratchPool{};
+    var pool: ScratchPool = .{};
 
     const failure = try bridge.decodeOutcome(fixture.bridge_outcome_error, try pool.next());
     const error_text = switch (failure) {
@@ -907,11 +983,13 @@ test "a version mismatch inside the outcome carrier is not a binding failure" {
     // inside the carrier rather than on the outer ACP message.
     try testing.expectEqualStrings(
         "-32022",
-        (try numberMember(error_text, "code", try pool.next())).?,
+        (try numberMember(error_text, "code", try pool.next())) orelse
+            return error.TestUnexpectedResult,
     );
     try testing.expectEqualStrings(
         "Unsupported protocol version",
-        (try stringMember(error_text, "message", try pool.next())).?,
+        (try stringMember(error_text, "message", try pool.next())) orelse
+            return error.TestUnexpectedResult,
     );
     // It is an MCP error the caller reports, not a transport failure it
     // retries, at either level.
@@ -940,22 +1018,29 @@ test "a version mismatch inside the outcome carrier is not a binding failure" {
     // The inner outcome is an ordinary MCP result, so the MCP decoder runs on
     // the bytes the binding carried through.
     const result_type = try mcp.decodeResultType(result_text, try pool.next());
-    try testing.expectEqualStrings("complete", result_type.value.?);
+    try testing.expectEqualStrings(
+        "complete",
+        result_type.value orelse return error.TestUnexpectedResult,
+    );
     try testing.expect(result_type.isComplete());
 
     // `content` is the member this fixture was selected for — it is what makes
     // a `CallToolResult` that document rather than any other result — and the
     // provenance row above names the declaration it is copied from, so it is
     // read here rather than carried through the carrier unread.
-    const content = (try rawMember(result_text, "content", try pool.next())).?;
-    const block = (try firstArrayElement(content, try pool.next())).?;
+    const content = (try rawMember(result_text, "content", try pool.next())) orelse
+        return error.TestUnexpectedResult;
+    const block = (try firstArrayElement(content, try pool.next())) orelse
+        return error.TestUnexpectedResult;
     try testing.expectEqualStrings(
         "text",
-        (try stringMember(block, "type", try pool.next())).?,
+        (try stringMember(block, "type", try pool.next())) orelse
+            return error.TestUnexpectedResult,
     );
     try testing.expectEqualStrings(
         "hello",
-        (try stringMember(block, "text", try pool.next())).?,
+        (try stringMember(block, "text", try pool.next())) orelse
+            return error.TestUnexpectedResult,
     );
 
     // The encoder, over the same normative outcome, and byte for byte. Neither
@@ -990,7 +1075,7 @@ test "a version mismatch inside the outcome carrier is not a binding failure" {
     const result_arm = try bridge.decodeOutcome(carried_result, try pool.next());
     try testing.expectEqualStrings(
         "{\"trace\":\"t\",\"vendor\":[1]}",
-        result_arm.result.meta.?,
+        result_arm.result.meta orelse return error.TestUnexpectedResult,
     );
     var carried = json.Writer.init(&out);
     try bridge.encodeOutcome(result_arm, &carried);
@@ -1004,7 +1089,10 @@ test "a version mismatch inside the outcome carrier is not a binding failure" {
     try error_carrier.slice(",\"_meta\":{\"trace\":\"t\"}}");
     const carried_error = error_carrier.written();
     const error_arm = try bridge.decodeOutcome(carried_error, try pool.next());
-    try testing.expectEqualStrings("{\"trace\":\"t\"}", error_arm.@"error".meta.?);
+    try testing.expectEqualStrings(
+        "{\"trace\":\"t\"}",
+        error_arm.@"error".meta orelse return error.TestUnexpectedResult,
+    );
     var carried_error_writer = json.Writer.init(&out);
     try bridge.encodeOutcome(error_arm, &carried_error_writer);
     try testing.expectEqualStrings(carried_error, carried_error_writer.written());
@@ -1013,20 +1101,21 @@ test "a version mismatch inside the outcome carrier is not a binding failure" {
 // --- A2A -----------------------------------------------------------------------
 
 test "the A2A JSON-RPC error envelope maps to the error its ErrorInfo names" {
-    var pool = ScratchPool{};
+    var pool: ScratchPool = .{};
 
     const message = try jsonrpc.decode(fixture.a2a_jsonrpc_error, try pool.next());
     try testing.expectEqual(jsonrpc.Kind.response, message.kind);
     try testing.expectEqual(@as(?i64, 2), integerId(message.id));
     try testing.expect(message.result == null);
 
-    const object = message.rpc_error.?;
+    const object = message.rpc_error orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(i32, -32001), object.code);
     try testing.expectEqualStrings("Task not found", object.message);
     // The `data` member rides along, and it is what distinguishes this error
     // from the standard JSON-RPC codes: six of the nine A2A errors collapse
     // onto one status pair, so the code alone cannot name the cause.
-    try testing.expect(std.mem.startsWith(u8, object.data.?, "["));
+    const data = object.data orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.startsWith(u8, data, "["));
 
     const known = a2a.A2aError.fromCode(object.code) orelse
         return error.TestUnexpectedResult;
@@ -1050,9 +1139,12 @@ test "the A2A JSON-RPC error envelope maps to the error its ErrorInfo names" {
 
     // The ErrorInfo inside `data` is what a decoder keys on, and it agrees with
     // the code the envelope carries.
-    const detail = (try firstArrayElement(object.data.?, try pool.next())).?;
-    const reason = (try stringMember(detail, "reason", try pool.next())).?;
-    const domain = (try stringMember(detail, "domain", try pool.next())).?;
+    const detail = (try firstArrayElement(data, try pool.next())) orelse
+        return error.TestUnexpectedResult;
+    const reason = (try stringMember(detail, "reason", try pool.next())) orelse
+        return error.TestUnexpectedResult;
+    const domain = (try stringMember(detail, "domain", try pool.next())) orelse
+        return error.TestUnexpectedResult;
     // The domain is a bare domain string, not a URI prefix, and it is the gate
     // on the reason lookup: the same reason under another domain is not an A2A
     // error at all.
@@ -1067,7 +1159,7 @@ test "the A2A JSON-RPC error envelope maps to the error its ErrorInfo names" {
 }
 
 test "the REST error envelope is not a JSON-RPC message and its status is not the discriminator" {
-    var pool = ScratchPool{};
+    var pool: ScratchPool = .{};
 
     // The HTTP+JSON/REST binding has no `jsonrpc` member, so this document is
     // not a JSON-RPC response and reading it as one would invent an `id`.
@@ -1076,14 +1168,17 @@ test "the REST error envelope is not a JSON-RPC message and its status is not th
         jsonrpc.decode(fixture.a2a_rest_error, try pool.next()),
     );
 
-    const error_object = (try rawMember(fixture.a2a_rest_error, "error", try pool.next())).?;
+    const error_object = (try rawMember(fixture.a2a_rest_error, "error", try pool.next())) orelse
+        return error.TestUnexpectedResult;
     try testing.expectEqualStrings(
         "404",
-        (try numberMember(error_object, "code", try pool.next())).?,
+        (try numberMember(error_object, "code", try pool.next())) orelse
+            return error.TestUnexpectedResult,
     );
     try testing.expectEqualStrings(
         "NOT_FOUND",
-        (try stringMember(error_object, "status", try pool.next())).?,
+        (try stringMember(error_object, "status", try pool.next())) orelse
+            return error.TestUnexpectedResult,
     );
 
     // Six of the nine A2A errors collapse onto `FAILED_PRECONDITION` and
@@ -1091,11 +1186,14 @@ test "the REST error envelope is not a JSON-RPC message and its status is not th
     // is the only discriminator, which is why the specification requires the
     // ErrorInfo object in `details`.
     const detail = (try firstArrayElement(
-        (try rawMember(error_object, "details", try pool.next())).?,
+        (try rawMember(error_object, "details", try pool.next())) orelse
+            return error.TestUnexpectedResult,
         try pool.next(),
-    )).?;
-    const reason = (try stringMember(detail, "reason", try pool.next())).?;
-    const domain = (try stringMember(detail, "domain", try pool.next())).?;
+    )) orelse return error.TestUnexpectedResult;
+    const reason = (try stringMember(detail, "reason", try pool.next())) orelse
+        return error.TestUnexpectedResult;
+    const domain = (try stringMember(detail, "domain", try pool.next())) orelse
+        return error.TestUnexpectedResult;
     const classified: a2a.A2aError = switch (a2a.classifyReason(domain, reason)) {
         .known => |value| value,
         .unknown_a2a, .missing_domain, .other_domain => return error.TestUnexpectedResult,
@@ -1107,18 +1205,18 @@ test "the REST error envelope is not a JSON-RPC message and its status is not th
 }
 
 test "the AgentCard signature shape decodes, and its protected header is the one the extraction names" {
-    var pool = ScratchPool{};
+    var pool: ScratchPool = .{};
 
     const protected = (try stringMember(
         fixture.a2a_agent_card_signature,
         "protected",
         try pool.next(),
-    )).?;
+    )) orelse return error.TestUnexpectedResult;
     const signature = (try stringMember(
         fixture.a2a_agent_card_signature,
         "signature",
         try pool.next(),
-    )).?;
+    )) orelse return error.TestUnexpectedResult;
 
     // §8.4.2 spells the signing input with `BASE64URL`, so both members are
     // base64url without padding. A standard-alphabet decoder that accepted the
@@ -1158,7 +1256,7 @@ test "the AgentCard signature shape decodes, and its protected header is the one
 }
 
 test "the AgentCard signature fixture decodes through the codec and re-encodes to its canonical form" {
-    var pool = ScratchPool{};
+    var pool: ScratchPool = .{};
 
     // The fixture is pretty-printed, so it is not the bytes the encoder writes.
     // The two differ in whitespace and in nothing else, which is the whole of
