@@ -1,5 +1,5 @@
 {
-  "schema": "zig-agent-proto/interop-sdk-pins/1",
+  "schema": "zig-agent-protocols/interop-sdk-pins/1",
   "purpose": "Every version, byte and API fact an interoperability peer depends on, with the primary source each one came from. The peer scripts read this file and refuse to run against an environment that does not match it, so a pin that silently drifts is a failed run rather than a claim nobody checked.",
   "compiled": "2026-10-03",
   "declarative_only": "No pip, no uv, no system installation. Everything below is realised by devenv.nix against the nixpkgs revision devenv.lock already pins. test/interop/*.py are development tooling and are never imported by the library, which keeps its zero-dependency guarantee.",
@@ -532,20 +532,20 @@
       "mcp": {
         "file": "src/mcp_interop.zig",
         "role": "MCP 2025-11-25 client over process stdio, using conn.Conn, stdio.Stdio and mcp_session.Client at Revision.previous",
-        "build": "zig build interop-mcp installs zig-agent-proto-mcp-interop; the step builds only, and the independent peer drives the exchange",
+        "build": "zig build interop-mcp installs zig-agent-protocols-mcp-interop; the step builds only, and the independent peer drives the exchange",
         "flags": ["--slow-entered-file <path>", "--report-file <path>", "--cancel-timeout-ms <n>"],
         "why_the_flag_exists": "the canceller task waits for the file the peer writes when its slow tool starts, so the cancellation cannot race the request; --cancel-timeout-ms bounds that marker wait"
       },
       "mcp-current": {
         "file": "src/mcp_current_interop.zig",
         "role": "MCP 2026-07-28 stdio client through conn.Conn, stdio.Stdio and mcp_session.Client at Revision.current",
-        "build": "zig build interop-mcp-current installs zig-agent-proto-mcp-current-interop; the step builds only",
+        "build": "zig build interop-mcp-current installs zig-agent-protocols-mcp-current-interop; the step builds only",
         "scope": "server/discover; cacheable tools/list; successful tool result; tool failure distinct from JSON-RPC error; input-required outcome and opaque-state retry under a new id; removed methods refused before writing"
       },
       "acp": {
         "file": "src/acp_interop.zig",
         "role": "ACP stdio client through acp_session.Client, with stable wire 1 by default and experimental wire 2 only when explicitly requested",
-        "build": "zig build interop-acp installs zig-agent-proto-acp-interop; the step builds only",
+        "build": "zig build interop-acp installs zig-agent-protocols-acp-interop; the step builds only",
         "scope": "initialize, session/new, session/prompt, agent session/update and a permission offer containing a granting option that the client cancels; no consent is emitted",
         "not_claimed": "The SDK's unstable mcp/message extension differs from the RFD binding. Neither wire version establishes MCP-over-ACP interoperability."
       },
@@ -553,7 +553,7 @@
         "file": "src/a2a_interop.zig",
         "role": "A2A 1.0 unary JSON-RPC over std.http, through the public a2a_http module. The client role discovers the agent card, binds the first advertised JSONRPC 1.0 interface, checks it against the endpoint it was told to expect and sends two typed SendMessage calls, one answered as a Task and one as a Message. The server role serves the card at the well-known path and answers one typed SendMessage per request, in whichever arm of the result oneof the request's text asked for.",
         "scope": "unary SendMessage only, in both roles. Nothing here claims REST, gRPC, SSE or streaming, push notification configuration, a remote task store or authentication, and the participant serves and calls no other shape than the one it claims.",
-        "build": "zig build interop-a2a installs zig-agent-proto-a2a-interop; the step builds only, and the independent peer drives the exchange",
+        "build": "zig build interop-a2a installs zig-agent-protocols-a2a-interop; the step builds only, and the independent peer drives the exchange",
         "roles": {
           "client": ["--role client", "--base-url <origin>", "--expect-endpoint <target>", "--report-file <path>"],
           "server": ["--role server", "--port <n>", "--advertise-port <n>", "--rpc-target <target>", "--requests <n>", "--report-file <path>"]

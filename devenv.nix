@@ -527,9 +527,9 @@ let
     in if u != "" then u else builtins.getEnv "LOGNAME";
   scratchCandidates =
     if scratchUser == "" then
-      throw "zig-agent-proto: USER and LOGNAME are both unset, so this environment cannot name its per-account scratch directory; export USER before evaluating."
+      throw "zig-agent-protocols: USER and LOGNAME are both unset, so this environment cannot name its per-account scratch directory; export USER before evaluating."
     else
-      builtins.map (mount: "${mount}/${scratchUser}/zig-agent-proto") scratchMounts;
+      builtins.map (mount: "${mount}/${scratchUser}/zig-agent-protocols") scratchMounts;
 
   # Downloaded toolchains are shared; build caches are not. The shim unpacks
   # each toolchain into `<zigGlobal>/p/<hash>` and records that hash under
@@ -549,7 +549,7 @@ let
     let present = builtins.filter builtins.pathExists scratchCandidates;
     in
     if present == [ ] then
-      throw "zig-agent-proto: no approved scratch mount is present, so this environment has nowhere to put its caches, its temporary directory or an interoperability capture; expected one of ${builtins.concatStringsSep ", " scratchCandidates}. See README.md."
+      throw "zig-agent-protocols: no approved scratch mount is present, so this environment has nowhere to put its caches, its temporary directory or an interoperability capture; expected one of ${builtins.concatStringsSep ", " scratchCandidates}. See README.md."
     else
       builtins.head present;
 
@@ -1005,7 +1005,7 @@ in
 
     # The peers read their pin file from this path, so a run cannot silently
     # pick up a different record than the one the pins were written against.
-    ZIG_AGENT_PROTO_SDK_PINS = "test/interop/sdk-pins.json";
+    ZIG_AGENT_PROTOCOLS_SDK_PINS = "test/interop/sdk-pins.json";
 
     # The house gate finds the project's Zig sources with `find`, and
     # `GATE_EXCLUDE` REPLACES the gate's built-in default list rather than
@@ -1069,7 +1069,7 @@ in
     for _zap_path in ${builtins.concatStringsSep " " (builtins.attrValues scratch)}; do
       if [ -e "$_zap_path" ] || [ -L "$_zap_path" ]; then
         if [ ! -d "$_zap_path" ] || [ -L "$_zap_path" ] || [ ! -O "$_zap_path" ]; then
-          echo "zig-agent-proto: refusing $_zap_path: not a directory this account owns." >&2
+          echo "zig-agent-protocols: refusing $_zap_path: not a directory this account owns." >&2
           exit 1
         fi
       fi
@@ -1100,7 +1100,7 @@ in
       done
     fi
     if [ -L "$_zap_p" ] && [ ! -d "$_zap_p" ]; then
-      echo "zig-agent-proto: $_zap_p is a link to nothing ($(readlink -- "$_zap_p"))." >&2
+      echo "zig-agent-protocols: $_zap_p is a link to nothing ($(readlink -- "$_zap_p"))." >&2
       echo "  The shim looks for every toolchain through that path, so nothing" >&2
       echo "  resolves until the link is gone, and this file will not remove it" >&2
       echo "  for you. Inspect it, then:" >&2
@@ -1129,19 +1129,19 @@ in
     _zap_root="''${DEVENV_ROOT:-$PWD}"
     _zap_pin=$(sed -n 's/.*\.minimum_zig_version = "\(.*\)".*/\1/p' "$_zap_root/build.zig.zon")
     if [ -z "$_zap_pin" ]; then
-      echo "zig-agent-proto: $_zap_root/build.zig.zon names no .minimum_zig_version," >&2
+      echo "zig-agent-protocols: $_zap_root/build.zig.zon names no .minimum_zig_version," >&2
       echo "  so there is no pinned toolchain to resolve and no answer to check one against." >&2
       exit 1
     fi
     if ! _zap_version=$(zig version); then
-      echo "zig-agent-proto: zig is $(command -v zig) and it could not resolve $_zap_pin." >&2
+      echo "zig-agent-protocols: zig is $(command -v zig) and it could not resolve $_zap_pin." >&2
       echo "  The shim reads the pin from build.zig.zon and unpacks the toolchain into" >&2
       echo "  $ZIG_GLOBAL_CACHE_DIR/p, and it exits without a message when that download" >&2
       echo "  fails. That silence is what this message replaces; see README.md." >&2
       exit 1
     fi
     if [ "$_zap_version" != "$_zap_pin" ]; then
-      echo "zig-agent-proto: zig $_zap_version is not the pinned $_zap_pin." >&2
+      echo "zig-agent-protocols: zig $_zap_version is not the pinned $_zap_pin." >&2
       echo "  $(command -v zig) is the shim, which takes its version from the manifest;" >&2
       echo "  something ahead of it on PATH is answering instead." >&2
       exit 1
@@ -1156,7 +1156,7 @@ in
     _zap_env=$(zig env) || exit 1
     _zap_exe=$(printf '%s\n' "$_zap_env" | sed -n 's/.*\.zig_exe = "\([^"\\]*\)".*/\1/p')
     if [ -z "$_zap_exe" ] || [ ! -x "$_zap_exe" ]; then
-      echo "zig-agent-proto: 'zig env' named no runnable .zig_exe for $_zap_pin." >&2
+      echo "zig-agent-protocols: 'zig env' named no runnable .zig_exe for $_zap_pin." >&2
       echo "  '$_zap_exe'" >&2
       exit 1
     fi
@@ -1349,7 +1349,7 @@ in
       set -eu
       exec ${interopPython}/bin/python3 test/interop/mcp_peer.py \
         --role supervise \
-        --zig-binary "''${ZIG_AGENT_PROTO_MCP_INTEROP:-zig-out/bin/zig-agent-proto-mcp-interop}" \
+        --zig-binary "''${ZIG_AGENT_PROTOCOLS_MCP_INTEROP:-zig-out/bin/zig-agent-protocols-mcp-interop}" \
         "$@"
     '';
   };
@@ -1360,7 +1360,7 @@ in
       set -eu
       exec ${interopPython}/bin/python3 test/interop/a2a_peer.py \
         --role zig-interop \
-        --zig-binary "''${ZIG_AGENT_PROTO_A2A_INTEROP:-zig-out/bin/zig-agent-proto-a2a-interop}" \
+        --zig-binary "''${ZIG_AGENT_PROTOCOLS_A2A_INTEROP:-zig-out/bin/zig-agent-protocols-a2a-interop}" \
         "$@"
     '';
   };
@@ -1377,7 +1377,7 @@ in
       set -eu
       exec ${acpPython}/bin/python3 test/interop/acp_peer.py \
         --role supervise \
-        --zig-binary "''${ZIG_AGENT_PROTO_ACP_INTEROP:-zig-out/bin/zig-agent-proto-acp-interop}" \
+        --zig-binary "''${ZIG_AGENT_PROTOCOLS_ACP_INTEROP:-zig-out/bin/zig-agent-protocols-acp-interop}" \
         "$@"
     '';
   };
@@ -1393,7 +1393,7 @@ in
       set -eu
       exec ${mcpCurrentPython}/bin/python3 test/interop/mcp_current_peer.py \
         --role supervise \
-        --zig-binary "''${ZIG_AGENT_PROTO_MCP_CURRENT_INTEROP:-zig-out/bin/zig-agent-proto-mcp-current-interop}" \
+        --zig-binary "''${ZIG_AGENT_PROTOCOLS_MCP_CURRENT_INTEROP:-zig-out/bin/zig-agent-protocols-mcp-current-interop}" \
         "$@"
     '';
   };

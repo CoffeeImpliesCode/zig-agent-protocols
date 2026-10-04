@@ -40,7 +40,7 @@
 //! exchange finished rather than that the test waited long enough to look.
 
 const std = @import("std");
-const proto = @import("zig-agent-proto");
+const proto = @import("zig-agent-protocols");
 
 /// The socket-name helper, development-only and not part of the library's
 /// public API. This file is rooted in `test/`, so it reaches `src/testio.zig`

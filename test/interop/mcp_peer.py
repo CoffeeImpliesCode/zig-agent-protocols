@@ -123,7 +123,7 @@ REVISION = "2025-11-25"
 
 # A fixed marker, not a path or a hostname: the capture is kept as evidence, so
 # it must not carry anything about the machine that produced it.
-MARKER = "zig-agent-proto-interop"
+MARKER = "zig-agent-protocols-interop"
 
 # Two codes the checks below compare against, both pinned in sdk-pins.json
 # against the mcp 1.29.0 source with line numbers:
@@ -157,7 +157,7 @@ def load_pins(path: Path) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise InteropFailure(f"pin file is not JSON: {path}: {exc}") from exc
     require(
-        pins.get("schema") == "zig-agent-proto/interop-sdk-pins/1",
+        pins.get("schema") == "zig-agent-protocols/interop-sdk-pins/1",
         f"pin file schema is {pins.get('schema')!r}, not the one this peer was written against",
     )
     return pins
@@ -521,7 +521,7 @@ def run_serve(args: argparse.Namespace) -> int:
         f"{MARKER}-peer",
         version=record["version"],
         instructions=(
-            "Interoperability peer for zig-agent-proto. Every tool name, argument and "
+            "Interoperability peer for zig-agent-protocols. Every tool name, argument and "
             "result is fixed so a capture can be compared against a later run."
         ),
     )
@@ -1408,8 +1408,8 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--role", choices=("supervise", "serve"), required=True)
     parser.add_argument("--pins", type=Path,
-                        default=Path(os.environ.get("ZIG_AGENT_PROTO_SDK_PINS", DEFAULT_PINS)))
-    parser.add_argument("--zig-binary", default="zig-out/bin/zig-agent-proto-mcp-interop",
+                        default=Path(os.environ.get("ZIG_AGENT_PROTOCOLS_SDK_PINS", DEFAULT_PINS)))
+    parser.add_argument("--zig-binary", default="zig-out/bin/zig-agent-protocols-mcp-interop",
                         help="the Zig MCP client executable; supervise only")
     parser.add_argument("--work-dir", default=None,
                         help="an absolute path outside /tmp and /var/tmp, owned by this account "

@@ -613,7 +613,7 @@ BUILD_FILE = '''const std = @import("std");
 pub fn build(b: *std.Build) void {
     // A module minted by a build step has no source path of its own, so it
     // reads as unwired however the prose around it describes it.
-    const lib_mod = b.addModule("zig-agent-proto", .{
+    const lib_mod = b.addModule("zig-agent-protocols", .{
         .root_source_file = b.path("src/root.zig"),
         .imports = &.{.{ .name = "testio", .module = testio_mod }},
     });
@@ -622,7 +622,7 @@ pub fn build(b: *std.Build) void {
 
 CONSUMER = (
     'const std = @import("std");\n'
-    'const agent = @import("zig-agent-proto");\n'
+    'const agent = @import("zig-agent-protocols");\n'
     'const options = @import("build_options");\n'
 )
 

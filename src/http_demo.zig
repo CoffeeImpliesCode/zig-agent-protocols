@@ -34,7 +34,7 @@
 //! Run it with `zig build run-http`.
 
 const std = @import("std");
-const proto = @import("zig-agent-proto");
+const proto = @import("zig-agent-protocols");
 
 const conn = proto.conn;
 const http = proto.http;
@@ -719,7 +719,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    try out.print("zig-agent-proto streamable http example\n\n", .{});
+    try out.print("zig-agent-protocols streamable http example\n\n", .{});
     try out.print("  mcp       {s}\n", .{mcp.latest_protocol_version});
     try out.print("  transport Streamable HTTP, the second of the two\n", .{});
 

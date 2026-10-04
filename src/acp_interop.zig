@@ -91,7 +91,7 @@
 //! show the evidence for, so a failure in it is this process's exit status.
 
 const std = @import("std");
-const proto = @import("zig-agent-proto");
+const proto = @import("zig-agent-protocols");
 
 const acp = proto.acp;
 const acp_session = proto.acp_session;
@@ -115,7 +115,7 @@ const default_requested_version: u16 = 1;
 /// What this participant calls itself in the handshake. A fixed name and
 /// version, so a capture taken from two runs is comparable to another and
 /// carries nothing about the machine that produced it.
-const client_name = "zig-agent-proto-acp-interop";
+const client_name = "zig-agent-protocols-acp-interop";
 const client_version = "0.0.0";
 
 /// The workspace root `session/new` names, and one line because a newline
@@ -125,12 +125,12 @@ const client_version = "0.0.0";
 /// Nothing touches it. The peer agent records it and answers; a workspace root
 /// on the wire is a value the agent is told about, and fixing it is what lets
 /// two captures be compared. It is absolute, which v2 requires and v1 names.
-const session_cwd = "/zig-agent-proto-acp-interop";
+const session_cwd = "/zig-agent-protocols-acp-interop";
 
 /// The text that goes out in `session/prompt` and has to come back in the
 /// agent's `session/update`. One value on both sides of the exchange, so the
 /// comparison is a comparison rather than two literals that happen to agree.
-const prompt_text = "zig-agent-proto";
+const prompt_text = "zig-agent-protocols";
 
 /// The `clientInfo` object, built at comptime from the values above.
 const client_info = std.fmt.comptimePrint(
@@ -1180,7 +1180,7 @@ fn failLocked(report: *Report, message: *[failure_capacity]u8, text: []const u8)
 }
 
 fn printSummary(err: *Io.Writer, version: acp.WireVersion, report: *const Report) Io.Writer.Error!void {
-    try err.print("zig-agent-proto acp interop client (wire {d})\n", .{version.number()});
+    try err.print("zig-agent-protocols acp interop client (wire {d})\n", .{version.number()});
     if (report.failure.len != 0) {
         try err.print("  FAILED: {s}\n", .{report.failure});
         return;
@@ -1317,7 +1317,7 @@ fn boolean(text: *json.Writer, value: bool) !void {
 }
 
 const usage =
-    "usage: zig-agent-proto-acp-interop [--protocol-version <1|2>] [--report-file <path>]\n" ++
+    "usage: zig-agent-protocols-acp-interop [--protocol-version <1|2>] [--report-file <path>]\n" ++
     "\n" ++
     "  --protocol-version <n>  the ACP wire version to ask for in initialize.\n" ++
     "                          1 is the stable version and the default; 2 is the\n" ++
@@ -1357,7 +1357,7 @@ fn parseArgs(init: std.process.Init) !Options {
 fn refuse(io: Io, phrase: []const u8) !noreturn {
     var buffer: [4096]u8 = undefined;
     var stderr = Io.File.stderr().writer(io, &buffer);
-    try stderr.interface.print("zig-agent-proto-acp-interop: {s}\n", .{phrase});
+    try stderr.interface.print("zig-agent-protocols-acp-interop: {s}\n", .{phrase});
     try stderr.interface.print("{s}", .{usage});
     try stderr.flush();
     std.process.exit(2);
@@ -1448,7 +1448,7 @@ test "session/update: the text is read out of the agent's own bytes" {
     // for an `AgentMessageChunk` carrying one text block.
     const raw =
         "{\"sessionId\":\"s-1\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\"," ++
-        "\"content\":{\"type\":\"text\",\"text\":\"zig-agent-proto\"}}}";
+        "\"content\":{\"type\":\"text\",\"text\":\"zig-agent-protocols\"}}}";
     var scratch: [512]u8 = undefined;
     const update = try readUpdate(raw, &scratch);
     try testing.expectEqualStrings("s-1", update.session_id);

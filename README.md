@@ -1,4 +1,4 @@
-# zig-agent-proto
+# zig-agent-protocols
 
 Zig 0.16.0 interface library for the agent wire protocols.
 
@@ -43,7 +43,7 @@ benchmark smoke, on Linux and on macOS.
 
 ## Native package use
 
-Use the `zig-agent-proto` module with stable Zig **0.16.0**. Add the package with
+Use the `zig-agent-protocols` module with stable Zig **0.16.0**. Add the package with
 `zig fetch --save <archive-or-url>`, then import its registered module:
 
 ```zig
@@ -52,7 +52,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const dependency = b.dependency("zig_agent_proto", .{
+    const dependency = b.dependency("zig_agent_protocols", .{
         .target = target,
         .optimize = optimize,
     });
@@ -64,7 +64,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    executable.root_module.addImport("zig-agent-proto", dependency.module("zig-agent-proto"));
+    executable.root_module.addImport("zig-agent-protocols", dependency.module("zig-agent-protocols"));
     b.installArtifact(executable);
 }
 ```
@@ -74,7 +74,7 @@ This `src/main.zig` uses the borrowing codec without a heap or executor:
 
 ```zig
 const std = @import("std");
-const proto = @import("zig-agent-proto");
+const proto = @import("zig-agent-protocols");
 
 pub fn main() !void {
     const input = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/list\"}";
@@ -353,12 +353,12 @@ outcome must carry no `optionId`, and the SDK's parsed outcome must also show
 non-consent.
 
 The A2A participant is a CLI with a required role, and each role refuses flags it
-does not take. `zig-agent-proto-a2a-interop --role client --base-url URL
+does not take. `zig-agent-protocols-a2a-interop --role client --base-url URL
 --expect-endpoint TARGET [--report-file PATH]` discovers a card, sends and
 checks the endpoint that card advertised;
 `--role server --port N --advertise-port M --rpc-target TARGET --requests N
 [--report-file PATH]` serves the card and that many requests, printing one line
-of readiness before it accepts any. `zig-agent-proto-mcp-interop` takes the
+of readiness before it accepts any. `zig-agent-protocols-mcp-interop` takes the
 SDK's own stdio pipes and runs the `2025-11-25` sequence itself; `mcp_peer.py
 --role serve` is the other end of those pipes.
 
@@ -404,12 +404,12 @@ One root, and every path derived from it:
 | `<root>/zig-cache` | `ZIG_GLOBAL_CACHE_DIR` | the global manifest and its `p/`, the toolchains the shim downloaded | `p/` is the slow half; removing it makes the shim fetch the pinned toolchain from ziglang.org again |
 | `<root>/build-cache` | `ZIG_LOCAL_CACHE_DIR` | the local build cache, which `zig build` rebuilds from the manifest | yes, first |
 
-  `<root>` is the first of the `zig-agent-proto` directories under
+  `<root>` is the first of the `zig-agent-protocols` directories under
   `/home/tmp2`, `/home/tmp`, `/vol/tmp2` and `/vol/tmp` that exists: the
   node-local physical mounts first, the approved NFS ones as a fallback.
   `.envrc` picks it with three facts about each mount -- it is a mount of
   its own, this account can write it, and it has at least 100 GiB free, a
-  floor `ZIG_AGENT_PROTO_SCRATCH_MIN_FREE_GIB` can raise -- then creates
+  floor `ZIG_AGENT_PROTOCOLS_SCRATCH_MIN_FREE_GIB` can raise -- then creates
   the five directories under a 077 umask and refuses any of them that is a
   symlink or belongs to another account. `devenv.nix` derives the same
   five paths from the caller's `USER` with `builtins.pathExists`, so the
@@ -437,7 +437,7 @@ after the first has stopped. The process guard resolves a bare executable
 against the child's environment and records its absolute path before launch;
 an explicit executable alias remains distinct from the process's argument list.
 
-`ZIG_AGENT_PROTO_SDK_PINS` selects the pin file every peer checks before launch.
+`ZIG_AGENT_PROTOCOLS_SDK_PINS` selects the pin file every peer checks before launch.
 
 ### Checkpoint cleanup
 

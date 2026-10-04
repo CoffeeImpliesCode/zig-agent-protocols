@@ -1,4 +1,4 @@
-//! zig-agent-proto — the root module.
+//! zig-agent-protocols — the root module.
 //!
 //! PROTOCOLS.md is the authority for every type name, tag value and byte layout
 //! in this library. Where the source and that document disagree, the source is
@@ -49,7 +49,7 @@
 //!     rather than selecting a silent fallback. The generic JSON-RPC codec
 //!     carries method text; protocol registries decide which names are supported.
 //!
-//! Supported consumer entry: the native Zig module `zig-agent-proto`, using
+//! Supported consumer entry: the native Zig module `zig-agent-protocols`, using
 //! stable Zig 0.16.0. The installed static archive is not a C ABI and does not
 //! force analysis of every lazy declaration. Public type and method doc comments
 //! define caller preconditions and error residue. Assertions diagnose caller

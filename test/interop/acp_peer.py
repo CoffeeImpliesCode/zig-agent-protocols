@@ -119,7 +119,7 @@ DISTRIBUTION = "agent-client-protocol"
 
 # A fixed marker, not a path or a hostname: the capture is kept as evidence, so
 # it must not carry anything about the machine that produced it.
-MARKER = "zig-agent-proto-acp-interop"
+MARKER = "zig-agent-protocols-acp-interop"
 
 # Everything both ends agree on. The Zig client sends these literals; they are
 # repeated here rather than negotiated, which is what a client and an agent do:
@@ -127,16 +127,16 @@ MARKER = "zig-agent-proto-acp-interop"
 # them at runtime would be testing the agreement instead of the protocol.
 CLIENT_NAME = MARKER
 CLIENT_VERSION = "0.0.0"
-WORKSPACE_CWD = "/zig-agent-proto-acp-interop"
-PROMPT_TEXT = "zig-agent-proto"
+WORKSPACE_CWD = "/zig-agent-protocols-acp-interop"
+PROMPT_TEXT = "zig-agent-protocols"
 
 # The ids the peer answers with. Fixed rather than generated, for the same
 # reason the names above are: two captures taken from two runs are then
 # comparable, and neither carries anything about the machine that produced it.
-SESSION_ID = "zig-agent-proto-acp-interop-session"
-MESSAGE_ID = "zig-agent-proto-acp-interop-message"
-TOOL_CALL_ID = "zig-agent-proto-acp-interop-tool"
-PERMISSION_TITLE = "zig-agent-proto permission"
+SESSION_ID = "zig-agent-protocols-acp-interop-session"
+MESSAGE_ID = "zig-agent-protocols-acp-interop-message"
+TOOL_CALL_ID = "zig-agent-protocols-acp-interop-tool"
+PERMISSION_TITLE = "zig-agent-protocols permission"
 
 # The two option ids the offer carries, and their kinds. The offer deliberately
 # contains a granting option: a permission run in which the client had nothing
@@ -179,7 +179,7 @@ def load_pins(path: Path) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise InteropFailure(f"pin file is not JSON: {path}: {exc}") from exc
     require(
-        pins.get("schema") == "zig-agent-proto/interop-sdk-pins/1",
+        pins.get("schema") == "zig-agent-protocols/interop-sdk-pins/1",
         f"pin file schema is {pins.get('schema')!r}, not the one this peer was written against",
     )
     return pins
@@ -1741,8 +1741,8 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--role", choices=("supervise", "serve"), required=True)
     parser.add_argument("--pins", type=Path,
-                        default=Path(os.environ.get("ZIG_AGENT_PROTO_SDK_PINS", DEFAULT_PINS)))
-    parser.add_argument("--zig-binary", default="zig-out/bin/zig-agent-proto-acp-interop",
+                        default=Path(os.environ.get("ZIG_AGENT_PROTOCOLS_SDK_PINS", DEFAULT_PINS)))
+    parser.add_argument("--zig-binary", default="zig-out/bin/zig-agent-protocols-acp-interop",
                         help="the Zig ACP client executable; supervise only")
     parser.add_argument("--work-dir", default=None,
                         help="an absolute path outside /tmp and /var/tmp, owned by this account "

@@ -13,7 +13,7 @@ pub fn build(b: *std.Build) void {
     // Consumers use the native Zig module below. Keep the static packaging
     // artifact, but it exports no C ABI and does not force analysis of every
     // lazy function body. Tests and executable consumers exercise those bodies.
-    const lib_mod = b.addModule("zig-agent-proto", .{
+    const lib_mod = b.addModule("zig-agent-protocols", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -22,7 +22,7 @@ pub fn build(b: *std.Build) void {
 
     const lib = b.addLibrary(.{
         .linkage = .static,
-        .name = "zig-agent-proto",
+        .name = "zig-agent-protocols",
         .root_module = lib_mod,
     });
     b.installArtifact(lib);
@@ -36,10 +36,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    demo_mod.addImport("zig-agent-proto", lib_mod);
+    demo_mod.addImport("zig-agent-protocols", lib_mod);
 
     const demo = b.addExecutable(.{
-        .name = "zig-agent-proto-demo",
+        .name = "zig-agent-protocols-demo",
         .root_module = demo_mod,
     });
     b.installArtifact(demo);
@@ -53,11 +53,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    runtime_mod.addImport("zig-agent-proto", lib_mod);
+    runtime_mod.addImport("zig-agent-protocols", lib_mod);
     runtime_mod.addImport("testio", testio_mod);
 
     const runtime_demo = b.addExecutable(.{
-        .name = "zig-agent-proto-runtime",
+        .name = "zig-agent-protocols-runtime",
         .root_module = runtime_mod,
     });
     b.installArtifact(runtime_demo);
@@ -72,11 +72,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    sessions_mod.addImport("zig-agent-proto", lib_mod);
+    sessions_mod.addImport("zig-agent-protocols", lib_mod);
     sessions_mod.addImport("testio", testio_mod);
 
     const sessions_demo = b.addExecutable(.{
-        .name = "zig-agent-proto-sessions",
+        .name = "zig-agent-protocols-sessions",
         .root_module = sessions_mod,
     });
     b.installArtifact(sessions_demo);
@@ -94,10 +94,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    http_mod.addImport("zig-agent-proto", lib_mod);
+    http_mod.addImport("zig-agent-protocols", lib_mod);
 
     const http_demo = b.addExecutable(.{
-        .name = "zig-agent-proto-http",
+        .name = "zig-agent-protocols-http",
         .root_module = http_mod,
     });
     b.installArtifact(http_demo);
@@ -117,9 +117,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    a2a_mod.addImport("zig-agent-proto", lib_mod);
+    a2a_mod.addImport("zig-agent-protocols", lib_mod);
     const a2a_demo = b.addExecutable(.{
-        .name = "zig-agent-proto-a2a",
+        .name = "zig-agent-protocols-a2a",
         .root_module = a2a_mod,
     });
     b.installArtifact(a2a_demo);
@@ -138,13 +138,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    bench_codec_mod.addImport("zig-agent-proto", lib_mod);
+    bench_codec_mod.addImport("zig-agent-protocols", lib_mod);
     const bench_runtime_mod = b.createModule(.{
         .root_source_file = b.path("src/bench_runtime.zig"),
         .target = target,
         .optimize = optimize,
     });
-    bench_runtime_mod.addImport("zig-agent-proto", lib_mod);
+    bench_runtime_mod.addImport("zig-agent-protocols", lib_mod);
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("src/bench.zig"),
         .target = target,
@@ -153,7 +153,7 @@ pub fn build(b: *std.Build) void {
     bench_mod.addImport("bench_codec", bench_codec_mod);
     bench_mod.addImport("bench_runtime", bench_runtime_mod);
     const bench = b.addExecutable(.{
-        .name = "zig-agent-proto-bench",
+        .name = "zig-agent-protocols-bench",
         .root_module = bench_mod,
     });
     b.installArtifact(bench);
@@ -174,9 +174,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    mcp_interop_mod.addImport("zig-agent-proto", lib_mod);
+    mcp_interop_mod.addImport("zig-agent-protocols", lib_mod);
     const mcp_interop = b.addExecutable(.{
-        .name = "zig-agent-proto-mcp-interop",
+        .name = "zig-agent-protocols-mcp-interop",
         .root_module = mcp_interop_mod,
     });
     const install_mcp_interop = b.addInstallArtifact(mcp_interop, .{});
@@ -191,9 +191,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    a2a_interop_mod.addImport("zig-agent-proto", lib_mod);
+    a2a_interop_mod.addImport("zig-agent-protocols", lib_mod);
     const a2a_interop = b.addExecutable(.{
-        .name = "zig-agent-proto-a2a-interop",
+        .name = "zig-agent-protocols-a2a-interop",
         .root_module = a2a_interop_mod,
     });
     const install_a2a_interop = b.addInstallArtifact(a2a_interop, .{});
@@ -208,9 +208,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    mcp_current_interop_mod.addImport("zig-agent-proto", lib_mod);
+    mcp_current_interop_mod.addImport("zig-agent-protocols", lib_mod);
     const mcp_current_interop = b.addExecutable(.{
-        .name = "zig-agent-proto-mcp-current-interop",
+        .name = "zig-agent-protocols-mcp-current-interop",
         .root_module = mcp_current_interop_mod,
     });
     const install_mcp_current_interop = b.addInstallArtifact(mcp_current_interop, .{});
@@ -225,9 +225,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    acp_interop_mod.addImport("zig-agent-proto", lib_mod);
+    acp_interop_mod.addImport("zig-agent-protocols", lib_mod);
     const acp_interop = b.addExecutable(.{
-        .name = "zig-agent-proto-acp-interop",
+        .name = "zig-agent-protocols-acp-interop",
         .root_module = acp_interop_mod,
     });
     const install_acp_interop = b.addInstallArtifact(acp_interop, .{});
@@ -268,7 +268,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    golden_mod.addImport("zig-agent-proto", lib_mod);
+    golden_mod.addImport("zig-agent-protocols", lib_mod);
 
     const golden_tests = b.addTest(.{
         .root_module = golden_mod,
@@ -286,7 +286,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    loopback_mod.addImport("zig-agent-proto", lib_mod);
+    loopback_mod.addImport("zig-agent-protocols", lib_mod);
     loopback_mod.addImport("testio", testio_mod);
 
     const loopback_tests = b.addTest(.{
@@ -431,7 +431,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    testkit_mod.addImport("zig-agent-proto", lib_mod);
+    testkit_mod.addImport("zig-agent-protocols", lib_mod);
     testkit_mod.addOptions("build_options", fuzz_options);
 
     const testkit_tests = b.addTest(.{

@@ -1,4 +1,4 @@
-# zig-agent-proto
+# zig-agent-protocols
 
 Zig 0.16.0 interface library for the agent wire protocols. The public surface is
 specified by [PROTOCOLS.md](PROTOCOLS.md), which is the authority for every type
@@ -115,7 +115,7 @@ Git.
   The two MCP participants cover separate revisions without a compatibility shim.
   The ACP participant uses wire 1 by default. Wire 2 requires explicit selection
   and the pinned SDK's experimental runtime.
-- `build.zig` exposes the `zig-agent-proto` module and installs a static library,
+- `build.zig` exposes the `zig-agent-protocols` module and installs a static library,
   five examples, the benchmark driver and four interoperability participants.
   It defines `run`, `run-runtime`, `run-sessions`, `run-http`, `run-a2a`,
   `run-bench`, `interop-mcp`, `interop-mcp-current`, `interop-a2a`, `interop-acp`,
@@ -359,7 +359,7 @@ Run at the repository root:
 
 - `zig build` installs the static library, the five examples, the benchmark
   driver and the four interoperability participants, and makes the
-  `zig-agent-proto` module available to consumers.
+  `zig-agent-protocols` module available to consumers.
   `zig build test` registers fifteen roots: the library unit tests, the golden
   vectors, the loopback tests, the test blocks the four socket-driven examples
   carry, the benchmark driver, each benchmark module as a root of its own,

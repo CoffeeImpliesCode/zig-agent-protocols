@@ -1,4 +1,4 @@
-# Continuous integration for zig-agent-proto.
+# Continuous integration for zig-agent-protocols.
 #
 # This runs the toolchain half of the house gate on Linux and macOS:
 # formatting, installation, tests in all four optimization modes, AST checks,
@@ -55,7 +55,7 @@ jobs:
         run: |
           set -euo pipefail
           test -d "$RUNNER_TEMP" && test -O "$RUNNER_TEMP" && test ! -L "$RUNNER_TEMP"
-          scratch_root="$(realpath "$RUNNER_TEMP")/zig-agent-proto"
+          scratch_root="$(realpath "$RUNNER_TEMP")/zig-agent-protocols"
           case "$scratch_root" in
             /tmp | /tmp/* | /var/tmp | /var/tmp/*)
               echo "RUNNER_TEMP resolved to shared system storage: $scratch_root" >&2

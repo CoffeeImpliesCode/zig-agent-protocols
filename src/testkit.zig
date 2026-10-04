@@ -120,7 +120,7 @@
 //! the library. The library still allocates nothing.
 
 const std = @import("std");
-const proto = @import("zig-agent-proto");
+const proto = @import("zig-agent-protocols");
 const build_options = @import("build_options");
 
 const json = proto.json;

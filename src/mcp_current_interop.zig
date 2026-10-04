@@ -82,7 +82,7 @@
 //! without looking at a wire is not.
 
 const std = @import("std");
-const proto = @import("zig-agent-proto");
+const proto = @import("zig-agent-protocols");
 
 const conn = proto.conn;
 const json = proto.json;
@@ -119,7 +119,7 @@ const tool_ask = "ask";
 /// What this participant calls itself in the per-request envelope. A fixed
 /// name and version, so a capture taken from two runs is comparable to another
 /// and carries nothing about the machine that produced it.
-const client_name = "zig-agent-proto-interop";
+const client_name = "zig-agent-protocols-interop";
 const client_version = "0.0.0";
 
 /// The text the echo tool is called with, and the text its answer has to carry.
@@ -127,7 +127,7 @@ const client_version = "0.0.0";
 /// is a comparison rather than two literals that happen to agree. The `ask`
 /// tool is called with it too, so the fourth step's answer is checked the same
 /// way against the same argument.
-const echo_argument = "zig-agent-proto";
+const echo_argument = "zig-agent-protocols";
 
 /// The answer this participant gives the elicitation the `ask` tool embeds.
 ///
@@ -1242,7 +1242,7 @@ fn fail(report: *Report, message: *[failure_capacity]u8, text: []const u8) void 
 }
 
 fn printSummary(err: *Io.Writer, report: *const Report) Io.Writer.Error!void {
-    try err.print("zig-agent-proto mcp interop client, current revision ({s})\n", .{
+    try err.print("zig-agent-protocols mcp interop client, current revision ({s})\n", .{
         report.revision,
     });
     try err.print("  refused before the wire: {d} methods this revision removed\n", .{
@@ -1331,7 +1331,7 @@ fn writeReport(io: Io, options: *const Options, report: *const Report) !void {
 /// was, never a document cut short.
 fn encodeReport(buffer: []u8, report: *const Report) proto.EncodeError![]const u8 {
     var text = json.Writer.init(buffer);
-    try text.slice("{\"schema\":\"zig-agent-proto/mcp-current-interop-report/2\"");
+    try text.slice("{\"schema\":\"zig-agent-protocols/mcp-current-interop-report/2\"");
     try text.slice(",\"revision\":");
     try text.string(report.revision);
     try text.slice(",\"refused_methods_count\":");

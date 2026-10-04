@@ -159,7 +159,7 @@ def build_payload(args: argparse.Namespace) -> None:
             raise GuestFailure(f"exported test root is missing: {root!r}")
     with guest_storage.temporary_directory(prefix="guest-seed-", dir=args.cache) as temporary:
         seed = Path(temporary)
-        (seed / "meta-data").write_text(f"instance-id: zig-agent-proto-{args.target}\n"
+        (seed / "meta-data").write_text(f"instance-id: zig-agent-protocols-{args.target}\n"
                                         "local-hostname: cross-test\n", encoding="ascii")
         (seed / "user-data").write_text(USER_DATA, encoding="ascii")
         (seed / "suite.sh").write_text(SUITE, encoding="ascii")

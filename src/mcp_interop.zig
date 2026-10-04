@@ -119,7 +119,7 @@
 //! show the evidence for, so a failure in it is this process's exit status.
 
 const std = @import("std");
-const proto = @import("zig-agent-proto");
+const proto = @import("zig-agent-protocols");
 
 const conn = proto.conn;
 const json = proto.json;
@@ -148,13 +148,13 @@ const tool_slow = "slow";
 /// What this participant calls itself in the handshake. A fixed name and
 /// version, so a capture taken from two runs is comparable to another and
 /// carries nothing about the machine that produced it.
-const client_name = "zig-agent-proto-interop";
+const client_name = "zig-agent-protocols-interop";
 const client_version = "0.0.0";
 
 /// The text the echo tool is called with, and the text its answer has to carry.
 /// One value on both sides of the call, so the comparison the fourth step
 /// makes is a comparison rather than two literals that happen to agree.
-const echo_argument = "zig-agent-proto";
+const echo_argument = "zig-agent-protocols";
 
 /// How long the slow tool is asked to take. Long enough that the cancellation
 /// has to go out while it runs, and short enough that a peer which ignored it
@@ -1030,7 +1030,7 @@ fn fail(report: *Report, message: *[failure_capacity]u8, text: []const u8) void 
 }
 
 fn printSummary(err: *Io.Writer, report: *const Report) void {
-    err.print("zig-agent-proto mcp interop client ({s})\n", .{report.revision}) catch return;
+    err.print("zig-agent-protocols mcp interop client ({s})\n", .{report.revision}) catch return;
     if (report.failure.len != 0) {
         err.print("  FAILED: {s}\n", .{report.failure}) catch return;
         return;

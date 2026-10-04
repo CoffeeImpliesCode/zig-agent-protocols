@@ -16,7 +16,7 @@
 //! Run it with `zig build run-runtime`.
 
 const std = @import("std");
-const proto = @import("zig-agent-proto");
+const proto = @import("zig-agent-protocols");
 
 /// The socket-name helper, development-only and deliberately not part of the
 /// library's public API.
@@ -545,7 +545,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    try out.print("zig-agent-proto runtime example\n\n", .{});
+    try out.print("zig-agent-protocols runtime example\n\n", .{});
     try out.print("  zig       {s}\n", .{@tagName(builtin.cpu.arch)});
     try out.print("  mcp       {s} (pinned)\n", .{mcp.latest_protocol_version});
     try out.print("  a2a       1.0.0\n", .{});

@@ -35,7 +35,7 @@
 //! Run it with `zig build run-a2a`.
 
 const std = @import("std");
-const proto = @import("zig-agent-proto");
+const proto = @import("zig-agent-protocols");
 
 const a2a = proto.a2a;
 const a2a_http = proto.a2a_http;
@@ -1031,7 +1031,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    try out.print("zig-agent-proto a2a 1.0 example\n\n", .{});
+    try out.print("zig-agent-protocols a2a 1.0 example\n\n", .{});
     try out.print("  protocol  A2A {s}, JSON-RPC over HTTP\n", .{version_text});
     try out.print("  endpoint  the agent advertises {s}\n", .{rpc_path});
 

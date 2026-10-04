@@ -71,7 +71,7 @@
 //!   fixture exists to carry |
 
 const std = @import("std");
-const proto = @import("zig-agent-proto");
+const proto = @import("zig-agent-protocols");
 
 const json = proto.json;
 const jsonrpc = proto.jsonrpc;

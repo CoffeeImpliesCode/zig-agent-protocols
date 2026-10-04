@@ -183,7 +183,7 @@ FAIL_MESSAGE = "deliberate tool failure"
 
 # A fixed marker, not a path or a hostname: the capture is kept as evidence, so it
 # must not carry anything about the machine that produced it.
-MARKER = "zig-agent-proto-interop"
+MARKER = "zig-agent-protocols-interop"
 
 # The three envelope keys `2026-07-28` requires on every request, as the SDK's own
 # names them. `mcp.shared.inbound.classify_inbound_request` (rung one) refuses a
@@ -298,7 +298,7 @@ def load_pins(path: Path) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise InteropFailure(f"pin file is not JSON: {path}: {exc}") from exc
     require(
-        pins.get("schema") == "zig-agent-proto/interop-sdk-pins/1",
+        pins.get("schema") == "zig-agent-protocols/interop-sdk-pins/1",
         f"pin file schema is {pins.get('schema')!r}, not the one this peer was written against",
     )
     return pins
@@ -732,7 +732,7 @@ def interim_result() -> Any:
 
 # The plaintext the peer's handler expects to find after the boundary unsealed the
 # token. A fixed string, so a capture from two runs is comparable to another.
-STATE_PLAINTEXT = "zig-agent-proto-colour"
+STATE_PLAINTEXT = "zig-agent-protocols-colour"
 
 
 def build_server(record: dict[str, Any], side: SideChannel) -> Any:
@@ -757,7 +757,7 @@ def build_server(record: dict[str, Any], side: SideChannel) -> Any:
         f"{MARKER}-peer",
         version=record["version"],
         instructions=(
-            "Interoperability peer for zig-agent-proto at MCP 2026-07-28. Every tool name, "
+            "Interoperability peer for zig-agent-protocols at MCP 2026-07-28. Every tool name, "
             "argument, question and answer is fixed so a capture can be compared against a "
             "later run."
         ),
@@ -1835,7 +1835,7 @@ def compare_report(zig_report: Path, names: list[str], mrtr: dict[str, Any],
 # The report schema this supervisor reads. Named here rather than only in the Zig
 # participant so a change to either side's shape fails loudly on one side instead of
 # silently producing a report the other does not understand.
-REPORT_SCHEMA = "zig-agent-proto/mcp-current-interop-report/2"
+REPORT_SCHEMA = "zig-agent-protocols/mcp-current-interop-report/2"
 
 
 def run_supervise(args: argparse.Namespace) -> int:
@@ -2279,7 +2279,7 @@ def write_summary(args: argparse.Namespace, record: dict[str, Any], zig_binary: 
     c2s = parse_frames((work / "wire-client-to-server.log").read_bytes(), "client to server", "c2s")
     s2c = parse_frames((work / "wire-server-to-client.log").read_bytes(), "server to client", "s2c")
     summary = {
-        "schema": "zig-agent-proto/mcp-current-interop-summary/1",
+        "schema": "zig-agent-protocols/mcp-current-interop-summary/1",
         "sdk": {
             "distribution": record.get("distribution", "mcp"),
             "version": record["version"],
@@ -2633,9 +2633,9 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument("--role", choices=("supervise", "serve", "refusals", "selftest"),
                         default="supervise")
     parser.add_argument("--pins", type=Path,
-                        default=Path(os.environ.get("ZIG_AGENT_PROTO_SDK_PINS", DEFAULT_PINS)))
+                        default=Path(os.environ.get("ZIG_AGENT_PROTOCOLS_SDK_PINS", DEFAULT_PINS)))
     parser.add_argument("--zig-binary",
-                        default="zig-out/bin/zig-agent-proto-mcp-current-interop",
+                        default="zig-out/bin/zig-agent-protocols-mcp-current-interop",
                         help="the Zig MCP client executable; supervise only")
     parser.add_argument("--work-dir", default=None,
                         help="an absolute path outside /tmp and /var/tmp, owned by this account "
@@ -2669,7 +2669,7 @@ def run_refusals(args: argparse.Namespace) -> int:
         stops: list[Stop] = []
         probe = run_refusal_probe(args, record, work, stops)
         summary = {
-            "schema": "zig-agent-proto/mcp-current-interop-refusals/1",
+            "schema": "zig-agent-protocols/mcp-current-interop-refusals/1",
             "sdk": {"distribution": record.get("distribution", "mcp"), "version": record["version"],
                     "types_version": record.get("types_version"), "protocol": REVISION},
             "refusal_probe": probe,

@@ -154,7 +154,7 @@ def advertised_endpoint(path: str, query: str) -> str:
 # the card names the agent it is, and claims no version of anything. Which SDK
 # is behind it is a fact about this run, recorded in the readiness line and the
 # summary rather than published as though it were part of the protocol.
-MARKER = "zig-agent-proto-interop"
+MARKER = "zig-agent-protocols-interop"
 
 PROTOCOL_VERSION = "1.0"
 
@@ -192,7 +192,7 @@ def load_pins(path: Path) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise InteropFailure(f"pin file is not JSON: {path}: {exc}") from exc
     require(
-        pins.get("schema") == "zig-agent-proto/interop-sdk-pins/1",
+        pins.get("schema") == "zig-agent-protocols/interop-sdk-pins/1",
         f"pin file schema is {pins.get('schema')!r}, not the one this peer was written against",
     )
     return pins
@@ -492,7 +492,7 @@ def build_agent_card(rpc_url: str) -> Any:
 
     return AgentCard(
         name=f"{MARKER}-agent",
-        description="Interoperability peer for zig-agent-proto. Fixed inputs, fixed outputs.",
+        description="Interoperability peer for zig-agent-protocols. Fixed inputs, fixed outputs.",
         version=MARKER,
         supported_interfaces=[
             AgentInterface(
@@ -2071,7 +2071,7 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument("--role", choices=("supervise", "serve", "probe", "zig-interop"),
                         required=True)
     parser.add_argument("--pins", type=Path,
-                        default=Path(os.environ.get("ZIG_AGENT_PROTO_SDK_PINS", DEFAULT_PINS)))
+                        default=Path(os.environ.get("ZIG_AGENT_PROTOCOLS_SDK_PINS", DEFAULT_PINS)))
     parser.add_argument("--port", type=int, default=None, help="serve and supervise")
     parser.add_argument("--rpc-path", default=RPC_PATH,
                         help="the path the card's route is mounted at")
@@ -2083,7 +2083,7 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
                         help="serve only. The scheme, host and port the card's advertised URL "
                              "names, when that is not the base uvicorn listens on; the "
                              "supervisor sets it so the card names its relay")
-    parser.add_argument("--zig-binary", default="zig-out/bin/zig-agent-proto-a2a-interop",
+    parser.add_argument("--zig-binary", default="zig-out/bin/zig-agent-protocols-a2a-interop",
                         help="the Zig participant executable; zig-interop only")
     parser.add_argument("--zig-requests", type=int, default=6,
                         help="zig-interop only. How many requests the Zig server may serve "

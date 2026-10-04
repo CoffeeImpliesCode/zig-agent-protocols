@@ -109,7 +109,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const proto = @import("zig-agent-proto");
+const proto = @import("zig-agent-protocols");
 
 const Io = std.Io;
 /// The standard library's HTTP client sits under this library's transport, so

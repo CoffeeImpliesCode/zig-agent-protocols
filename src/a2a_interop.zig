@@ -59,7 +59,7 @@
 //! coming.
 
 const std = @import("std");
-const proto = @import("zig-agent-proto");
+const proto = @import("zig-agent-protocols");
 
 const a2a = proto.a2a;
 const a2a_http = proto.a2a_http;
@@ -72,7 +72,7 @@ const testing = std.testing;
 /// process reports itself under. A fixed word rather than a path or a
 /// hostname: what a report carries is kept as evidence, so it must not say
 /// anything about the machine that produced it.
-const marker = "zig-agent-proto-interop";
+const marker = "zig-agent-protocols-interop";
 
 /// The text that asks the peer for the other arm of the result `oneof`.
 ///
@@ -85,12 +85,12 @@ const ask_for_message = "result:message";
 
 /// The message id this client sends. Fixed, because the evidence is compared
 /// against a later run and a generated id would be a different document.
-const request_message_id = "zig-agent-proto-interop-request";
+const request_message_id = "zig-agent-protocols-interop-request";
 
 /// The ids the server answers with, for the same reason.
-const answer_message_id = "zig-agent-proto-interop-answer";
-const answer_task_id = "zig-agent-proto-interop-task";
-const answer_artifact_id = "zig-agent-proto-interop-artifact";
+const answer_message_id = "zig-agent-protocols-interop-answer";
+const answer_task_id = "zig-agent-protocols-interop-task";
+const answer_artifact_id = "zig-agent-protocols-interop-artifact";
 
 /// Agent software label, separate from each interface's `protocolVersion`.
 /// PROTOCOLS.md section 5.1 forbids patch components in Agent Cards.
@@ -1213,7 +1213,7 @@ fn readinessLine(
 fn agentCard(interfaces: []const a2a.AgentInterface) a2a.AgentCard {
     return .{
         .name = marker,
-        .description = "Interoperability participant for zig-agent-proto. " ++
+        .description = "Interoperability participant for zig-agent-protocols. " ++
             "Fixed inputs, fixed outputs.",
         .supported_interfaces = interfaces,
         .version = card_version,

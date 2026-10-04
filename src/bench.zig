@@ -178,7 +178,7 @@ const usage =
     \\usage: bench [--mode codec|runtime|all] [--iterations N] [--samples N]
     \\       bench --help
     \\
-    \\Sizes a zig-agent-proto benchmark run and then runs it. Every argument is
+    \\Sizes a zig-agent-protocols benchmark run and then runs it. Every argument is
     \\a flag this driver knows, and every other word is a refusal.
     \\
     \\  --mode MODE     what runs. codec measures the codec against a fixed

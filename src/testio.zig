@@ -3,7 +3,7 @@
 //! ## What this replaces
 //!
 //! Every test and every example that needs a real Unix socket used to spell its
-//! own `/tmp/zig-agent-proto-<what>-<pid>-<tag>.sock` literal, a copy per
+//! own `/tmp/zig-agent-protocols-<what>-<pid>-<tag>.sock` literal, a copy per
 //! file, each one a string a rename had to find, and every one of them a write
 //! into a directory the operating system owns and clears on its own schedule.
 //! A socket file there outlives the run that made it, so a run killed halfway
@@ -274,7 +274,7 @@ test "an unset or empty TMPDIR is a refusal rather than a default directory" {
 }
 
 test "the two directories the system clears are refused, and what is under them" {
-    for ([_][:0]const u8{ "/tmp", "/tmp/zig-agent-proto", "/var/tmp", "/var/tmp/zig-agent-proto" }) |dir| {
+    for ([_][:0]const u8{ "/tmp", "/tmp/zig-agent-protocols", "/var/tmp", "/var/tmp/zig-agent-protocols" }) |dir| {
         try testing.expectError(error.UnsafeScratchDirectory, scratchDir(dir));
     }
     // A name that merely starts with the same bytes is a different directory,

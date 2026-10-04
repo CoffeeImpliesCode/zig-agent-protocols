@@ -25,7 +25,7 @@
 //! Run it with `zig build run-sessions`.
 
 const std = @import("std");
-const proto = @import("zig-agent-proto");
+const proto = @import("zig-agent-protocols");
 
 /// The socket-name helper, development-only and deliberately not part of the
 /// library's public API. Where a socket may be created belongs to the
@@ -725,7 +725,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    try out.print("zig-agent-proto sessions example\n\n", .{});
+    try out.print("zig-agent-protocols sessions example\n\n", .{});
     try out.print("  acp   1 (settled by the handshake)\n", .{});
     try out.print("  mcp   {s} (carried over the acp connection)\n\n", .{
         mcp.latest_protocol_version,
