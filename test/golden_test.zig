@@ -39,7 +39,7 @@
 //! | `bridge_outcome_result.json` | `mcp-2026-07-28.md` 5, a `complete` result |
 
 const std = @import("std");
-const proto = @import("zig-agent-proto");
+const proto = @import("zig-agent-protocols");
 
 const json = proto.json;
 const jsonrpc = proto.jsonrpc;

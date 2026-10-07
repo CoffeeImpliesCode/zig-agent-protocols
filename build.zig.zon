@@ -1,7 +1,7 @@
 .{
-    .name = .zig_agent_proto,
+    .name = .zig_agent_protocols,
     .version = "0.0.0",
-    .fingerprint = 0xd05e6738d1c51d14, // Changing this has security and trust implications.
+    .fingerprint = 0x91f4a0242e6ae9a0, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
     .paths = .{

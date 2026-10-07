@@ -1,4 +1,4 @@
-# zig-agent-proto
+# zig-agent-protocols
 
 Zig 0.16.0 interface library for the agent wire protocols.
 

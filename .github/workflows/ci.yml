@@ -1,4 +1,4 @@
-# Continuous integration for zig-agent-proto.
+# Continuous integration for zig-agent-protocols.
 #
 # This runs the half of the house gate that a pinned Zig toolchain can
 # reproduce on any machine: `zig fmt --check`, `zig build`, `zig build test`,

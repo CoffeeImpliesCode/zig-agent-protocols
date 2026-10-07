@@ -27,7 +27,7 @@
 //! long enough to look.
 
 const std = @import("std");
-const proto = @import("zig-agent-proto");
+const proto = @import("zig-agent-protocols");
 const conn = proto.conn;
 const json = proto.json;
 const jsonrpc = proto.jsonrpc;
@@ -142,7 +142,7 @@ const Endpoint = struct {
 };
 
 fn socketPath(buffer: []u8, id: u64) ![]const u8 {
-    return std.fmt.bufPrint(buffer, "/tmp/zig-agent-proto-test-{x}.sock", .{id});
+    return std.fmt.bufPrint(buffer, "/tmp/zig-agent-protocols-test-{x}.sock", .{id});
 }
 
 test "a client and a server complete a request over a real socket" {

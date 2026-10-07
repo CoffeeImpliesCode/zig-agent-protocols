@@ -1681,7 +1681,7 @@ const Socket = struct {
 fn listenOn(io: Io, path_buffer: []u8, tag: u64) !Socket {
     const path = try std.fmt.bufPrint(
         path_buffer,
-        "/tmp/zig-agent-proto-acp-session-{x}.sock",
+        "/tmp/zig-agent-protocols-acp-session-{x}.sock",
         .{tag},
     );
     // A socket file left by a killed run would make `listen` fail.

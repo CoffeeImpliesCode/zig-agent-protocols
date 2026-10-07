@@ -8,7 +8,7 @@ pub fn build(b: *std.Build) void {
     // importers, not linked as a binary. The static artifact exists so that
     // `zig build` produces a checkable proof of compilation and so that a
     // C-ABI consumer has something to link.
-    const lib_mod = b.addModule("zig-agent-proto", .{
+    const lib_mod = b.addModule("zig-agent-protocols", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -16,7 +16,7 @@ pub fn build(b: *std.Build) void {
 
     const lib = b.addLibrary(.{
         .linkage = .static,
-        .name = "zig-agent-proto",
+        .name = "zig-agent-protocols",
         .root_module = lib_mod,
     });
     b.installArtifact(lib);
@@ -30,10 +30,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    demo_mod.addImport("zig-agent-proto", lib_mod);
+    demo_mod.addImport("zig-agent-protocols", lib_mod);
 
     const demo = b.addExecutable(.{
-        .name = "zig-agent-proto-demo",
+        .name = "zig-agent-protocols-demo",
         .root_module = demo_mod,
     });
     b.installArtifact(demo);
@@ -47,10 +47,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    runtime_mod.addImport("zig-agent-proto", lib_mod);
+    runtime_mod.addImport("zig-agent-protocols", lib_mod);
 
     const runtime_demo = b.addExecutable(.{
-        .name = "zig-agent-proto-runtime",
+        .name = "zig-agent-protocols-runtime",
         .root_module = runtime_mod,
     });
     b.installArtifact(runtime_demo);
@@ -86,7 +86,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    golden_mod.addImport("zig-agent-proto", lib_mod);
+    golden_mod.addImport("zig-agent-protocols", lib_mod);
 
     const golden_tests = b.addTest(.{
         .root_module = golden_mod,
@@ -104,7 +104,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    loopback_mod.addImport("zig-agent-proto", lib_mod);
+    loopback_mod.addImport("zig-agent-protocols", lib_mod);
 
     const loopback_tests = b.addTest(.{
         .root_module = loopback_mod,
@@ -140,7 +140,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    testkit_mod.addImport("zig-agent-proto", lib_mod);
+    testkit_mod.addImport("zig-agent-protocols", lib_mod);
     testkit_mod.addOptions("build_options", fuzz_options);
 
     const testkit_tests = b.addTest(.{

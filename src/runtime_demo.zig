@@ -13,7 +13,7 @@
 //! Run it with `zig build run`.
 
 const std = @import("std");
-const proto = @import("zig-agent-proto");
+const proto = @import("zig-agent-protocols");
 
 const conn = proto.conn;
 const json = proto.json;
@@ -105,7 +105,7 @@ pub fn main(init: std.process.Init) !void {
     const out = &stdout.interface;
     defer stdout.flush() catch {};
 
-    try out.print("zig-agent-proto runtime example\n\n", .{});
+    try out.print("zig-agent-protocols runtime example\n\n", .{});
     try out.print("  zig       {s}\n", .{@tagName(@import("builtin").cpu.arch)});
     try out.print("  mcp       {s} (pinned)\n", .{mcp.latest_protocol_version});
     try out.print("  a2a       1.0.0\n", .{});
@@ -115,7 +115,7 @@ pub fn main(init: std.process.Init) !void {
     // take over a pipe. stdio is the normative ACP transport and one of the two
     // MCP ones; a socket exercises the identical framing and JSON-RPC.
     var path_buffer: [128]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buffer, "/tmp/zig-agent-proto-example-{d}.sock", .{
+    const path = try std.fmt.bufPrint(&path_buffer, "/tmp/zig-agent-protocols-example-{d}.sock", .{
         std.os.linux.getpid(),
     });
     std.Io.Dir.cwd().deleteFile(io, path) catch {};

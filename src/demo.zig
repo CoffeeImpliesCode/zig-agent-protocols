@@ -19,7 +19,7 @@
 //! provokes is as much a part of the contract as a success.
 
 const std = @import("std");
-const proto = @import("zig-agent-proto");
+const proto = @import("zig-agent-protocols");
 
 const json = proto.json;
 const jsonrpc = proto.jsonrpc;

@@ -1,4 +1,4 @@
-//! zig-agent-proto — the root module.
+//! zig-agent-protocols — the root module.
 //!
 //! PROTOCOLS.md is the authority for every type name, tag value and byte layout
 //! in this library. Where the source and that document disagree, the source is

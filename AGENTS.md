@@ -1,4 +1,4 @@
-# zig-agent-proto
+# zig-agent-protocols
 
 Zig 0.16.0 interface library for the agent wire protocols. The public surface is
 specified by [PROTOCOLS.md](PROTOCOLS.md), which is the authority for every type
@@ -48,7 +48,7 @@ Git.
 - `src/runtime_demo.zig` is the `run-runtime` step: a real MCP client and a
   real server talking to each other over a socket, with the same `conn.Conn` a
   server binary would use.
-- `build.zig` exposes the `zig-agent-proto` module, installs a static library,
+- `build.zig` exposes the `zig-agent-protocols` module, installs a static library,
   the codec demonstration and the runtime example, and defines `run`,
   `run-runtime`, `test`, `fuzz`, and `docs` steps.
 - The library has no dependencies beyond the Zig toolchain and no system library
@@ -136,7 +136,7 @@ style; each one has a failure that is hard to see from the code alone.
 Run at the repository root:
 
 - `zig build` installs the static library, the codec demonstration and the
-  runtime example, and makes the `zig-agent-proto` module available to
+  runtime example, and makes the `zig-agent-protocols` module available to
   consumers. `zig build test` runs the unit tests, the golden vectors and the
   loopback tests. `zig build docs` generates documentation. `zig build run`
   executes the codec demonstration, which prints what each decoder produced
