@@ -511,7 +511,7 @@ const Client = struct {
     /// The headers each POST carried, as the transport built them.
     // SAFETY: `single` and `listen` copy the returned headers in before they set `sent_len`.
     sent: [plans.len][8]wire.Header = undefined,
-    sent_len: [plans.len]usize = [_]usize{0} ** plans.len,
+    sent_len: [plans.len]usize = @splat(0),
 
     /// The single-body reply, which borrowed the side's buffers and is
     /// copied out before the second POST reuses them.
@@ -532,7 +532,7 @@ const Client = struct {
     chunked: bool = false,
     // SAFETY: `listen` copies each event in before it grows `event_count` and sets `event_len`.
     events: [expected_events][1024]u8 = undefined,
-    event_len: [expected_events]usize = [_]usize{0} ** expected_events,
+    event_len: [expected_events]usize = @splat(0),
     event_count: usize = 0,
 
     failed: bool = false,
@@ -806,7 +806,7 @@ pub fn main(init: std.process.Init) !void {
     try out.print("-- 1. one JSON body --\n", .{});
     try showRequest(out, &call, 0, tools_call_body);
     try out.print("\n  status    {d} {s}, one JSON body\n", .{
-        @intFromEnum(call.status),
+        @backingInt(call.status),
         call.status.phrase() orelse @tagName(call.status),
     });
     try out.print("  reply     {s}\n", .{call.message[0..call.message_len]});
@@ -818,7 +818,7 @@ pub fn main(init: std.process.Init) !void {
     try out.print("\n-- 2. an event stream --\n", .{});
     try showRequest(out, &call, 1, listen_body);
     try out.print("\n  status    {d} {s}, {s}, transfer-encoding: {s}\n", .{
-        @intFromEnum(call.stream_status),
+        @backingInt(call.stream_status),
         call.stream_status.phrase() orelse @tagName(call.stream_status),
         call.content_type[0..call.content_type_len],
         if (call.chunked) "chunked" else "not chunked",

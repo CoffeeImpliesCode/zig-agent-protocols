@@ -126,7 +126,7 @@ const ToolServer = struct {
         text.slice("no handler for ") catch return standardRefusal(request, answer);
         text.string(request.method.text) catch return standardRefusal(request, answer);
         return conn.errorResponse(request, .{
-            .code = @intFromEnum(jsonrpc.StandardError.method_not_found),
+            .code = @backingInt(jsonrpc.StandardError.method_not_found),
             .message = text.written(),
         }, answer) catch null;
     }

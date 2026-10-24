@@ -244,11 +244,11 @@ const Agent = struct {
                 "\"domain\":\"{s}\",\"reason\":\"{s}\"}}",
             .{ a2a.error_domain, reason.reason() },
         ) catch return .{ .peer_error = .{
-            .code = @intFromEnum(reason),
+            .code = @backingInt(reason),
             .message = "Unsupported operation",
         } }).len;
         return .{ .peer_error = .{
-            .code = @intFromEnum(reason),
+            .code = @backingInt(reason),
             .message = "Unsupported operation",
             .data = self.detail[0..self.detail_len],
         } };
@@ -837,7 +837,7 @@ const Call = struct {
 
         switch (arm) {
             .task => {
-                self.exchange.task_status = @intFromEnum(reply.status);
+                self.exchange.task_status = @backingInt(reply.status);
                 const result = switch (reply.outcome) {
                     .result => |value| value,
                     .peer_error => return self.giveUp(@tagName(arm), "refused the call"),
@@ -852,7 +852,7 @@ const Call = struct {
                 return true;
             },
             .message => {
-                self.exchange.message_status = @intFromEnum(reply.status);
+                self.exchange.message_status = @backingInt(reply.status);
                 const result = switch (reply.outcome) {
                     .result => |value| value,
                     .peer_error => return self.giveUp(@tagName(arm), "refused the call"),
@@ -876,7 +876,7 @@ const Call = struct {
                     .peer_error => |value| value,
                     .result => return self.giveUp(@tagName(arm), "answered, not refused"),
                 };
-                self.exchange.error_status = @intFromEnum(reply.status);
+                self.exchange.error_status = @backingInt(reply.status);
                 self.exchange.error_code = object.code;
                 self.exchange.error_message_len = Exchange.keep(&self.exchange.error_message, object.message);
                 self.exchange.error_detail_len = Exchange.keep(&self.exchange.error_detail, object.data orelse "");
@@ -1139,7 +1139,7 @@ test "the exchange discovers the card, and a task, a message and a refusal each 
     // normative detail that tells it apart from the other A2A errors that
     // share its status.
     try testing.expectEqual(
-        @intFromEnum(a2a.A2aError.unsupported_operation),
+        @backingInt(a2a.A2aError.unsupported_operation),
         exchange.error_code,
     );
     try testing.expectEqualStrings("Unsupported operation", exchange.errorMessage());

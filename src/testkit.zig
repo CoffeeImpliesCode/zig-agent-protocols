@@ -2533,19 +2533,19 @@ fn collectTreeDecoders(out: [][]const u8) usize {
     // type is `type`, and `@typeInfo` of that has no declarations to walk.
     const root = proto;
     var count: usize = 0;
-    for (@typeInfo(root).@"struct".decls) |decl| {
-        if (!isPublicDecoder(root, decl.name)) continue;
-        out[count] = decl.name;
+    for (@typeInfo(root).@"struct".decl_names) |name| {
+        if (!isPublicDecoder(root, name)) continue;
+        out[count] = name;
         count += 1;
     }
-    for (@typeInfo(root).@"struct".decls) |module_decl| {
-        if (!isNamespaceDecl(module_decl.name)) continue;
-        const ns = @field(root, module_decl.name);
-        for (@typeInfo(ns).@"struct".decls) |decl| {
-            if (!isPublicDecoder(ns, decl.name)) continue;
+    for (@typeInfo(root).@"struct".decl_names) |module_name| {
+        if (!isNamespaceDecl(module_name)) continue;
+        const ns = @field(root, module_name);
+        for (@typeInfo(ns).@"struct".decl_names) |name| {
+            if (!isPublicDecoder(ns, name)) continue;
             out[count] = comptime std.fmt.comptimePrint(
                 "{s}.{s}",
-                .{ module_decl.name, decl.name },
+                .{ module_name, name },
             );
             count += 1;
         }
@@ -2682,7 +2682,7 @@ const Stats = struct {
     /// run. One bit per decoder rather than one count for all of them, because
     /// a single total cannot say which one went missing.
     reached_battery_codecs: [battery_codec_names.len]bool =
-        .{false} ** battery_codec_names.len,
+        @splat(false),
     /// How many byte comparisons carried a carrier `_meta` through, per object.
     ///
     /// The carrier is the one member of the two `bridge` objects the encoders
@@ -7721,7 +7721,7 @@ test "the borrow reader and std.json agree on generated documents" {
     // renders it through.
     var fixed: [max_doc_len]u8 = undefined;
     var without: [2 * max_doc_len + 8]u8 = undefined;
-    var per_shape = [_]usize{0} ** shapes.len;
+    var per_shape: [shapes.len]usize = @splat(0);
     var accepted: usize = 0;
     var leading_zero: usize = 0;
     var prefixes: usize = 0;
@@ -7744,7 +7744,7 @@ test "the borrow reader and std.json agree on generated documents" {
         writeShape(rng, &doc, &splice, index);
         const bytes = doc.slice();
         if (bytes.len == 0) continue;
-        per_shape[@as(usize, @intFromEnum(shapes[index % shapes.len]))] += 1;
+        per_shape[@as(usize, @backingInt(shapes[index % shapes.len]))] += 1;
 
         const mine = borrowAccepts(bytes, &scratch);
         const theirs = try referenceAccepts(scoped, bytes);

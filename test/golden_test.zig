@@ -117,9 +117,9 @@ const fixture: Fixture = .{};
 /// fixture added there is reached by the well-formedness test without a second
 /// edit, and a failure there names the file rather than a line number.
 const every_fixture = blk: {
-    var list: [std.meta.fields(Fixture).len]struct { name: []const u8, bytes: []const u8 } = undefined;
-    for (std.meta.fields(Fixture), 0..) |field, at| {
-        list[at] = .{ .name = field.name, .bytes = @field(fixture, field.name) };
+    var list: [@typeInfo(Fixture).@"struct".field_names.len]struct { name: []const u8, bytes: []const u8 } = undefined;
+    for (@typeInfo(Fixture).@"struct".field_names, 0..) |name, at| {
+        list[at] = .{ .name = name, .bytes = @field(fixture, name) };
     }
     break :blk list;
 };
@@ -1128,8 +1128,8 @@ test "the A2A JSON-RPC error envelope maps to the error its ErrorInfo names" {
     try testing.expectEqual(a2a.error_range_max, object.code);
     var lowest: i32 = a2a.error_range_max;
     var highest: i32 = a2a.error_range_min;
-    inline for (@typeInfo(a2a.A2aError).@"enum".fields) |field| {
-        const code: i32 = @intFromEnum(@field(a2a.A2aError, field.name));
+    inline for (@typeInfo(a2a.A2aError).@"enum".field_names) |name| {
+        const code: i32 = @backingInt(@field(a2a.A2aError, name));
         lowest = @min(lowest, code);
         highest = @max(highest, code);
     }

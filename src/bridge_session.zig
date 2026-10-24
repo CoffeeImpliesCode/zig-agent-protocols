@@ -813,7 +813,7 @@ pub const Provider = struct {
         if (idOverlaps(request.id, out)) return error.OverlappingBuffers;
         if (conn.overlaps(out, message)) return error.OverlappingBuffers;
         return conn.errorResponse(request, .{
-            .code = @intFromEnum(binding),
+            .code = @backingInt(binding),
             .message = message,
         }, out);
     }
@@ -836,7 +836,7 @@ fn methodNotCarried(
     try writer.slice("{\"code\":");
     var digits: [16]u8 = undefined;
     const code = std.fmt.bufPrint(&digits, "{d}", .{
-        @intFromEnum(jsonrpc.StandardError.method_not_found),
+        @backingInt(jsonrpc.StandardError.method_not_found),
     }) catch return error.BufferTooSmall;
     try writer.slice(code);
     try writer.slice(",\"message\":");

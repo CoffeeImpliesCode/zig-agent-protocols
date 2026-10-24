@@ -1672,7 +1672,7 @@ test "the refusal frame is a JSON-RPC error carrying -32601 and no result" {
     try testing.expect(message.result == null);
     const failure = message.rpc_error orelse return error.TestUnexpectedResult;
     try testing.expectEqual(
-        @as(i32, @intFromEnum(jsonrpc.StandardError.method_not_found)),
+        @as(i32, @backingInt(jsonrpc.StandardError.method_not_found)),
         failure.code,
     );
     // The id is the one the request carried, because the shared builder wrote
@@ -1811,7 +1811,7 @@ test "an interim result is written only for a method PROTOCOLS.md 4.7 allows" {
     // that grew its buffer and called again gets the whole body; one sent on
     // the truncated prefix would hand the peer a state the server never chose,
     // and the retry that comes back would key off it.
-    const long_state = "x" ** 200;
+    const long_state = &@as([200]u8, @splat('x'));
     var short_out: [120]u8 = undefined;
     try testing.expectError(
         error.BufferTooSmall,
@@ -2261,7 +2261,7 @@ fn scriptedHandler(
         // one every branch below uses, so it cannot land inside a `result`.
         exchange.read_calls += 1;
         return conn.errorResponse(request, .{
-            .code = @intFromEnum(jsonrpc.StandardError.invalid_params),
+            .code = @backingInt(jsonrpc.StandardError.invalid_params),
             .message = "unknown resource",
         }, answer) catch null;
     } else if (std.mem.eql(u8, method.text, "tools/list")) {

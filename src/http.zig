@@ -290,7 +290,7 @@ pub fn parseAccept(value: ?[]const u8) Accept {
         const major = bare[0..slash];
         const minor = bare[slash + 1 ..];
         for (&decided, 0..) |*slot, index| {
-            const rank = precedence(major, minor, @enumFromInt(index)) orelse continue;
+            const rank = precedence(major, minor, @fromBackingInt(@intCast(index))) orelse continue;
             if (slot.* == null or rank > slot.*.?.rank) {
                 slot.* = .{ .rank = rank, .allowed = !refused };
             }
@@ -4479,7 +4479,7 @@ test "a body larger than the caller's buffer is refused, not grown for" {
     const body = try std.fmt.bufPrint(
         &big,
         "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{{\"pad\":\"{s}\"}}}}",
-        .{"x" ** 5900},
+        .{@as([5900]u8, @splat('x'))},
     );
 
     const Refuse = struct {

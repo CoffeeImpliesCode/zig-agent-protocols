@@ -351,7 +351,7 @@ pub fn errorResponse(request: jsonrpc.Request, object: jsonrpc.Error, out: []u8)
 /// rather than assembling the frame itself.
 pub fn methodNotFound(request: jsonrpc.Request, out: []u8) Error![]const u8 {
     return errorResponse(request, .{
-        .code = @intFromEnum(jsonrpc.StandardError.method_not_found),
+        .code = @backingInt(jsonrpc.StandardError.method_not_found),
         .message = "Method not found",
     }, out);
 }
@@ -1005,7 +1005,7 @@ pub const Conn = struct {
         // and nothing is written, exactly as for a handler that declined one.
         const request = jsonrpc.decodeRequest(frame, self.decode_scratch) catch return;
         const body = errorResponse(request, .{
-            .code = @intFromEnum(jsonrpc.StandardError.internal_error),
+            .code = @backingInt(jsonrpc.StandardError.internal_error),
             .message = "this peer could not serve the request",
         }, self.answer) catch return;
         // A handler fault does not excuse a failed transport write. Wake
@@ -2404,7 +2404,7 @@ test "a frame the frame buffer cannot hold ends the connection, and a call says 
     var sent: [256]u8 = undefined;
     // A peer that never sends the delimiter, and sends more of it than the
     // frame buffer can hold.
-    var source: Scripted = .{ .io = io, .bytes = "x" ** 200 };
+    var source: Scripted = .{ .io = io, .bytes = &@as([200]u8, @splat('x')) };
     var recorder: Recorder = .{ .io = io, .sent = &sent };
     var connection = try Conn.init(io, &source.reader, &recorder.writer, .{
         .frame_buffer = &frame_buffer,

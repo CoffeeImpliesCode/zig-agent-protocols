@@ -115,7 +115,7 @@ pub const Reader = struct {
     /// Whether the container open at each depth has yielded a member or an
     /// element yet. Indexed by `depth`, which `enterContainer` bounds by
     /// `max_depth`, so the array is never indexed out of range.
-    has_member: [max_depth + 1]bool = [_]bool{false} ** (max_depth + 1),
+    has_member: [max_depth + 1]bool = @splat(false),
 
     /// A reader positioned at the first byte of `input`.
     ///
@@ -1527,7 +1527,7 @@ test "the depth bound holds on the failure path too" {
     reader.has_member[reader.depth] = false;
 
     // The same through the helper a decoder actually calls.
-    reader = Reader.init("{" ** (max_depth + 1));
+    reader = Reader.init(&@as([max_depth + 1]u8, @splat('{')));
     for (0..max_depth) |_| try testing.expect(!try reader.beginObject());
     try testing.expectError(error.LimitExceeded, reader.beginObject());
     try testing.expectEqual(@as(u32, max_depth), reader.depth);

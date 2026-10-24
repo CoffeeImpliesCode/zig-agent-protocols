@@ -130,7 +130,7 @@ pub fn build(b: *std.Build) void {
     // questions. The driver only sizes a run and prints it, and refusing a
     // mistyped count before any work starts is its whole job; the codec module
     // measures literals in buffers; the runtime module opens sockets and
-    // measures a round trip. `b.args` reaches the driver rather than the build,
+    // measures a round trip. Passthru arguments reach the driver,
     // so `zig build run-bench -- --mode codec` sizes the run and the driver
     // decides what is in range.
     const bench_codec_mod = b.createModule(.{
@@ -158,7 +158,7 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(bench);
     const run_bench_cmd = b.addRunArtifact(bench);
-    if (b.args) |args| run_bench_cmd.addArgs(args);
+    run_bench_cmd.addPassthruArgs();
     b.step("run-bench", "Run bounded codec and live runtime benchmarks").dependOn(&run_bench_cmd.step);
 
     // The interoperability participants are peers, not examples. Each one is
@@ -241,9 +241,7 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(demo);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
     const run_step = b.step("run", "Run the demonstration against real wire bytes");
     run_step.dependOn(&run_cmd.step);
 
@@ -394,7 +392,7 @@ pub fn build(b: *std.Build) void {
     for (suites) |suite| {
         // std.testing.tmpDir is relative to cwd, not --cache-dir. Keep fixture
         // writes in the caller's cache rather than beside the source checkout.
-        suite.run.setCwd(.{ .cwd_relative = b.cache_root.path.? });
+        suite.run.setCwd(.cache_root);
         test_step.dependOn(&suite.run.step);
         const install = b.addInstallArtifact(suite.binary, .{
             .dest_dir = .{ .override = .prefix },
@@ -438,7 +436,7 @@ pub fn build(b: *std.Build) void {
         .root_module = testkit_mod,
     });
     const run_testkit_tests = b.addRunArtifact(testkit_tests);
-    run_testkit_tests.setCwd(.{ .cwd_relative = b.cache_root.path.? });
+    run_testkit_tests.setCwd(.cache_root);
 
     const fuzz_step = b.step("fuzz", "Run the property and differential harness");
     fuzz_step.dependOn(&run_testkit_tests.step);

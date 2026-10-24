@@ -271,22 +271,22 @@ fn parseA2AVersions(out: *std.Io.Writer) !void {
     }
 
     try out.print("\n  TaskState wire names and classification:\n", .{});
-    inline for (@typeInfo(a2a.TaskState).@"enum".fields) |field| {
-        const value: a2a.TaskState = @field(a2a.TaskState, field.name);
+    inline for (@typeInfo(a2a.TaskState).@"enum".field_names) |name| {
+        const value: a2a.TaskState = @field(a2a.TaskState, name);
         const class = if (a2a.isTerminal(value))
             "terminal"
         else if (a2a.isInterrupted(value))
             "interrupted"
         else
             "-";
-        try out.print("    {d}  {s:<26} {s}\n", .{ @intFromEnum(value), value.wireName(), class });
+        try out.print("    {d}  {s:<26} {s}\n", .{ @backingInt(value), value.wireName(), class });
     }
 
     try out.print("\n  The nine A2A errors; six share one status pair:\n", .{});
-    inline for (@typeInfo(a2a.A2aError).@"enum".fields) |field| {
-        const value: a2a.A2aError = @field(a2a.A2aError, field.name);
+    inline for (@typeInfo(a2a.A2aError).@"enum".field_names) |name| {
+        const value: a2a.A2aError = @field(a2a.A2aError, name);
         try out.print("    {d}  {s:<38} http {d}  grpc {s}\n", .{
-            @intFromEnum(value),
+            @backingInt(value),
             value.reason(),
             value.httpStatus(),
             value.grpcStatus(),
@@ -302,7 +302,7 @@ fn showA2AFieldNames(out: *std.Io.Writer) !void {
     // type rather than from any one message. The Zig name is read from the
     // declaration, where a reader looks for it, and not from the table that has
     // to agree with it, because two names from one source would prove nothing.
-    const members = @typeInfo(a2a.AgentCard).@"struct".fields;
+    const members = @typeInfo(a2a.AgentCard).@"struct".field_names;
     try out.print("  AgentCard: number, ProtoJSON name, Zig name:\n", .{});
     inline for (members, 0..) |member, index| {
         // No member of this message lacks a name. A map entry's key and its
@@ -312,7 +312,7 @@ fn showA2AFieldNames(out: *std.Io.Writer) !void {
         try out.print("    {d:>2}  {s:<22} {s}\n", .{
             a2a.fieldNumber(a2a.AgentCard, index),
             a2a.jsonName(a2a.AgentCard, index) orelse "-",
-            member.name,
+            member,
         });
     }
 
@@ -324,7 +324,7 @@ fn showA2AFieldNames(out: *std.Io.Writer) !void {
     // The middle column is what the rule derives, so the gap between that column
     // and the Zig name is the exception and not a second opinion.
     try out.print("      {s:<28} {s:<32} {s}\n", .{ "wire name", "rule derives", "zig name" });
-    const arms = @typeInfo(a2a.SecurityScheme).@"union".fields;
+    const arms = @typeInfo(a2a.SecurityScheme).@"union".field_names;
     inline for (arms, 0..) |arm, index| {
         // `comptime` so the binding is a compile-time value: `snakeCaseName`
         // takes a comptime parameter, and a `const` bound to a comptime
@@ -334,7 +334,7 @@ fn showA2AFieldNames(out: *std.Io.Writer) !void {
             a2a.fieldNumber(a2a.SecurityScheme, index),
             wire,
             a2a.snakeCaseName(wire),
-            arm.name,
+            arm,
         });
     }
 

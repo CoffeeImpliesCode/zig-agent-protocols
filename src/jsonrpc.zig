@@ -973,7 +973,7 @@ pub fn errorResponse(request: Request, object: Error, out: []u8) EncodeError![]c
 /// A string id must be disjoint from `out`, unchecked in every optimize mode.
 pub fn methodNotFound(request: Request, out: []u8) EncodeError![]const u8 {
     return errorResponse(request, .{
-        .code = @intFromEnum(StandardError.method_not_found),
+        .code = @backingInt(StandardError.method_not_found),
         .message = "Method not found",
     }, out);
 }
@@ -2131,8 +2131,8 @@ test "methodNotFound pins the -32601 frame, member for member" {
 }
 
 test "error data spends both enclosing object depths" {
-    const accepted = "[" ** (json.max_depth - 2) ++ "0" ++ "]" ** (json.max_depth - 2);
-    const too_deep = "[" ** (json.max_depth - 1) ++ "0" ++ "]" ** (json.max_depth - 1);
+    const accepted = @as([json.max_depth - 2]u8, @splat('[')) ++ "0" ++ @as([json.max_depth - 2]u8, @splat(']'));
+    const too_deep = @as([json.max_depth - 1]u8, @splat('[')) ++ "0" ++ @as([json.max_depth - 1]u8, @splat(']'));
     var out: [512]u8 = undefined;
     var scratch: [64]u8 = undefined;
     const request: Request = .{
@@ -2151,7 +2151,7 @@ test "error data spends both enclosing object depths" {
     try testing.expectEqualStrings(accepted, answer.rpc_error.?.data.?);
 
     const invalid_error: Error = .{ .code = -1, .message = "m", .data = too_deep };
-    const untouched = [_]u8{0xa5} ** out.len;
+    const untouched: [out.len]u8 = @splat(0xa5);
     @memcpy(&out, &untouched);
     writer = json.Writer.init(&out);
     try testing.expectError(error.InvalidField, encode(

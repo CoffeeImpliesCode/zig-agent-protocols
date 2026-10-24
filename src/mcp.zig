@@ -4656,8 +4656,8 @@ fn contains(expected: []const []const u8, needle: []const u8) bool {
 
 /// Whether `namespace` declares a member whose value is `key`.
 fn declaresKey(comptime namespace: type, key: []const u8) bool {
-    inline for (@typeInfo(namespace).@"struct".decls) |decl| {
-        if (std.mem.eql(u8, @field(namespace, decl.name), key)) return true;
+    inline for (@typeInfo(namespace).@"struct".decl_names) |name| {
+        if (std.mem.eql(u8, @field(namespace, name), key)) return true;
     }
     return false;
 }
@@ -4756,14 +4756,14 @@ test "the _meta key set is exactly the ten keys section 4.3 lists" {
     // Every member the table declares is a key the document lists. `meta_key` is
     // a namespace of reserved keys and nothing else, so a declaration that is not
     // one is a fault here rather than an addition.
-    inline for (@typeInfo(meta_key).@"struct".decls) |decl| {
-        try testing.expect(contains(&keys, @field(meta_key, decl.name)));
+    inline for (@typeInfo(meta_key).@"struct".decl_names) |name| {
+        try testing.expect(contains(&keys, @field(meta_key, name)));
     }
     // And every key the document lists is one the table declares.
     for (keys) |key| {
         try testing.expect(declaresKey(meta_key, key));
     }
-    try testing.expectEqual(keys.len, @typeInfo(meta_key).@"struct".decls.len);
+    try testing.expectEqual(keys.len, @typeInfo(meta_key).@"struct".decl_names.len);
 }
 
 test "lookupMethod accepts every core client request at the current revision" {
@@ -5508,7 +5508,7 @@ test "the four parameter rows resolve to one verdict each" {
     try testing.expectEqual(@as(?ErrorCode, null), ParamVerdict.unexpected_header.errorCode());
     try testing.expectEqual(
         @as(i32, -32020),
-        @intFromEnum(ParamVerdict.mismatch.errorCode().?),
+        @backingInt(ParamVerdict.mismatch.errorCode().?),
     );
 }
 
@@ -5759,9 +5759,9 @@ test "the three result rules answer for a body with no session in hand" {
 }
 
 test "error codes match the renumbering record" {
-    try testing.expectEqual(@as(i32, -32020), @intFromEnum(ErrorCode.header_mismatch));
-    try testing.expectEqual(@as(i32, -32021), @intFromEnum(ErrorCode.missing_required_client_capability));
-    try testing.expectEqual(@as(i32, -32022), @intFromEnum(ErrorCode.unsupported_protocol_version));
+    try testing.expectEqual(@as(i32, -32020), @backingInt(ErrorCode.header_mismatch));
+    try testing.expectEqual(@as(i32, -32021), @backingInt(ErrorCode.missing_required_client_capability));
+    try testing.expectEqual(@as(i32, -32022), @backingInt(ErrorCode.unsupported_protocol_version));
     try testing.expectEqual(@as(i32, -32001), ErrorCode.header_mismatch.renumberedFrom().?);
     try testing.expectEqual(@as(i32, -32003), ErrorCode.missing_required_client_capability.renumberedFrom().?);
     try testing.expectEqual(@as(i32, -32004), ErrorCode.unsupported_protocol_version.renumberedFrom().?);
@@ -5770,9 +5770,9 @@ test "error codes match the renumbering record" {
 test "a wire code maps back to the member PROTOCOLS.md section 4.5 names" {
     // The reverse of the enum. A tag added without a row here resolves to null,
     // and this fails rather than letting the gap reach a caller.
-    inline for (@typeInfo(ErrorCode).@"enum".fields) |field| {
-        const value: ErrorCode = @field(ErrorCode, field.name);
-        try testing.expectEqual(value, ErrorCode.fromCode(@intFromEnum(value)).?);
+    inline for (@typeInfo(ErrorCode).@"enum".field_names) |name| {
+        const value: ErrorCode = @field(ErrorCode, name);
+        try testing.expectEqual(value, ErrorCode.fromCode(@backingInt(value)).?);
     }
 
     // The three the specification allocates carry their current values, and the
@@ -7340,10 +7340,10 @@ test "inputRequired refuses a request map that is not one whole JSON object" {
 }
 
 test "opaque MCP values spend their enclosing containers" {
-    const map = "{\"1\":" ++ "[" ** (json.max_depth - 2) ++ "0" ++ "]" ** (json.max_depth - 2) ++ "}";
-    const deep_map = "{\"1\":" ++ "[" ** (json.max_depth - 1) ++ "0" ++ "]" ** (json.max_depth - 1) ++ "}";
-    const schema = "{\"k\":" ++ "[" ** (json.max_depth - 4) ++ "0" ++ "]" ** (json.max_depth - 4) ++ "}";
-    const deep_schema = "{\"k\":" ++ "[" ** (json.max_depth - 3) ++ "0" ++ "]" ** (json.max_depth - 3) ++ "}";
+    const map = "{\"1\":" ++ @as([json.max_depth - 2]u8, @splat('[')) ++ "0" ++ @as([json.max_depth - 2]u8, @splat(']')) ++ "}";
+    const deep_map = "{\"1\":" ++ @as([json.max_depth - 1]u8, @splat('[')) ++ "0" ++ @as([json.max_depth - 1]u8, @splat(']')) ++ "}";
+    const schema = "{\"k\":" ++ @as([json.max_depth - 4]u8, @splat('[')) ++ "0" ++ @as([json.max_depth - 4]u8, @splat(']')) ++ "}";
+    const deep_schema = "{\"k\":" ++ @as([json.max_depth - 3]u8, @splat('[')) ++ "0" ++ @as([json.max_depth - 3]u8, @splat(']')) ++ "}";
     var out: [1024]u8 = undefined;
     var scratch: [256]u8 = undefined;
     var verbatim: [8]VerbatimMember = undefined;
@@ -7352,7 +7352,7 @@ test "opaque MCP values spend their enclosing containers" {
     try testing.expectEqualStrings(map, decoded_interim.input_requests.?);
     @memset(&out, 0xa5);
     try testing.expectError(error.InvalidField, inputRequired("tools/call", deep_map, "state", &out));
-    try testing.expectEqualSlices(u8, &([_]u8{0xa5} ** out.len), &out);
+    try testing.expectEqualSlices(u8, &@as([out.len]u8, @splat(0xa5)), &out);
 
     const tools = [_]Tool{.{ .name = "t", .input_schema = schema }};
     var writer = json.Writer.init(&out);
@@ -7370,5 +7370,5 @@ test "opaque MCP values spend their enclosing containers" {
         .cacheable = .{ .ttl_ms = 0, .cache_scope = .public },
         .tools = &deep_tools,
     }, &writer));
-    try testing.expectEqualSlices(u8, &([_]u8{0xa5} ** out.len), &out);
+    try testing.expectEqualSlices(u8, &@as([out.len]u8, @splat(0xa5)), &out);
 }

@@ -1465,7 +1465,7 @@ pub fn answerPermissionRequest(
         .grants => try conn.errorResponse(
             request,
             .{
-                .code = @intFromEnum(jsonrpc.StandardError.internal_error),
+                .code = @backingInt(jsonrpc.StandardError.internal_error),
                 .message = "a granting answer needs an option id",
             },
             out,
@@ -2889,7 +2889,7 @@ test "an initialize is shaped by the version it asks for" {
     );
     @memset(&out, 0xa5);
     try testing.expectError(error.MissingInfo, initializeParams(.draft, 2, null, null, &out));
-    try testing.expectEqualSlices(u8, &([_]u8{0xa5} ** out.len), &out);
+    try testing.expectEqualSlices(u8, &@as([out.len]u8, @splat(0xa5)), &out);
 }
 
 test "an agent answers initialize in its own version's spelling" {
@@ -2932,7 +2932,7 @@ test "an agent answers initialize in its own version's spelling" {
         error.MissingInfo,
         v2.initializeBody(null, "{\"session\":{}}", null, &out),
     );
-    try testing.expectEqualSlices(u8, &([_]u8{0xa5} ** out.len), &out);
+    try testing.expectEqualSlices(u8, &@as([out.len]u8, @splat(0xa5)), &out);
 }
 
 test "a downgrade is read in the version the agent answered with" {
@@ -3186,7 +3186,7 @@ test "params that are not an object are refused before they are framed" {
 
 test "a non-object params is refused at the entry point, before a byte is written" {
     var connection: conn.Conn = undefined;
-    const blank: [128]u8 = [_]u8{0} ** 128;
+    const blank: [128]u8 = @splat(0);
     var out: [128]u8 = blank;
     var result: [128]u8 = blank;
     var client: Client = .{ .connection = &connection, .version = .stable };

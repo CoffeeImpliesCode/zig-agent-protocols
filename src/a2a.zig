@@ -343,8 +343,8 @@ pub const TaskState = enum(u8) {
     /// convenience and no peer sends them, so accepting `submitted` here would
     /// accept a value the specification does not define on the wire.
     pub fn fromWireName(text: []const u8) ?TaskState {
-        inline for (@typeInfo(TaskState).@"enum".fields) |field| {
-            const value: TaskState = @field(TaskState, field.name);
+        inline for (@typeInfo(TaskState).@"enum".field_names) |name| {
+            const value: TaskState = @field(TaskState, name);
             if (std.mem.eql(u8, text, value.wireName())) return value;
         }
         return null;
@@ -363,9 +363,9 @@ pub const TaskState = enum(u8) {
     /// peer that moved on would otherwise look like one that said nothing.
     pub fn fromTag(tag: u8) DecodeError!TaskState {
         if (tag > task_state_max) return error.UnknownTag;
-        inline for (@typeInfo(TaskState).@"enum".fields) |field| {
-            const value: TaskState = @field(TaskState, field.name);
-            if (@intFromEnum(value) == tag) return value;
+        inline for (@typeInfo(TaskState).@"enum".field_names) |name| {
+            const value: TaskState = @field(TaskState, name);
+            if (@backingInt(value) == tag) return value;
         }
         // Every tag from 0 to `task_state_max` is declared, so this is only
         // reachable if a future tag opens a gap. A gap is an unknown tag too,
@@ -436,8 +436,8 @@ pub const Role = enum(u8) {
     /// [`TaskState.fromWireName`] gives: `error.UnknownTag` for the Zig field
     /// name `user`, and never a fallback to `unspecified`.
     pub fn parse(text: []const u8) DecodeError!Role {
-        inline for (@typeInfo(Role).@"enum".fields) |field| {
-            const value: Role = @field(Role, field.name);
+        inline for (@typeInfo(Role).@"enum".field_names) |name| {
+            const value: Role = @field(Role, name);
             if (std.mem.eql(u8, text, value.wireName())) return value;
         }
         return error.UnknownTag;
@@ -449,9 +449,9 @@ pub const Role = enum(u8) {
     /// `error.UnknownTag` rather than `unspecified`.
     pub fn fromTag(tag: u8) DecodeError!Role {
         if (tag > role_max) return error.UnknownTag;
-        inline for (@typeInfo(Role).@"enum".fields) |field| {
-            const value: Role = @field(Role, field.name);
-            if (@intFromEnum(value) == tag) return value;
+        inline for (@typeInfo(Role).@"enum".field_names) |name| {
+            const value: Role = @field(Role, name);
+            if (@backingInt(value) == tag) return value;
         }
         return error.UnknownTag;
     }
@@ -530,15 +530,15 @@ pub fn snakeCaseName(comptime json_name: []const u8) []const u8 {
 /// only the first field is examined.
 fn numberAfterLeadingOneof(comptime T: type) u32 {
     const first = switch (@typeInfo(T)) {
-        .@"struct" => |s| if (s.fields.len == 0) return 0 else s.fields[0],
+        .@"struct" => |s| if (s.field_types.len == 0) return 0 else s.field_types[0],
         else => return 0,
     };
-    const oneof = switch (@typeInfo(first.type)) {
+    const oneof = switch (@typeInfo(first)) {
         .@"union" => |u| u,
         else => return 0,
     };
     if (oneof.tag_type == null) return 0;
-    return oneof.fields.len + 1;
+    return oneof.field_names.len + 1;
 }
 
 /// Assert that `T`'s `fields` table agrees with `T`'s own fields.
@@ -552,8 +552,8 @@ fn numberAfterLeadingOneof(comptime T: type) u32 {
 /// all covered here, where the old count-and-name pair covered only the first.
 fn assertFieldTable(comptime T: type) void {
     switch (@typeInfo(T)) {
-        .@"struct" => |s| assertTable(T, s.fields),
-        .@"union" => |u| assertTable(T, u.fields),
+        .@"struct" => |s| assertTable(T, s.field_names),
+        .@"union" => |u| assertTable(T, u.field_names),
         else => @compileError(std.fmt.comptimePrint(
             "{s} is neither a struct nor a tagged union, so it is not a message",
             .{@typeName(T)},
@@ -563,9 +563,7 @@ fn assertFieldTable(comptime T: type) void {
 
 /// The body of `assertFieldTable`, for a struct or for a tagged union.
 ///
-/// `members` is `[]const StructField` in one case and `[]const UnionField` in the
-/// other. The loop reads only the name, which both carry, so one body checks
-/// both shapes.
+/// `members` contains the reflected field names in declaration order.
 fn assertTable(comptime T: type, comptime members: anytype) void {
     const table = T.fields;
     if (table.len != members.len) {
@@ -605,10 +603,10 @@ fn assertTable(comptime T: type, comptime members: anytype) void {
                 "{s} field {d} has neither a ProtoJSON name nor a Zig name",
                 .{ @typeName(T), index },
             )));
-        if (comptime !std.mem.eql(u8, member.name, expected_name)) {
+        if (comptime !std.mem.eql(u8, member, expected_name)) {
             @compileError(std.fmt.comptimePrint(
                 "{s} field {d} is named '{s}', but its table row says '{s}'",
-                .{ @typeName(T), index, member.name, expected_name },
+                .{ @typeName(T), index, member, expected_name },
             ));
         }
         const expected_number: u32 = if (index == 0)
@@ -1885,8 +1883,8 @@ pub fn classifyReason(domain: ?[]const u8, reason: []const u8) UnmappedReason {
 
 /// Look up the A2A error a known reason names.
 pub fn errorForReason(reason: []const u8) ?A2aError {
-    inline for (@typeInfo(A2aError).@"enum".fields) |field| {
-        const value: A2aError = @field(A2aError, field.name);
+    inline for (@typeInfo(A2aError).@"enum".field_names) |name| {
+        const value: A2aError = @field(A2aError, name);
         if (std.mem.eql(u8, reason, value.reason())) return value;
     }
     return null;
@@ -4942,7 +4940,7 @@ fn oneofMemberName(comptime U: type, comptime index: usize) []const u8 {
         "{s} is not a tagged union, so it has no oneof member names",
         .{@typeName(U)},
     ));
-    const ordinal = @intFromEnum(@field(tag_type, info.fields[index].name));
+    const ordinal = @backingInt(@field(tag_type, info.field_names[index]));
     if (comptime ordinal != index) {
         @compileError(std.fmt.comptimePrint(
             "{s} member {d} has tag ordinal {d}, so a codec taking the ordinal" ++
@@ -6702,8 +6700,8 @@ const testing = std.testing;
 fn expectUnionOrdinals(comptime U: type) !void {
     // The five `oneof` types are tagged unions, so the unwrap cannot fail here.
     const tag_type = @typeInfo(U).@"union".tag_type.?;
-    inline for (@typeInfo(tag_type).@"enum".fields, 0..) |tag, index| {
-        const ordinal: usize = @intCast(@intFromEnum(@field(tag_type, tag.name)));
+    inline for (@typeInfo(tag_type).@"enum".field_names, 0..) |name, index| {
+        const ordinal: usize = @intCast(@backingInt(@field(tag_type, name)));
         try testing.expectEqual(index, ordinal);
         try testing.expectEqual(index + 1, U.fields[index].number);
     }
@@ -6750,15 +6748,15 @@ test "a field name is the snake_case form of the name ProtoJSON writes" {
     try testing.expectEqualStrings("list", snakeCaseName("list"));
 
     // Every field of a message follows the rule, with no override in sight.
-    inline for (@typeInfo(AgentCard).@"struct".fields, 0..) |member, index| {
+    inline for (@typeInfo(AgentCard).@"struct".field_names, 0..) |member, index| {
         try testing.expectEqualStrings(
-            member.name,
+            member,
             snakeCaseName(jsonName(AgentCard, index).?),
         );
     }
-    inline for (@typeInfo(ListTasksRequest).@"struct".fields, 0..) |member, index| {
+    inline for (@typeInfo(ListTasksRequest).@"struct".field_names, 0..) |member, index| {
         try testing.expectEqualStrings(
-            member.name,
+            member,
             snakeCaseName(jsonName(ListTasksRequest, index).?),
         );
     }
@@ -6836,15 +6834,15 @@ test "the protobuf package carries the lf prefix" {
 }
 
 test "TaskState tags match the proto exactly" {
-    try testing.expectEqual(@as(u8, 0), @intFromEnum(TaskState.unspecified));
-    try testing.expectEqual(@as(u8, 1), @intFromEnum(TaskState.submitted));
-    try testing.expectEqual(@as(u8, 2), @intFromEnum(TaskState.working));
-    try testing.expectEqual(@as(u8, 3), @intFromEnum(TaskState.completed));
-    try testing.expectEqual(@as(u8, 4), @intFromEnum(TaskState.failed));
-    try testing.expectEqual(@as(u8, 5), @intFromEnum(TaskState.canceled));
-    try testing.expectEqual(@as(u8, 6), @intFromEnum(TaskState.input_required));
-    try testing.expectEqual(@as(u8, 7), @intFromEnum(TaskState.rejected));
-    try testing.expectEqual(@as(u8, 8), @intFromEnum(TaskState.auth_required));
+    try testing.expectEqual(@as(u8, 0), @backingInt(TaskState.unspecified));
+    try testing.expectEqual(@as(u8, 1), @backingInt(TaskState.submitted));
+    try testing.expectEqual(@as(u8, 2), @backingInt(TaskState.working));
+    try testing.expectEqual(@as(u8, 3), @backingInt(TaskState.completed));
+    try testing.expectEqual(@as(u8, 4), @backingInt(TaskState.failed));
+    try testing.expectEqual(@as(u8, 5), @backingInt(TaskState.canceled));
+    try testing.expectEqual(@as(u8, 6), @backingInt(TaskState.input_required));
+    try testing.expectEqual(@as(u8, 7), @backingInt(TaskState.rejected));
+    try testing.expectEqual(@as(u8, 8), @backingInt(TaskState.auth_required));
 }
 
 test "TASK_STATE_CANCELED is spelled with one L" {
@@ -6853,8 +6851,8 @@ test "TASK_STATE_CANCELED is spelled with one L" {
     try testing.expectEqualStrings("TASK_STATE_CANCELED", TaskState.canceled.wireName());
     try testing.expectEqual(@as(?TaskState, null), TaskState.fromWireName("TASK_STATE_CANCELLED"));
     // And the round trip is exact.
-    inline for (@typeInfo(TaskState).@"enum".fields) |field| {
-        const value: TaskState = @field(TaskState, field.name);
+    inline for (@typeInfo(TaskState).@"enum".field_names) |name| {
+        const value: TaskState = @field(TaskState, name);
         try testing.expectEqual(value, try TaskState.parse(value.wireName()));
     }
 }
@@ -6875,9 +6873,9 @@ test "Role tags and wire names match" {
 }
 
 test "a numeric TaskState tag decodes and one above the range is UnknownTag" {
-    inline for (@typeInfo(TaskState).@"enum".fields) |field| {
-        const value: TaskState = @field(TaskState, field.name);
-        try testing.expectEqual(value, try TaskState.fromTag(@intFromEnum(value)));
+    inline for (@typeInfo(TaskState).@"enum".field_names) |name| {
+        const value: TaskState = @field(TaskState, name);
+        try testing.expectEqual(value, try TaskState.fromTag(@backingInt(value)));
     }
     try testing.expectEqual(@as(u8, 8), task_state_max);
     try testing.expectEqual(TaskState.auth_required, try TaskState.fromTag(8));
@@ -7024,7 +7022,7 @@ test "an unimplemented version answers no method at all" {
         try testing.expect(!isMethodValidAt(two_zero, rpc.name));
         try testing.expect(!isMethodValidAt(zero_five, rpc.name));
     }
-    try testing.expectEqual(@as(i32, -32009), @intFromEnum(A2aError.version_not_supported));
+    try testing.expectEqual(@as(i32, -32009), @backingInt(A2aError.version_not_supported));
     try testing.expectEqualStrings(
         "VERSION_NOT_SUPPORTED",
         A2aError.version_not_supported.reason(),
@@ -7133,18 +7131,18 @@ test "an empty nextPageToken means the last page, and absence is an error" {
 }
 
 test "the nine A2A error codes match the table" {
-    try testing.expectEqual(@as(i32, -32001), @intFromEnum(A2aError.task_not_found));
-    try testing.expectEqual(@as(i32, -32002), @intFromEnum(A2aError.task_not_cancelable));
-    try testing.expectEqual(@as(i32, -32003), @intFromEnum(A2aError.push_notification_not_supported));
-    try testing.expectEqual(@as(i32, -32004), @intFromEnum(A2aError.unsupported_operation));
-    try testing.expectEqual(@as(i32, -32005), @intFromEnum(A2aError.content_type_not_supported));
-    try testing.expectEqual(@as(i32, -32006), @intFromEnum(A2aError.invalid_agent_response));
-    try testing.expectEqual(@as(i32, -32007), @intFromEnum(A2aError.extended_agent_card_not_configured));
-    try testing.expectEqual(@as(i32, -32008), @intFromEnum(A2aError.extension_support_required));
-    try testing.expectEqual(@as(i32, -32009), @intFromEnum(A2aError.version_not_supported));
+    try testing.expectEqual(@as(i32, -32001), @backingInt(A2aError.task_not_found));
+    try testing.expectEqual(@as(i32, -32002), @backingInt(A2aError.task_not_cancelable));
+    try testing.expectEqual(@as(i32, -32003), @backingInt(A2aError.push_notification_not_supported));
+    try testing.expectEqual(@as(i32, -32004), @backingInt(A2aError.unsupported_operation));
+    try testing.expectEqual(@as(i32, -32005), @backingInt(A2aError.content_type_not_supported));
+    try testing.expectEqual(@as(i32, -32006), @backingInt(A2aError.invalid_agent_response));
+    try testing.expectEqual(@as(i32, -32007), @backingInt(A2aError.extended_agent_card_not_configured));
+    try testing.expectEqual(@as(i32, -32008), @backingInt(A2aError.extension_support_required));
+    try testing.expectEqual(@as(i32, -32009), @backingInt(A2aError.version_not_supported));
     // All nine sit inside the range the specification states.
-    inline for (@typeInfo(A2aError).@"enum".fields) |field| {
-        const value: i32 = @intFromEnum(@field(A2aError, field.name));
+    inline for (@typeInfo(A2aError).@"enum".field_names) |name| {
+        const value: i32 = @backingInt(@field(A2aError, name));
         try testing.expect(value >= error_range_min and value <= error_range_max);
     }
 }
@@ -7162,8 +7160,8 @@ test "the reason is the type name in upper snake case" {
 test "six of the nine errors collapse onto one status pair" {
     var failed_precondition: usize = 0;
     var bad_request: usize = 0;
-    inline for (@typeInfo(A2aError).@"enum".fields) |field| {
-        const value: A2aError = @field(A2aError, field.name);
+    inline for (@typeInfo(A2aError).@"enum".field_names) |name| {
+        const value: A2aError = @field(A2aError, name);
         if (std.mem.eql(u8, value.grpcStatus(), GrpcStatus.failed_precondition)) {
             failed_precondition += 1;
         }
@@ -7228,8 +7226,8 @@ test "an API key location renders the spelling the location field carries" {
     try testing.expectEqualStrings("query", ApiKeyLocation.query.string());
     try testing.expectEqualStrings("header", ApiKeyLocation.header.string());
     try testing.expectEqualStrings("cookie", ApiKeyLocation.cookie.string());
-    inline for (@typeInfo(ApiKeyLocation).@"enum".fields) |field| {
-        const value: ApiKeyLocation = @field(ApiKeyLocation, field.name);
+    inline for (@typeInfo(ApiKeyLocation).@"enum".field_names) |name| {
+        const value: ApiKeyLocation = @field(ApiKeyLocation, name);
         try testing.expectEqual(value, try ApiKeyLocation.parse(value.string()));
     }
 }
@@ -7247,7 +7245,7 @@ test "a required extension that is not activated is -32008" {
     try testing.expect(!extensionSatisfied(&activations, true, other));
     // An extension that is not required may simply be skipped.
     try testing.expect(extensionSatisfied(&activations, false, other));
-    try testing.expectEqual(@as(i32, -32008), @intFromEnum(extension_missing_error));
+    try testing.expectEqual(@as(i32, -32008), @backingInt(extension_missing_error));
 }
 
 test "an AgentInterface carries a protocol version with no patch component" {
@@ -7494,9 +7492,10 @@ test "the AgentCard requires exactly the eight fields the proto marks required" 
 /// absent default.
 fn hasDefault(comptime T: type, comptime field: []const u8) bool {
     return comptime blk: {
-        for (@typeInfo(T).@"struct".fields) |candidate| {
-            if (std.mem.eql(u8, candidate.name, field)) {
-                break :blk candidate.default_value_ptr != null;
+        const info = @typeInfo(T).@"struct";
+        for (info.field_names, info.field_attrs) |name, attrs| {
+            if (std.mem.eql(u8, name, field)) {
+                break :blk attrs.default_value_ptr != null;
             }
         }
         @compileError(std.fmt.comptimePrint(
@@ -7554,8 +7553,9 @@ test "a REQUIRED field carries no default and an optional one is a presence" {
 /// reason `hasDefault` gives: a renamed field cannot pass as an absent one.
 fn FieldType(comptime T: type, comptime field: []const u8) type {
     return comptime blk: {
-        for (@typeInfo(T).@"struct".fields) |candidate| {
-            if (std.mem.eql(u8, candidate.name, field)) break :blk candidate.type;
+        const info = @typeInfo(T).@"struct";
+        for (info.field_names, info.field_types) |name, field_type| {
+            if (std.mem.eql(u8, name, field)) break :blk field_type;
         }
         @compileError(std.fmt.comptimePrint(
             "{s} has no field named '{s}'",
@@ -7871,13 +7871,13 @@ test "an opaque lexeme that is not one value is refused before a byte is written
     try testing.expectError(
         error.InvalidField,
         encodeCancelTaskRequest(
-            .{ .id = "t", .metadata = "[" ** json.max_depth ++ "]" ** json.max_depth },
+            .{ .id = "t", .metadata = &(@as([json.max_depth]u8, @splat('[')) ++ @as([json.max_depth]u8, @splat(']'))) },
             &writer,
         ),
     );
     try testing.expectEqual(@as(usize, 0), writer.written().len);
 
-    const at_limit = "[" ** (json.max_depth - 1) ++ "]" ** (json.max_depth - 1);
+    const at_limit = &(@as([json.max_depth - 1]u8, @splat('[')) ++ @as([json.max_depth - 1]u8, @splat(']')));
     writer = json.Writer.init(&out);
     try encodeCancelTaskRequest(.{ .id = "t", .metadata = at_limit }, &writer);
     try testing.expectEqualStrings(
@@ -7923,7 +7923,7 @@ test "an opaque lexeme is checked at the depth its member is written" {
         .tasks = &[_]Task{.{
             .id = "t",
             .status = .{ .state = .working },
-            .metadata = "[" ** page_fits ++ "]" ** page_fits,
+            .metadata = &(@as([page_fits]u8, @splat('[')) ++ @as([page_fits]u8, @splat(']'))),
         }},
         .next_page_token = "",
         .page_size = 1,
@@ -7938,7 +7938,7 @@ test "an opaque lexeme is checked at the depth its member is written" {
         .tasks = &[_]Task{.{
             .id = "t",
             .status = .{ .state = .working },
-            .metadata = "[" ** (page_fits + 1) ++ "]" ** (page_fits + 1),
+            .metadata = &(@as([page_fits + 1]u8, @splat('[')) ++ @as([page_fits + 1]u8, @splat(']'))),
         }},
         .next_page_token = "",
         .page_size = 1,
@@ -7966,7 +7966,7 @@ test "an opaque lexeme is checked at the depth its member is written" {
             .message_id = "m",
             .role = .user,
             .parts = &[_]Part{.{
-                .content = .{ .data = "[" ** nested_fits ++ "]" ** nested_fits },
+                .content = .{ .data = &(@as([nested_fits]u8, @splat('[')) ++ @as([nested_fits]u8, @splat(']'))) },
             }},
         } },
     } };
@@ -7979,7 +7979,7 @@ test "an opaque lexeme is checked at the depth its member is written" {
             .message_id = "m",
             .role = .user,
             .parts = &[_]Part{.{
-                .content = .{ .data = "[" ** (nested_fits + 1) ++ "]" ** (nested_fits + 1) },
+                .content = .{ .data = &(@as([nested_fits + 1]u8, @splat('[')) ++ @as([nested_fits + 1]u8, @splat(']'))) },
             }},
         } },
     } };
@@ -7993,7 +7993,7 @@ test "an opaque lexeme is checked at the depth its member is written" {
     // And the deepest a decode admits is the deepest an encode writes, so a
     // value that decoded still writes back and decodes again. A bare task is at
     // one, so a `metadata` lexeme nested `max_depth - 1` deep is the boundary.
-    const deepest = "[" ** (json.max_depth - 1) ++ "]" ** (json.max_depth - 1);
+    const deepest = &(@as([json.max_depth - 1]u8, @splat('[')) ++ @as([json.max_depth - 1]u8, @splat(']')));
     const body = "{\"id\":\"t\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}," ++
         "\"metadata\":" ++ deepest ++ "}";
     const task = try decodeTask(body, &arena, &scratch);

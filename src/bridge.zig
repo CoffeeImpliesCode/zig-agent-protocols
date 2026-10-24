@@ -1494,11 +1494,11 @@ test "the binding allocates no code inside either MCP code range" {
     // binding code in either would make the two spaces ambiguous, so all
     // five binding codes have to fall outside both.
     const codes = [_]i32{
-        @intFromEnum(BindingError.invalid_request),
-        @intFromEnum(BindingError.operation_cancelled),
-        @intFromEnum(BindingError.resource_limit_exceeded),
-        @intFromEnum(BindingError.server_registration_unavailable),
-        @intFromEnum(BindingError.backend_failed),
+        @backingInt(BindingError.invalid_request),
+        @backingInt(BindingError.operation_cancelled),
+        @backingInt(BindingError.resource_limit_exceeded),
+        @backingInt(BindingError.server_registration_unavailable),
+        @backingInt(BindingError.backend_failed),
     };
     for (codes) |code| {
         const in_legacy = code >= mcp.legacy_error_min and code <= mcp.legacy_error_max;

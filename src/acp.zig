@@ -150,7 +150,7 @@ pub const WireVersion = enum(u16) {
     /// Total, allocation-free and comptime-known per tag, so a handshake or a
     /// dispatch key can be computed from a value with no branch.
     pub fn number(self: WireVersion) u16 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 
@@ -2593,9 +2593,9 @@ pub const PermissionOptionKind = enum {
     /// Total and allocation-free. The scan is unrolled at compile time over
     /// the four fields, so it costs at most four byte comparisons.
     pub fn fromString(text: []const u8) ?PermissionOptionKind {
-        inline for (@typeInfo(PermissionOptionKind).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) {
-                return @field(PermissionOptionKind, field.name);
+        inline for (@typeInfo(PermissionOptionKind).@"enum".field_names) |name| {
+            if (std.mem.eql(u8, text, name)) {
+                return @field(PermissionOptionKind, name);
             }
         }
         return null;
@@ -3815,7 +3815,7 @@ pub const ElicitationMode = enum {
     /// against a comptime table of static strings and dropped.
     pub fn fromString(text: []const u8) ?ElicitationMode {
         for (elicitation_modes, 0..) |name, index| {
-            if (std.mem.eql(u8, text, name)) return @enumFromInt(index);
+            if (std.mem.eql(u8, text, name)) return @fromBackingInt(@intCast(index));
         }
         return null;
     }
@@ -3829,12 +3829,12 @@ pub const ElicitationMode = enum {
     /// mis-spell a tag. The result points at static storage inside this file,
     /// so it is never released and outlives anything the caller holds.
     pub fn string(self: ElicitationMode) []const u8 {
-        return elicitation_modes[@intFromEnum(self)];
+        return elicitation_modes[@backingInt(self)];
     }
 };
 
 comptime {
-    if (elicitation_modes.len != @typeInfo(ElicitationMode).@"enum".fields.len) {
+    if (elicitation_modes.len != @typeInfo(ElicitationMode).@"enum".field_names.len) {
         @compileError("elicitation_modes and ElicitationMode must name the same modes");
     }
 }
@@ -4571,8 +4571,8 @@ test "permission option kinds are the four stated values" {
     try testing.expectEqualStrings("allow_always", PermissionOptionKind.allow_always.string());
     try testing.expectEqualStrings("reject_once", PermissionOptionKind.reject_once.string());
     try testing.expectEqualStrings("reject_always", PermissionOptionKind.reject_always.string());
-    inline for (@typeInfo(PermissionOptionKind).@"enum".fields) |field| {
-        const value: PermissionOptionKind = @field(PermissionOptionKind, field.name);
+    inline for (@typeInfo(PermissionOptionKind).@"enum".field_names) |name| {
+        const value: PermissionOptionKind = @field(PermissionOptionKind, name);
         try testing.expectEqual(value, PermissionOptionKind.fromString(value.string()).?);
     }
 }
@@ -4851,15 +4851,15 @@ test "elicitation modes and actions are the stated sets" {
     // rejects, and nothing in the library called either one.
     try testing.expectEqualStrings("form", ElicitationMode.form.string());
     try testing.expectEqualStrings("url", ElicitationMode.url.string());
-    inline for (@typeInfo(ElicitationMode).@"enum".fields) |field| {
-        const value: ElicitationMode = @field(ElicitationMode, field.name);
+    inline for (@typeInfo(ElicitationMode).@"enum".field_names) |name| {
+        const value: ElicitationMode = @field(ElicitationMode, name);
         try testing.expectEqual(value, ElicitationMode.fromString(value.string()).?);
     }
     try testing.expectEqualStrings("accept", ElicitationAction.accept.string());
     try testing.expectEqualStrings("decline", ElicitationAction.decline.string());
     try testing.expectEqualStrings("cancel", ElicitationAction.cancel.string());
-    inline for (@typeInfo(ElicitationAction).@"enum".fields) |field| {
-        const value: ElicitationAction = @field(ElicitationAction, field.name);
+    inline for (@typeInfo(ElicitationAction).@"enum".field_names) |name| {
+        const value: ElicitationAction = @field(ElicitationAction, name);
         try testing.expectEqual(value, ElicitationAction.fromString(value.string()).?);
     }
 }
@@ -4873,7 +4873,7 @@ test "the elicitation mode table and the typed set are one set" {
     for (elicitation_modes, 0..) |name, index| {
         const mode = ElicitationMode.fromString(name) orelse return error.TestUnexpectedResult;
         try testing.expectEqual(name, mode.string());
-        try testing.expectEqual(mode, @as(ElicitationMode, @enumFromInt(index)));
+        try testing.expectEqual(mode, @as(ElicitationMode, @fromBackingInt(@intCast(index))));
         for ([_]WireVersion{ .stable, .draft }) |version| {
             switch (classifyElicitationMode(version, name)) {
                 .named => |found| try testing.expectEqual(index, found),
@@ -6370,8 +6370,8 @@ test "a capability set is bounded by the deepest nesting a decode admits" {
     // different number there — one level shallower — and both numbers are one
     // contract rather than two.
     const deepest = json.max_depth - 1;
-    const source = "{\"v\":" ** (deepest + 1) ++ "true" ++ "}" ** (deepest + 1);
-    const too_deep_document = "{\"v\":" ** (deepest + 2) ++ "true" ++ "}" ** (deepest + 2);
+    const source = @as([5 * (deepest + 1)]u8, @bitCast(@as([deepest + 1][5]u8, @splat("{\"v\":".*)))) ++ "true" ++ @as([deepest + 1]u8, @splat('}'));
+    const too_deep_document = @as([5 * (deepest + 2)]u8, @bitCast(@as([deepest + 2][5]u8, @splat("{\"v\":".*)))) ++ "true" ++ @as([deepest + 2]u8, @splat('}'));
 
     // A path at nesting level `k` is `2k + 1` bytes and every one owns its own
     // region of `paths`, so the sum over `deepest` objects and one boolean leaf
@@ -6504,7 +6504,7 @@ test "a capability set is bounded by the deepest nesting a decode admits" {
     // than the `json.max_depth - 1` above. That body decodes, re-encodes to
     // the same bytes, and decodes back to the same entries.
     const body_deepest = json.max_depth - 2;
-    const body_object = "{\"v\":" ** (body_deepest + 1) ++ "true" ++ "}" ** (body_deepest + 1);
+    const body_object = @as([5 * (body_deepest + 1)]u8, @bitCast(@as([body_deepest + 1][5]u8, @splat("{\"v\":".*)))) ++ "true" ++ @as([body_deepest + 1]u8, @splat('}'));
     const body_source = "{\"" ++ v2_renames.client_capabilities_v1 ++ "\":" ++ body_object ++ "}";
 
     // Sized the same way as the paths above, so a short buffer here would
@@ -6613,7 +6613,7 @@ test "a capability set is bounded by the deepest nesting a decode admits" {
         .value = null,
     };
     const v2_body = "{\"" ++ v2_renames.client_capabilities_v2 ++ "\":" ++
-        "{" ++ "\"v\":{" ** body_deepest ++ "}" ** body_deepest ++ ",\"z\":{}}" ++ "}";
+        "{" ++ @as([5 * body_deepest]u8, @bitCast(@as([body_deepest][5]u8, @splat("\"v\":{".*)))) ++ @as([body_deepest]u8, @splat('}')) ++ ",\"z\":{}}" ++ "}";
 
     var v2_buffer: [512]u8 = undefined;
     var v2_writer = json.Writer.init(&v2_buffer);
@@ -7104,9 +7104,9 @@ fn findCapability(set: CapabilitySet, path: []const u8) ?Capability {
 }
 
 test "permission tool calls spend subject and request containers" {
-    const call = "{\"k\":" ++ "[" ** (json.max_depth - 2) ++ "0" ++ "]" ** (json.max_depth - 2) ++ "}";
-    const too_deep = "{\"k\":" ++ "[" ** (json.max_depth - 1) ++ "0" ++ "]" ** (json.max_depth - 1) ++ "}";
-    const nested_call = "{\"k\":" ++ "[" ** (json.max_depth - 3) ++ "0" ++ "]" ** (json.max_depth - 3) ++ "}";
+    const call = "{\"k\":" ++ @as([json.max_depth - 2]u8, @splat('[')) ++ "0" ++ @as([json.max_depth - 2]u8, @splat(']')) ++ "}";
+    const too_deep = "{\"k\":" ++ @as([json.max_depth - 1]u8, @splat('[')) ++ "0" ++ @as([json.max_depth - 1]u8, @splat(']')) ++ "}";
+    const nested_call = "{\"k\":" ++ @as([json.max_depth - 3]u8, @splat('[')) ++ "0" ++ @as([json.max_depth - 3]u8, @splat(']')) ++ "}";
     const options = [_]PermissionOption{.{
         .option_id = "a",
         .name = "Allow",
@@ -7122,7 +7122,7 @@ test "permission tool calls spend subject and request containers" {
     @memset(&out, 0xa5);
     writer = json.Writer.init(&out);
     try testing.expectError(error.InvalidField, encodePermissionSubject(.{ .tool_call = too_deep }, &writer));
-    try testing.expectEqualSlices(u8, &([_]u8{0xa5} ** out.len), &out);
+    try testing.expectEqualSlices(u8, &@as([out.len]u8, @splat(0xa5)), &out);
 
     writer = json.Writer.init(&out);
     try encodePermissionRequest(.{ .draft = .{
@@ -7143,5 +7143,5 @@ test "permission tool calls spend subject and request containers" {
         .subject = .{ .tool_call = call },
         .options = &options,
     } }, &writer));
-    try testing.expectEqualSlices(u8, &([_]u8{0xa5} ** out.len), &out);
+    try testing.expectEqualSlices(u8, &@as([out.len]u8, @splat(0xa5)), &out);
 }

@@ -946,9 +946,9 @@ fn addressedTo(id: jsonrpc.Id) jsonrpc.Request {
 /// category table and the rest are a call this server refused, which is a bad
 /// request however it was spelled.
 fn errorStatus(code: i32) wire.Status {
-    if (a2a.A2aError.fromCode(code)) |known| return @enumFromInt(known.httpStatus());
+    if (a2a.A2aError.fromCode(code)) |known| return @fromBackingInt(@intCast(known.httpStatus()));
     return switch (code) {
-        @intFromEnum(jsonrpc.StandardError.internal_error) => .internal_server_error,
+        @backingInt(jsonrpc.StandardError.internal_error) => .internal_server_error,
         else => .bad_request,
     };
 }
@@ -969,7 +969,7 @@ fn refuseVersion(session: *const Session, id: ?jsonrpc.Id) Error!void {
     try detail.slice("\"}");
 
     try session.refuse(id, .{
-        .code = @intFromEnum(reason),
+        .code = @backingInt(reason),
         .message = "Version not supported",
         .data = detail.written(),
     });
@@ -982,7 +982,7 @@ fn refuseStandard(
     code: jsonrpc.StandardError,
 ) Error!void {
     try session.refuse(id, .{
-        .code = @intFromEnum(code),
+        .code = @backingInt(code),
         .message = switch (code) {
             .parse_error => "Parse error",
             .invalid_request => "Invalid Request",
@@ -1698,7 +1698,7 @@ const Agent = struct {
 
         return switch (self.arm) {
             .peer_error => .{ .peer_error = .{
-                .code = @intFromEnum(a2a.A2aError.unsupported_operation),
+                .code = @backingInt(a2a.A2aError.unsupported_operation),
                 .message = "Unsupported operation",
             } },
             .message => blk: {
@@ -1914,10 +1914,10 @@ const Peer = struct {
     /// The head and the body of each request, as the bytes that arrived.
     // SAFETY: `run` copies the head in and sets `head_lens` from that same copy.
     heads: [4][4096]u8 = undefined,
-    head_lens: [4]usize = [_]usize{0} ** 4,
+    head_lens: [4]usize = @splat(0),
     // SAFETY: `run` fills it through `bodyReader` and sets `body_lens` from that count.
     bodies: [4][4096]u8 = undefined,
-    body_lens: [4]usize = [_]usize{0} ** 4,
+    body_lens: [4]usize = @splat(0),
     served: usize = 0,
     failed: bool = false,
 
@@ -2328,7 +2328,7 @@ const Caller = struct {
             step.failure = err;
             return;
         };
-        step.status = @intFromEnum(reply.status);
+        step.status = @backingInt(reply.status);
         switch (reply.outcome) {
             .result => |value| switch (value) {
                 .task => |task| {
@@ -3158,9 +3158,9 @@ test "an unknown method and an invalid params body are refused with their own co
     }
 
     const expected = [_]i32{
-        @intFromEnum(jsonrpc.StandardError.method_not_found),
-        @intFromEnum(jsonrpc.StandardError.method_not_found),
-        @intFromEnum(jsonrpc.StandardError.invalid_params),
+        @backingInt(jsonrpc.StandardError.method_not_found),
+        @backingInt(jsonrpc.StandardError.method_not_found),
+        @backingInt(jsonrpc.StandardError.invalid_params),
     };
     var rest = fixture.answered();
     var scratch: [1024]u8 = undefined;
@@ -3242,7 +3242,7 @@ test "a version this server does not serve is refused, and so is an absent, empt
         try testing.expectEqual(@as(u16, 400), frame.code);
         const decoded = jsonrpc.decode(frame.body, &scratch) catch return error.TestUnexpectedResult;
         try testing.expectEqual(
-            @intFromEnum(a2a.A2aError.version_not_supported),
+            @backingInt(a2a.A2aError.version_not_supported),
             decoded.rpc_error.?.code,
         );
         try testing.expectEqual(@as(?[]const u8, null), decoded.result);
@@ -3318,7 +3318,7 @@ test "a repeated version header is refused rather than resolved, and so is a rep
     const first_body = jsonrpc.decode(first.body, &fixture.envelope_scratch) catch
         return error.TestUnexpectedResult;
     try testing.expectEqual(
-        @intFromEnum(a2a.A2aError.version_not_supported),
+        @backingInt(a2a.A2aError.version_not_supported),
         first_body.rpc_error.?.code,
     );
     // The id was identifiable, so it is echoed: a null id here would tell
@@ -3418,7 +3418,7 @@ test "malformed JSON is a parse error with a null id, and an invalid request wit
     const first = nextFrame(fixture.answered()) orelse return error.TestUnexpectedResult;
     const parse_failure = jsonrpc.decode(first.body, &scratch) catch return error.TestUnexpectedResult;
     try testing.expectEqual(
-        @intFromEnum(jsonrpc.StandardError.parse_error),
+        @backingInt(jsonrpc.StandardError.parse_error),
         parse_failure.rpc_error.?.code,
     );
     try testing.expect(parse_failure.id_null);
@@ -3427,7 +3427,7 @@ test "malformed JSON is a parse error with a null id, and an invalid request wit
     const second = nextFrame(first.rest) orelse return error.TestUnexpectedResult;
     const invalid = jsonrpc.decode(second.body, &scratch) catch return error.TestUnexpectedResult;
     try testing.expectEqual(
-        @intFromEnum(jsonrpc.StandardError.invalid_request),
+        @backingInt(jsonrpc.StandardError.invalid_request),
         invalid.rpc_error.?.code,
     );
     try testing.expectEqualStrings("x-1", invalid.id.?.string);
@@ -3517,7 +3517,7 @@ test "a document that parses but is not a request is an invalid request, not a p
         const decoded = jsonrpc.decode(frame.body, &scratch) catch
             return error.TestUnexpectedResult;
         try testing.expectEqual(
-            @intFromEnum(jsonrpc.StandardError.invalid_request),
+            @backingInt(jsonrpc.StandardError.invalid_request),
             decoded.rpc_error.?.code,
         );
         try testing.expectEqual(@as(?[]const u8, null), decoded.result);

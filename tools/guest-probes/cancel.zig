@@ -77,7 +77,7 @@
 //! this file's entire value is that its output survives the fault it is
 //! reporting.
 //!
-//! Build and run: `zig build-exe -OReleaseSafe -target riscv64-freebsd -lc
+//! Build and run: `zig build-exe -Osafe -target riscv64-freebsd -lc
 //! cancel.zig`, then `cancel <stage>`. Exit status 0 means every assertion in
 //! the stage held; 3 means a stage ran and rejected its result; 4 means a
 //! stage could not start. A status of 124 is the harness reporting a hang.
@@ -452,7 +452,7 @@ const SockCtx = struct {
     /// the one that says *which* failure it was.
     read_detail: ?anyerror = null,
     got: usize = 0,
-    got_buffer: [16]u8 = [_]u8{0} ** 16,
+    got_buffer: [16]u8 = @splat(0),
     /// SAFETY: as `WaitCtx.entered`.
     task_stream_closed: bool = false,
     /// SAFETY: as `WaitCtx.entered`.

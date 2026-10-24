@@ -181,13 +181,13 @@ jobs:
       # ReleaseSafe preserves runtime checks while the optimizer transforms code.
       # ReleaseFast and ReleaseSmall must preserve valid-input behavior without them.
       - name: zig build test (ReleaseSafe)
-        run: zig build test -Doptimize=ReleaseSafe
+        run: zig build test -Doptimize=safe
 
       - name: zig build test (ReleaseFast)
-        run: zig build test -Doptimize=ReleaseFast
+        run: zig build test -Doptimize=fast
 
       - name: zig build test (ReleaseSmall)
-        run: zig build test -Doptimize=ReleaseSmall
+        run: zig build test -Doptimize=small
 
       - name: zig ast-check
         run: |

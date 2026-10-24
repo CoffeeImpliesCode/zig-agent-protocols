@@ -276,7 +276,7 @@ pub fn main(init: std.process.Init) !void {
 
     // ---- stage A: Group.concurrent, then Group.await -----------------------
     markf("RISC_PROBE_CONC_A_SPAWN_BEGIN tasks={d}\n", .{stage_a_tasks});
-    var slots = [_]u64{0} ** stage_a_tasks;
+    var slots: [stage_a_tasks]u64 = @splat(0);
     var tasks: [stage_a_tasks]GroupTask = undefined;
     var a_group: Io.Group = .init;
     defer a_group.cancel(io);

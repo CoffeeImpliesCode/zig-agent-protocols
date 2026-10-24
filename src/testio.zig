@@ -321,7 +321,7 @@ test "the bound is the whole path, and the last length that fits is the one that
     // and the name is exactly `max_len`.
     const exact = try render(
         &buffer,
-        "/" ++ "x" ** (max_len - name_len - 2),
+        "/" ++ @as([max_len - name_len - 2]u8, @splat('x')),
         0x5eed_0101,
         0x5eed_0202,
     );
@@ -329,7 +329,7 @@ test "the bound is the whole path, and the last length that fits is the one that
     // One byte more is not a shorter socket name, it is no socket.
     try testing.expectError(error.PathTooLong, render(
         &buffer,
-        "/" ++ "x" ** (max_len - name_len - 1),
+        "/" ++ @as([max_len - name_len - 1]u8, @splat('x')),
         0x5eed_0101,
         0x5eed_0202,
     ));

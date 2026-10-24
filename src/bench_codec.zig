@@ -901,7 +901,7 @@ fn acceptRow(
                 .url => |url| sink.fold(url),
                 .data => |data| sink.fold(data),
             };
-            sink.mix(@intFromEnum(message.role));
+            sink.mix(@backingInt(message.role));
             try a2a.encodeMessage(message, writer, &st.base64);
         },
         .a2a_request => {
