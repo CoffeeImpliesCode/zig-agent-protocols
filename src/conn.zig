@@ -1946,11 +1946,8 @@ test "a peer error too large for the result buffer is reported, not read as an a
 }
 
 test "a peer error is a refusal, and `failed` is what says so" {
-    // A peer that answers with `error` produces an ordinary return, because
-    // nothing went wrong on the wire. A caller that reads `body` alone then
-    // reads the `error` object as a result and calls a tool failure a success,
-    // which is the contract AGENTS.md states and the one `failed` exists to
-    // make impossible to get wrong.
+    // A peer error returns normally because transport succeeded.
+    // `failed` distinguishes that refusal from a result.
     var threaded: Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();

@@ -960,12 +960,8 @@ test "an envelope member the input spells twice resolves first-wins" {
     var scratch: [256]u8 = undefined;
     var buffer: [256]u8 = undefined;
 
-    // `AGENTS.md` pins first-wins for a repeated member, and names the harm
-    // it prevents: a later member must not be able to make a failed
-    // comparison pass. This walk took the last occurrence of every member it
-    // compared, so a peer could name one tenant and then, on the same line,
-    // name another, and a proxy reading the document with `json.memberText`
-    // beside it would forward the call somewhere the first reader did not.
+    // Repeated members resolve first-wins. A later tenant must not redirect
+    // a call already read by an intermediary.
     const redirected =
         \\{"serverId":"tenant-a","requestId":"r","method":"tools/call","serverId":"tenant-b"}
     ;

@@ -4,10 +4,8 @@ The wire contract for `src/`. This document is the authority for every type name
 tag value and byte layout in the library. If the source and this document
 disagree, the source is wrong.
 
-Evidence, dated to **2026-09-29**, lives in [`research/`](research/README.md). Where
-a value here is marked `NOT ESTABLISHED`, no primary source defined it and this
-library does not invent one; the corresponding case is an explicit decode or encode
-failure rather than a guess.
+Source transcriptions live in [`research/normative/`](research/normative/README.md).
+Where a value is marked `NOT ESTABLISHED`, the codec returns an explicit error.
 
 ## 1. Scope
 
@@ -721,12 +719,8 @@ sequences at all.
 
 #### 4.10.6 Open sets, closed sets, and one silence
 
-The rule from `AGENTS.md` — a decoder that accepts a member has to be able to
-write it back — bites hardest here, so which sets are open has to be stated
-rather than left to the implementer. Two questions have to be kept apart, because
-the artifact answers them differently and an earlier revision of this table ran
-them together: **is a set of values closed** — is `type` permitted to be anything
-— and **is a set of members closed** — may a key the type does not name appear.
+A decoder must preserve every represented member when it writes a value back.
+Value sets and object member sets have separate closure rules.
 The first is answered by a literal union, and where the union is closed the
 generated `schema.json` says so on the wire: the five `ContentBlock` arms emit
 `"type": {"const": "text"}` … `{"const": "resource"}` and `LoggingLevel` emits an
@@ -1424,7 +1418,7 @@ and **zero** times in `schema/v2/schema.json`, and neither `meta.json` lists any
 `mcp/*` method. Full transcription and the RFD fragments:
 [`research/normative/acp-v1-v2.md`](research/normative/acp-v1-v2.md) §10e.
 
-Re-verified 2026-10-03 against the immutable tags, not a moving `main`:
+The immutable schema tags are:
 `schema-v1.23.0` and `schema-v2.0.0-alpha.5` are annotated tags on the same
 commit,
 [`6d08f412a7a1370d3cc9a124e3be3d6acf92641e`](https://github.com/agentclientprotocol/agent-client-protocol/tree/6d08f412a7a1370d3cc9a124e3be3d6acf92641e/schema).
@@ -1645,7 +1639,7 @@ encode them.
 | A2UI | `v1.0` is a Candidate, last updated 2026-06-08, with the production release older still. Deferred |
 | WebMCP, NLWeb | Not shipping. WebMCP is a Community Group draft behind a browser origin trial |
 | AG-UI | Declined for the same reason as A2UI: a vendor-governed 1.0 with no foundation home. Revisit if it is donated |
-| Commerce, payments, identity | Not integration protocols for this library's consumers. See [`research/sota-2026-09-29.md`](research/sota-2026-09-29.md) |
+| Commerce, payments, identity | Outside this library's integration scope |
 | ANP, AGNTCY | Upstream adoption does not justify a wire implementation |
 | MCP sampling and roots | Deprecated, earliest removal 2027-07-28 |
 
@@ -1659,7 +1653,7 @@ in the corresponding document under [`research/`](research/README.md).
   `schema.json`; specification pages under
   `modelcontextprotocol.io/specification/2026-07-28/`; extension specifications in
   `modelcontextprotocol/ext-apps` and `modelcontextprotocol/ext-tasks`. See
-  [`research/mcp.md`](research/mcp.md).
+  [`the MCP transcription`](research/normative/mcp-2026-07-28.md).
   The schema artifact this document's §4.8, §4.10 and §4.11 are transcribed from
   is also pinned at the immutable commit
   `3098fe94caa1b9e0afaaa6d30e040b61d5802471`, which serves byte-identical content
@@ -1670,11 +1664,11 @@ in the corresponding document under [`research/`](research/README.md).
   [`research/normative/mcp-2026-07-28-schema.md`](research/normative/mcp-2026-07-28-schema.md).
 - A2A normative proto: `a2aproject/A2A` at `specification/a2a.proto`, tag `v1.0.0`,
   plus the rendered specification at `a2a-protocol.org/latest/specification/`.
-  See [`research/a2a.md`](research/a2a.md).
+  See [`the A2A transcription`](research/normative/a2a-1.0.0.md).
 - ACP normative schemas: `agentclientprotocol/agent-client-protocol` at
   `schema/v1/meta.json` and `schema/v2/meta.json`, plus the normative prose at
   `agentclientprotocol.com/protocol/v1/` and `/protocol/v2/`. See
-  [`research/acp-agent-client.md`](research/acp-agent-client.md).
+  [`the ACP transcription`](research/normative/acp-v1-v2.md).
 - MCP over ACP: the `mcp-over-acp` RFD at `agentclientprotocol.com/rfds/mcp-over-acp`.
 - Normative extractions, one per protocol, are the value-level source of record:
   [`research/normative/mcp-2026-07-28.md`](research/normative/mcp-2026-07-28.md),

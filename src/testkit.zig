@@ -2513,8 +2513,7 @@ const tree_decoder_capacity = battery_codec_names.len + 8;
 /// was true and enforced by nothing. Two kinds of declaration are skipped, and
 /// both are asked about rather than assumed:
 ///
-/// - a private one, because `@typeInfo` lists those beside the public ones and a
-///   battery that fed a helper would be measuring nothing;
+/// - a private declaration, excluded by reflection;
 /// - a declaration that is not a decoder by name, for the reason
 ///   [`isDecoderDeclName`] gives.
 ///
@@ -4827,10 +4826,7 @@ fn expectDisjointRegions(scratch: []const u8, regions: []const []const u8) !void
 
 test "one reader hands out disjoint scratch regions" {
     const testing = std.testing;
-    // The property AGENTS.md pins for the substrate: two escaped strings read
-    // from one reader take separate regions of the caller's scratch, so the
-    // first is still intact when the second is read. A bump offset that
-    // recycled a region would pass every single-string test there is.
+    // Escaped strings from one reader use separate scratch regions.
     const input = "\"a\\nb\" \"c\\nd\" \"plain\"";
     var scratch: [16]u8 = undefined;
     var reader = json.Reader.init(input);

@@ -1,347 +1,129 @@
 # Specification decisions
 
-Points where `PROTOCOLS.md` and the deeper value source
-`research/normative/*.md` disagree, and how this library resolved them. Each
-decision is grounded in a primary artifact, not a preference.
+[PROTOCOLS.md](PROTOCOLS.md) defines the implemented wire contract.
+The [normative transcriptions](research/normative/README.md) identify upstream artifacts.
+For A2A, the protobuf artifact takes precedence when the contract's summary disagrees.
+An unknown value remains an explicit decode or encode error.
 
-`PROTOCOLS.md` is the stated authority for `src/`. But it also states, in §5.1,
-that A2A's `specification/a2a.proto` "is the single normative artifact". Where
-the two conflict, the more specific authority for that protocol wins, and the
-reasoning is recorded here so it is discoverable rather than buried in a source
-comment.
+## 1. A2A `DeleteTaskPushNotificationConfig` response
 
-The library's governing rule, from `PROTOCOLS.md` §1: where a value is marked
-`NOT ESTABLISHED`, no primary source defined it, and this library does not
-invent one; the case is an explicit decode or encode failure instead.
+The response is `google.protobuf.Empty`.
+The protobuf declaration in `research/normative/a2a-1.0.0.md` section 3 takes
+precedence over the `TaskPushNotificationConfig` entry in PROTOCOLS section 5.3.
 
-## 1. A2A `DeleteTaskPushNotificationConfig` response type
+## 2. A2A extension and binding namespaces
 
-- **Decision:** the response is `google.protobuf.Empty`.
-- **Conflict:** `PROTOCOLS.md` §5.3 line 411 lists `TaskPushNotificationConfig`.
-  The proto, at `research/normative/a2a-1.0.0.md` line 644, lists
-  `google.protobuf.Empty`.
-- **Resolution:** the proto wins under `PROTOCOLS.md`'s own authority clause
-  (§5.1). A real 1.0.0 agent returns an empty body; declaring a config payload
-  would make a peer wait for a body that never arrives.
+The library exposes no `https://a2a-protocol.org/extensions/` or `/bindings/` prefix.
+The source defines no A2A-owned namespace or mandatory prefix.
+Extension URIs remain free-form strings. A required extension without activation
+still produces `-32008`.
+See `research/normative/a2a-1.0.0.md` sections 9.3 and 9.4.
 
-## 2. A2A §5.8 extension and binding namespace prefixes
+## 3. JSON-RPC message classification
 
-- **Decision:** not modelled. The prefixes
-  `https://a2a-protocol.org/extensions/` and `.../bindings/` are **not** exposed
-  as constants.
-- **Conflict:** `PROTOCOLS.md` §5.8 presents them as a specification table. The
-  normative extraction states, verbatim (§9.3 and §9.4), that the specification
-  "defines no A2A-owned extension URI namespace and no mandatory prefix" and
-  that the only URIs present are illustrative `example.com` values; it lists the
-  namespace as `NOT ESTABLISHED IN SOURCE`.
-- **Resolution:** the library does not invent values that no primary source
-  establishes. `AgentCard.capabilities.extensions[].uri` is a free-form string;
-  `activatesExtension` matches on whatever URI a caller supplies. The
-  activation semantics that PROTOCOLS.md *does* establish — a required
-  extension with no activation is `-32008` — are implemented.
-
-## 3. `jsonrpc.Kind` message classification
-
-- **Decision:** `Kind` has three variants — `request`, `notification`,
-  `response` — matching the specification's rule.
-- **Conflict:** an earlier revision had four, adding `error_response`.
-  `PROTOCOLS.md` §3 line 107 classifies on `id` and `method` presence only: "a
-  message with an `id` and no `method` is a response; a message with a `method`
-  and no `id` is a notification; a message with both is a request." A message
-  carrying `error` rather than `result` is still a response by that rule.
-- **Resolution:** the error-versus-result distinction is carried losslessly on
-  the `Message` itself (`result` and `rpc_error` are separate optional members
-  and exactly one is set on a response), so collapsing the fourth variant loses
-  no information while matching the authority.
+`jsonrpc.Kind` has `request`, `notification`, and `response` variants.
+Presence of `id` and `method` determines the kind.
+A response carries either `result` or `rpc_error`. Error responses need no fourth kind.
 
 ## 4. MCP Apps and AG-UI scope
 
-- **Decision:** neither is implemented. The `PROTOCOLS.md` §9 exclusion list is
-  the scope this library holds itself to.
-- **Conflict:** `research/sota-2026-09-29.md` §7, "Scope for this library",
-  places both protocols in scope, because "both are Stable or 1.0 and both are
-  consumed by the hosts this library's users already run". `PROTOCOLS.md` §9,
-  "Not implemented", excludes both: "Specified and stable, but the client
-  support matrix is a community-maintained list. Deferred until a host is chosen"
-  for MCP Apps, and "Declined for the same reason as A2UI: a vendor-governed 1.0
-  with no foundation home. Revisit if it is donated" for AG-UI.
-- **Resolution:** `PROTOCOLS.md` is the stated authority for `src/`, so §9
-  governs and the **Conditional** list stays unimplemented. The exclusions stand
-  on the reasons §9 records: the MCP Apps `ui/*` surface waits for a host,
-  because its client support matrix is community-maintained, and AG-UI waits
-  for a foundation home it does not have. Each is lifted by the condition §9
-  names, a chosen host or a donation. The research document stays the deeper
-  value source and the protocol document the authority, as for A2A above.
+Neither protocol is implemented. PROTOCOLS section 9 defines the exclusions.
+MCP Apps requires a selected host. AG-UI remains outside the implemented subset.
 
-## 5. MCP `ContentBlock` is a closed union; the result object around it is open
+## 5. MCP content discriminators and result members
 
-- **Decision:** an unrecognised `type` on a `ContentBlock` is
-  `error.UnknownTag`, exactly as an unrecognised tag is on every other closed
-  set in this library. A **member the result object does not model** is carried
-  as the borrowed lexeme it arrived as, and written back verbatim.
-- **Conflict:** no primary source states a decoding policy either way. The
-  schema artifact declares `ContentBlock = TextContent | ImageContent |
-  AudioContent | ResourceLink | EmbeddedResource` with **no `| string` arm and no
-  "not a closed set" sentence** — and that sentence appears verbatim on
-  `ClientCapabilities` and `ServerCapabilities` and nowhere else, so the
-  artifact's own idiom marks an open discriminator
-  explicitly. Meanwhile `Result` declares `[key: string]: unknown` and
-  `basic/index.md` says a result "MAY follow any JSON object structure", so
-  the object is open in its keys whatever the discriminator is.
-  The index signature is not part of that argument, and decision 9 removes it: a
-  TypeScript index signature is not a wire rule. What carries the closedness is
-  the union's own idiom, confirmed on the wire by the generated `schema.json`, which
-  emits `"type": {"const": "text"}` through `{"const": "resource"}` — one `const`
-  per arm, so a sixth string is invalid by the schema itself.
-- **Resolution:** the two facts are not in tension and the policy follows
-  each. The discriminator is closed, so an unknown `type` has no arm to decode
-  into and refusing it is the only answer that reports a fault rather than
-  inventing one — the same rule `a2a.TaskState.fromTag`, `a2a.Role.fromTag` and
-  `acp.PermissionOptionKind` already follow, and the reason
-  `root.DecodeError` carries `UnknownTag` at all. The object is open, so a key
-  no result type models cannot be dropped: `PROTOCOLS.md` §2 requires modeled
-  opaque JSON and its presence to survive. A closed shape cannot hold an open
-  key set. `bridge.Envelope.meta` and `bridge.OutcomePayload` therefore carry
-  borrowed lexemes. That is a wire-value preservation rule, not a promise to
-  replay the surrounding document's whitespace, ordering or escapes.
-- **Note:** an earlier draft of `PROTOCOLS.md` §4.10 described `ContentBlock`
-  as an open union. The artifact does not support that, and the transcription
-  follows the artifact.
-- **Note, added by decision 9:** this decision's outcome is unchanged and its
-  evidence is now stated on the union rather than on member sets. The same
-  obsolete "no index signature" clause in `src/mcp.zig` was removed; its comment
-  now cites the literal discriminator and generated-schema `const` evidence.
+`ContentBlock` is a closed union of text, image, audio, resource link, and embedded resource.
+An unknown discriminator returns `UnknownTag`.
+The generated schema uses a literal `const` for each arm.
 
-## 6. `roots/list` and `sampling/createMessage` resolve at `2025-11-25`
+The surrounding result object remains open.
+Carried opaque members retain their borrowed JSON bytes and presence.
+This does not preserve whitespace, ordering, or escapes in the outer document.
+See `research/normative/mcp-2026-07-28-schema.md` sections 8 and 9.
 
-- **Decision:** `mcp.lookupMethod(.previous, …)` resolves `roots/list`,
-  `sampling/createMessage` and `elicitation/create`, each with
-  `present_at_current = false` and `deprecated = true`. Before this wave all
-  three were refused at every revision, and `AGENTS.md` restated that as
-  settled — which is how a defect becomes indistinguishable from a decision.
-- **Conflict:** two passages of `PROTOCOLS.md` point opposite ways.
-  §4.4 lists all three as "Removed in `2026-07-28`, and therefore decoded as
-  `UnknownMethod` **at that revision**", which reads as: they resolve at
-  `2025-11-25`. §9 "Not implemented" lists "MCP sampling and roots" as
-  excluded outright, which reads as: not at any revision. For
-  `elicitation/create` there is no conflict at all — §9 does not name it, §4.9's
-  deprecation registry does not list it, and the internal evidence is
-  decisive: `mcp.removed_methods` carries `notifications/elicitation/complete`
-  as a notification, so the library resolves the sibling beside a request it
-  refuses.
-- **Resolution:** §4.4 wins, for all three, because it is the method-registry
-  authority and it speaks to this exact question, whereas §9 is a scope list
-  about *surfaces*. The distinction that makes both true: §9's exclusion is
-  about the sampling and roots **capabilities** — `Roots`, the
-  `notifications/roots/list_changed` handler, the client sampling capability —
-  none of which this library models. The **MRTR input requests** are modelled
-  and always were: `mcp.input_requests` has carried all three with
-  `.deprecated = true` since before this wave, and `lookupInputRequest` finds
-  them independently of `lookupMethod`. So §9 is not contradicted by resolving
-  the names; it is obeyed about the surfaces it names.
-- **Consequence for the table.** The new rows carry `.client_to_server`, and
-  they are a table of their own rather than a reuse of `input_requests`. That
-  row's direction is `server_to_client_mrtr_only` and the session gate refuses
-  anything that is not `client_to_server`, so handing it the carried row would
-  resolve the name and then refuse it in **both** directions — a
-  `2025-11-25` server would decline to answer `roots/list` as well as a client
-  being unable to send it.
-- **Tests.** Two tests pinned the old behaviour as an expectation and were
-  deleted rather than inverted, which is this repository's rule for a test that
-  encodes the behaviour being removed.
+## 6. Previous MCP method registry
 
-## 7. The bridge `acp` capability and `{"type":"acp"}` are RFD-only, and stay labelled
+At revision `2025-11-25`, `lookupMethod` resolves `roots/list`,
+`sampling/createMessage`, and `elicitation/create` as deprecated methods.
+They have `present_at_current = false` and are unknown at `2026-07-28`.
+Their registry entries use `client_to_server`.
+MRTR input-request entries use the separate `server_to_client_mrtr_only` direction.
 
-- **Decision:** the library carries the `acp` capability path and the
-  `{"type":"acp"}` server declaration as constants — `bridge.capability_path`
-  and `bridge.server_declaration` — and `PROTOCOLS.md` §6.5.1 and §7.1–7.2 state
-  in the contract that **neither appears in any released ACP schema**. The
-  shapes are encoded per version: v1 a `boolean`, v2 a presence object.
-- **Conflict:** `PROTOCOLS.md` §6 previously described ACP capabilities from the
-  released schemas only, so the binding's own capability had no entry — while
-  `src/bridge.zig` had exported both constants with a doc comment saying the key
-  "is in no published schema in either version". The code knew a fact the
-  contract did not state, which is the §6 shape of the decision 5 defect.
-  Meanwhile the mcp-over-acp RFD specifies both values and the released schemas
-  declare neither, so a contract that listed `acp` beside `mcpCapabilities.http`
-  as an ordinary capability would have **invented** a published one.
-- **Evidence.** Verified directly against the published artifacts, not from a
-  transcription: the literal `"acp"` occurs **zero** times in
-  `schema/v1/schema.json` and **zero** times in `schema/v2/schema.json`; v1
-  `McpCapabilities` has exactly `http`, `sse`, `_meta`; v2 `McpCapabilities` has
-  exactly `stdio`, `http`, `_meta`; the v2 `McpServer` union has exactly the
-  branches `http`, `stdio` and an `other` catch-all, with no `acp` branch, so the
-  RFD declaration currently validates by falling through to `other`; and neither
-  `meta.json` lists any `mcp/*` method. Full transcription at
-  [`research/normative/acp-v1-v2.md`](research/normative/acp-v1-v2.md) §10e.
-  Re-counted 2026-10-03 at the immutable tags this library pins —
-  `schema-v1.23.0` and `schema-v2.0.0-alpha.5`, both annotated tags on commit
-  `6d08f412` — where every count above holds; entry 11 records the released SDK
-  that declares the key anyway.
-- **Resolution:** both values are stated, as §5 does for `ContentBlock` — the
-  RFD's and the released schemas' positions are recorded side by side and
-  neither is presented as the other's correction. The constants stay because the
-  binding is RFD-specified and `bridge.zig` implements the RFD; what changes is
-  that the contract now says out loud what the source comment already said, so a
-  reader of `PROTOCOLS.md` alone learns the capability is not in a released
-  schema. §6.5.1 also records the cross-revision shape change — v1 `boolean`
-  where omission means `false`, v2 presence object where `{}` means supported —
-  because reading `{}` as `false` at v2 would invert the advertisement.
+PROTOCOLS section 4.4 defines method availability.
+Section 9 excludes the sampling and roots capability surfaces, not these older method names.
 
-## 8. `progressToken` is optional in a request `_meta` and required in a notification payload
+## 7. The bridge's RFD-only ACP capability
 
-- **Decision:** `PROTOCOLS.md` §4.11.2 states both, in one table, and neither is
-  altered to match the other. §4.3 continues to list `progressToken` as a bare
-  `_meta` key — which is true of the *request* declaration only.
-- **Conflict:** none in the artifact, and none in the library before this wave.
-  Read quickly, the two declarations look like a contradiction: artifact L67
-  writes `progressToken?: ProgressToken` and artifact L1013 writes
-  `progressToken: ProgressToken`. An earlier note treated that as a defect
-  needing a fixture relocated or one declaration corrected.
-- **Resolution:** they are different members of different types and both
-  requirednesses are correct. `RequestMetaObject.progressToken` is a request
-  `_meta` key and an **opt-in** — *"If specified, the caller is requesting
-  out-of-band progress notifications… The receiver is not obligated to provide
-  these notifications."* `ProgressNotificationParams.progressToken` is a
-  **payload member of the notification**, not a `_meta` key at all, and it is
-  required precisely because a well-formed `notifications/progress` can only
-  exist for a request that carried the token. Nothing is moved and no fixture is
-  relocated; the two rows are tabulated together so the apparent contradiction
-  cannot be re-derived. Declarations quoted at
-  [`research/normative/mcp-2026-07-28-schema.md`](research/normative/mcp-2026-07-28-schema.md)
-  §10.
+`bridge.capability_path` and `bridge.server_declaration` carry the RFD's `acp`
+capability and `{"type":"acp"}` declaration.
+Neither appears in the pinned released ACP schema artifacts.
+The v1 capability is a boolean. The v2 capability is a presence object,
+where `{}` means support.
 
-## 9. No MCP object member set is closed; "declared" replaces "closed"
+The pinned schema tags are `schema-v1.23.0` and `schema-v2.0.0-alpha.5` at
+commit `6d08f412a7a1370d3cc9a124e3be3d6acf92641e`.
+The v1 MCP capabilities declare `http`, `sse`, and `_meta`.
+The v2 capabilities declare `stdio`, `http`, and `_meta`.
+The v2 server union has `http`, `stdio`, and `other` arms.
+The RFD declaration matches that `other` arm.
+See `research/normative/acp-v1-v2.md` section 10e and decision 11.
 
-- **Decision:** the contract states each object's **declared** member set and each
-  member's requiredness, and marks *closing* `NOT ESTABLISHED`. The word *closed*
-  is now used only for a **value** set a literal union fixes, which is what the
-  artifact actually says. `PROTOCOLS.md` §4.8.3, §4.10.6, §4.10.7 and §4.11.5 were
-  revised; no `src/` behaviour changes, and the Consequence bullet below says why that
-  is a measurement and not an assumption.
-- **Conflict:** `PROTOCOLS.md` §4.8.3, §4.10.6 and the extract's §10 each stated
-  that a member set is **Closed**, and gave the same evidence each time — the
-  interface declares no `[key: string]` index signature. The same inference appeared
-  in §4.10.6's list of thirteen result element interfaces and in the extract's
-  finding 8. Nothing in the source says any of them is closed; the absence of an
-  index signature was read as a normative JSON rule it does not express.
-- **Evidence, measured over both artifacts at commit
-  `3098fe94caa1b9e0afaaa6d30e040b61d5802471`, fetched 2026-10-01.** In
-  `schema/2026-07-28/schema.ts` — 3,197 lines, 98,426 bytes, sha256
-  `742750af0bb8c716e7030c4977c992b55d1adc4407e9e66997db5846baedc2cd` — the strings
-  `additionalProperties` and `unevaluatedProperties` occur **zero** times each. In
-  the generated `schema/2026-07-28/schema.json` — 3,963 lines, 181,474 bytes, sha256
-  `ef70b61f99b6d2e5e3b46863822eab08dff6a45bedc7a08914e0e5b133f40203`, declared
-  draft 2020-12 — `additionalProperties` occurs **20** times and **none** is `false`
-  (five bare `{}`, fifteen typed maps), and `unevaluatedProperties` occurs zero
-  times. `elicitation`, `sampling`, `prompts`, `resources`, `tools`, the six
-  notification params interfaces, `SubscriptionFilter`, `TextContent`, `Tool`,
-  `Prompt`, `Resource` and `ResourceContents` carry **no** `additionalProperties`
-  at all, and under draft 2020-12 an absent keyword permits undeclared properties.
-  A TypeScript index signature constrains an object literal at compile time; it is
-  not `additionalProperties: false`, and the protocol writes that keyword nowhere.
-  Census and method: the extract's §9; record: its finding 11.
-- **Resolution:** a **value** set and a **member** set are two questions, and the
-  artifact answers them by different means. Values: a literal union with no `| string`
-  arm, corroborated on the wire by `schema.json` — `"type": {"const": "text"}`
-  through `{"const": "resource"}` for the five `ContentBlock` arms, an `enum` of
-  eight literals for `LoggingLevel`, `{"type": "boolean"}` for `listChanged` and
-  `subscribe`. Those stay closed, and decision 5's `UnknownTag` is unaffected
-  because it rested on the union, not on a member set. Members: the declaration
-  fixes the names and the requiredness and nothing more. There is no clause to
-  reject an undeclared key against and none to forbid one, so the contract states
-  the silence instead of resolving it. A typed decoder may skip unmodeled members.
-  Section 2 requires represented opaque JSON and open carriers to preserve them.
-- **Consequence.** `src/mcp.zig` has no typed capability decoder. The field
-  `DiscoverResult.capabilities` is `[]const u8` — the whole object carried as the
-  lexeme it arrived as, L3752–L3763 — so there is no nested member set to accept or
-  reject and the correction moves no behaviour. The `ContentBlock` comment now
-  cites the union's literal discriminator values and generated-schema `const`
-  constraints, not the unrelated absence of an index signature.
+## 8. Progress token requiredness
 
-## 10. Native API contract corrections
+`RequestMetaObject.progressToken` is optional.
+It requests out-of-band progress notifications, which the receiver need not provide.
+`ProgressNotificationParams.progressToken` is required in a notification payload.
+These members have different locations and requiredness.
+See `research/normative/mcp-2026-07-28-schema.md` section 10.
 
-These records describe this API-conformance change on stable Zig 0.16.0.
-They do not infer motives for earlier implementations.
+## 9. MCP object member sets
 
-### Round-trip normalization
+A TypeScript declaration without an index signature does not close a JSON object.
+The pinned generated JSON Schema contains no `additionalProperties: false`
+and no `unevaluatedProperties` keyword.
+Its draft 2020-12 semantics permit undeclared properties when the keyword is absent.
+The contract therefore records declared members and requiredness without asserting closure.
 
-- **Priority:** preserve modeled wire values and open data without heap-owned
-  documents.
-- **Constraint:** typed models do not retain original member order, whitespace
-  or escape spelling. The user approved stable encoding, not lexical provenance.
-- **Caller cost:** consumers cannot use re-encoded bytes as an exact copy of
-  the incoming document. They must retain input themselves when they need that copy.
-  Input, scratch and arena borrows must remain alive and unchanged.
-- **Counterchoice:** lexical provenance storage wins for a byte-preserving proxy
-  or signature pipeline. It requires retained source spans and additional model
-  state that this zero-allocation typed interface does not provide.
-- **Grade and origin:** taste `analyst-inferred`, from this conformance change.
-  The normalization contract itself is user-approved.
+Literal discriminators and value enums remain closed.
+Typed decoders can skip unmodeled members. Represented opaque data and open
+carriers must preserve them under PROTOCOLS section 2.
+`DiscoverResult.capabilities` retains the entire JSON object as a borrowed lexeme.
 
-### Connection-wide metadata
+Both schema artifacts use commit `3098fe94caa1b9e0afaaa6d30e040b61d5802471`.
+The transcription records source hashes and the keyword inventory in section 9.
 
-- **Priority:** remove races without changing call/notification return shapes.
-- **Constraint:** existing consumers observe `lastEncodedLen` and `nextId`;
-  each value describes one shared connection, not one caller.
-- **Caller cost:** getters require mutable Conn and a short uncancelable lock.
-  Consumers must exclude other encoders when correlating a length with their buffer.
-  An id snapshot does not reserve an id.
-- **Counterchoice:** per-call encoding receipts win when independent concurrent
-  issuers must retain correlated metadata. That would change the return surface
-  and migrate every consumer that expects the current response shape.
-- **Grade and origin:** taste `analyst-inferred`, from this conformance change.
+## 10. Native API contracts
 
-### Validation boundaries and error meaning
+Round trips preserve modeled values and presence, then produce stable normalized encoding.
+Consumers that need the original bytes must retain the input.
+Decoded values borrow input, scratch, or arena storage.
 
-- **Safety-fixed:** a malformed raw body cannot become a successful wire message.
-  Conn now reuses JSON-RPC validation. Raw fields are charged for their actual
-  enclosing containers. MCP input-required construction validates its source
-  document before output writes. ACP v2 initialization checks required info
-  before composing either body.
-- **Safety-fixed:** decode input and writable scratch must not overlap.
-  MCP HTTP checks this before decoding. Constructor buffer assertions document
-  caller preconditions and their optimize-mode limits.
-- **Semantics-fixed:** cancellation, local encoding shortage and inbound response
-  shortage are different events. Conn exposes `Canceled`, `EncodeBufferTooSmall`
-  and `ResponseTooLarge` separately. A reserved id is never reused.
-- **Caller cost:** exhaustive error handling must cover the new Conn tags.
-  Failed operations may dirty caller buffers. Cancellation or inbound overflow
-  does not prove that the peer performed no action.
-- **Origin:** obligations identified and repaired in this conformance change.
-  No unsafe counterchoice is presented as a design preference.
+`lastEncodedLen` and `nextId` observe shared connection state.
+The getters require mutable Conn for synchronization.
+A length does not identify a caller's buffer unless other encoders are excluded.
+An id observation does not reserve an id.
 
-## 11. The pinned SDK declares `acp` and `mcp/message`; PROTOCOLS keeps both RFD-only
+Conn reuses JSON-RPC validation for constructed messages.
+Opaque JSON spends the depth of its enclosing containers.
+MCP input-required construction validates its source before writing.
+ACP v2 initialization checks required info before composing the body.
+Writable scratch must not overlap decode input.
 
-- **Decision:** unchanged. `bridge` carries `mcpCapabilities.acp`,
-  `capabilities.session.mcp.acp` and `{"type":"acp"}` as RFD-specified values.
-  The pinned v1 and v2 schema artifacts do not declare them; §6.5.1 records
-  the differing SDK snapshot.
-- **Conflict:** `agent-client-protocol` `1.0.0rc2`, the SDK this repository pins
-  for `interop-acp`, generates `acp.schema.McpCapabilities.acp` — `acp: False`
-  sits in the `InitializeResponse.agent_capabilities` default dict — and the
-  `MessageMcpRequest`, `MessageMcpResponse` and `MessageMcpNotification`
-  models, and its `schema/meta.json` registers `mcp/message` on both sides.
-  Read against entry 7 that looks like a contradiction: the same tag, a
-  different answer.
-- **Evidence:** the SDK's own bytes settle it. Its `schema/VERSION` reads
-  `refs/tags/schema-v1.23.0` and `schema/v2/VERSION` reads
-  `refs/tags/schema-v2.0.0-alpha.5` — the tags this library pins — but the files
-  beside them are not those artifacts. The released `schema/v1/schema.json` at
-  commit `6d08f412` is 247 168 bytes with 170 `$defs`; the SDK's vendored copy is
-  389 552 bytes with 268, adds `McpServerAcp`, `McpConnectionId` and the
-  provider, document and NES surfaces, and carries `"acp"` four times. Upstream
-  `main` also had no `"acp"` or `mcp/message` on the research date. This
-  comparison covers the two pinned schema artifacts and the SDK snapshot,
-  not every historical schema release. The SDK's `MessageMcpRequest` carries
-  `connectionId`, where the implemented RFD envelope carries `serverId`.
-  The SDK labels the key `**UNSTABLE**`: *"This capability is not part of
-  the spec yet, and may be removed or changed at any point."*
-- **Resolution:** both states stand side by side, as §5 does for
-  `ContentBlock`. The key belongs to a schema snapshot upstream marks unstable
-  and that SDK generates from. It is absent from the two pinned published
-  schema artifacts. Their shared commit is
-  [`6d08f412a7a1370d3cc9a124e3be3d6acf92641e`](https://github.com/agentclientprotocol/agent-client-protocol/tree/6d08f412a7a1370d3cc9a124e3be3d6acf92641e/schema).
-  No library behaviour changes: `bridge` still decodes the RFD's shapes, and the
-  `acp` advertisement still gates `mcp/message` here rather than being read as
-  evidence that a peer built from a released schema will honour it.
+`Canceled`, `EncodeBufferTooSmall`, and `ResponseTooLarge` distinguish cancellation,
+local output shortage, and inbound response shortage.
+Failed operations can dirty caller storage.
+Cancellation and overflow do not prove that the peer performed no action.
+Reserved ids are never reused.
+
+## 11. ACP SDK snapshot versus released schema artifacts
+
+The pinned `agent-client-protocol` SDK `1.0.0rc2` includes unstable `acp` and
+`mcp/message` models that the released schema artifacts do not declare.
+The SDK's version files name the same tags as decision 7, but its vendored
+schema differs from those tagged artifacts.
+The SDK labels the capability unstable.
+
+Its `MessageMcpRequest` carries `connectionId`.
+The implemented RFD envelope carries `serverId`.
+The library retains the RFD shapes and labels the capability RFD-only.
+An SDK advertisement does not establish support in a peer built from a released schema.

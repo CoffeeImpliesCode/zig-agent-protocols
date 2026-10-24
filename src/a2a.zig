@@ -12695,9 +12695,8 @@ fn readAgentCard(reader: *json.Reader, arena: *CardArena, scratch: []u8) DecodeE
     // `""` is `error.InvalidField` one line below, so absent and empty are the
     // same value and only the flag separates them. A `null` under one of them
     // never reaches this check — `reader.string` refuses it with
-    // `error.MalformedJson`, which is the behaviour AGENTS.md pins and which
-    // this file's own test holds — so the flag is set only by an occurrence
-    // that carried a string.
+    // `error.MalformedJson`. The flag is set only when an occurrence carries
+    // a string.
     if (!saw_name or !saw_description or !saw_version) return error.MissingField;
     // A card with no name, no description or no version is not a card. The
     // version is not parsed here: PROTOCOLS.md section 5.1 forbids a patch

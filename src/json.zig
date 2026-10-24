@@ -652,9 +652,7 @@ pub const Reader = struct {
                     // `enterContainer`: both container arms call it before they
                     // descend, and it refuses a container past `max_depth`
                     // with `error.LimitExceeded` before the depth is spent,
-                    // so this call cannot outrun the stack. AGENTS.md records
-                    // the recursion finding as advisory for exactly this
-                    // reason, and a test covers the bound.
+                    // so this call cannot outrun the stack.
                     // gate-reviewed-zbc-next-line: recursive-parse-fn-without-stack-check
                     try self.skipValue(scratch);
                     self.skipWhitespace();
