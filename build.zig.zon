@@ -8,6 +8,8 @@
         "build.zig",
         "build.zig.zon",
         "README.md",
+        "LICENSE",
+        "THIRD_PARTY_NOTICES.md",
         "PROTOCOLS.md",
         "ARCHITECTURE.md",
         "SPEC-DECISIONS.md",

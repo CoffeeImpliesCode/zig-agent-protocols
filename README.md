@@ -122,4 +122,4 @@ The optional `gate` command requires separately installed `zig-gate` and analyze
 
 ## License
 
-This repository does not declare a license.
+MIT, see [LICENSE](LICENSE). Third-party components keep their own licenses: see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
