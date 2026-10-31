@@ -249,8 +249,7 @@ pub fn main(init: std.process.Init) !void {
         break :blk @as(?usize, null);
     };
     if (cpus) |n| markf("RISC_PROBE_THREAD_ENV cpu_count={d}", .{n});
-    markf("RISC_PROBE_THREAD_ENV tid={d} single_threaded={s} use_pthreads={s} pointer_bits={d}",
-        .{ main_tid, boolText(builtin.single_threaded), boolText(std.Thread.use_pthreads), @bitSizeOf(usize) });
+    markf("RISC_PROBE_THREAD_ENV tid={d} single_threaded={s} use_pthreads={s} pointer_bits={d}", .{ main_tid, boolText(builtin.single_threaded), boolText(std.Thread.use_pthreads), @bitSizeOf(usize) });
     // The executor is received, not constructed: this probe must observe the
     // same `Io` the real test roots get from `std.start`, so that a difference
     // between the suite and this file cannot be an executor difference.

@@ -32,10 +32,10 @@ concurrency:
 
 jobs:
   gate:
-    # Both runners execute natively. The library has no system library
-    # dependencies, so a native run on Linux and on macOS is a real
-    # portability check. A cross-compile matrix would only prove that
-    # `zig build -Dtarget=...` emits objects that nothing ever runs.
+    # Execute the native target on Linux and macOS, including Linux containers.
+    # The library has no system library dependencies. A cross-compile matrix
+    # would only prove that `zig build -Dtarget=...` emits objects that nothing
+    # ever runs.
     name: gate (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -50,7 +50,8 @@ jobs:
 
       # Keep temporary files, both Zig caches and installed artifacts outside
       # the checkout. RUNNER_TEMP is caller-owned local storage on these runners.
-      # Refuse shared system temporary directories rather than silently using one.
+      # Containers may expose private /tmp as RUNNER_TEMP. Put their scratch
+      # area under HOME instead: socket tests deliberately reject /tmp paths.
       - name: Initialize this job's temporary and cache directories
         run: |
           set -euo pipefail
@@ -58,8 +59,11 @@ jobs:
           scratch_root="$(realpath "$RUNNER_TEMP")/zig-agent-protocols"
           case "$scratch_root" in
             /tmp | /tmp/* | /var/tmp | /var/tmp/*)
-              echo "RUNNER_TEMP resolved to shared system storage: $scratch_root" >&2
-              exit 1
+              if [ ! -e /.dockerenv ] && [ ! -e /run/.containerenv ]; then
+                echo "RUNNER_TEMP resolved to shared host storage: $scratch_root" >&2
+                exit 1
+              fi
+              scratch_root="$(realpath "$HOME")/.zig-agent-protocols-ci"
               ;;
           esac
           umask 077
